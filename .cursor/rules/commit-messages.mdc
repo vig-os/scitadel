@@ -1,0 +1,44 @@
+---
+description: Commit message format and rules (type, Refs). Attach when committing, writing commit messages, or preparing PRs.
+alwaysApply: false
+globs:
+  - .gitmessage
+---
+
+# Commit Message Standard
+
+
+## Format (exactly)
+
+```
+type(scope)!: short description
+
+Refs: #<issue>
+```
+
+- **First line:** `type(scope)!: short description` — imperative, no period. Use only: `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `ci`, `build`, `revert`, `style`. Scope optional; `!` only for breaking changes.
+- **Blank line** after the subject.
+- **Optional body** (what/why). If present, end body with a blank line.
+- **Refs line** — mandatory for most types. At least one GitHub issue, e.g. `Refs: #36` or `Refs: #36, #37`. May add `REQ-...`, `RISK-...`, `SOP-...` after the issue.
+- **Exactly one Refs line** — no duplicate `Refs:` lines; Refs must be the last line.
+- **Exemption:** `chore` commits may omit the `Refs:` line when no issue/PR is directly related. Include `Refs:` when one is available.
+
+## Examples
+
+```
+feat(ci): add commit-msg validation hook
+
+Refs: #36
+```
+
+```
+fix: correct subject pattern for optional scope
+
+Refs: #36
+```
+
+## Do not use
+
+- Emojis or semantic-release style.
+- Types outside the list (e.g. `feature`, `bugfix`).
+- Commit messages without a `Refs:` line or without at least one issue ID (e.g. `#36`), except for `chore` type where `Refs:` is optional.

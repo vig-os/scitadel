@@ -1,0 +1,15 @@
+# .cursor/agent-models.toml
+# Single source of truth for cursor-agent model assignments.
+# Referenced by: justfile.worktree (worktree-start recipe)
+
+[models]
+lightweight = "composer-1.5"   # branch naming, quick single-shot tasks
+standard    = "sonnet-4.5"     # structured output, data gathering, mechanical steps
+autonomous  = "opus-4.6"       # full agent sessions (solve-and-pr, execute, etc.)
+
+[skill-tiers]
+# Which model tier each skill category should use for delegated sub-steps
+data-gathering = "lightweight"  # CLI commands, API calls, file reading, parsing
+formatting     = "lightweight"  # template filling, markdown generation, comment posting
+review         = "standard"     # code review, structured analysis with clear inputs
+orchestration  = "autonomous"   # design, planning, code generation, debugging

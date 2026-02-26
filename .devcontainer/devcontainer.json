@@ -1,0 +1,56 @@
+{
+    "name": "scitadel-devc",
+    "dockerComposeFile": [
+        "docker-compose.yml",
+        "docker-compose.project.yaml",
+        "docker-compose.local.yaml"
+    ],
+    "service": "devcontainer",
+    "workspaceFolder": "/workspace/scitadel",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "charliermarsh.ruff",
+                "ms-vscode.vscode-json",
+                "redhat.vscode-yaml",
+                "GitHub.vscode-pull-request-github",
+                "nefrob.vscode-just-syntax"
+            ],
+            "settings": {
+                "python.defaultInterpreterPath": "/root/assets/workspace/.venv/bin/python",
+                "[python]": {
+                    "editor.defaultFormatter": "charliermarsh.ruff",
+                    "editor.formatOnSave": true,
+                    "editor.codeActionsOnSave": {
+                        "source.organizeImports": "explicit",
+                        "source.fixAll": "explicit"
+                    }
+                },
+                "files.exclude": {
+                    "**/__pycache__": true,
+                    "**/*.pyc": true,
+                    "**/.pytest_cache": true
+                },
+                "git.ignoredFolders": [
+                    ".pre-commit-cache"
+                ]
+            }
+        }
+    },
+    "containerEnv": {
+        "CONTAINER_HOST": "unix:///var/run/docker.sock",
+        "DOCKER_HOST": "unix:///var/run/docker.sock"
+    },
+    "runArgs": [
+        "--cap-add=SYS_ADMIN",
+        "--cap-add=MKNOD",
+        "--security-opt=label=disable",
+        "--device=/dev/fuse",
+        "--group-add=0"
+    ],
+    "initializeCommand": ".devcontainer/scripts/initialize.sh",
+    "postStartCommand": "/bin/bash /workspace/scitadel/.devcontainer/scripts/post-start.sh",
+    "postAttachCommand": "/bin/bash /workspace/scitadel/.devcontainer/scripts/post-attach.sh",
+    "postCreateCommand": "/bin/bash /workspace/scitadel/.devcontainer/scripts/post-create.sh"
+}

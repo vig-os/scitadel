@@ -1,0 +1,96 @@
+# Subagent Delegation
+
+When executing skills, delegate mechanical sub-steps to lightweight subagents via the Task tool to reduce token consumption on the primary model.
+
+## Model Tiers
+
+See [.cursor/agent-models.toml](../.cursor/agent-models.toml) for the single source of truth. Summary:
+
+- **lightweight** (`composer-1.5`) — CLI commands, API calls, file reading, parsing, template filling
+- **standard** (`sonnet-4.5`) — structured analysis, code review with clear inputs
+- **autonomous** (`opus-4.6`) — design, planning, code generation, debugging
+
+## When to Delegate
+
+Delegate a step if it matches one of these patterns:
+
+### Pattern: Data Gathering (use lightweight)
+
+- **Precondition checks** — branch name validation, regex parsing
+- **Issue/PR fetching** — `gh issue view`, `gh api`, `gh pr list`, `git log`
+- **File reading** — reading config files, parsing JSON/YAML
+- **CLI execution** — running tests, checking git status
+
+Example:
+
+```markdown
+Spawn a Task subagent with `model: "fast"` that:
+1. Runs `gh issue view <issue_number> --json title,body,labels,comments`
+2. Parses the JSON output
+3. Returns the parsed data as a structured response
+```
+
+### Pattern: Formatting (use lightweight)
+
+- **Template filling** — populating markdown templates with data
+- **Comment posting** — formatting and posting GitHub issue/PR comments
+- **Progress updates** — updating markdown task lists with checkboxes
+- **Report generation** — formatting verification results, CI status
+
+Example:
+
+```markdown
+Spawn a Task subagent with `model: "fast"` that:
+1. Takes the formatted markdown body
+2. Posts it via `gh api repos/{owner}/{repo}/issues/{issue_number}/comments -f body="..."`
+3. Returns the comment URL
+```
+
+### Pattern: Structured Review (use standard)
+
+- **Code review** — analyzing diffs against acceptance criteria
+- **Log analysis** — parsing CI failure logs, extracting key errors
+- **Verification** — checking test results, lint output against expectations
+
+Example:
+
+```markdown
+Spawn a Task subagent with `readonly: true` that:
+1. Reads the diff and issue acceptance criteria
+2. Reviews the changes following the code review checklist
+3. Returns a structured report with Critical/Important/Minor issues
+```
+
+### Pattern: Keep in Main Agent (no delegation)
+
+Do NOT delegate if the step requires:
+
+- **Deep reasoning** — architectural decisions, design trade-offs
+- **Code generation** — writing implementation code, tests
+- **Debugging** — root cause analysis, hypothesis formation
+- **Tight loops** — TDD RED-GREEN-REFACTOR cycles that need shared context
+
+## How to Delegate in Skills
+
+In a skill's `## Delegation` section, specify which steps should use subagents:
+
+```markdown
+## Delegation
+
+The following steps SHOULD be delegated to reduce token consumption:
+
+- **Step 1-2** (precondition check, read issue): Spawn a Task subagent with
+  `model: "fast"` that runs gh CLI commands and returns parsed JSON.
+- **Step 6** (publish comment): Spawn a Task subagent with `model: "fast"` that
+  posts the formatted comment and returns the comment URL.
+
+Reference: [subagent-delegation rule](../../rules/subagent-delegation.mdc)
+```
+
+## Important Notes
+
+- Skills are markdown instructions, not executable code. The agent executing the skill reads these delegation instructions and decides when to spawn subagents.
+- Use `model: "fast"` for lightweight tasks (data-gathering, formatting).
+- Omit the `model` parameter for standard-tier tasks (it defaults to the session model or a capable mid-tier model).
+- Always pass sufficient context to the subagent — it has no access to the parent session's state.
+- The Task tool's `description` parameter should be concise (3-5 words), while the `prompt` should contain all necessary context and instructions.

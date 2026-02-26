@@ -1,0 +1,78 @@
+---
+description: When and how to update CHANGELOG.md during development. Attach when editing CHANGELOG.md, committing changes, or preparing PRs.
+alwaysApply: false
+globs:
+  - CHANGELOG.md
+---
+
+# Changelog Update Rules
+
+When making code changes, follow these rules for updating [CHANGELOG.md](CHANGELOG.md).
+
+## When to update
+
+- **Always update** for `feat`, `fix`, `refactor`, `build`, `revert`, `style`, `test`, `docs` changes that affect user-visible behavior, public API, or developer workflow.
+- **Always update** for dependency version bumps (including Dependabot PRs) — users and operators need to know what changed.
+- **Skip** for `chore` commits that are purely internal (CI-only config tweaks, formatting) unless they have user-visible impact.
+- When in doubt, add an entry — it's easier to remove during review than to add later.
+
+## Where to update
+
+- Edit **only** the `## Unreleased` section at the top of `CHANGELOG.md`.
+- Place the entry under the correct category heading. Create the heading if it doesn't exist yet.
+- **Never** modify entries below `## Unreleased` (those are released versions).
+- **Never** change the release date or version number of any section.
+- **Sort order:** within `## Unreleased`, add new entries chronologically (newest at the bottom of each category). Entries are reordered by issue on release.
+- **Editing unreleased entries:** entries in `## Unreleased` represent the atomic user-facing state between versions, not a copy of commit history. You may update or consolidate existing unreleased entries across PRs (e.g. fixing a bug introduced in an earlier unreleased PR).
+
+## Category headings (in order)
+
+Use these [Keep a Changelog](https://keepachangelog.com/) categories:
+
+```
+### Added       — new features, capabilities, tools
+### Changed     — changes to existing functionality
+### Deprecated  — features that will be removed
+### Removed     — features that were removed
+### Fixed       — bug fixes
+### Security    — vulnerability fixes or security improvements
+```
+
+## Entry format
+
+Follow the existing style in the file:
+
+```markdown
+- **Bold short title** ([#<issue>](<repo_issues_url>/<issue>))
+  - Detail bullet explaining what was done
+  - Additional detail bullet if needed
+```
+
+Rules:
+- Start with `- **Bold title**` followed by the issue link in parentheses.
+- Determine the repo issues URL with `gh repo view --json url --jq '.url + "/issues"'`.
+- Use sub-bullets (indented with two spaces) for implementation details.
+- Reference the GitHub issue number from the `Refs:` line in the commit.
+- If multiple issues are related, list them: `([#12](url), [#13](url))`.
+- Keep descriptions concise and user-focused (what changed, not how).
+
+## Example
+
+```markdown
+## Unreleased
+
+### Added
+
+- **SSH agent forwarding** ([#42](<repo_issues_url>/42))
+  - Forward host SSH agent into devcontainer for seamless git authentication
+  - Integration tests for SSH socket availability
+
+### Fixed
+
+- **Broken venv prompt after rename** ([#43](<repo_issues_url>/43))
+  - Post-create script now correctly updates the activate script prompt
+```
+
+## Relationship to issue templates
+
+If the issue has a **Changelog Category** field (e.g. "Added", "Fixed"), use that as the category. If the field says "No changelog needed", skip the changelog update.

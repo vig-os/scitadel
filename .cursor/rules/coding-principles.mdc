@@ -1,0 +1,21 @@
+---
+description: Coding principles enforced on every file edit
+alwaysApply: true
+---
+
+# Coding Principles
+
+1. **YAGNI** -- Implement only what the issue or user explicitly requests. No speculative features. Ask before adding anything unasked.
+2. **Minimal diff** -- Touch only files and lines required for the task. No drive-by refactors, renames, or reformats. Mention improvements separately; don't silently change them.
+3. **DRY** -- Don't duplicate logic. Extract shared code only after the pattern appears twice. Prefer existing abstractions over new ones.
+4. **No secrets** -- Never hardcode tokens, passwords, keys, or connection strings. Use env vars. Don't commit .env or credential files. Flag existing secrets to the user.
+5. **Traceability** -- Every change must link to a GitHub issue. No out-of-scope fixes. Suggest a new issue instead of bundling unrelated changes.
+6. **Single responsibility** -- One function = one job. Prefer new functions over extending existing ones. Split functions exceeding ~50 lines or handling multiple concerns.
+
+## Stop if
+
+- Adding code the issue didn't ask for
+- Editing files outside the task scope
+- Hardcoding a secret or credential
+- Making changes not traceable to an issue
+- Growing a function beyond one clear purpose

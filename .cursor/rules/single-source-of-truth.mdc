@@ -1,0 +1,27 @@
+---
+description: Single Source of Truth — no duplication of knowledge
+alwaysApply: true
+---
+
+# Single Source of Truth (SSoT)
+
+Every piece of knowledge must live in exactly one place. Reference it everywhere else.
+
+## Core Principle
+
+If information exists in a file, **link to it** — never copy it.
+
+## Applies to
+
+- **Documentation as code** — docs live in the repo, version-controlled alongside the code they describe.
+- **Config as code** — configuration is declarative, checked in, and machine-readable. No manual portal settings.
+- **Infrastructure as code** — all infra is defined in versioned templates/scripts. No click-ops.
+- **Rules & standards** — define once in a canonical file, reference via path or link. Never duplicate across READMEs, comments, or wikis.
+- **Comments & docstrings** — don't repeat what a referenced doc already says. Link to the source instead.
+
+## In Practice
+
+- Before writing explanatory text, check if a canonical source already exists.
+- If it does → link to it (`see docs/COMMIT_MESSAGE_STANDARD.md`).
+- If it doesn't → create the canonical file first, then link to it.
+- Never maintain the same information in two places.

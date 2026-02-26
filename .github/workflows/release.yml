@@ -1,0 +1,482 @@
+# Release Workflow
+#
+# Creates a versioned release from a release branch.
+# Default template for Python projects using the vigOS devcontainer.
+#
+# Prerequisites:
+#   - A release branch (release/X.Y.Z) exists
+#   - CHANGELOG.md contains "## [X.Y.Z] - TBD"
+#   - A PR from release/X.Y.Z to main is open, approved, and CI has passed
+#   - Tag X.Y.Z does not yet exist
+#
+# Steps:
+#   1. Validate  — Check all prerequisites
+#   2. Finalize  — Set release date in CHANGELOG, commit, push
+#   3. Test      — Run full test suite on finalized code
+#   4. Release   — Create tag and GitHub Release with changelog notes
+#   5. Rollback  — Revert changes and create issue on failure
+#
+# Trigger:
+#   - Manual workflow_dispatch with version input
+#
+# TODO: For branch-protected repos, replace GITHUB_TOKEN with a GitHub App token
+#       to allow pushing finalization commits. See:
+#       https://github.com/apps/settings → create app with contents:write permission.
+
+name: Release
+
+on:  # yamllint disable-line rule:truthy
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Semantic version to release (e.g., 1.2.3)'
+        required: true
+        type: string
+      dry-run:
+        description: 'Validate without making changes'
+        required: false
+        default: false
+        type: boolean
+      git-user-name:
+        description: 'Git user name for release commits'
+        required: false
+        default: 'github-actions[bot]'
+        type: string
+      git-user-email:
+        description: 'Git user email for release commits'
+        required: false
+        default: '41898282+github-actions[bot]@users.noreply.github.com'
+        type: string
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate Release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.vars.outputs.version }}
+      pr_number: ${{ steps.pr.outputs.pr_number }}
+      release_date: ${{ steps.vars.outputs.release_date }}
+      pre_finalize_sha: ${{ steps.pre_sha.outputs.pre_finalize_sha }}
+
+    steps:
+      - name: Validate and prepare variables
+        id: vars
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          VERSION="$INPUT_VERSION"
+
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "ERROR: Invalid version format '$VERSION'"
+            echo "Version must follow semantic versioning: MAJOR.MINOR.PATCH (e.g., 1.2.3)"
+            exit 1
+          fi
+
+          RELEASE_DATE=$(date -u +%Y-%m-%d)
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "release_date=$RELEASE_DATE" >> $GITHUB_OUTPUT
+
+      - name: Checkout release branch
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+        with:
+          ref: release/${{ steps.vars.outputs.version }}
+          fetch-depth: 0
+
+      - name: Record pre-finalization SHA
+        id: pre_sha
+        run: |
+          PRE_FINALIZE_SHA=$(git rev-parse HEAD)
+          echo "pre_finalize_sha=$PRE_FINALIZE_SHA" >> $GITHUB_OUTPUT
+          echo "Pre-finalization SHA: $PRE_FINALIZE_SHA"
+
+      - name: Verify CHANGELOG has TBD entry
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+        run: |
+          if ! grep -q "## \[$VERSION\] - TBD" CHANGELOG.md; then
+            echo "ERROR: CHANGELOG.md does not contain '## [$VERSION] - TBD'"
+            exit 1
+          fi
+
+      - name: Verify tag does not exist
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+        run: |
+          if git tag -l | grep -q "^${VERSION}$"; then
+            echo "ERROR: Tag $VERSION already exists"
+            exit 1
+          fi
+
+      - name: Find and verify PR
+        id: pr
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          PR_JSON=$(gh pr list \
+            --head "release/$VERSION" \
+            --base main \
+            --json number,isDraft,reviewDecision,statusCheckRollup \
+            --limit 1)
+
+          PR_COUNT=$(echo "$PR_JSON" | jq 'length')
+
+          if [ "$PR_COUNT" != "1" ]; then
+            echo "ERROR: Expected exactly 1 PR from release/$VERSION to main, found $PR_COUNT"
+            exit 1
+          fi
+
+          PR_NUMBER=$(echo "$PR_JSON" | jq -r '.[0].number')
+          IS_DRAFT=$(echo "$PR_JSON" | jq -r '.[0].isDraft')
+          REVIEW_DECISION=$(echo "$PR_JSON" | jq -r '.[0].reviewDecision')
+
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+
+          if [ "$IS_DRAFT" = "true" ]; then
+            echo "ERROR: PR #$PR_NUMBER is still in draft"
+            exit 1
+          fi
+
+          if [ "$REVIEW_DECISION" != "APPROVED" ]; then
+            echo "ERROR: PR #$PR_NUMBER is not approved (status: $REVIEW_DECISION)"
+            exit 1
+          fi
+
+          STATUS_ROLLUP=$(echo "$PR_JSON" | jq -r '.[0].statusCheckRollup // []')
+          CI_FAILED=$(echo "$STATUS_ROLLUP" | jq '[.[] | select(.conclusion == "FAILURE" or .conclusion == "ERROR")] | length')
+
+          if [ "$CI_FAILED" != "0" ]; then
+            echo "ERROR: PR #$PR_NUMBER has failed CI checks"
+            exit 1
+          fi
+
+          echo "PR #$PR_NUMBER verified: ready, approved, CI passed"
+
+      - name: Summary
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          RELEASE_DATE: ${{ steps.vars.outputs.release_date }}
+          DRY_RUN: ${{ github.event.inputs.dry-run }}
+        run: |
+          echo "Validation passed"
+          echo ""
+          echo "  Version:      $VERSION"
+          echo "  Branch:       release/$VERSION"
+          echo "  PR:           #$PR_NUMBER"
+          echo "  Release Date: $RELEASE_DATE"
+          echo "  Dry-run:      $DRY_RUN"
+
+  finalize:
+    name: Finalize Release
+    needs: validate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    if: ${{ github.event.inputs.dry-run != 'true' }}
+    permissions:
+      contents: write
+    outputs:
+      finalize_sha: ${{ steps.finalize.outputs.finalize_sha }}
+
+    steps:
+      - name: Checkout release branch
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: release/${{ needs.validate.outputs.version }}
+          persist-credentials: true
+
+      - name: Set release date in CHANGELOG
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          RELEASE_DATE: ${{ needs.validate.outputs.release_date }}
+        run: |
+          set -euo pipefail
+          sed -i "s/## \[$VERSION\] - TBD/## [$VERSION] - $RELEASE_DATE/" CHANGELOG.md
+
+          if ! grep -q "## \[$VERSION\] - $RELEASE_DATE" CHANGELOG.md; then
+            echo "ERROR: Failed to set release date in CHANGELOG"
+            exit 1
+          fi
+          echo "Release date set in CHANGELOG.md"
+
+      - name: Commit and push finalization changes via API
+        uses: vig-os/commit-action@b70c2d87acd0f146c40e8d88a9bda40b76c084b5  # v0.1.3
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          TARGET_BRANCH: refs/heads/release/${{ needs.validate.outputs.version }}
+          COMMIT_MESSAGE: |-
+            chore: finalize release ${{ needs.validate.outputs.version }}
+
+            Set release date to ${{ needs.validate.outputs.release_date }} in CHANGELOG.md
+
+            Refs: #${{ needs.validate.outputs.pr_number }}
+          FILE_PATHS: CHANGELOG.md
+
+      - name: Trigger sync-issues workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          echo "Triggering sync-issues workflow..."
+          gh workflow run sync-issues.yml \
+            -f "target-branch=release/$VERSION"
+          echo "✓ sync-issues workflow triggered"
+
+      - name: Wait for sync-issues completion
+        run: |
+          set -euo pipefail
+          TIMEOUT=120
+          ELAPSED=0
+          INTERVAL=10
+
+          sleep 5
+          ELAPSED=5
+
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            RUN_STATUS=$(gh run list \
+              --workflow sync-issues.yml \
+              --limit 1 \
+              --json status,conclusion \
+              --jq '.[0].status' 2>/dev/null || echo "unknown")
+
+            if [ "$RUN_STATUS" = "completed" ]; then
+              RUN_CONCLUSION=$(gh run list \
+                --workflow sync-issues.yml \
+                --limit 1 \
+                --json conclusion \
+                --jq '.[0].conclusion' 2>/dev/null || echo "unknown")
+
+              if [ "$RUN_CONCLUSION" = "success" ]; then
+                echo "✓ sync-issues workflow completed successfully"
+              else
+                echo "⚠ sync-issues workflow completed with status: $RUN_CONCLUSION"
+              fi
+              break
+            fi
+
+            sleep "$INTERVAL"
+            ELAPSED=$((ELAPSED + INTERVAL))
+            echo "Waiting for sync-issues... (${ELAPSED}s / ${TIMEOUT}s)"
+          done
+
+          if [ $ELAPSED -ge $TIMEOUT ]; then
+            echo "⚠ Timed out waiting for sync-issues workflow"
+            echo "The release may continue, but PR documentation may not be synced"
+          fi
+
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Pull sync-issues changes
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          git fetch origin "release/$VERSION"
+          git reset --hard "origin/release/$VERSION"
+          echo "✓ Synced with remote release branch"
+
+      - name: Output finalize SHA
+        id: finalize
+        run: |
+          FINALIZE_SHA=$(git rev-parse HEAD)
+          echo "finalize_sha=$FINALIZE_SHA" >> $GITHUB_OUTPUT
+          echo "Finalized at commit: $FINALIZE_SHA"
+
+  test:
+    name: Test (Finalized)
+    needs: [validate, finalize]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout finalized commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ needs.finalize.outputs.finalize_sha }}
+
+      - name: Set up environment
+        uses: ./.github/actions/setup-env
+        with:
+          sync-dependencies: 'true'
+
+      - name: Run tests
+        run: uv run pytest
+
+  release:
+    name: Create Release
+    needs: [validate, finalize, test]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout finalized commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ needs.finalize.outputs.finalize_sha }}
+          persist-credentials: true
+
+      - name: Configure git
+        env:
+          GIT_USER_NAME: ${{ github.event.inputs.git-user-name }}
+          GIT_USER_EMAIL: ${{ github.event.inputs.git-user-email }}
+        run: |
+          git config user.name "$GIT_USER_NAME"
+          git config user.email "$GIT_USER_EMAIL"
+
+      - name: Create and push tag
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          git tag -a "$VERSION" -m "Release $VERSION"
+          git push origin "$VERSION"
+          echo "Tag $VERSION created and pushed"
+
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Extract content between this version header and the next version header
+          awk '/^## \['"$VERSION"'\]/{found=1; next} /^## \[/{found=0} found' \
+            CHANGELOG.md > /tmp/release-notes.md
+
+          if [ ! -s /tmp/release-notes.md ]; then
+            echo "No changelog notes found for $VERSION" > /tmp/release-notes.md
+          fi
+
+          echo "Release notes:"
+          cat /tmp/release-notes.md
+
+      - name: Create GitHub Release
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$VERSION" \
+            --title "$VERSION" \
+            --notes-file /tmp/release-notes.md \
+            --verify-tag
+          echo "GitHub Release $VERSION created"
+
+      - name: Summary
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          echo "Release published successfully"
+          echo ""
+          echo "  Version: $VERSION"
+          echo "  Tag:     $VERSION"
+          echo "  Release: https://github.com/${{ github.repository }}/releases/tag/$VERSION"
+          echo ""
+          echo "Next steps:"
+          echo "  1. Merge the release PR to main"
+          echo "  2. Merge main back into dev"
+
+  rollback:
+    name: Rollback on Failure
+    needs: [validate, finalize, test, release]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    if: failure()
+    permissions:
+      contents: write
+      issues: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: true
+
+      - name: Configure git
+        env:
+          GIT_USER_NAME: ${{ github.event.inputs.git-user-name }}
+          GIT_USER_EMAIL: ${{ github.event.inputs.git-user-email }}
+        run: |
+          git config user.name "$GIT_USER_NAME"
+          git config user.email "$GIT_USER_EMAIL"
+
+      - name: Rollback release branch
+        continue-on-error: true
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          PRE_SHA: ${{ needs.validate.outputs.pre_finalize_sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin "release/$VERSION"
+          git checkout "release/$VERSION"
+
+          if git reset --hard "$PRE_SHA" 2>/dev/null; then
+            if git push --force-with-lease origin "release/$VERSION"; then
+              echo "Release branch rolled back"
+            else
+              echo "Warning: Could not push rollback"
+            fi
+          fi
+
+      - name: Delete tag if created
+        continue-on-error: true
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          if git ls-remote origin "refs/tags/$VERSION" | grep -q "$VERSION"; then
+            git push origin ":refs/tags/$VERSION" && echo "Tag deleted" || echo "Warning: Could not delete tag"
+          else
+            echo "Tag does not exist (not created yet)"
+          fi
+
+      - name: Create failure issue
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          PR_NUMBER: ${{ needs.validate.outputs.pr_number }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          WORKFLOW_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          gh issue create \
+            --title "Release $VERSION failed — automatic rollback" \
+            --label "bug" \
+            --body "Release $VERSION encountered an error during the automated release workflow.
+
+          **Workflow Run:** [View logs]($WORKFLOW_URL)
+          **Release PR:** #$PR_NUMBER
+
+          **Automatic rollback attempted:**
+          - Release branch reset to pre-finalization state
+          - Release tag deleted (if created)
+
+          **Next steps:**
+          1. Review the workflow logs to identify the root cause
+          2. Verify rollback completed cleanly
+          3. Fix the issue on the release branch
+          4. Re-run the release workflow"
+
+      - name: Summary
+        run: |
+          echo "Release workflow failed"
+          echo ""
+          echo "Automatic rollback completed."
+          echo "A GitHub issue has been created for investigation."
+          echo "Check the workflow logs for details."

@@ -1,0 +1,55 @@
+---
+description: TDD discipline and test scenario guidance when writing code
+alwaysApply: false
+globs:
+  - "**/*.py"
+  - "**/*.ts"
+  - "**/*.js"
+  - "**/*.sh"
+  - "**/test_*"
+  - "**/*_test.*"
+  - "**/tests/**"
+---
+
+# TDD
+
+When implementing features or fixes that have testable behavior:
+
+1. Write the failing test first. Run it. Confirm it fails.
+2. **Commit** the failing test following [commit-messages.mdc](commit-messages.mdc) (`test: ...`). Do not proceed before committing.
+3. Write minimal code to make the test pass. Run it. Confirm it passes. **Commit** the implementation.
+4. Refactor. Run tests. Confirm no regressions. **Commit** the refactor if meaningful.
+
+All commits must follow [commit-messages.mdc](commit-messages.mdc). Never use `--no-verify`.
+
+Each phase gets its own commit so the git history proves TDD compliance.
+
+Do not write implementation code before its test. If you already wrote code, delete it and start with the test.
+
+Skip TDD only for non-testable changes (config, templates, docs). Note why when skipping.
+
+## Test scenario checklist
+
+Before writing a test, evaluate which scenarios apply. Not every category applies to every change — skip with a note.
+
+| Category | Consider |
+|---|---|
+| Happy path | Does the expected input produce the expected output? |
+| Edge cases | Empty input, single element, max values, boundary values |
+| Error paths | Invalid input, missing dependencies, network/IO failures |
+| Input validation | Null, undefined, wrong type, malformed data |
+| State & side effects | Does it modify state correctly? Cleanup? |
+| Idempotency | Does running the operation twice produce the same result as once? |
+| Concurrency | Do parallel or overlapping executions corrupt state or race? |
+| Regression | If fixing a bug, does the test prove the bug is fixed? |
+| Canary | Inject a known-bad state into the real environment, confirm the guard catches it, clean up |
+| Smoke | After integration, does the system start and key flows work? |
+
+## Test types
+
+Use the narrowest type that covers the behavior. Prefer unit tests. Escalate only when the behavior crosses boundaries.
+
+- **Unit** — isolated function behavior, fast, no external dependencies
+- **Integration** — components working together, may need fixtures or containers
+- **Smoke** — system starts, critical paths respond (post-deploy or post-build)
+- **E2E** — full user flow through the system

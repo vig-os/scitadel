@@ -1,0 +1,10 @@
+# ===============================================================================
+# GITHUB CLI RECIPES - Issue, PR, and Repository Management
+# ===============================================================================
+
+_gh_scripts := source_directory() / "scripts"
+
+# List open issues and PRs grouped by milestone
+[group('github')]
+gh-issues:
+    uv run python {{ _gh_scripts }}/gh_issues.py

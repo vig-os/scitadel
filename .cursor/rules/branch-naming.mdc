@@ -1,0 +1,65 @@
+---
+description: Topic branch naming and workflow for starting work on an issue. Attach when creating branches, starting work on issues, or checking out branches.
+alwaysApply: false
+---
+
+# Topic Branch Naming and Workflow
+
+When the user asks to create or start work on an issue (e.g. "create branch for issue 36", "start working on issue 36", or references `.github_data/issues/issue-36.md`), follow this workflow.
+
+## Workflow: Create and link a development branch
+
+1. **Verify no developer branch is linked yet**
+   - Run: `gh issue develop --list <issue_number>`
+   - If the issue already has a linked branch, tell the user and offer to checkout that branch locally (`git fetch origin && git checkout <branch_name>`) or stop. Do not create a second linked branch.
+
+2. **Infer branch type**
+   - From issue labels or intent, pick one: `feature` | `bugfix` | `release`.
+   - Ask the user if labels and title are ambiguous.
+
+3. **Set short summary**
+   - From the issue title or description, derive a kebab-case `short_summary` (a few words).
+   - Omit prefixes like "FEATURE", "BUG", "Add". Example: "Standardize and Enforce Commit Message Format" → `standardize-commit-messages`.
+
+4. **Propose branch name and ask for validation**
+   - Propose: `<type>/<issue_number>-<short_summary>` (e.g. `feature/36-standardize-commit-messages`).
+   - Explicitly ask the user to confirm or give a different name before proceeding.
+
+5. **Determine base branch**
+   - Check if the issue has a parent: `gh api repos/{owner}/{repo}/issues/{issue_number}/parent --jq '.number'`
+   - If a parent exists, resolve its linked branch: `gh issue develop --list <parent_number>`. Use the parent's branch as `<base_branch>`. If the parent has no linked branch, fall back to `dev`.
+   - If no parent exists, use `dev` as `<base_branch>`.
+
+6. **Create and link the branch via GitHub**
+   - After user confirms: `gh issue develop <issue_number> --base <base_branch> --name <branch_name> --checkout`
+   - This creates the branch on the remote from `<base_branch>`, links it to the issue, and checks it out locally. If `gh` reports that the branch already exists on the remote, run `git fetch origin` and `git checkout <branch_name>` instead.
+
+7. **Ensure local branch is up to date**
+   - After checkout: `git pull origin <branch_name>` (if the branch already had commits and you created it via another path, or to sync with remote).
+
+## Branch name format (reference)
+
+### Issue-tied branches
+```
+<type>/<issue_number>-<short_summary>
+```
+Example: `feature/36-standardize-commit-messages`, `bugfix/42-fix-login-bug`
+
+### Chore branches (no issue required)
+```
+chore/<short_summary>
+```
+Example: `chore/sync-main-to-dev`, `chore/update-dependencies`
+
+## Branch types (reference)
+
+| Type     | Issue Required | Use for                                                                 |
+|----------|----------------|-------------------------------------------------------------------------|
+| feature  | Yes            | New functionality, enhancements                                         |
+| bugfix   | Yes            | Bug fixes (non-urgent)                                                  |
+| release  | Yes            | Release preparation, version bumps, release notes                       |
+| chore   | No             | Maintenance tasks, syncing branches, dependency updates, routine work   |
+
+## One-off branch name only
+
+When the user only wants a branch name suggestion (no "create" or "start work"), propose the name in the format above and do not run the full workflow.
