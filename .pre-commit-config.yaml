@@ -128,6 +128,25 @@ repos:
         files: ^\.cursor/skills/
         pass_filenames: false
 
+  # AI agent identity: strip trailers before commit-msg (Refs: #163)
+  - repo: local
+    hooks:
+      - id: prepare-commit-msg-strip-trailers
+        name: strip agent trailers from commit message
+        entry: uv run python .devcontainer/scripts/prepare-commit-msg-strip-trailers.py
+        language: system
+        stages: [prepare-commit-msg]
+        pass_filenames: true
+
+  # AI agent identity: reject author/committer matching blocklist (Refs: #163)
+  - repo: local
+    hooks:
+      - id: check-agent-identity
+        name: check agent identity
+        entry: uv run python .devcontainer/scripts/check-agent-identity.py
+        language: system
+        pass_filenames: false
+
   # Commit message validation (commit-msg stage)
   - repo: local
     hooks:

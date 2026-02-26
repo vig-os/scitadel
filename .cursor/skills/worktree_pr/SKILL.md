@@ -136,4 +136,4 @@ Reference: [subagent-delegation rule](../../rules/subagent-delegation.mdc)
 - Never block for user review of the PR text. Generate the best text from available context.
 - Base branch is auto-detected: parent issue's branch for sub-issues, `dev` otherwise.
 - The PR title should follow commit message conventions: `type(scope): description (#issue)`.
-- **NEVER add 'Co-authored-by: Cursor <cursoragent@cursor.com>'** to commit messages.
+- Never add Co-authored-by trailers. Never set git author/committer to an AI agent identity. Never mention AI agent names in commit messages or PR descriptions. The pre-commit hooks will reject violations.

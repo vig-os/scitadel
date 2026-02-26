@@ -18,6 +18,7 @@
                 "nefrob.vscode-just-syntax"
             ],
             "settings": {
+                "terminal.integrated.defaultProfile.linux": "bash",
                 "python.defaultInterpreterPath": "/root/assets/workspace/.venv/bin/python",
                 "[python]": {
                     "editor.defaultFormatter": "charliermarsh.ruff",

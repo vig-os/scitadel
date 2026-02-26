@@ -2,6 +2,12 @@
 # GITHUB CLI RECIPES - Issue, PR, and Repository Management
 # ===============================================================================
 
+# -------------------------------------------------------------------------------
+# ALIASES
+# -------------------------------------------------------------------------------
+
+alias gh-i := gh-issues
+
 _gh_scripts := source_directory() / "scripts"
 
 # List open issues and PRs grouped by milestone
