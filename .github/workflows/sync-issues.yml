@@ -93,7 +93,7 @@ jobs:
 
       - name: Sync Issues and PRs
         id: sync
-        uses: vig-os/sync-issues-action@b4cdf371bb708230ce410a8203e6463e9e6caf2d  # v0.1.1
+        uses: vig-os/sync-issues-action@bad447d330526a7313ffddae084010c39b335fc1  # v0.2.2
         with:
           app-id: ${{ secrets.APP_SYNC_ISSUES_ID }}
           app-private-key: ${{ secrets.APP_SYNC_ISSUES_PRIVATE_KEY }}
