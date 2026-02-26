@@ -1,6 +1,16 @@
 # ===============================================================================
 # WORKTREE RECIPES — CLI-based parallel agent development
 # ===============================================================================
+
+# -------------------------------------------------------------------------------
+# ALIASES — short prefixes for faster typing (worktree -> wt)
+# -------------------------------------------------------------------------------
+
+alias wt-start := worktree-start
+alias wt-list := worktree-list
+alias wt-attach := worktree-attach
+alias wt-stop := worktree-stop
+alias wt-clean := worktree-clean
 # NOTE: Cursor's native worktree UI does NOT work inside devcontainers (Feb 2026).
 # These recipes provide a CLI-based alternative using tmux + cursor-agent.
 # Native worktree support (.cursor/worktrees.json) works on macOS/Linux local only.
