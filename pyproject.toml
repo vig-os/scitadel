@@ -44,6 +44,9 @@ src = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "contract: tests that hit real external APIs (deselect with -m 'not contract')",
+]
 
 [dependency-groups]
 dev = [
