@@ -136,6 +136,7 @@ repos:
         entry: uv run validate-commit-msg
         language: system
         stages: [commit-msg]
+        pass_filenames: false
         # Optional: customize commit types, scopes, or refs-optional types via CLI arguments.
         # By default, scopes are not enforced. Set --scopes to require specific scopes.
         # Examples (choose one args line):
