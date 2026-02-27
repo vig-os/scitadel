@@ -223,3 +223,153 @@ def init(db: str | None) -> None:
     database.migrate()
     click.echo(f"Database initialized at: {db_path}")
     database.close()
+
+
+# -- Research question commands --
+
+
+@cli.group()
+def question() -> None:
+    """Manage research questions."""
+
+
+@question.command("create")
+@click.argument("text")
+@click.option("--description", "-d", default="", help="Additional context.")
+def question_create(text: str, description: str) -> None:
+    """Create a research question for relevance scoring."""
+    from scitadel.domain.models import ResearchQuestion
+    from scitadel.repositories.sqlite import Database, SQLiteResearchQuestionRepository
+
+    config = load_config()
+    db = Database(config.db_path)
+    db.migrate()
+    q_repo = SQLiteResearchQuestionRepository(db)
+
+    q = ResearchQuestion(text=text, description=description)
+    q_repo.save_question(q)
+    click.echo(f"  Question ID: {q.id}")
+    click.echo(f"  Text: {text}")
+    db.close()
+
+
+@question.command("list")
+def question_list() -> None:
+    """List all research questions."""
+    from scitadel.repositories.sqlite import Database, SQLiteResearchQuestionRepository
+
+    config = load_config()
+    db = Database(config.db_path)
+    db.migrate()
+    q_repo = SQLiteResearchQuestionRepository(db)
+
+    questions = q_repo.list_questions()
+    if not questions:
+        click.echo("No research questions found.")
+        db.close()
+        return
+
+    for q in questions:
+        click.echo(f'  {q.id[:8]}  {q.created_at:%Y-%m-%d %H:%M}  "{q.text}"')
+    db.close()
+
+
+# -- Assess command --
+
+
+@cli.command()
+@click.argument("search_id")
+@click.option(
+    "--question", "-q", "question_id", required=True, help="Research question ID."
+)
+@click.option(
+    "--model",
+    "-m",
+    default="claude-sonnet-4-6",
+    help="Model for scoring (default: claude-sonnet-4-6).",
+)
+@click.option(
+    "--temperature",
+    "-t",
+    default=0.0,
+    type=float,
+    help="Temperature for scoring (default: 0.0).",
+)
+def assess(search_id: str, question_id: str, model: str, temperature: float) -> None:
+    """Score papers from a search against a research question using Claude.
+
+    Requires ANTHROPIC_API_KEY environment variable.
+    """
+    from scitadel.repositories.sqlite import (
+        Database,
+        SQLiteAssessmentRepository,
+        SQLitePaperRepository,
+        SQLiteResearchQuestionRepository,
+        SQLiteSearchRepository,
+    )
+    from scitadel.services.scoring import ScoringConfig, score_papers
+
+    config = load_config()
+    db = Database(config.db_path)
+    db.migrate()
+    search_repo = SQLiteSearchRepository(db)
+    paper_repo = SQLitePaperRepository(db)
+    q_repo = SQLiteResearchQuestionRepository(db)
+    a_repo = SQLiteAssessmentRepository(db)
+
+    # Resolve search ID
+    s = search_repo.get(search_id)
+    if not s:
+        searches = search_repo.list_searches(limit=100)
+        matches = [sr for sr in searches if sr.id.startswith(search_id)]
+        if len(matches) == 1:
+            s = matches[0]
+        else:
+            click.echo(f"Search '{search_id}' not found.")
+            db.close()
+            sys.exit(1)
+
+    # Resolve question ID
+    q = q_repo.get_question(question_id)
+    if not q:
+        questions = q_repo.list_questions()
+        matches = [rq for rq in questions if rq.id.startswith(question_id)]
+        if len(matches) == 1:
+            q = matches[0]
+        else:
+            click.echo(f"Question '{question_id}' not found.")
+            db.close()
+            sys.exit(1)
+
+    # Load papers
+    results = search_repo.get_results(s.id)
+    paper_ids = {r.paper_id for r in results}
+    papers = [p for pid in paper_ids if (p := paper_repo.get(pid))]
+
+    click.echo(f'Scoring {len(papers)} papers against: "{q.text}"')
+    click.echo(f"  Model: {model}  Temperature: {temperature}")
+
+    scoring_config = ScoringConfig(
+        model=model,
+        temperature=temperature,
+    )
+
+    def on_progress(i, total, paper, assessment):
+        click.echo(f"  [{i + 1}/{total}] {assessment.score:.2f}  {paper.title[:60]}")
+
+    assessments = score_papers(
+        papers, q, config=scoring_config, on_progress=on_progress
+    )
+
+    # Persist
+    for a in assessments:
+        a_repo.save(a)
+
+    # Summary
+    scores = [a.score for a in assessments]
+    avg = sum(scores) / len(scores) if scores else 0
+    relevant = sum(1 for s in scores if s >= 0.6)
+    click.echo(f"\n  Scored: {len(assessments)} papers")
+    click.echo(f"  Average relevance: {avg:.2f}")
+    click.echo(f"  Relevant (≥0.6): {relevant}/{len(assessments)}")
+    db.close()
