@@ -70,59 +70,54 @@ class SQLitePaperRepository:
     def __init__(self, db: Database) -> None:
         self._db = db
 
-    def save(self, paper: Paper) -> None:
-        self._db.conn.execute(
-            """INSERT OR REPLACE INTO papers
-               (id, title, authors, abstract, doi, arxiv_id, pubmed_id,
-                inspire_id, openalex_id, year, journal, url, source_urls,
-                created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                paper.id,
-                paper.title,
-                json.dumps(paper.authors),
-                paper.abstract,
-                paper.doi,
-                paper.arxiv_id,
-                paper.pubmed_id,
-                paper.inspire_id,
-                paper.openalex_id,
-                paper.year,
-                paper.journal,
-                paper.url,
-                json.dumps(paper.source_urls),
-                paper.created_at.isoformat(),
-                paper.updated_at.isoformat(),
-            ),
+    _UPSERT_SQL = """\
+        INSERT INTO papers
+            (id, title, authors, abstract, doi, arxiv_id, pubmed_id,
+             inspire_id, openalex_id, year, journal, url, source_urls,
+             created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            title      = excluded.title,
+            authors    = excluded.authors,
+            abstract   = CASE WHEN excluded.abstract != '' THEN excluded.abstract
+                              ELSE papers.abstract END,
+            doi        = COALESCE(excluded.doi, papers.doi),
+            arxiv_id   = COALESCE(excluded.arxiv_id, papers.arxiv_id),
+            pubmed_id  = COALESCE(excluded.pubmed_id, papers.pubmed_id),
+            inspire_id = COALESCE(excluded.inspire_id, papers.inspire_id),
+            openalex_id= COALESCE(excluded.openalex_id, papers.openalex_id),
+            year       = COALESCE(excluded.year, papers.year),
+            journal    = COALESCE(excluded.journal, papers.journal),
+            url        = COALESCE(excluded.url, papers.url),
+            source_urls= excluded.source_urls,
+            updated_at = excluded.updated_at"""
+
+    def _paper_row(self, paper: Paper) -> tuple:
+        return (
+            paper.id,
+            paper.title,
+            json.dumps(paper.authors),
+            paper.abstract,
+            paper.doi,
+            paper.arxiv_id,
+            paper.pubmed_id,
+            paper.inspire_id,
+            paper.openalex_id,
+            paper.year,
+            paper.journal,
+            paper.url,
+            json.dumps(paper.source_urls),
+            paper.created_at.isoformat(),
+            paper.updated_at.isoformat(),
         )
+
+    def save(self, paper: Paper) -> None:
+        self._db.conn.execute(self._UPSERT_SQL, self._paper_row(paper))
         self._db.conn.commit()
 
     def save_many(self, papers: list[Paper]) -> None:
         for paper in papers:
-            self._db.conn.execute(
-                """INSERT OR REPLACE INTO papers
-                   (id, title, authors, abstract, doi, arxiv_id, pubmed_id,
-                    inspire_id, openalex_id, year, journal, url, source_urls,
-                    created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    paper.id,
-                    paper.title,
-                    json.dumps(paper.authors),
-                    paper.abstract,
-                    paper.doi,
-                    paper.arxiv_id,
-                    paper.pubmed_id,
-                    paper.inspire_id,
-                    paper.openalex_id,
-                    paper.year,
-                    paper.journal,
-                    paper.url,
-                    json.dumps(paper.source_urls),
-                    paper.created_at.isoformat(),
-                    paper.updated_at.isoformat(),
-                ),
-            )
+            self._db.conn.execute(self._UPSERT_SQL, self._paper_row(paper))
         self._db.conn.commit()
 
     def get(self, paper_id: str) -> Paper | None:
@@ -161,10 +156,17 @@ class SQLiteSearchRepository:
     def save(self, search: Search) -> None:
         outcomes_json = json.dumps([o.model_dump() for o in search.source_outcomes])
         self._db.conn.execute(
-            """INSERT OR REPLACE INTO searches
+            """INSERT INTO searches
                (id, query, sources, parameters, source_outcomes,
                 total_candidates, total_papers, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                query = excluded.query,
+                sources = excluded.sources,
+                parameters = excluded.parameters,
+                source_outcomes = excluded.source_outcomes,
+                total_candidates = excluded.total_candidates,
+                total_papers = excluded.total_papers""",
             (
                 search.id,
                 search.query,
@@ -187,9 +189,13 @@ class SQLiteSearchRepository:
     def save_results(self, results: list[SearchResult]) -> None:
         for r in results:
             self._db.conn.execute(
-                """INSERT OR REPLACE INTO search_results
+                """INSERT INTO search_results
                    (search_id, paper_id, source, rank, score, raw_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(search_id, paper_id, source) DO UPDATE SET
+                    rank = excluded.rank,
+                    score = excluded.score,
+                    raw_metadata = excluded.raw_metadata""",
                 (
                     r.search_id,
                     r.paper_id,

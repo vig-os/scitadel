@@ -94,11 +94,22 @@ def search(query: str, sources: str, max_results: int) -> None:
     paper_repo = SQLitePaperRepository(db)
     search_repo = SQLiteSearchRepository(db)
 
+    # Resolve new papers against existing DB records (match by DOI)
+    # so we reuse existing IDs instead of creating duplicates.
+    id_map: dict[str, str] = {}
+    for paper in papers:
+        if paper.doi:
+            existing = paper_repo.find_by_doi(paper.doi)
+            if existing and existing.id != paper.id:
+                id_map[paper.id] = existing.id
+                paper.id = existing.id
+
     paper_repo.save_many(papers)
     search_repo.save(search_record)
 
     for sr in search_results:
         sr.search_id = search_record.id
+        sr.paper_id = id_map.get(sr.paper_id, sr.paper_id)
     search_repo.save_results(search_results)
 
     click.echo(f"\n  Search ID: {search_record.id}")
