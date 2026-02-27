@@ -137,3 +137,32 @@ else
 	echo "Warning: GitHub CLI (gh) is not installed on host"
 	echo "GitHub CLI authentication will not be available in the container"
 fi
+
+# Export Cursor API key from host to container (for agent/conductor)
+# Tries: 1) macOS keychain 2) Cursor SQLite state DB
+DEVCONTAINER_DIR="$(dirname "$0")/.."
+ENV_FILE="$DEVCONTAINER_DIR/.env"
+CURSOR_TOKEN=""
+if [[ "$(uname -s)" == "Darwin" ]]; then
+	# Try macOS keychain (agent CLI uses cursor-user / cursor-access-token)
+	CURSOR_TOKEN=$(security find-generic-password -s "cursor-access-token" -a "cursor-user" -w 2>/dev/null || true)
+	if [[ -z "$CURSOR_TOKEN" ]]; then
+		# Fallback: Cursor IDE stores token in SQLite state DB
+		CURSOR_STATE_DB="$HOME/Library/Application Support/Cursor/User/state.vscdb"
+		if [[ -f "$CURSOR_STATE_DB" ]] && command -v sqlite3 >/dev/null 2>&1; then
+			CURSOR_TOKEN=$(sqlite3 "$CURSOR_STATE_DB" "SELECT value FROM ItemTable WHERE key='cursorAuth/accessToken'" 2>/dev/null | head -1 || true)
+		fi
+	fi
+fi
+if [[ -n "$CURSOR_TOKEN" ]]; then
+	# Update or append CURSOR_API_KEY in .env (loaded by docker-compose)
+	if [[ -f "$ENV_FILE" ]]; then
+		grep -v '^CURSOR_API_KEY=' "$ENV_FILE" > "${ENV_FILE}.tmp" 2>/dev/null || true
+		mv "${ENV_FILE}.tmp" "$ENV_FILE" 2>/dev/null || true
+	fi
+	echo "CURSOR_API_KEY=$CURSOR_TOKEN" >> "$ENV_FILE"
+	echo "Exported Cursor API key to container env"
+else
+	echo "Warning: Could not find Cursor API key (keychain or state.vscdb)"
+	echo "Run 'agent login' on the host or set CURSOR_API_KEY in .devcontainer/.env for conductor"
+fi

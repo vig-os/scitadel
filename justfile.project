@@ -19,14 +19,66 @@ info:
     @echo "Project: {{ project }}"
 
 # ===============================================================================
-# PROJECT-SPECIFIC RECIPES
+# SECURITY
 # ===============================================================================
-# Uncomment and customize for your project:
-# # Run the application
-# [group('app')]
-# run *args:
-#     uv run python -m {{project}} {{args}}
-# # Run database migrations (if using sidecar)
-# [group('app')]
-# migrate:
-#     just sidecar postgres migrate
+
+# Run security scans (Bandit + Safety) — mirrors CI security job
+[group('quality')]
+security:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "=== Bandit (Python security linting) ==="
+    uvx bandit -r src/ -ll
+    echo ""
+    echo "=== Safety (dependency vulnerability check) ==="
+    uvx safety==3.2.11 check || true
+
+# ===============================================================================
+# FULL VERIFICATION
+# ===============================================================================
+
+# Run the full CI suite locally: precommit + tests + security
+[group('quality')]
+verify:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "=== Pre-commit (lint, format, hooks) ==="
+    just precommit
+    echo ""
+    echo "=== Tests with coverage ==="
+    just test-cov
+    echo ""
+    echo "=== Security ==="
+    just security
+    echo ""
+    echo "=== All checks passed ==="
+
+# ===============================================================================
+# CONDUCTOR (agent orchestrator)
+# ===============================================================================
+
+# Initialize conductor config from defaults
+[group('conductor')]
+conductor-init:
+    uv run conductor --init
+
+# Pre-trust workspace for agent (add to ~/.cursor/cli-config.json trustedDirectories)
+conductor-trust:
+    #!/usr/bin/env bash
+    set -e
+    PROJECT_ROOT="$(git rev-parse --show-toplevel)"
+    cfg="${HOME}/.cursor/cli-config.json"
+    mkdir -p "$(dirname "$cfg")"
+    [ ! -f "$cfg" ] && echo '{}' > "$cfg"
+    if ! jq -e --arg d "$PROJECT_ROOT" '.trustedDirectories // [] | index($d)' "$cfg" >/dev/null 2>&1; then
+        jq --arg d "$PROJECT_ROOT" '.trustedDirectories = ((.trustedDirectories // []) + [$d])' "$cfg" > "${cfg}.tmp" && mv "${cfg}.tmp" "$cfg"
+        echo "[OK] Trusted directory added: $PROJECT_ROOT"
+    else
+        echo "[OK] Directory already trusted: $PROJECT_ROOT"
+    fi
+
+# Run the conductor orchestrator (ensures workspace is trusted first)
+[group('conductor')]
+conductor *args='':
+    just conductor-trust
+    uv run conductor run --repo vig-os/scitadel {{ args }}
