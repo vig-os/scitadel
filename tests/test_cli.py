@@ -19,19 +19,33 @@ class TestCLI:
         assert "search" in result.output
         assert "history" in result.output
         assert "export" in result.output
+        assert "init" in result.output
 
-    def test_search_placeholder(self):
+    def test_init_command(self, tmp_path):
         runner = CliRunner()
-        result = runner.invoke(cli, ["search", "PET tracer"])
+        db_path = tmp_path / "test.db"
+        result = runner.invoke(cli, ["init", "--db", str(db_path)])
         assert result.exit_code == 0
-        assert "Searching" in result.output
+        assert "initialized" in result.output
+        assert db_path.exists()
 
-    def test_history_placeholder(self):
+    def test_history_empty(self, tmp_path):
         runner = CliRunner()
-        result = runner.invoke(cli, ["history"])
+        db_path = tmp_path / "test.db"
+        # Init first
+        runner.invoke(cli, ["init", "--db", str(db_path)])
+        result = runner.invoke(cli, ["history"], env={"SCITADEL_DB": str(db_path)})
         assert result.exit_code == 0
+        assert "No search history" in result.output
 
-    def test_export_placeholder(self):
+    def test_export_not_found(self, tmp_path):
         runner = CliRunner()
-        result = runner.invoke(cli, ["export", "test-id", "-f", "bibtex"])
-        assert result.exit_code == 0
+        db_path = tmp_path / "test.db"
+        runner.invoke(cli, ["init", "--db", str(db_path)])
+        result = runner.invoke(
+            cli,
+            ["export", "nonexistent"],
+            env={"SCITADEL_DB": str(db_path)},
+        )
+        assert result.exit_code == 1
+        assert "not found" in result.output
