@@ -1,0 +1,9 @@
+#!/bin/bash
+# Strip AI agent trailers from commit message before validation.
+# Refs: #163
+set -euo pipefail
+
+# Only run hooks inside the dev container where pre-commit is installed
+if command -v pre-commit >/dev/null 2>&1; then
+	pre-commit run --hook-stage prepare-commit-msg --commit-msg-filename "$1"
+fi

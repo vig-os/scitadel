@@ -91,4 +91,4 @@ Reference: [subagent-delegation rule](../../rules/subagent-delegation.mdc)
 - Each task should leave the codebase in a working, testable state.
 - Skip TDD for non-testable changes (config, templates, docs) — note why in the commit.
 - The plan comment is the single source of truth for progress.
-- **NEVER add 'Co-authored-by: Cursor <cursoragent@cursor.com>'** to commit messages.
+- Never add Co-authored-by trailers. Never set git author/committer to an AI agent identity. Never mention AI agent names in commit messages or PR descriptions. The pre-commit hooks will reject violations.
