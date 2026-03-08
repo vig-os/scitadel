@@ -47,4 +47,19 @@ if ! command -v claude >/dev/null 2>&1; then
     npm install -g @anthropic-ai/claude-code
 fi
 
+# Pre-trust workspace for agent/conductor (add to ~/.cursor/cli-config.json trustedDirectories)
+if command -v agent >/dev/null 2>&1; then
+    echo "Adding workspace to Cursor agent trustedDirectories..."
+    cfg="${HOME}/.cursor/cli-config.json"
+    mkdir -p "$(dirname "$cfg")"
+    [ ! -f "$cfg" ] && echo '{}' > "$cfg"
+    if ! jq -e --arg d "$PROJECT_ROOT" '.trustedDirectories // [] | index($d)' "$cfg" >/dev/null 2>&1; then
+        jq --arg d "$PROJECT_ROOT" '.trustedDirectories = ((.trustedDirectories // []) + [$d])' "$cfg" > "${cfg}.tmp" \
+            && mv "${cfg}.tmp" "$cfg"
+        echo "[OK] Trusted directory added: $PROJECT_ROOT"
+    else
+        echo "[OK] Directory already trusted: $PROJECT_ROOT"
+    fi
+fi
+
 echo "Post-create setup complete"

@@ -9,6 +9,8 @@ services:
       # Path is set by initialize.sh in .env, falls back to Docker default
       - "${CONTAINER_SOCKET_PATH:-/var/run/docker.sock}:/var/run/docker.sock"
     environment:
+      # Cursor API key for agent/conductor (from .env, populated by copy-host-user-conf.sh)
+      - CURSOR_API_KEY=${CURSOR_API_KEY:-}
       # Use pre-built pre-commit cache from container image (instant, no download needed)
       # The cache is baked into the image at /opt/pre-commit-cache via Containerfile
       # Host users running pre-commit locally will use their own cache (~/.cache/pre-commit)
