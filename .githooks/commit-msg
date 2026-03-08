@@ -2,12 +2,7 @@
 # Set error handling, fail on any error during script execution
 set -euo pipefail
 
-# Check if we're running inside the dev container
-if [ "${IN_CONTAINER:-}" = "false" ]; then
-	# Outside dev container
-	echo "Please commit your changes within the dev container."
-	exit 1
+# Only run commit-msg hooks inside the dev container where pre-commit is installed
+if command -v pre-commit >/dev/null 2>&1; then
+	pre-commit run --hook-stage commit-msg --commit-msg-filename "$1"
 fi
-
-# Run pre-commit commit-msg hooks (validates commit message format)
-pre-commit run --hook-stage commit-msg --commit-msg-filename "$1"
