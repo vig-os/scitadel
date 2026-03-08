@@ -10,11 +10,13 @@ from typing import Protocol
 
 from scitadel.domain.models import (
     Assessment,
+    Citation,
     Paper,
     ResearchQuestion,
     Search,
     SearchResult,
     SearchTerm,
+    SnowballRun,
 )
 
 
@@ -78,3 +80,25 @@ class AssessmentRepository(Protocol):
     ) -> list[Assessment]: ...
 
     def get_for_question(self, question_id: str) -> list[Assessment]: ...
+
+
+class CitationRepository(Protocol):
+    """Port for citation edge and snowball run persistence."""
+
+    def save(self, citation: Citation) -> None: ...
+
+    def save_many(self, citations: list[Citation]) -> None: ...
+
+    def get_references(self, paper_id: str) -> list[Citation]: ...
+
+    def get_citations(self, paper_id: str) -> list[Citation]: ...
+
+    def exists(
+        self, source_paper_id: str, target_paper_id: str, direction: str
+    ) -> bool: ...
+
+    def save_snowball_run(self, run: SnowballRun) -> None: ...
+
+    def get_snowball_run(self, run_id: str) -> SnowballRun | None: ...
+
+    def list_snowball_runs(self, limit: int = 20) -> list[SnowballRun]: ...

@@ -66,7 +66,7 @@ class TestDatabase:
         row = db.conn.execute(
             "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"
         ).fetchone()
-        assert row["version"] == 1
+        assert row["version"] == 3
 
 
 class TestPaperRepository:
