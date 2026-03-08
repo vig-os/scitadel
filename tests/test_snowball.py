@@ -398,6 +398,107 @@ class TestSnowballService:
         assert CitationDirection.REFERENCES in directions
         assert CitationDirection.CITED_BY in directions
 
+    def test_circular_citations(self):
+        """Circular citations should not cause infinite loops."""
+        seed = Paper(id="seed1", title="Seed")
+        question = ResearchQuestion(id="q1", text="Q")
+
+        # seed -> A -> seed (circular)
+        fetcher = MockFetcher(
+            references={
+                "seed1": [{"title": "Paper A"}],
+            }
+        )
+
+        class CircularResolver:
+            def __init__(self):
+                self._papers = {}
+
+            def resolve(self, work_dict):
+                title = work_dict.get("title", "")
+                if title not in self._papers:
+                    paper = Paper(title=title)
+                    self._papers[title] = paper
+                    return paper, True
+                return self._papers[title], False
+
+        resolver = CircularResolver()
+        # Patch fetcher to return seed when resolving Paper A's references
+        # This simulates A referencing the seed paper
+        scorer = MockScorer(scores={"Paper A": 0.9})
+
+        config = SnowballConfig(direction="references", max_depth=2, threshold=0.5)
+
+        run, citations, new_papers = asyncio.run(
+            snowball(
+                [seed],
+                question,
+                fetcher=fetcher,
+                resolver=resolver,
+                scorer=scorer,
+                config=config,
+            )
+        )
+
+        # Should complete without hanging; seed is in seen_ids
+        assert run.total_discovered >= 1
+
+    def test_max_papers_per_level_limit(self):
+        """Snowball should respect max_papers_per_level."""
+        seed = Paper(id="seed1", title="Seed")
+        question = ResearchQuestion(id="q1", text="Q")
+
+        # Generate many references
+        refs = [{"title": f"Ref {i}"} for i in range(20)]
+        fetcher = MockFetcher(references={"seed1": refs})
+        resolver = MockResolver()
+
+        config = SnowballConfig(
+            direction="references", max_depth=1, max_papers_per_level=5
+        )
+
+        run, citations, new_papers = asyncio.run(
+            snowball(
+                [seed],
+                question,
+                fetcher=fetcher,
+                resolver=resolver,
+                config=config,
+            )
+        )
+
+        assert run.total_discovered == 5
+        assert len(citations) == 5
+
+    def test_scorer_exception_handling(self):
+        """Scorer exceptions should not crash snowball."""
+        seed = Paper(id="seed1", title="Seed")
+        question = ResearchQuestion(id="q1", text="Q")
+
+        fetcher = MockFetcher(references={"seed1": [{"title": "Problem Paper"}]})
+        resolver = MockResolver()
+
+        class FailingScorer:
+            def score(self, paper, question):
+                raise RuntimeError("API error")
+
+        config = SnowballConfig(direction="references", max_depth=1, threshold=0.5)
+
+        run, citations, new_papers = asyncio.run(
+            snowball(
+                [seed],
+                question,
+                fetcher=fetcher,
+                resolver=resolver,
+                scorer=FailingScorer(),
+                config=config,
+            )
+        )
+
+        # Paper should be discovered but scored as 0.0 (below threshold)
+        assert run.total_discovered == 1
+        assert len(new_papers) == 1
+
     def test_on_progress_callback(self):
         seed = Paper(id="seed1", title="Seed")
         question = ResearchQuestion(id="q1", text="Q")

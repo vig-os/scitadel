@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import anthropic
@@ -56,6 +57,42 @@ class ScoringConfig:
     max_tokens: int = 512
 
 
+def _build_user_prompt(paper: Paper, question: ResearchQuestion) -> str:
+    """Build the scoring prompt from paper and question data."""
+    return SCORING_USER_PROMPT.format(
+        question_text=question.text,
+        question_description=(
+            f"Context: {question.description}" if question.description else ""
+        ),
+        title=paper.title,
+        authors="; ".join(paper.authors[:5]),
+        year=paper.year or "N/A",
+        journal=paper.journal or "N/A",
+        abstract=paper.abstract[:2000] or "No abstract available.",
+    )
+
+
+def _build_assessment(
+    paper: Paper,
+    question: ResearchQuestion,
+    config: ScoringConfig,
+    user_prompt: str,
+    raw_text: str,
+) -> Assessment:
+    """Parse API response and build an Assessment."""
+    parsed = _parse_scoring_response(raw_text)
+    return Assessment(
+        paper_id=paper.id,
+        question_id=question.id,
+        score=parsed["score"],
+        reasoning=parsed["reasoning"],
+        model=config.model,
+        prompt=user_prompt,
+        temperature=config.temperature,
+        assessor=config.model,
+    )
+
+
 def score_paper(
     paper: Paper,
     question: ResearchQuestion,
@@ -69,17 +106,7 @@ def score_paper(
     config = config or ScoringConfig()
     client = client or anthropic.Anthropic()
 
-    user_prompt = SCORING_USER_PROMPT.format(
-        question_text=question.text,
-        question_description=(
-            f"Context: {question.description}" if question.description else ""
-        ),
-        title=paper.title,
-        authors="; ".join(paper.authors[:5]),
-        year=paper.year or "N/A",
-        journal=paper.journal or "N/A",
-        abstract=paper.abstract[:2000] or "No abstract available.",
-    )
+    user_prompt = _build_user_prompt(paper, question)
 
     response = client.messages.create(
         model=config.model,
@@ -89,19 +116,7 @@ def score_paper(
         messages=[{"role": "user", "content": user_prompt}],
     )
 
-    raw_text = response.content[0].text
-    parsed = _parse_scoring_response(raw_text)
-
-    return Assessment(
-        paper_id=paper.id,
-        question_id=question.id,
-        score=parsed["score"],
-        reasoning=parsed["reasoning"],
-        model=config.model,
-        prompt=user_prompt,
-        temperature=config.temperature,
-        assessor=config.model,
-    )
+    return _build_assessment(paper, question, config, user_prompt, response.content[0].text)
 
 
 async def score_paper_async(
@@ -117,17 +132,7 @@ async def score_paper_async(
     config = config or ScoringConfig()
     client = client or anthropic.AsyncAnthropic()
 
-    user_prompt = SCORING_USER_PROMPT.format(
-        question_text=question.text,
-        question_description=(
-            f"Context: {question.description}" if question.description else ""
-        ),
-        title=paper.title,
-        authors="; ".join(paper.authors[:5]),
-        year=paper.year or "N/A",
-        journal=paper.journal or "N/A",
-        abstract=paper.abstract[:2000] or "No abstract available.",
-    )
+    user_prompt = _build_user_prompt(paper, question)
 
     response = await client.messages.create(
         model=config.model,
@@ -137,19 +142,7 @@ async def score_paper_async(
         messages=[{"role": "user", "content": user_prompt}],
     )
 
-    raw_text = response.content[0].text
-    parsed = _parse_scoring_response(raw_text)
-
-    return Assessment(
-        paper_id=paper.id,
-        question_id=question.id,
-        score=parsed["score"],
-        reasoning=parsed["reasoning"],
-        model=config.model,
-        prompt=user_prompt,
-        temperature=config.temperature,
-        assessor=config.model,
-    )
+    return _build_assessment(paper, question, config, user_prompt, response.content[0].text)
 
 
 def score_papers(
@@ -157,7 +150,7 @@ def score_papers(
     question: ResearchQuestion,
     config: ScoringConfig | None = None,
     client: anthropic.Anthropic | None = None,
-    on_progress: callable | None = None,
+    on_progress: Callable | None = None,
 ) -> list[Assessment]:
     """Score multiple papers against a research question.
 

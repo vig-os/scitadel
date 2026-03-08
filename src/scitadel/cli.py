@@ -6,6 +6,7 @@ Thin wrapper over application services — business logic lives in services/.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -143,27 +144,32 @@ def search(
     paper_repo = SQLitePaperRepository(db)
     search_repo = SQLiteSearchRepository(db)
 
-    # Resolve new papers against existing DB records (match by DOI)
-    # so we reuse existing IDs instead of creating duplicates.
-    id_map: dict[str, str] = {}
-    for paper in papers:
-        if paper.doi:
-            existing = paper_repo.find_by_doi(paper.doi)
-            if existing and existing.id != paper.id:
-                id_map[paper.id] = existing.id
-                paper.id = existing.id
+    try:
+        # Resolve new papers against existing DB records (match by DOI)
+        # so we reuse existing IDs instead of creating duplicates.
+        id_map: dict[str, str] = {}
+        for paper in papers:
+            if paper.doi:
+                existing = paper_repo.find_by_doi(paper.doi)
+                if existing and existing.id != paper.id:
+                    id_map[paper.id] = existing.id
+                    paper.id = existing.id
 
-    paper_repo.save_many(papers)
-    search_repo.save(search_record)
+        paper_repo.save_many(papers)
+        search_repo.save(search_record)
 
-    for sr in search_results:
-        sr.search_id = search_record.id
-        sr.paper_id = id_map.get(sr.paper_id, sr.paper_id)
-    search_repo.save_results(search_results)
+        for sr in search_results:
+            sr.search_id = search_record.id
+            sr.paper_id = id_map.get(sr.paper_id, sr.paper_id)
+        search_repo.save_results(search_results)
 
-    click.echo(f"\n  Search ID: {search_record.id}")
-    click.echo(f"  Results saved to: {config.db_path}")
-    db.close()
+        click.echo(f"\n  Search ID: {search_record.id}")
+        click.echo(f"  Results saved to: {config.db_path}")
+    except (sqlite3.Error, OSError) as exc:
+        click.echo(f"\n  Warning: failed to persist results: {exc}", err=True)
+        click.echo(f"  Search ID (not saved): {search_record.id}")
+    finally:
+        db.close()
 
 
 @cli.command()
@@ -451,8 +457,11 @@ def assess(search_id: str, question_id: str, model: str, temperature: float) -> 
     )
 
     # Persist
-    for a in assessments:
-        a_repo.save(a)
+    try:
+        for a in assessments:
+            a_repo.save(a)
+    except (sqlite3.Error, OSError) as exc:
+        click.echo(f"\n  Warning: failed to persist assessments: {exc}", err=True)
 
     # Summary
     scores = [a.score for a in assessments]
@@ -613,8 +622,11 @@ def snowball(
     run = run.model_copy(update={"search_id": s.id})
 
     # Persist
-    citation_repo.save_many(citations)
-    citation_repo.save_snowball_run(run)
+    try:
+        citation_repo.save_many(citations)
+        citation_repo.save_snowball_run(run)
+    except (sqlite3.Error, OSError) as exc:
+        click.echo(f"\n  Warning: failed to persist snowball results: {exc}", err=True)
 
     click.echo(f"\n  Snowball run: {run.id[:8]}")
     click.echo(f"  Discovered: {run.total_discovered} papers")

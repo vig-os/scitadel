@@ -4,9 +4,9 @@
 
 | Field | Value |
 |---|---|
-| **Status** | proposed |
+| **Status** | accepted |
 | **Created** | 2026-02-26 |
-| **Updated** | 2026-02-26 |
+| **Updated** | 2026-03-08 |
 | **RFC** | `docs/rfcs/RFC-001-2026-02-26-scitadel-problem-space.md` |
 
 ## Overview
@@ -26,11 +26,35 @@ In scope:
 - DB-backed export (BibTeX, JSON, CSV)
 - CLI + library API parity
 
-Out of scope:
-- Built-in LLM scoring
-- Citation chaining
-- UI/MCP layers
+Out of scope (Phase 1):
+- Built-in LLM scoring → delivered in Phase 2 (see DES-003)
+- Citation chaining → delivered in Phase 2 (see DES-003)
+- MCP server → delivered in Phase 2 (see DES-003)
+- TUI dashboard → delivered in Phase 2 (see DES-003)
+- Chat engine → delivered in Phase 2 (see DES-003)
 - Runtime citation/similarity graph rendering (Phase 3+)
+
+## Implementation Status
+
+All Phase 1 issues are complete and merged.
+
+| Component | Status | Issues |
+|---|---|---|
+| Package/config/CLI skeleton | Done | #2 |
+| Domain models and repository ports | Done | #3 |
+| SQLite schema, migrations, repositories | Done | #4 |
+| PubMed adapter | Done | #5 |
+| arXiv adapter | Done | #6 |
+| OpenAlex adapter | Done | #7 |
+| INSPIRE-HEP adapter | Done | #8, #9 |
+| Federated orchestrator | Done | #10 |
+| Dedup and canonicalization | Done | #11 |
+| DB-backed export service | Done | #12 |
+| CLI commands | Done | #13 |
+| E2E + contract test suite | Done | #14 |
+
+Phase 2+ features (MCP server, LLM scoring, snowball, TUI, chat engine) are
+documented in DES-003.
 
 ## Architecture Approach
 
@@ -58,7 +82,7 @@ Decision: combine modular monolith + hexagonal boundaries now; defer broker-back
 ## System Context
 
 Scitadel is a Python package with two entry surfaces:
-- `scitadel` CLI commands (`search`, `history`, `export`)
+- `scitadel` CLI commands (`search`, `history`, `export`, `question`, `assess`, `snowball`, `tui`)
 - Importable Python API (same capabilities as CLI)
 
 Both call the same application services. Core data is persisted to local DB first.
@@ -76,6 +100,7 @@ Interface:
 - CLI commands and typed Python functions
 
 Implementation notes:
+- CLI built with Click (selected over Typer for simplicity and fewer dependencies)
 - CLI remains a thin wrapper; business logic lives outside command handlers
 
 ### 2) Search Orchestrator (Application Service)
@@ -89,8 +114,9 @@ Interface:
 - `run_search(query, sources, parameters) -> search_id`
 
 Implementation notes:
-- Adapter calls run in parallel
+- Adapter calls run in parallel via `asyncio.gather`
 - Failures from one source do not abort all sources
+- Retry with jittered exponential backoff
 
 ### 3) Source Adapter Ports + Implementations
 
@@ -103,7 +129,7 @@ Interface:
 
 Implementation notes:
 - Adapters are isolated modules
-- OpenAlex can use `pyalex`; others use direct APIs/libraries as selected
+- OpenAlex uses `pyalex`; PubMed uses E-utilities XML; arXiv uses Atom feed; INSPIRE uses REST API
 
 ### 4) Deduplication and Canonicalization
 
@@ -112,24 +138,26 @@ Responsibility:
 - Maintain source provenance and per-source metadata
 
 Interface:
-- `merge_candidates(candidates) -> CanonicalBatch`
+- `deduplicate(candidates) -> (papers, search_results)`
 
 Implementation notes:
 - DOI exact match first
-- Fuzzy title matching as fallback
+- Fuzzy title matching as fallback (Jaccard similarity)
 - Deterministic matching rules (versioned in code)
 
 ### 5) Repository Ports + DB Implementations
 
 Responsibility:
-- Persist and query `papers`, `searches`, `search_results`, `research_questions`, `search_terms`, `assessments`
+- Persist and query `papers`, `searches`, `search_results`, `research_questions`, `search_terms`, `assessments`, `citations`, `snowball_runs`
 - Provide stable persistence API independent of DB engine
 
 Interface:
-- `PaperRepository`, `SearchRepository`, `AssessmentRepository`, etc.
+- `SQLitePaperRepository`, `SQLiteSearchRepository`, `SQLiteAssessmentRepository`, `SQLiteCitationRepository`, `SQLiteResearchQuestionRepository`
 
 Implementation notes:
-- Phase 1 concrete implementation: SQLite
+- Phase 1 concrete implementation: SQLite with WAL mode
+- `Database` class supports context manager (`with` blocks) for safe resource cleanup
+- Migrations tracked by version number to avoid re-application
 - Future implementation: Dolt-compatible repository
 - No raw SQL in application service layer
 
@@ -164,7 +192,8 @@ Implementation notes:
   - Source is marked partial-failure in run metadata
   - Remaining sources complete normally
 - Persistence failure:
-  - Search run marked failed; no “successful” export from transient memory
+  - CLI catches exception, warns user, and reports the search ID
+  - Search data is not silently lost
 - Dedup conflict:
   - Deterministic tie-break rules apply; source provenance kept for audit
 
@@ -199,35 +228,40 @@ graph TD
 | Component | Choice | Build vs Buy | Rationale |
 |---|---|---|---|
 | Runtime | Python | Buy ecosystem | Matches team constraints and RFC |
-| CLI | Typer/Click | Buy | Mature CLI tooling, thin command layer |
+| CLI | Click | Buy | Mature CLI tooling, thin command layer |
 | HTTP | `httpx` | Buy | Async-friendly for concurrent source calls |
 | OpenAlex | `pyalex` | Buy | Mature, reduces maintenance burden |
 | PubMed/arXiv adapters | Custom module | Build | Controlled normalization and behavior |
-| INSPIRE-HEP | Evaluate `inspy-hep`; fallback custom | Buy + Build fallback | Keep optional dependency path |
+| INSPIRE-HEP | Custom REST adapter | Build | Direct API is clean enough |
 | Persistence | SQLite via repository ports | Buy stdlib + Build abstraction | Local-first and swappable |
-| Export | Internal service + `bibtexparser` | Build + Buy helper | Deterministic DB-based projection |
+| Export | Internal service | Build | Deterministic DB-based projection |
 
 ## Testing Strategy
 
 - Unit tests:
-  - Adapter normalization logic
+  - Adapter normalization logic (including edge cases: missing DOI, abstract, year, authors)
   - Dedup rule engine and deterministic tie-breaks
-  - Export formatting by schema
+  - Export formatting by schema (JSON, CSV, BibTeX including edge cases)
+  - Prefix resolution helper
+  - Message history trimming
 - Integration tests:
   - End-to-end search across test fixtures
   - Persistence + history diff behavior
   - Export from stored search runs
+  - CLI command workflows (question create/list, search, export)
 - Contract tests:
   - Per-adapter response schema handling for external API drift
+
+Current coverage: 176 unit/integration tests passing.
 
 ## Blind Spot Review
 
 ### Observability
-- Structured logs with `search_id` correlation
+- Structured logs with `search_id` correlation via `extra` dict
 - Per-adapter latency and status metrics in run metadata
 
 ### Security
-- API keys via environment variables only
+- API keys via environment variables or system keyring
 - Redaction of credentials from logs
 - No full-text copyrighted storage beyond allowed OA policies
 
@@ -236,9 +270,11 @@ graph TD
 - Design allows future queue-backed async tasks for heavier workflows
 
 ### Reliability
-- Retry with backoff for transient source errors
+- Retry with jittered exponential backoff for transient source errors
 - Partial-failure tolerant federated search
 - Immutable run records preserve forensic trail
+- DB resource management via context managers prevents connection leaks
+- CLI persistence failures are caught and reported (not silent)
 
 ### Data consistency
 - Canonical paper identity maintained by deterministic dedup rules
@@ -282,13 +318,6 @@ Accepted risk:
 Mitigation:
 - Keep orchestration abstractions queue-ready; introduce broker in Phase 2 as needed.
 
-## Review Prompts
-
-Architecture is ready for review. Validate:
-- Are component boundaries right for your implementation style?
-- Should Phase 1 include a minimal in-process task queue abstraction now?
-- Do you want stricter export contracts (for example, mandatory `search_id`)?
-
 ## Implementation Issues
 
 - Epic: [#1](https://github.com/vig-os/scitadel/issues/1)
@@ -308,4 +337,5 @@ Architecture is ready for review. Validate:
 
 ## Next Step
 
-Planning is complete. Begin development by claiming unblocked issues in dependency order from the epic checklist.
+Phase 1 is complete. Phase 2+ features (MCP server, LLM scoring, snowball, TUI, chat engine)
+are documented in DES-003.

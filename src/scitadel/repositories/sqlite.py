@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime
 from importlib import resources
 from pathlib import Path
 
@@ -25,10 +25,6 @@ from scitadel.domain.models import (
     SourceOutcome,
     SourceStatus,
 )
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 class Database:
@@ -50,16 +46,46 @@ class Database:
         return self._conn
 
     def migrate(self) -> None:
-        """Apply all pending migrations."""
+        """Apply all pending migrations, skipping already-applied ones."""
+        # Ensure schema_version table exists for tracking
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_version "
+            "(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        self.conn.commit()
+
+        applied = {
+            row[0]
+            for row in self.conn.execute(
+                "SELECT version FROM schema_version"
+            ).fetchall()
+        }
+
         migration_dir = resources.files("scitadel.repositories") / "migrations"
         migration_files = sorted(
             f for f in migration_dir.iterdir() if f.name.endswith(".sql")
         )
 
         for migration_file in migration_files:
+            # Extract version number from filename (e.g. "001_initial.sql" -> 1)
+            version_str = migration_file.name.split("_", 1)[0]
+            try:
+                version = int(version_str)
+            except ValueError:
+                continue  # skip non-conforming filenames
+
+            if version in applied:
+                continue
+
             sql = migration_file.read_text()
             self.conn.executescript(sql)
         self.conn.commit()
+
+    def __enter__(self) -> Database:
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
 
     def close(self) -> None:
         if self._conn is not None:

@@ -108,7 +108,7 @@ class ToolDispatcher:
         parameters: dict = {}
 
         if question_id:
-            resolved = self._store.resolve_prefix("question", question_id)
+            resolved = self._store.resolve_prefix_id("question", question_id)
             if not resolved:
                 return f"Question '{question_id}' not found."
             question_id = resolved
@@ -189,7 +189,7 @@ class ToolDispatcher:
         return "\n".join(lines)
 
     async def _tool_get_papers(self, search_id: str) -> str:
-        resolved = self._store.resolve_prefix("search", search_id)
+        resolved = self._store.resolve_prefix_id("search", search_id)
         if not resolved:
             return f"Search '{search_id}' not found."
         search_id = resolved
@@ -214,7 +214,7 @@ class ToolDispatcher:
         return "\n".join(out)
 
     async def _tool_get_paper(self, paper_id: str) -> str:
-        resolved = self._store.resolve_prefix("paper", paper_id)
+        resolved = self._store.resolve_prefix_id("paper", paper_id)
         if not resolved:
             return f"Paper '{paper_id}' not found."
 
@@ -224,7 +224,7 @@ class ToolDispatcher:
         return json.dumps(paper.model_dump(mode="json"), indent=2, ensure_ascii=False)
 
     async def _tool_export_search(self, search_id: str, format: str = "json") -> str:
-        resolved = self._store.resolve_prefix("search", search_id)
+        resolved = self._store.resolve_prefix_id("search", search_id)
         if not resolved:
             return f"Search '{search_id}' not found."
 
@@ -258,7 +258,7 @@ class ToolDispatcher:
         terms: list[str],
         query_string: str = "",
     ) -> str:
-        resolved = self._store.resolve_prefix("question", question_id)
+        resolved = self._store.resolve_prefix_id("question", question_id)
         if not resolved:
             return f"Question '{question_id}' not found."
 
@@ -282,11 +282,11 @@ class ToolDispatcher:
         assessor: str = "claude",
         model: str | None = None,
     ) -> str:
-        paper_resolved = self._store.resolve_prefix("paper", paper_id)
+        paper_resolved = self._store.resolve_prefix_id("paper", paper_id)
         if not paper_resolved:
             return f"Paper '{paper_id}' not found."
 
-        q_resolved = self._store.resolve_prefix("question", question_id)
+        q_resolved = self._store.resolve_prefix_id("question", question_id)
         if not q_resolved:
             return f"Question '{question_id}' not found."
 
@@ -360,11 +360,11 @@ class ToolDispatcher:
 
         config = load_config()
 
-        s_resolved = self._store.resolve_prefix("search", search_id)
+        s_resolved = self._store.resolve_prefix_id("search", search_id)
         if not s_resolved:
             return f"Search '{search_id}' not found."
 
-        q_resolved = self._store.resolve_prefix("question", question_id)
+        q_resolved = self._store.resolve_prefix_id("question", question_id)
         if not q_resolved:
             return f"Question '{question_id}' not found."
 
@@ -429,6 +429,36 @@ class ToolDispatcher:
 # -- Chat engine --
 
 
+MAX_HISTORY_MESSAGES = 40
+
+
+def _trim_messages(messages: list[dict], max_messages: int) -> list[dict]:
+    """Trim message history with a sliding window.
+
+    Never splits tool_use/tool_result pairs: if trimming would land between
+    an assistant message containing tool_use and the following user message
+    with tool_results, we keep both.
+    """
+    if len(messages) <= max_messages:
+        return messages
+
+    start = len(messages) - max_messages
+    trimmed = messages[start:]
+
+    # If the first message is a user message containing tool_results,
+    # it's the second half of a tool_use/tool_result pair — include the
+    # preceding assistant message too.
+    if trimmed and trimmed[0].get("role") == "user":
+        content = trimmed[0].get("content")
+        if isinstance(content, list) and any(
+            isinstance(c, dict) and c.get("type") == "tool_result" for c in content
+        ):
+            if start > 0:
+                trimmed.insert(0, messages[start - 1])
+
+    return trimmed
+
+
 @dataclass
 class ChatEngine:
     """Async agentic loop managing conversation with Claude.
@@ -440,6 +470,7 @@ class ChatEngine:
     store: DataStore
     model: str = "claude-sonnet-4-6"
     max_tokens: int = 4096
+    max_history_messages: int = MAX_HISTORY_MESSAGES
     _client: anthropic.AsyncAnthropic | None = field(default=None, init=False)
     _messages: list[dict] = field(default_factory=list, init=False)
     _dispatcher: ToolDispatcher = field(init=False)
@@ -470,6 +501,7 @@ class ChatEngine:
         self._messages.append({"role": "user", "content": user_message})
 
         while True:
+            self._messages = _trim_messages(self._messages, self.max_history_messages)
             response = await self._get_client().messages.create(
                 model=self.model,
                 max_tokens=self.max_tokens,

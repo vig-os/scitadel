@@ -21,6 +21,7 @@ from scitadel.repositories.sqlite import (
     SQLiteResearchQuestionRepository,
     SQLiteSearchRepository,
 )
+from scitadel.services.resolve import resolve_prefix
 
 
 class DataStore:
@@ -124,21 +125,18 @@ class DataStore:
     def find_paper_by_title(self, title: str) -> Paper | None:
         return self._papers.find_by_title(title)
 
-    def resolve_prefix(self, entity_type: str, prefix: str) -> str | None:
+    def resolve_prefix_id(self, entity_type: str, prefix: str) -> str | None:
         """Resolve a short ID prefix to a full ID. Returns None if ambiguous."""
         if entity_type == "search":
-            searches = self._searches.list_searches(limit=100)
-            matches = [s for s in searches if s.id.startswith(prefix)]
-            return matches[0].id if len(matches) == 1 else None
-        if entity_type == "paper":
-            papers = self._papers.list_all(limit=1000)
-            matches = [p for p in papers if p.id.startswith(prefix)]
-            return matches[0].id if len(matches) == 1 else None
-        if entity_type == "question":
-            questions = self._questions.list_questions()
-            matches = [q for q in questions if q.id.startswith(prefix)]
-            return matches[0].id if len(matches) == 1 else None
-        return None
+            items = self._searches.list_searches(limit=100)
+        elif entity_type == "paper":
+            items = self._papers.list_all(limit=1000)
+        elif entity_type == "question":
+            items = self._questions.list_questions()
+        else:
+            return None
+        match = resolve_prefix(items, prefix, lambda x: x.id)
+        return match.id if match else None
 
     def save_citations(self, citations: list[Citation]) -> None:
         self._citations.save_many(citations)

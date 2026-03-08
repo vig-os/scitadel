@@ -61,6 +61,48 @@ class TestPubMedParser:
         candidates = _parse_pubmed_xml("<PubmedArticleSet></PubmedArticleSet>")
         assert candidates == []
 
+    def test_parse_missing_doi(self):
+        xml = """<PubmedArticleSet><PubmedArticle><MedlineCitation>
+            <PMID>99999</PMID>
+            <Article><ArticleTitle>No DOI Paper</ArticleTitle>
+            <Abstract><AbstractText>Some text.</AbstractText></Abstract>
+            <Journal><Title>J</Title><JournalIssue><PubDate><Year>2024</Year></PubDate></JournalIssue></Journal>
+            </Article></MedlineCitation></PubmedArticle></PubmedArticleSet>"""
+        candidates = _parse_pubmed_xml(xml)
+        assert len(candidates) == 1
+        assert candidates[0].doi is None
+        assert candidates[0].title == "No DOI Paper"
+
+    def test_parse_missing_abstract(self):
+        xml = """<PubmedArticleSet><PubmedArticle><MedlineCitation>
+            <PMID>88888</PMID>
+            <Article><ArticleTitle>No Abstract</ArticleTitle>
+            <Journal><Title>J</Title><JournalIssue><PubDate><Year>2024</Year></PubDate></JournalIssue></Journal>
+            </Article></MedlineCitation></PubmedArticle></PubmedArticleSet>"""
+        candidates = _parse_pubmed_xml(xml)
+        assert len(candidates) == 1
+        assert candidates[0].abstract == ""
+
+    def test_parse_missing_year(self):
+        xml = """<PubmedArticleSet><PubmedArticle><MedlineCitation>
+            <PMID>77777</PMID>
+            <Article><ArticleTitle>No Year</ArticleTitle>
+            <Journal><Title>J</Title><JournalIssue><PubDate></PubDate></JournalIssue></Journal>
+            </Article></MedlineCitation></PubmedArticle></PubmedArticleSet>"""
+        candidates = _parse_pubmed_xml(xml)
+        assert len(candidates) == 1
+        assert candidates[0].year is None
+
+    def test_parse_empty_authors(self):
+        xml = """<PubmedArticleSet><PubmedArticle><MedlineCitation>
+            <PMID>66666</PMID>
+            <Article><ArticleTitle>No Authors</ArticleTitle>
+            <Journal><Title>J</Title><JournalIssue><PubDate><Year>2024</Year></PubDate></JournalIssue></Journal>
+            </Article></MedlineCitation></PubmedArticle></PubmedArticleSet>"""
+        candidates = _parse_pubmed_xml(xml)
+        assert len(candidates) == 1
+        assert candidates[0].authors == []
+
 
 # -- arXiv fixtures --
 
@@ -102,6 +144,60 @@ class TestArxivParser:
         empty = '<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"></feed>'
         assert _parse_arxiv_atom(empty) == []
 
+    def test_parse_missing_doi(self):
+        xml = """<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"
+              xmlns:arxiv="http://arxiv.org/schemas/atom">
+          <entry>
+            <id>http://arxiv.org/abs/2301.00001v1</id>
+            <title>No DOI Paper</title>
+            <summary>Abstract text.</summary>
+            <author><name>Author A</name></author>
+            <published>2023-01-01T00:00:00Z</published>
+          </entry></feed>"""
+        candidates = _parse_arxiv_atom(xml)
+        assert len(candidates) == 1
+        assert candidates[0].doi is None
+
+    def test_parse_missing_abstract(self):
+        xml = """<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"
+              xmlns:arxiv="http://arxiv.org/schemas/atom">
+          <entry>
+            <id>http://arxiv.org/abs/2301.00002v1</id>
+            <title>No Abstract</title>
+            <summary></summary>
+            <author><name>Author A</name></author>
+            <published>2023-01-01T00:00:00Z</published>
+          </entry></feed>"""
+        candidates = _parse_arxiv_atom(xml)
+        assert len(candidates) == 1
+        assert candidates[0].abstract == ""
+
+    def test_parse_missing_year(self):
+        xml = """<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"
+              xmlns:arxiv="http://arxiv.org/schemas/atom">
+          <entry>
+            <id>http://arxiv.org/abs/2301.00003v1</id>
+            <title>No Year</title>
+            <summary>Text.</summary>
+            <author><name>Author A</name></author>
+          </entry></feed>"""
+        candidates = _parse_arxiv_atom(xml)
+        assert len(candidates) == 1
+        assert candidates[0].year is None
+
+    def test_parse_empty_authors(self):
+        xml = """<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"
+              xmlns:arxiv="http://arxiv.org/schemas/atom">
+          <entry>
+            <id>http://arxiv.org/abs/2301.00004v1</id>
+            <title>No Authors</title>
+            <summary>Text.</summary>
+            <published>2023-01-01T00:00:00Z</published>
+          </entry></feed>"""
+        candidates = _parse_arxiv_atom(xml)
+        assert len(candidates) == 1
+        assert candidates[0].authors == []
+
 
 # -- OpenAlex fixtures --
 
@@ -141,6 +237,26 @@ class TestOpenAlexParser:
         assert c.pubmed_id == "9999"
         assert c.abstract == "ML is great"
         assert c.journal == "Science"
+
+    def test_work_missing_doi(self):
+        work = {"id": "https://openalex.org/W111", "title": "No DOI"}
+        c = _work_to_candidate(work, rank=1)
+        assert c.doi is None
+
+    def test_work_missing_abstract(self):
+        work = {"id": "https://openalex.org/W222", "title": "No Abstract"}
+        c = _work_to_candidate(work, rank=1)
+        assert c.abstract == ""
+
+    def test_work_missing_year(self):
+        work = {"id": "https://openalex.org/W333", "title": "No Year"}
+        c = _work_to_candidate(work, rank=1)
+        assert c.year is None
+
+    def test_work_empty_authors(self):
+        work = {"id": "https://openalex.org/W444", "title": "No Authors", "authorships": []}
+        c = _work_to_candidate(work, rank=1)
+        assert c.authors == []
 
 
 # -- INSPIRE fixtures --
@@ -192,3 +308,39 @@ class TestInspireParser:
     def test_parse_empty_response(self):
         empty = {"hits": {"hits": []}}
         assert _parse_inspire_results(empty) == []
+
+    def test_parse_missing_doi(self):
+        data = {"hits": {"hits": [{"id": 111, "metadata": {
+            "titles": [{"title": "No DOI"}],
+            "authors": [{"full_name": "A"}],
+            "abstracts": [{"value": "Text"}],
+        }}]}}
+        candidates = _parse_inspire_results(data)
+        assert len(candidates) == 1
+        assert candidates[0].doi is None
+
+    def test_parse_missing_abstract(self):
+        data = {"hits": {"hits": [{"id": 222, "metadata": {
+            "titles": [{"title": "No Abstract"}],
+        }}]}}
+        candidates = _parse_inspire_results(data)
+        assert len(candidates) == 1
+        assert candidates[0].abstract == ""
+
+    def test_parse_missing_year(self):
+        data = {"hits": {"hits": [{"id": 333, "metadata": {
+            "titles": [{"title": "No Year"}],
+            "publication_info": [{"journal_title": "JINST"}],
+        }}]}}
+        candidates = _parse_inspire_results(data)
+        assert len(candidates) == 1
+        assert candidates[0].year is None
+
+    def test_parse_empty_authors(self):
+        data = {"hits": {"hits": [{"id": 444, "metadata": {
+            "titles": [{"title": "No Authors"}],
+            "authors": [],
+        }}]}}
+        candidates = _parse_inspire_results(data)
+        assert len(candidates) == 1
+        assert candidates[0].authors == []
