@@ -14,11 +14,14 @@ from pathlib import Path
 
 from scitadel.domain.models import (
     Assessment,
+    Citation,
+    CitationDirection,
     Paper,
     ResearchQuestion,
     Search,
     SearchResult,
     SearchTerm,
+    SnowballRun,
     SourceOutcome,
     SourceStatus,
 )
@@ -72,15 +75,17 @@ class SQLitePaperRepository:
 
     _UPSERT_SQL = """\
         INSERT INTO papers
-            (id, title, authors, abstract, doi, arxiv_id, pubmed_id,
-             inspire_id, openalex_id, year, journal, url, source_urls,
-             created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, title, authors, abstract, full_text, summary, doi, arxiv_id,
+             pubmed_id, inspire_id, openalex_id, year, journal, url,
+             source_urls, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             title      = excluded.title,
             authors    = excluded.authors,
             abstract   = CASE WHEN excluded.abstract != '' THEN excluded.abstract
                               ELSE papers.abstract END,
+            full_text  = COALESCE(excluded.full_text, papers.full_text),
+            summary    = COALESCE(excluded.summary, papers.summary),
             doi        = COALESCE(excluded.doi, papers.doi),
             arxiv_id   = COALESCE(excluded.arxiv_id, papers.arxiv_id),
             pubmed_id  = COALESCE(excluded.pubmed_id, papers.pubmed_id),
@@ -98,6 +103,8 @@ class SQLitePaperRepository:
             paper.title,
             json.dumps(paper.authors),
             paper.abstract,
+            paper.full_text,
+            paper.summary,
             paper.doi,
             paper.arxiv_id,
             paper.pubmed_id,
@@ -381,6 +388,98 @@ class SQLiteAssessmentRepository:
         return [_row_to_assessment(r) for r in rows]
 
 
+class SQLiteCitationRepository:
+    """SQLite implementation of CitationRepository."""
+
+    def __init__(self, db: Database) -> None:
+        self._db = db
+
+    _UPSERT_SQL = """\
+        INSERT INTO citations
+            (source_paper_id, target_paper_id, direction,
+             discovered_by, depth, snowball_run_id)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_paper_id, target_paper_id, direction) DO UPDATE SET
+            depth = MIN(citations.depth, excluded.depth),
+            snowball_run_id = COALESCE(excluded.snowball_run_id,
+                                       citations.snowball_run_id)"""
+
+    def _citation_row(self, c: Citation) -> tuple:
+        return (
+            c.source_paper_id,
+            c.target_paper_id,
+            c.direction.value,
+            c.discovered_by,
+            c.depth,
+            c.snowball_run_id,
+        )
+
+    def save(self, citation: Citation) -> None:
+        self._db.conn.execute(self._UPSERT_SQL, self._citation_row(citation))
+        self._db.conn.commit()
+
+    def save_many(self, citations: list[Citation]) -> None:
+        for c in citations:
+            self._db.conn.execute(self._UPSERT_SQL, self._citation_row(c))
+        self._db.conn.commit()
+
+    def get_references(self, paper_id: str) -> list[Citation]:
+        rows = self._db.conn.execute(
+            "SELECT * FROM citations WHERE source_paper_id = ? AND direction = ?",
+            (paper_id, CitationDirection.REFERENCES.value),
+        ).fetchall()
+        return [_row_to_citation(r) for r in rows]
+
+    def get_citations(self, paper_id: str) -> list[Citation]:
+        rows = self._db.conn.execute(
+            "SELECT * FROM citations WHERE target_paper_id = ? AND direction = ?",
+            (paper_id, CitationDirection.CITED_BY.value),
+        ).fetchall()
+        return [_row_to_citation(r) for r in rows]
+
+    def exists(
+        self, source_paper_id: str, target_paper_id: str, direction: str
+    ) -> bool:
+        row = self._db.conn.execute(
+            "SELECT 1 FROM citations WHERE source_paper_id = ? "
+            "AND target_paper_id = ? AND direction = ?",
+            (source_paper_id, target_paper_id, direction),
+        ).fetchone()
+        return row is not None
+
+    def save_snowball_run(self, run: SnowballRun) -> None:
+        self._db.conn.execute(
+            """INSERT OR REPLACE INTO snowball_runs
+               (id, search_id, question_id, direction, max_depth,
+                threshold, total_discovered, total_new_papers, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                run.id,
+                run.search_id,
+                run.question_id,
+                run.direction,
+                run.max_depth,
+                run.threshold,
+                run.total_discovered,
+                run.total_new_papers,
+                run.created_at.isoformat(),
+            ),
+        )
+        self._db.conn.commit()
+
+    def get_snowball_run(self, run_id: str) -> SnowballRun | None:
+        row = self._db.conn.execute(
+            "SELECT * FROM snowball_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        return _row_to_snowball_run(row) if row else None
+
+    def list_snowball_runs(self, limit: int = 20) -> list[SnowballRun]:
+        rows = self._db.conn.execute(
+            "SELECT * FROM snowball_runs ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [_row_to_snowball_run(r) for r in rows]
+
+
 # -- Row mapping helpers --
 
 
@@ -390,6 +489,8 @@ def _row_to_paper(row: sqlite3.Row) -> Paper:
         title=row["title"],
         authors=json.loads(row["authors"]),
         abstract=row["abstract"],
+        full_text=row["full_text"],
+        summary=row["summary"],
         doi=row["doi"],
         arxiv_id=row["arxiv_id"],
         pubmed_id=row["pubmed_id"],
@@ -439,5 +540,30 @@ def _row_to_assessment(row: sqlite3.Row) -> Assessment:
         prompt=row["prompt"],
         temperature=row["temperature"],
         assessor=row["assessor"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _row_to_citation(row: sqlite3.Row) -> Citation:
+    return Citation(
+        source_paper_id=row["source_paper_id"],
+        target_paper_id=row["target_paper_id"],
+        direction=CitationDirection(row["direction"]),
+        discovered_by=row["discovered_by"],
+        depth=row["depth"],
+        snowball_run_id=row["snowball_run_id"],
+    )
+
+
+def _row_to_snowball_run(row: sqlite3.Row) -> SnowballRun:
+    return SnowballRun(
+        id=row["id"],
+        search_id=row["search_id"],
+        question_id=row["question_id"],
+        direction=row["direction"],
+        max_depth=row["max_depth"],
+        threshold=row["threshold"],
+        total_discovered=row["total_discovered"],
+        total_new_papers=row["total_new_papers"],
         created_at=datetime.fromisoformat(row["created_at"]),
     )

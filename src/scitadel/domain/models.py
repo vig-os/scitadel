@@ -32,6 +32,8 @@ class Paper(BaseModel):
     title: str
     authors: list[str] = Field(default_factory=list)
     abstract: str = ""
+    full_text: str | None = None
+    summary: str | None = None
     doi: str | None = None
     arxiv_id: str | None = None
     pubmed_id: str | None = None
@@ -147,4 +149,36 @@ class Assessment(BaseModel):
     prompt: str | None = None
     temperature: float | None = None
     assessor: str = ""  # "human", model name, etc.
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class CitationDirection(str, enum.Enum):
+    """Direction of a citation edge."""
+
+    REFERENCES = "references"
+    CITED_BY = "cited_by"
+
+
+class Citation(BaseModel):
+    """Directed citation edge between two papers."""
+
+    source_paper_id: str
+    target_paper_id: str
+    direction: CitationDirection
+    discovered_by: str = ""  # e.g. "openalex"
+    depth: int = 0
+    snowball_run_id: str | None = None
+
+
+class SnowballRun(BaseModel):
+    """Record of a snowball (citation chaining) run."""
+
+    id: str = Field(default_factory=_new_id)
+    search_id: str | None = None
+    question_id: str | None = None
+    direction: str = "both"  # "references", "cited_by", "both"
+    max_depth: int = 1
+    threshold: float = 0.6
+    total_discovered: int = 0
+    total_new_papers: int = 0
     created_at: datetime = Field(default_factory=_utcnow)
