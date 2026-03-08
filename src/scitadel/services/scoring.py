@@ -104,6 +104,54 @@ def score_paper(
     )
 
 
+async def score_paper_async(
+    paper: Paper,
+    question: ResearchQuestion,
+    config: ScoringConfig | None = None,
+    client: anthropic.AsyncAnthropic | None = None,
+) -> Assessment:
+    """Async version of score_paper using AsyncAnthropic.
+
+    Returns an Assessment with full provenance.
+    """
+    config = config or ScoringConfig()
+    client = client or anthropic.AsyncAnthropic()
+
+    user_prompt = SCORING_USER_PROMPT.format(
+        question_text=question.text,
+        question_description=(
+            f"Context: {question.description}" if question.description else ""
+        ),
+        title=paper.title,
+        authors="; ".join(paper.authors[:5]),
+        year=paper.year or "N/A",
+        journal=paper.journal or "N/A",
+        abstract=paper.abstract[:2000] or "No abstract available.",
+    )
+
+    response = await client.messages.create(
+        model=config.model,
+        max_tokens=config.max_tokens,
+        temperature=config.temperature,
+        system=SCORING_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_prompt}],
+    )
+
+    raw_text = response.content[0].text
+    parsed = _parse_scoring_response(raw_text)
+
+    return Assessment(
+        paper_id=paper.id,
+        question_id=question.id,
+        score=parsed["score"],
+        reasoning=parsed["reasoning"],
+        model=config.model,
+        prompt=user_prompt,
+        temperature=config.temperature,
+        assessor=config.model,
+    )
+
+
 def score_papers(
     papers: list[Paper],
     question: ResearchQuestion,
