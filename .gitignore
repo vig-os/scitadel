@@ -217,3 +217,20 @@ __marimo__/
 
 # Pre-commit cache
 .pre-commit-cache/
+
+# Scitadel runtime data
+.scitadel/
+results.bib
+
+# Claude Code (keep CLAUDE.md, ignore local settings)
+.claude/settings.local.json
+
+# Conductor orchestration state
+.conductor/
+
+# VS Code (mcp.json is committed for shared MCP config)
+.vscode/*
+!.vscode/mcp.json
+
+# VS Code extension (separate project, has its own build artifacts)
+vscode-scitadel/

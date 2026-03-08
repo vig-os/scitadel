@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "scitadel": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "scitadel-mcp"]
+    }
+  }
+}
