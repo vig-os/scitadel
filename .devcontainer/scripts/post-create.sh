@@ -35,7 +35,16 @@ sed -i 's/template-project/scitadel/g' /root/assets/workspace/.venv/bin/activate
 echo "Syncing dependencies..."
 just --justfile "$PROJECT_ROOT/justfile" --working-directory "$PROJECT_ROOT" sync
 
-# User specific setup
-# Add your custom setup commands here to install any dependencies or tools needed for your project
+# Claude Code setup
+# Create /.dockerenv so Claude Code can detect it's running in a container.
+# Podman doesn't create this file (Docker does), which causes Claude Code to
+# refuse --dangerously-skip-permissions when running as root (standard Podman issue).
+touch /.dockerenv
+
+# Install Claude Code if not already present
+if ! command -v claude >/dev/null 2>&1; then
+    echo "Installing Claude Code..."
+    npm install -g @anthropic-ai/claude-code
+fi
 
 echo "Post-create setup complete"
