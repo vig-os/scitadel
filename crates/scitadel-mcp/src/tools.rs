@@ -13,6 +13,7 @@ use scitadel_core::ports::{
     AssessmentRepository, PaperRepository, QuestionRepository, SearchRepository,
 };
 use scitadel_db::sqlite::Database;
+use scitadel_scoring::{build_user_prompt, SCORING_SYSTEM_PROMPT};
 
 fn open_db() -> Result<Database, String> {
     let config = load_config();
@@ -387,4 +388,187 @@ pub fn get_assessments_tool(
         .collect();
 
     Ok(lines.join("\n\n"))
+}
+
+/// Prepare an assessment rubric and paper data for the host LLM to evaluate inline.
+///
+/// Returns the scoring rubric (system prompt) and filled user prompt so the host
+/// LLM can evaluate the paper directly, then call `save_assessment` with the result.
+pub fn prepare_assessment_tool(paper_id: &str, question_id: &str) -> Result<String, String> {
+    let db = open_db()?;
+    let (paper_repo, _, q_repo, _, _) = db.repositories();
+
+    let paper = paper_repo
+        .get(paper_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Paper '{paper_id}' not found."))?;
+
+    let question = q_repo
+        .get_question(question_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Question '{question_id}' not found."))?;
+
+    let user_prompt = build_user_prompt(&paper, &question);
+
+    Ok(format!(
+        "=== SCORING RUBRIC ===\n\
+         {SCORING_SYSTEM_PROMPT}\n\n\
+         === PAPER TO EVALUATE ===\n\
+         {user_prompt}\n\n\
+         === INSTRUCTIONS ===\n\
+         Evaluate this paper using the rubric above. Then call `save_assessment` with:\n\
+         - paper_id: \"{paper_id}\"\n\
+         - question_id: \"{question_id}\"\n\
+         - score: <your 0.0-1.0 score>\n\
+         - reasoning: <your 1-3 sentence reasoning>"
+    ))
+}
+
+/// Save an MCP-native assessment (scored by the host LLM, not a subprocess).
+///
+/// Validates that score is in 0.0-1.0 range and persists the assessment with
+/// assessor set to "mcp-native".
+pub fn save_assessment_tool(
+    paper_id: &str,
+    question_id: &str,
+    score: f64,
+    reasoning: &str,
+) -> Result<String, String> {
+    if !(0.0..=1.0).contains(&score) {
+        return Err(format!(
+            "Score must be between 0.0 and 1.0, got {score:.2}"
+        ));
+    }
+
+    let db = open_db()?;
+    let (paper_repo, _, q_repo, a_repo, _) = db.repositories();
+
+    let paper = paper_repo
+        .get(paper_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Paper '{paper_id}' not found."))?;
+
+    let question = q_repo
+        .get_question(question_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Question '{question_id}' not found."))?;
+
+    let mut assessment = Assessment::new(paper.id.clone(), question.id.clone(), score);
+    assessment.reasoning = reasoning.to_string();
+    assessment.assessor = "mcp-native".to_string();
+    assessment.model = None;
+
+    a_repo.save(&assessment).map_err(|e| e.to_string())?;
+
+    Ok(format!(
+        "Assessment saved: {}\nPaper: {}\nQuestion: {}\nScore: {score:.2}\nAssessor: mcp-native\nReasoning: {}",
+        assessment.id.short(),
+        &paper.title[..paper.title.len().min(60)],
+        &question.text[..question.text.len().min(60)],
+        &reasoning[..reasoning.len().min(200)]
+    ))
+}
+
+/// Prepare batch assessments for all papers in a search.
+///
+/// Returns the rubric once, then a summary of each paper so the host LLM can
+/// evaluate them all and call `save_assessment` for each.
+pub fn prepare_batch_assessments_tool(
+    search_id: &str,
+    question_id: &str,
+) -> Result<String, String> {
+    let db = open_db()?;
+    let (paper_repo, search_repo, q_repo, _, _) = db.repositories();
+
+    let search = search_repo
+        .get(search_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Search '{search_id}' not found."))?;
+
+    let question = q_repo
+        .get_question(question_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Question '{question_id}' not found."))?;
+
+    let results = search_repo
+        .get_results(search.id.as_str())
+        .map_err(|e| e.to_string())?;
+
+    let paper_ids: std::collections::HashSet<&str> =
+        results.iter().map(|r| r.paper_id.as_str()).collect();
+    let papers: Vec<Paper> = paper_ids
+        .iter()
+        .filter_map(|id| paper_repo.get(id).ok().flatten())
+        .collect();
+
+    if papers.is_empty() {
+        return Ok(format!(
+            "No papers found for search '{}'.",
+            search.id.short()
+        ));
+    }
+
+    let mut out = vec![format!(
+        "=== SCORING RUBRIC ===\n\
+         {SCORING_SYSTEM_PROMPT}\n\n\
+         === RESEARCH QUESTION ===\n\
+         {}\n\
+         {}\n\n\
+         === PAPERS TO EVALUATE ({} total) ===\n",
+        question.text,
+        if question.description.is_empty() {
+            String::new()
+        } else {
+            format!("Context: {}", question.description)
+        },
+        papers.len()
+    )];
+
+    for (i, p) in papers.iter().enumerate() {
+        let authors = p
+            .authors
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ");
+        let authors_suffix = if p.authors.len() > 3 {
+            format!(" et al. ({} total)", p.authors.len())
+        } else {
+            String::new()
+        };
+        let abstract_preview = if p.r#abstract.len() > 300 {
+            format!("{}...", &p.r#abstract[..300])
+        } else {
+            p.r#abstract.clone()
+        };
+
+        out.push(format!(
+            "[{}] {}\n\
+             \x20   Authors: {}{}\n\
+             \x20   Year: {}  Journal: {}\n\
+             \x20   Paper ID: {}\n\
+             \x20   Abstract: {}\n",
+            i + 1,
+            p.title,
+            authors,
+            authors_suffix,
+            p.year.map_or_else(|| "N/A".into(), |y| y.to_string()),
+            p.journal.as_deref().unwrap_or("N/A"),
+            p.id.as_str(),
+            abstract_preview
+        ));
+    }
+
+    out.push(format!(
+        "=== INSTRUCTIONS ===\n\
+         Evaluate each paper above against the research question using the rubric.\n\
+         For each paper, call `save_assessment` with:\n\
+         - paper_id: <the paper's ID>\n\
+         - question_id: \"{question_id}\"\n\
+         - score: <your 0.0-1.0 score>\n\
+         - reasoning: <your 1-3 sentence reasoning>"
+    ));
+
+    Ok(out.join("\n"))
 }

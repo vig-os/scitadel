@@ -5,7 +5,7 @@ use scitadel_core::models::{Assessment, Paper, ResearchQuestion};
 
 use crate::error::ScoringError;
 
-const SCORING_SYSTEM_PROMPT: &str = "\
+pub const SCORING_SYSTEM_PROMPT: &str = "\
 You are a scientific literature relevance assessor. You evaluate how relevant \
 a paper is to a specific research question.
 
@@ -19,7 +19,7 @@ Score on a scale of 0.0 to 1.0:
 Respond with valid JSON only: {\"score\": float, \"reasoning\": \"string\"}
 The reasoning should be 1-3 sentences explaining your assessment.";
 
-const SCORING_USER_PROMPT: &str = "\
+pub const SCORING_USER_PROMPT: &str = "\
 Research Question: {question_text}
 {question_description}
 
@@ -169,7 +169,7 @@ impl ClaudeScorer {
     }
 }
 
-fn build_user_prompt(paper: &Paper, question: &ResearchQuestion) -> String {
+pub fn build_user_prompt(paper: &Paper, question: &ResearchQuestion) -> String {
     let description = if question.description.is_empty() {
         String::new()
     } else {
@@ -195,7 +195,7 @@ fn build_user_prompt(paper: &Paper, question: &ResearchQuestion) -> String {
         .replace("{abstract}", abstract_text)
 }
 
-fn parse_scoring_response(text: &str) -> (f64, String) {
+pub fn parse_scoring_response(text: &str) -> (f64, String) {
     let text = text.trim();
 
     // Handle markdown code blocks
