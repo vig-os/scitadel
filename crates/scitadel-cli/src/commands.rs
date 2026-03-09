@@ -29,6 +29,12 @@ where
     }
 }
 
+pub fn tui() -> Result<()> {
+    let config = load_config();
+    scitadel_tui::run(&config.db_path)?;
+    Ok(())
+}
+
 pub fn init(db_path: Option<PathBuf>) -> Result<()> {
     let config = load_config();
     let path = db_path.unwrap_or(config.db_path);
