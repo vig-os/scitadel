@@ -6,7 +6,14 @@ use ratatui::Frame;
 
 use crate::data::DataStore;
 
-pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, paper_id: &str, scroll: u16) {
+pub fn draw(
+    frame: &mut Frame,
+    area: Rect,
+    data: &DataStore,
+    paper_id: &str,
+    scroll: u16,
+    question_id: Option<&str>,
+) {
     let Ok(Some(paper)) = data.load_paper(paper_id) else {
         let block = Block::default()
             .title(" Paper Detail ")
@@ -17,7 +24,7 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, paper_id: &str, scr
     };
 
     let assessments = data
-        .load_assessments_for_paper(paper_id, None)
+        .load_assessments_for_paper(paper_id, question_id)
         .unwrap_or_default();
 
     let label_style = Style::default()
@@ -93,7 +100,7 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, paper_id: &str, scr
                 "  Score: {:.2}  Assessor: {}  Date: {}",
                 a.score,
                 if a.assessor.is_empty() {
-                    "—"
+                    "\u{2014}"
                 } else {
                     &a.assessor
                 },

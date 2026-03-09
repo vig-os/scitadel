@@ -1,92 +1,85 @@
-use ratatui::layout::{Constraint, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use scitadel_core::models::Paper;
 
 use crate::data::DataStore;
 
-pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, selected: usize) {
-    let papers = data.load_papers(1000, 0).unwrap_or_default();
-    render_paper_table(frame, area, &papers, selected, " Papers ");
-}
-
-pub fn draw_for_search(
+/// Right-pane preview for a highlighted paper (not full detail, just key info).
+pub fn draw_preview(
     frame: &mut Frame,
     area: Rect,
     data: &DataStore,
-    search_id: &str,
-    selected: usize,
+    paper: &Paper,
+    question_id: Option<&str>,
 ) {
-    let papers = data.load_papers_for_search(search_id).unwrap_or_default();
-    let title = format!(" Papers for search {} ", &search_id[..search_id.len().min(8)]);
-    render_paper_table(frame, area, &papers, selected, &title);
-}
+    let label_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
 
-fn render_paper_table(
-    frame: &mut Frame,
-    area: Rect,
-    papers: &[Paper],
-    selected: usize,
-    title: &str,
-) {
-    if papers.is_empty() {
-        let block = Block::default().title(title.to_string()).borders(Borders::ALL);
-        let empty = Paragraph::new("No papers found.").block(block);
-        frame.render_widget(empty, area);
-        return;
+    let mut lines = vec![Line::from(vec![
+        Span::styled("Title: ", label_style),
+        Span::raw(&paper.title),
+    ])];
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(vec![
+        Span::styled("Authors: ", label_style),
+        Span::raw(format_authors(&paper.authors)),
+    ]));
+
+    if let Some(year) = paper.year {
+        lines.push(Line::from(vec![
+            Span::styled("Year: ", label_style),
+            Span::raw(year.to_string()),
+        ]));
     }
 
-    let header = Row::new(vec![
-        Cell::from("#"),
-        Cell::from("Title"),
-        Cell::from("Authors"),
-        Cell::from("Year"),
-    ])
-    .style(
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    );
+    if let Some(ref journal) = paper.journal {
+        lines.push(Line::from(vec![
+            Span::styled("Journal: ", label_style),
+            Span::raw(journal.as_str()),
+        ]));
+    }
 
-    let rows: Vec<Row<'_>> = papers
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            let authors = format_authors(&p.authors);
-            let year = p
-                .year
-                .map_or_else(|| "—".to_string(), |y| y.to_string());
+    // Score for selected question
+    if let Some(qid) = question_id
+        && let Ok(assessments) = data.load_assessments_for_paper(paper.id.as_str(), Some(qid))
+        && let Some(a) = assessments.first()
+    {
+        lines.push(Line::from(vec![
+            Span::styled("Score: ", label_style),
+            Span::raw(format!("{:.2}", a.score)),
+        ]));
+    }
 
-            Row::new(vec![
-                Cell::from((i + 1).to_string()),
-                Cell::from(truncate(&p.title, 60)),
-                Cell::from(truncate(&authors, 30)),
-                Cell::from(year),
-            ])
-        })
-        .collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("Abstract:", label_style)));
+    if paper.r#abstract.is_empty() {
+        lines.push(Line::from("  (no abstract available)"));
+    } else {
+        // Show truncated abstract for preview
+        let abstract_preview: String = paper
+            .r#abstract
+            .chars()
+            .take(500)
+            .collect();
+        for line in abstract_preview.lines() {
+            lines.push(Line::from(format!("  {line}")));
+        }
+        if paper.r#abstract.len() > 500 {
+            lines.push(Line::from("  ..."));
+        }
+    }
 
-    let widths = [
-        Constraint::Length(5),
-        Constraint::Min(30),
-        Constraint::Length(32),
-        Constraint::Length(6),
-    ];
-
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(Block::default().title(title.to_string()).borders(Borders::ALL))
-        .row_highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        );
-
-    let mut state = TableState::default();
-    state.select(Some(selected));
-    frame.render_stateful_widget(table, area, &mut state);
+    let block = Block::default()
+        .title(" Paper Preview ")
+        .borders(Borders::ALL);
+    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
 }
 
 fn format_authors(authors: &[String]) -> String {
@@ -95,13 +88,5 @@ fn format_authors(authors: &[String]) -> String {
         1 => authors[0].clone(),
         2 => format!("{}, {}", authors[0], authors[1]),
         _ => format!("{}, {} et al.", authors[0], authors[1]),
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max.saturating_sub(3)])
     }
 }

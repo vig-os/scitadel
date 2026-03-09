@@ -1,76 +1,114 @@
-use ratatui::layout::{Constraint, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
+
+use scitadel_core::models::ResearchQuestion;
 
 use crate::data::DataStore;
 
-pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, selected: usize) {
-    let questions = data.load_questions().unwrap_or_default();
+/// Right-pane summary when "All" is selected at Questions level.
+pub fn draw_summary(
+    frame: &mut Frame,
+    area: Rect,
+    data: &DataStore,
+    questions: &[ResearchQuestion],
+) {
+    let label_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
 
-    if questions.is_empty() {
-        let block = Block::default()
-            .title(" Research Questions ")
-            .borders(Borders::ALL);
-        let empty =
-            Paragraph::new("No research questions yet. Run `scitadel question create` to add one.")
-                .block(block);
-        frame.render_widget(empty, area);
-        return;
+    let mut lines = vec![Line::from(Span::styled(
+        "All Research Questions",
+        label_style,
+    ))];
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!(
+        "Total questions: {}",
+        questions.len()
+    )));
+    lines.push(Line::from(""));
+
+    for q in questions {
+        let term_count = data
+            .load_terms(q.id.as_str())
+            .map(|t| t.len())
+            .unwrap_or(0);
+        lines.push(Line::from(format!(
+            "  {} — {} ({} terms)",
+            q.id.short(),
+            truncate(&q.text, 50),
+            term_count,
+        )));
     }
 
-    let header = Row::new(vec![
-        Cell::from("ID"),
-        Cell::from("Date"),
-        Cell::from("Text"),
-        Cell::from("# Terms"),
-    ])
-    .style(
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    );
+    let block = Block::default()
+        .title(" Questions Overview ")
+        .borders(Borders::ALL);
+    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
 
-    let rows: Vec<Row<'_>> = questions
-        .iter()
-        .map(|q| {
-            let term_count = data
-                .load_terms(q.id.as_str())
-                .map(|t| t.len())
-                .unwrap_or(0);
+/// Right-pane detail for a single question.
+pub fn draw_detail(frame: &mut Frame, area: Rect, data: &DataStore, q: &ResearchQuestion) {
+    let label_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
 
-            Row::new(vec![
-                Cell::from(q.id.short().to_string()),
-                Cell::from(q.created_at.format("%Y-%m-%d %H:%M").to_string()),
-                Cell::from(truncate(&q.text, 60)),
-                Cell::from(term_count.to_string()),
-            ])
-        })
-        .collect();
-
-    let widths = [
-        Constraint::Length(10),
-        Constraint::Length(18),
-        Constraint::Min(20),
-        Constraint::Length(9),
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Question: ", label_style),
+            Span::raw(&q.text),
+        ]),
+        Line::from(""),
     ];
 
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(
-            Block::default()
-                .title(" Research Questions ")
-                .borders(Borders::ALL),
-        )
-        .row_highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        );
+    if !q.description.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("Description: ", label_style),
+            Span::raw(&q.description),
+        ]));
+        lines.push(Line::from(""));
+    }
 
-    let mut state = TableState::default();
-    state.select(Some(selected));
-    frame.render_stateful_widget(table, area, &mut state);
+    lines.push(Line::from(vec![
+        Span::styled("ID: ", label_style),
+        Span::raw(q.id.as_str()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Created: ", label_style),
+        Span::raw(q.created_at.format("%Y-%m-%d %H:%M").to_string()),
+    ]));
+
+    // Search terms
+    let terms = data.load_terms(q.id.as_str()).unwrap_or_default();
+    if !terms.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Search Terms:", label_style)));
+        for t in &terms {
+            if !t.query_string.is_empty() {
+                lines.push(Line::from(format!("  Query: {}", t.query_string)));
+            }
+            if !t.terms.is_empty() {
+                lines.push(Line::from(format!("  Terms: {}", t.terms.join(", "))));
+            }
+        }
+    }
+
+    // Search count
+    let search_count = data
+        .load_searches_for_question(q.id.as_str())
+        .map(|s| s.len())
+        .unwrap_or(0);
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!("Searches linked: {search_count}")));
+
+    let block = Block::default()
+        .title(" Question Detail ")
+        .borders(Borders::ALL);
+    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
 }
 
 fn truncate(s: &str, max: usize) -> String {

@@ -57,6 +57,19 @@ impl DataStore {
         Ok(q_repo.get_terms(question_id)?)
     }
 
+    pub fn load_searches_for_question(&self, question_id: &str) -> Result<Vec<Search>> {
+        let searches = self.load_searches(100)?;
+        Ok(searches
+            .into_iter()
+            .filter(|s| {
+                s.parameters
+                    .get("question_id")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|qid| qid == question_id)
+            })
+            .collect())
+    }
+
     pub fn load_assessments_for_paper(
         &self,
         paper_id: &str,

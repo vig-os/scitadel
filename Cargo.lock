@@ -2017,6 +2017,7 @@ dependencies = [
  "ratatui",
  "scitadel-core",
  "scitadel-db",
+ "serde_json",
  "tracing",
 ]
 
