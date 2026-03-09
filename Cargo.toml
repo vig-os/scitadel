@@ -8,6 +8,7 @@ members = [
     "crates/scitadel-export",
     "crates/scitadel-cli",
     "crates/scitadel-mcp",
+    "crates/scitadel-tui",
 ]
 
 [workspace.package]
@@ -47,6 +48,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
+
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
 
 # MCP
 rmcp = { version = "0.1", features = ["server", "transport-io"] }

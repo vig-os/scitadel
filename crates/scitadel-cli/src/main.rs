@@ -83,6 +83,8 @@ enum Commands {
         #[arg(short, long, default_value = "0.0")]
         temperature: f64,
     },
+    /// Launch interactive TUI dashboard
+    Tui,
     /// Run citation chaining (snowballing)
     Snowball {
         /// Search ID
@@ -168,6 +170,7 @@ async fn main() -> Result<()> {
                 query,
             } => commands::question_add_terms(&question_id, &terms, query),
         },
+        Commands::Tui => commands::tui(),
         Commands::Assess {
             search_id,
             question,
