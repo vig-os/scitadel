@@ -1,0 +1,188 @@
+use std::path::PathBuf;
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use tracing_subscriber::EnvFilter;
+
+mod commands;
+
+#[derive(Parser)]
+#[command(name = "scitadel", version, about = "Programmable, reproducible scientific literature retrieval")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Initialize the scitadel database
+    Init {
+        /// Database path
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// Run a federated literature search
+    Search {
+        /// Search query
+        query: Option<String>,
+        /// Comma-separated list of sources
+        #[arg(short, long, default_value = "pubmed,arxiv,openalex,inspire")]
+        sources: String,
+        /// Maximum results per source
+        #[arg(short = 'n', long, default_value = "50")]
+        max_results: usize,
+        /// Research question ID — auto-builds query from linked terms
+        #[arg(short, long)]
+        question: Option<String>,
+    },
+    /// Show past search runs
+    History {
+        /// Number of recent searches
+        #[arg(short = 'n', long, default_value = "20")]
+        limit: i64,
+    },
+    /// Show paper details
+    Show {
+        /// Paper or search ID
+        id: String,
+    },
+    /// Export search results
+    Export {
+        /// Search ID
+        search_id: String,
+        /// Export format
+        #[arg(short, long, default_value = "json", value_parser = ["bibtex", "json", "csv"])]
+        format: String,
+        /// Output file path
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Diff two search runs
+    Diff {
+        /// First search ID
+        search_a: String,
+        /// Second search ID
+        search_b: String,
+    },
+    /// Manage research questions
+    Question {
+        #[command(subcommand)]
+        command: QuestionCommands,
+    },
+    /// Score papers against a research question using Claude
+    Assess {
+        /// Search ID
+        search_id: String,
+        /// Research question ID
+        #[arg(short, long)]
+        question: String,
+        /// Model for scoring
+        #[arg(short, long, default_value = "claude-sonnet-4-6")]
+        model: String,
+        /// Temperature for scoring
+        #[arg(short, long, default_value = "0.0")]
+        temperature: f64,
+    },
+    /// Run citation chaining (snowballing)
+    Snowball {
+        /// Search ID
+        search_id: String,
+        /// Research question ID
+        #[arg(short, long)]
+        question: String,
+        /// Max chaining depth (1-3)
+        #[arg(short, long, default_value = "1")]
+        depth: i32,
+        /// Min relevance score to expand
+        #[arg(long, default_value = "0.6")]
+        threshold: f64,
+        /// Citation direction
+        #[arg(long, default_value = "both", value_parser = ["references", "cited_by", "both"])]
+        direction: String,
+        /// Model for scoring
+        #[arg(short, long, default_value = "claude-sonnet-4-6")]
+        model: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum QuestionCommands {
+    /// Create a research question
+    Create {
+        /// Question text
+        text: String,
+        /// Additional context
+        #[arg(short, long, default_value = "")]
+        description: String,
+    },
+    /// List all research questions
+    List,
+    /// Add search terms linked to a question
+    AddTerms {
+        /// Question ID
+        question_id: String,
+        /// Search terms
+        #[arg(required = true)]
+        terms: Vec<String>,
+        /// Custom query string
+        #[arg(short, long)]
+        query: Option<String>,
+    },
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Init { db } => commands::init(db),
+        Commands::Search {
+            query,
+            sources,
+            max_results,
+            question,
+        } => commands::search(query, sources, max_results, question).await,
+        Commands::History { limit } => commands::history(limit),
+        Commands::Show { id } => commands::show(&id),
+        Commands::Export {
+            search_id,
+            format,
+            output,
+        } => commands::export(&search_id, &format, output),
+        Commands::Diff {
+            search_a,
+            search_b,
+        } => commands::diff(&search_a, &search_b),
+        Commands::Question { command } => match command {
+            QuestionCommands::Create { text, description } => {
+                commands::question_create(&text, &description)
+            }
+            QuestionCommands::List => commands::question_list(),
+            QuestionCommands::AddTerms {
+                question_id,
+                terms,
+                query,
+            } => commands::question_add_terms(&question_id, &terms, query),
+        },
+        Commands::Assess {
+            search_id,
+            question,
+            model,
+            temperature,
+        } => commands::assess(&search_id, &question, &model, temperature).await,
+        Commands::Snowball {
+            search_id,
+            question,
+            depth,
+            threshold,
+            direction,
+            model,
+        } => {
+            commands::snowball(&search_id, &question, depth, threshold, &direction, &model)
+        }
+    }
+}
