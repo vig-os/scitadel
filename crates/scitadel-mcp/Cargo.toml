@@ -1,0 +1,25 @@
+[package]
+name = "scitadel-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+scitadel-core = { path = "../scitadel-core" }
+scitadel-db = { path = "../scitadel-db" }
+scitadel-adapters = { path = "../scitadel-adapters" }
+scitadel-scoring = { path = "../scitadel-scoring" }
+scitadel-export = { path = "../scitadel-export" }
+rmcp = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+
+[lints]
+workspace = true

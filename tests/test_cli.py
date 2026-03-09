@@ -49,3 +49,44 @@ class TestCLI:
         )
         assert result.exit_code == 1
         assert "not found" in result.output
+
+    def test_question_create(self, tmp_path):
+        runner = CliRunner()
+        db_path = tmp_path / "test.db"
+        runner.invoke(cli, ["init", "--db", str(db_path)])
+        result = runner.invoke(
+            cli,
+            ["question", "create", "What are PET tracers?"],
+            env={"SCITADEL_DB": str(db_path)},
+        )
+        assert result.exit_code == 0
+        assert "Question ID:" in result.output
+
+    def test_question_list_empty(self, tmp_path):
+        runner = CliRunner()
+        db_path = tmp_path / "test.db"
+        runner.invoke(cli, ["init", "--db", str(db_path)])
+        result = runner.invoke(
+            cli,
+            ["question", "list"],
+            env={"SCITADEL_DB": str(db_path)},
+        )
+        assert result.exit_code == 0
+        assert "No research questions" in result.output
+
+    def test_question_create_then_list(self, tmp_path):
+        runner = CliRunner()
+        db_path = tmp_path / "test.db"
+        runner.invoke(cli, ["init", "--db", str(db_path)])
+        runner.invoke(
+            cli,
+            ["question", "create", "Test question"],
+            env={"SCITADEL_DB": str(db_path)},
+        )
+        result = runner.invoke(
+            cli,
+            ["question", "list"],
+            env={"SCITADEL_DB": str(db_path)},
+        )
+        assert result.exit_code == 0
+        assert "Test question" in result.output

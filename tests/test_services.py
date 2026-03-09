@@ -1,4 +1,4 @@
-"""Tests for application services: orchestrator, dedup, export."""
+"""Tests for application services: orchestrator, dedup, export, chat engine."""
 
 from __future__ import annotations
 
@@ -7,9 +7,57 @@ import json
 
 
 from scitadel.domain.models import CandidatePaper, Paper, SourceStatus
+from scitadel.services.chat_engine import _trim_messages
 from scitadel.services.dedup import _normalize_title, _title_similarity, deduplicate
 from scitadel.services.export import export_bibtex, export_csv, export_json
 from scitadel.services.orchestrator import run_search
+
+
+# -- Message trimming tests --
+
+
+class TestTrimMessages:
+    def test_no_trim_when_under_limit(self):
+        msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+        assert _trim_messages(msgs, 10) == msgs
+
+    def test_trim_to_limit(self):
+        msgs = [{"role": "user", "content": f"msg{i}"} for i in range(10)]
+        result = _trim_messages(msgs, 4)
+        assert len(result) == 4
+        assert result[0]["content"] == "msg6"
+
+    def test_preserves_tool_pair(self):
+        msgs = [
+            {"role": "user", "content": "msg0"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "let me search"},
+                {"type": "tool_use", "id": "t1", "name": "search", "input": {}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "results"},
+            ]},
+            {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+        ]
+        # Trim to 2: would get last 2 messages (tool_result user + assistant)
+        # But tool_result needs its preceding assistant, so we get 3
+        result = _trim_messages(msgs, 2)
+        assert len(result) == 3
+        assert result[0]["role"] == "assistant"
+        assert any(
+            c.get("type") == "tool_use"
+            for c in result[0]["content"]
+        )
+
+    def test_no_expansion_for_normal_user_message(self):
+        msgs = [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "response"},
+            {"role": "user", "content": "second"},
+            {"role": "assistant", "content": "response2"},
+        ]
+        result = _trim_messages(msgs, 2)
+        assert len(result) == 2
 
 
 # -- Dedup tests --
@@ -173,6 +221,41 @@ class TestExportCSV:
     def test_export_csv_header(self):
         result = export_csv([])
         assert result.startswith("id,title,authors")
+
+
+class TestExportEdgeCases:
+    def test_export_json_missing_fields(self):
+        papers = [Paper(id="mf1", title="Minimal")]
+        result = export_json(papers)
+        data = json.loads(result)
+        assert data[0]["title"] == "Minimal"
+        assert data[0]["doi"] is None
+        assert data[0]["year"] is None
+
+    def test_export_csv_special_chars(self):
+        papers = [
+            Paper(
+                id="sc1",
+                title='Paper with "quotes" and, commas',
+                authors=["O'Brien, Tim"],
+            )
+        ]
+        result = export_csv(papers)
+        lines = result.strip().split("\n")
+        assert len(lines) == 2
+        # CSV should properly escape the special characters
+        assert "quotes" in lines[1]
+        assert "O'Brien" in lines[1]
+
+    def test_export_csv_empty(self):
+        result = export_csv([])
+        lines = result.strip().split("\n")
+        assert len(lines) == 1  # header only
+
+    def test_export_bibtex_missing_fields(self):
+        papers = [Paper(id="bf1", title="Just A Title")]
+        result = export_bibtex(papers)
+        assert "title = {Just A Title}" in result
 
 
 class TestExportBibTeX:

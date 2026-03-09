@@ -1,0 +1,390 @@
+// MCP tool definitions for scitadel.
+//
+// This module defines the tool handlers that will be exposed via rmcp.
+// Each tool: validate input, call service, format response.
+//
+// Note: rmcp integration requires the rmcp crate's macro system.
+// This is a structural placeholder — the actual rmcp server setup
+// depends on the rmcp API which may change. The tool logic is complete.
+
+use scitadel_core::config::load_config;
+use scitadel_core::models::{Assessment, Paper, ResearchQuestion, SearchTerm};
+use scitadel_core::ports::{
+    AssessmentRepository, PaperRepository, QuestionRepository, SearchRepository,
+};
+use scitadel_db::sqlite::Database;
+
+fn open_db() -> Result<Database, String> {
+    let config = load_config();
+    let db = Database::open(&config.db_path).map_err(|e| e.to_string())?;
+    db.migrate().map_err(|e| e.to_string())?;
+    Ok(db)
+}
+
+pub async fn search_tool(
+    query: String,
+    sources: String,
+    max_results: usize,
+    question_id: Option<String>,
+) -> Result<String, String> {
+    let config = load_config();
+    let source_list: Vec<String> = sources.split(',').map(|s| s.trim().to_string()).collect();
+
+    let mut query = if query.is_empty() { None } else { Some(query) };
+    let mut parameters = serde_json::Map::new();
+
+    if let Some(ref qid) = question_id {
+        let db = open_db()?;
+        let (_, _, q_repo, _, _) = db.repositories();
+        let question = q_repo
+            .get_question(qid)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Question '{qid}' not found."))?;
+
+        parameters.insert(
+            "question_id".into(),
+            serde_json::Value::String(question.id.as_str().to_string()),
+        );
+
+        if query.is_none() {
+            let terms = q_repo.get_terms(question.id.as_str()).map_err(|e| e.to_string())?;
+            if terms.is_empty() {
+                return Err(format!(
+                    "No search terms linked to question '{}'.",
+                    question.id.short()
+                ));
+            }
+            query = Some(
+                terms
+                    .iter()
+                    .filter(|t| !t.query_string.is_empty())
+                    .map(|t| t.query_string.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" OR "),
+            );
+        }
+    }
+
+    let query = query.ok_or("Provide a query or question_id with linked search terms.")?;
+
+    let adapters = scitadel_adapters::build_adapters(
+        &source_list,
+        &config.pubmed.api_key,
+        &config.openalex.api_key,
+    )
+    .map_err(|e| e.to_string())?;
+
+    let (mut search_record, candidates) =
+        scitadel_core::services::orchestrator::run_search(&query, &adapters, max_results, 3).await;
+
+    let (papers, mut search_results) =
+        scitadel_core::services::dedup::deduplicate(&candidates, 0.85);
+    search_record.total_papers = papers.len() as i32;
+
+    let db = open_db()?;
+    let (paper_repo, search_repo, _, _, _) = db.repositories();
+
+    paper_repo.save_many(&papers).map_err(|e| e.to_string())?;
+    search_repo.save(&search_record).map_err(|e| e.to_string())?;
+
+    for sr in &mut search_results {
+        sr.search_id = search_record.id.clone();
+    }
+    search_repo
+        .save_results(&search_results)
+        .map_err(|e| e.to_string())?;
+
+    let outcomes: Vec<String> = search_record
+        .source_outcomes
+        .iter()
+        .map(|o| {
+            format!(
+                "  {}: {} results ({}, {:.0}ms)",
+                o.source, o.result_count, o.status, o.latency_ms
+            )
+        })
+        .collect();
+
+    Ok(format!(
+        "Search ID: {}\nQuery: {query}\nSources: {}\nTotal candidates: {}\nUnique papers after dedup: {}\n{}",
+        search_record.id,
+        source_list.join(", "),
+        search_record.total_candidates,
+        papers.len(),
+        outcomes.join("\n")
+    ))
+}
+
+pub fn list_searches_tool(limit: i64) -> Result<String, String> {
+    let db = open_db()?;
+    let (_, search_repo, _, _, _) = db.repositories();
+    let searches = search_repo.list_searches(limit).map_err(|e| e.to_string())?;
+
+    if searches.is_empty() {
+        return Ok("No search history found.".into());
+    }
+
+    let lines: Vec<String> = searches
+        .iter()
+        .map(|s| {
+            let success = s
+                .source_outcomes
+                .iter()
+                .filter(|o| o.status == scitadel_core::models::SourceStatus::Success)
+                .count();
+            format!(
+                "{}  {}  \"{}\"  {} papers  {}/{} sources ok",
+                s.id.short(),
+                s.created_at.format("%Y-%m-%d %H:%M"),
+                s.query,
+                s.total_papers,
+                success,
+                s.source_outcomes.len()
+            )
+        })
+        .collect();
+
+    Ok(lines.join("\n"))
+}
+
+pub fn get_papers_tool(search_id: &str) -> Result<String, String> {
+    let db = open_db()?;
+    let (paper_repo, search_repo, _, _, _) = db.repositories();
+
+    let search = search_repo
+        .get(search_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Search '{search_id}' not found."))?;
+
+    let results = search_repo
+        .get_results(search.id.as_str())
+        .map_err(|e| e.to_string())?;
+
+    let paper_ids: std::collections::HashSet<&str> =
+        results.iter().map(|r| r.paper_id.as_str()).collect();
+    let papers: Vec<Paper> = paper_ids
+        .iter()
+        .filter_map(|id| paper_repo.get(id).ok().flatten())
+        .collect();
+
+    let mut out = vec![format!(
+        "Search: {} — \"{}\" — {} papers\n",
+        search.id.short(),
+        search.query,
+        papers.len()
+    )];
+
+    for (i, p) in papers.iter().enumerate() {
+        let authors = p.authors.iter().take(3).cloned().collect::<Vec<_>>().join("; ");
+        let authors_suffix = if p.authors.len() > 3 {
+            format!(" et al. ({} total)", p.authors.len())
+        } else {
+            String::new()
+        };
+        let abstract_preview = if p.r#abstract.len() > 300 {
+            format!("{}...", &p.r#abstract[..300])
+        } else {
+            p.r#abstract.clone()
+        };
+
+        out.push(format!(
+            "[{}] {}\n    Authors: {}{}\n    Year: {}  Journal: {}\n    DOI: {}  ID: {}\n    Abstract: {}\n",
+            i + 1,
+            p.title,
+            authors,
+            authors_suffix,
+            p.year.map_or_else(|| "N/A".into(), |y| y.to_string()),
+            p.journal.as_deref().unwrap_or("N/A"),
+            p.doi.as_deref().unwrap_or("N/A"),
+            p.id.short(),
+            abstract_preview
+        ));
+    }
+
+    Ok(out.join("\n"))
+}
+
+pub fn get_paper_tool(paper_id: &str) -> Result<String, String> {
+    let db = open_db()?;
+    let (paper_repo, _, _, _, _) = db.repositories();
+
+    let paper = paper_repo
+        .get(paper_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Paper '{paper_id}' not found."))?;
+
+    serde_json::to_string_pretty(&paper).map_err(|e| e.to_string())
+}
+
+pub fn export_search_tool(search_id: &str, format: &str) -> Result<String, String> {
+    let db = open_db()?;
+    let (paper_repo, search_repo, _, _, _) = db.repositories();
+
+    let search = search_repo
+        .get(search_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Search '{search_id}' not found."))?;
+
+    let results = search_repo
+        .get_results(search.id.as_str())
+        .map_err(|e| e.to_string())?;
+    let paper_ids: std::collections::HashSet<&str> =
+        results.iter().map(|r| r.paper_id.as_str()).collect();
+    let papers: Vec<Paper> = paper_ids
+        .iter()
+        .filter_map(|id| paper_repo.get(id).ok().flatten())
+        .collect();
+
+    match format {
+        "csv" => Ok(scitadel_export::export_csv(&papers)),
+        "bibtex" => Ok(scitadel_export::export_bibtex(&papers)),
+        // Default to JSON for unknown formats
+        _ => Ok(scitadel_export::export_json(&papers, 2)),
+    }
+}
+
+pub fn create_question_tool(text: &str, description: &str) -> Result<String, String> {
+    let db = open_db()?;
+    let (_, _, q_repo, _, _) = db.repositories();
+
+    let mut question = ResearchQuestion::new(text);
+    question.description = description.to_string();
+    q_repo.save_question(&question).map_err(|e| e.to_string())?;
+
+    Ok(format!("Question created: {}\nText: {text}", question.id.short()))
+}
+
+pub fn list_questions_tool() -> Result<String, String> {
+    let db = open_db()?;
+    let (_, _, q_repo, _, _) = db.repositories();
+    let questions = q_repo.list_questions().map_err(|e| e.to_string())?;
+
+    if questions.is_empty() {
+        return Ok("No research questions found.".into());
+    }
+
+    let lines: Vec<String> = questions
+        .iter()
+        .map(|q| {
+            format!(
+                "{}  {}  \"{}\"",
+                q.id.short(),
+                q.created_at.format("%Y-%m-%d %H:%M"),
+                q.text
+            )
+        })
+        .collect();
+
+    Ok(lines.join("\n"))
+}
+
+pub fn add_search_terms_tool(
+    question_id: &str,
+    terms: &[String],
+    query_string: &str,
+) -> Result<String, String> {
+    let db = open_db()?;
+    let (_, _, q_repo, _, _) = db.repositories();
+
+    let question = q_repo
+        .get_question(question_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Question '{question_id}' not found."))?;
+
+    let query_str = if query_string.is_empty() {
+        terms.join(" ")
+    } else {
+        query_string.to_string()
+    };
+
+    let mut term = SearchTerm::new(question.id.clone());
+    term.terms = terms.to_vec();
+    term.query_string = query_str;
+    q_repo.save_term(&term).map_err(|e| e.to_string())?;
+
+    Ok(format!(
+        "Search terms added to question {}: {:?}",
+        question.id.short(),
+        terms
+    ))
+}
+
+pub fn assess_paper_tool(
+    paper_id: &str,
+    question_id: &str,
+    score: f64,
+    reasoning: &str,
+    assessor: &str,
+    model: Option<&str>,
+) -> Result<String, String> {
+    let db = open_db()?;
+    let (paper_repo, _, q_repo, a_repo, _) = db.repositories();
+
+    let paper = paper_repo
+        .get(paper_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Paper '{paper_id}' not found."))?;
+
+    let question = q_repo
+        .get_question(question_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Question '{question_id}' not found."))?;
+
+    let mut assessment = Assessment::new(paper.id.clone(), question.id.clone(), score);
+    assessment.reasoning = reasoning.to_string();
+    assessment.assessor = assessor.to_string();
+    assessment.model = model.map(String::from);
+
+    a_repo.save(&assessment).map_err(|e| e.to_string())?;
+
+    Ok(format!(
+        "Assessment saved: {}\nPaper: {}\nQuestion: {}\nScore: {score:.2}\nReasoning: {}",
+        assessment.id.short(),
+        &paper.title[..paper.title.len().min(60)],
+        &question.text[..question.text.len().min(60)],
+        &reasoning[..reasoning.len().min(200)]
+    ))
+}
+
+pub fn get_assessments_tool(
+    paper_id: Option<&str>,
+    question_id: Option<&str>,
+) -> Result<String, String> {
+    let db = open_db()?;
+    let (paper_repo, _, _, a_repo, _) = db.repositories();
+
+    let assessments = if let Some(pid) = paper_id {
+        a_repo
+            .get_for_paper(pid, question_id)
+            .map_err(|e| e.to_string())?
+    } else if let Some(qid) = question_id {
+        a_repo.get_for_question(qid).map_err(|e| e.to_string())?
+    } else {
+        return Err("Provide at least one of paper_id or question_id.".into());
+    };
+
+    if assessments.is_empty() {
+        return Ok("No assessments found.".into());
+    }
+
+    let lines: Vec<String> = assessments
+        .iter()
+        .map(|a| {
+            let title = paper_repo
+                .get(a.paper_id.as_str())
+                .ok()
+                .flatten()
+                .map_or_else(|| "Unknown".into(), |p| p.title[..p.title.len().min(50)].to_string());
+            format!(
+                "Score: {:.2}  Paper: {}  Assessor: {}  {}\n  Reasoning: {}",
+                a.score,
+                title,
+                a.assessor,
+                a.created_at.format("%Y-%m-%d %H:%M"),
+                &a.reasoning[..a.reasoning.len().min(200)]
+            )
+        })
+        .collect();
+
+    Ok(lines.join("\n\n"))
+}
