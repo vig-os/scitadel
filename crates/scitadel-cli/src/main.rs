@@ -82,6 +82,9 @@ enum Commands {
         /// Temperature for scoring
         #[arg(short, long, default_value = "0.0")]
         temperature: f64,
+        /// Scorer backend: auto, cli, api
+        #[arg(long, default_value = "auto")]
+        scorer: String,
     },
     /// Launch interactive TUI dashboard
     Tui,
@@ -176,7 +179,8 @@ async fn main() -> Result<()> {
             question,
             model,
             temperature,
-        } => commands::assess(&search_id, &question, &model, temperature).await,
+            scorer,
+        } => commands::assess(&search_id, &question, &model, temperature, &scorer).await,
         Commands::Snowball {
             search_id,
             question,
