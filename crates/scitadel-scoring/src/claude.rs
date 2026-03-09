@@ -1,9 +1,11 @@
+use async_trait::async_trait;
 use reqwest::Client;
 use tracing::{info, warn};
 
 use scitadel_core::models::{Assessment, Paper, ResearchQuestion};
 
 use crate::error::ScoringError;
+use crate::scorer::Scorer;
 
 pub const SCORING_SYSTEM_PROMPT: &str = "\
 You are a scientific literature relevance assessor. You evaluate how relevant \
@@ -225,6 +227,17 @@ pub fn parse_scoring_response(text: &str) -> (f64, String) {
     } else {
         warn!("Failed to parse scoring response: {}", &text[..text.len().min(200)]);
         (0.0, format!("Parse error. Raw response: {}", &text[..text.len().min(500)]))
+    }
+}
+
+#[async_trait]
+impl Scorer for ClaudeScorer {
+    async fn score_paper(
+        &self,
+        paper: &Paper,
+        question: &ResearchQuestion,
+    ) -> Result<Assessment, ScoringError> {
+        self.score_paper(paper, question).await
     }
 }
 

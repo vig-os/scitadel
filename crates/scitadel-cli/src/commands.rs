@@ -340,6 +340,7 @@ pub async fn assess(
     question_id: &str,
     model: &str,
     temperature: f64,
+    scorer_backend: &str,
 ) -> Result<()> {
     let db = open_db()?;
     let (paper_repo, search_repo, q_repo, a_repo, _) = db.repositories();
@@ -367,28 +368,56 @@ pub async fn assess(
         .collect();
 
     println!("Scoring {} papers against: \"{}\"", papers.len(), question.text);
-    println!("  Model: {model}  Temperature: {temperature}");
+    println!("  Model: {model}  Temperature: {temperature}  Backend: {scorer_backend}");
 
-    let config = scitadel_scoring::ScoringConfig {
-        model: model.to_string(),
-        temperature,
-        api_key: std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
-        ..Default::default()
+    let backend = match scorer_backend {
+        "cli" => scitadel_scoring::ScorerBackend::Cli,
+        "api" => scitadel_scoring::ScorerBackend::Api,
+        _ => scitadel_scoring::ScorerBackend::Auto,
     };
 
-    let scorer = scitadel_scoring::ClaudeScorer::new(config);
+    let options = scitadel_scoring::ScoringOptions {
+        backend,
+        model: model.to_string(),
+        temperature,
+    };
 
-    let assessments = scorer
-        .score_papers(&papers, &question, Some(&|i, total, paper, assessment| {
-            println!(
-                "  [{}/{}] {:.2}  {}",
-                i + 1,
-                total,
-                assessment.score,
-                &paper.title[..paper.title.len().min(60)]
-            );
-        }))
-        .await;
+    let scorer = scitadel_scoring::create_scorer(options)
+        .await
+        .context("failed to create scorer")?;
+
+    let mut assessments = Vec::new();
+    let total = papers.len();
+
+    for (i, paper) in papers.iter().enumerate() {
+        match scorer.score_paper(paper, &question).await {
+            Ok(assessment) => {
+                println!(
+                    "  [{}/{}] {:.2}  {}",
+                    i + 1,
+                    total,
+                    assessment.score,
+                    &paper.title[..paper.title.len().min(60)]
+                );
+                assessments.push(assessment);
+            }
+            Err(e) => {
+                println!("  [{}/{}] FAIL  {}", i + 1, total, e);
+                assessments.push(scitadel_core::models::Assessment {
+                    id: scitadel_core::models::AssessmentId::new(),
+                    paper_id: paper.id.clone(),
+                    question_id: question.id.clone(),
+                    score: 0.0,
+                    reasoning: format!("Scoring failed: {e}"),
+                    model: Some(model.to_string()),
+                    prompt: None,
+                    temperature: Some(temperature),
+                    assessor: format!("{model}:error"),
+                    created_at: chrono::Utc::now(),
+                });
+            }
+        }
+    }
 
     for a in &assessments {
         a_repo.save(a)?;

@@ -13,6 +13,9 @@ pub enum ScoringError {
 
     #[error("parse error: {0}")]
     Parse(String),
+
+    #[error("subprocess error: {0}")]
+    Subprocess(String),
 }
 
 impl From<ScoringError> for scitadel_core::error::CoreError {
