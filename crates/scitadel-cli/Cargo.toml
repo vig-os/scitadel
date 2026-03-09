@@ -14,7 +14,9 @@ scitadel-db = { path = "../scitadel-db" }
 scitadel-adapters = { path = "../scitadel-adapters" }
 scitadel-scoring = { path = "../scitadel-scoring" }
 scitadel-export = { path = "../scitadel-export" }
+scitadel-mcp = { path = "../scitadel-mcp" }
 scitadel-tui = { path = "../scitadel-tui" }
+rmcp = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }

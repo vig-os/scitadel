@@ -11,6 +11,7 @@ scitadel-adapters = { path = "../scitadel-adapters" }
 scitadel-scoring = { path = "../scitadel-scoring" }
 scitadel-export = { path = "../scitadel-export" }
 rmcp = { workspace = true }
+schemars = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -86,6 +86,8 @@ enum Commands {
         #[arg(long, default_value = "auto")]
         scorer: String,
     },
+    /// Launch MCP server on stdio
+    Mcp,
     /// Launch interactive TUI dashboard
     Tui,
     /// Run citation chaining (snowballing)
@@ -173,6 +175,7 @@ async fn main() -> Result<()> {
                 query,
             } => commands::question_add_terms(&question_id, &terms, query),
         },
+        Commands::Mcp => commands::mcp().await,
         Commands::Tui => commands::tui(),
         Commands::Assess {
             search_id,

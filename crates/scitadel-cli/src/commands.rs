@@ -29,6 +29,15 @@ where
     }
 }
 
+pub async fn mcp() -> Result<()> {
+    use rmcp::ServiceExt;
+    let transport = rmcp::transport::io::stdio();
+    let server = scitadel_mcp::server::ScitadelServer;
+    let service = server.serve(transport).await?;
+    service.waiting().await?;
+    Ok(())
+}
+
 pub fn tui() -> Result<()> {
     let config = load_config();
     scitadel_tui::run(&config.db_path)?;

@@ -55,6 +55,7 @@ crossterm = "0.28"
 
 # MCP
 rmcp = { version = "0.1", features = ["server", "transport-io"] }
+schemars = "0.8"
 
 # Testing
 insta = { version = "1", features = ["json"] }
