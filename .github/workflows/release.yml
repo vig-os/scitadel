@@ -213,7 +213,7 @@ jobs:
           echo "Release date set in CHANGELOG.md"
 
       - name: Commit and push finalization changes via API
-        uses: vig-os/commit-action@b70c2d87acd0f146c40e8d88a9bda40b76c084b5  # v0.1.3
+        uses: vig-os/commit-action@c0024cbad0e501764127cccab732c6cd465b4646  # v0.1.5
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
