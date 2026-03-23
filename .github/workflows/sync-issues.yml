@@ -65,7 +65,7 @@ jobs:
 
       - name: Restore sync state (last synced timestamp)
         id: restore-state
-        uses: actions/cache/restore@cdf6c1fa76f9f475f3d7449005a359c84ca0f306  # v5.0.3
+        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7  # v5.0.4
         with:
           path: .sync-state
           key: sync-issues-state-${{ github.repository }}
@@ -107,7 +107,7 @@ jobs:
       - name: Commit and push changes via API
         id: commit
         if: steps.sync.outputs.modified-files != ''
-        uses: vig-os/commit-action@b70c2d87acd0f146c40e8d88a9bda40b76c084b5  # v0.1.3
+        uses: vig-os/commit-action@c0024cbad0e501764127cccab732c6cd465b4646  # v0.1.5
         env:
           # Use App token so push can bypass branch protection when App is in bypass list
           GH_TOKEN: ${{ steps.generate-token.outputs.token || github.token }}
@@ -118,7 +118,7 @@ jobs:
 
       - name: Save sync state
         if: always()
-        uses: actions/cache/save@cdf6c1fa76f9f475f3d7449005a359c84ca0f306  # v5.0.3
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7  # v5.0.4
         with:
           path: .sync-state
           key: sync-issues-state-${{ github.repository }}
