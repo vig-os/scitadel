@@ -1,12 +1,19 @@
+use std::collections::HashMap;
+
 use crate::error::CoreError;
 use crate::models::{
-    Assessment, Citation, Paper, ResearchQuestion, Search, SearchResult, SearchTerm, SnowballRun,
+    Assessment, Citation, Paper, PaperId, ResearchQuestion, Search, SearchResult, SearchTerm,
+    SnowballRun,
 };
 
 /// Port for paper persistence.
 pub trait PaperRepository: Send + Sync {
     fn save(&self, paper: &Paper) -> Result<(), CoreError>;
-    fn save_many(&self, papers: &[Paper]) -> Result<(), CoreError>;
+    /// Save multiple papers, resolving DOI conflicts with existing records.
+    /// Returns a map of original_id → resolved_id for papers whose ID was
+    /// remapped to an existing record (callers should use this to fix up
+    /// search_results and other references).
+    fn save_many(&self, papers: &[Paper]) -> Result<HashMap<PaperId, PaperId>, CoreError>;
     fn get(&self, paper_id: &str) -> Result<Option<Paper>, CoreError>;
     fn find_by_doi(&self, doi: &str) -> Result<Option<Paper>, CoreError>;
     fn find_by_title(&self, title: &str) -> Result<Option<Paper>, CoreError>;

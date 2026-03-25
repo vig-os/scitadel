@@ -85,11 +85,14 @@ pub async fn search_tool(
     let db = open_db()?;
     let (paper_repo, search_repo, _, _, _) = db.repositories();
 
-    paper_repo.save_many(&papers).map_err(|e| e.to_string())?;
+    let id_remap = paper_repo.save_many(&papers).map_err(|e| e.to_string())?;
     search_repo.save(&search_record).map_err(|e| e.to_string())?;
 
     for sr in &mut search_results {
         sr.search_id = search_record.id.clone();
+        if let Some(new_id) = id_remap.get(&sr.paper_id) {
+            sr.paper_id = new_id.clone();
+        }
     }
     search_repo
         .save_results(&search_results)

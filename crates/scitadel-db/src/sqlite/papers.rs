@@ -371,4 +371,80 @@ mod tests {
         let papers = repo.list_all(3, 0).unwrap();
         assert_eq!(papers.len(), 3);
     }
+
+    /// Integration test: simulate two searches with overlapping DOIs going
+    /// through dedup → save_many, the same flow as the MCP search tool.
+    #[test]
+    fn test_cross_search_dedup_save_roundtrip() {
+        use scitadel_core::models::CandidatePaper;
+        use scitadel_core::services::dedup::deduplicate;
+
+        let (_, repo) = setup();
+
+        // --- First search: returns 3 papers ---
+        let candidates_1 = vec![
+            CandidatePaper {
+                doi: Some("10.1000/alpha".into()),
+                ..CandidatePaper::new("openalex", "oa-1", "Alpha Paper")
+            },
+            CandidatePaper {
+                doi: Some("10.1000/beta".into()),
+                ..CandidatePaper::new("openalex", "oa-2", "Beta Paper")
+            },
+            CandidatePaper {
+                doi: Some("10.1000/gamma".into()),
+                ..CandidatePaper::new("pubmed", "pm-1", "Gamma Paper")
+            },
+        ];
+        let (papers_1, _results_1) = deduplicate(&candidates_1, 0.85);
+        assert_eq!(papers_1.len(), 3);
+        let remap_1 = repo.save_many(&papers_1).unwrap();
+        assert!(remap_1.is_empty(), "no conflicts on first save");
+
+        // --- Second search: 2 overlapping DOIs + 1 new ---
+        let candidates_2 = vec![
+            CandidatePaper {
+                doi: Some("10.1000/alpha".into()),
+                arxiv_id: Some("2301.00001".into()),
+                ..CandidatePaper::new("arxiv", "ax-1", "Alpha Paper (arxiv)")
+            },
+            CandidatePaper {
+                doi: Some("10.1000/gamma".into()),
+                pubmed_id: Some("99999".into()),
+                ..CandidatePaper::new("pubmed", "pm-2", "Gamma Paper Revised")
+            },
+            CandidatePaper {
+                doi: Some("10.1000/delta".into()),
+                ..CandidatePaper::new("openalex", "oa-3", "Delta Paper")
+            },
+        ];
+        let (papers_2, results_2) = deduplicate(&candidates_2, 0.85);
+        assert_eq!(papers_2.len(), 3, "dedup sees them as distinct (different IDs)");
+
+        let remap_2 = repo.save_many(&papers_2).unwrap();
+        assert_eq!(remap_2.len(), 2, "alpha and gamma should remap to existing IDs");
+
+        // Verify the remap points to the original paper IDs
+        let alpha_original = papers_1.iter().find(|p| p.doi.as_deref() == Some("10.1000/alpha")).unwrap();
+        let alpha_new = papers_2.iter().find(|p| p.doi.as_deref() == Some("10.1000/alpha")).unwrap();
+        assert_eq!(remap_2[&alpha_new.id], alpha_original.id);
+
+        // Verify DB state: should have 4 papers total, not 6
+        let all = repo.list_all(100, 0).unwrap();
+        assert_eq!(all.len(), 4, "3 from first search + 1 new from second");
+
+        // Verify metadata was merged
+        let alpha = repo.find_by_doi("10.1000/alpha").unwrap().unwrap();
+        assert_eq!(alpha.id, alpha_original.id, "kept original ID");
+        assert_eq!(alpha.arxiv_id, Some("2301.00001".into()), "merged arxiv_id from second search");
+
+        // Verify search_results can be remapped correctly
+        for sr in &results_2 {
+            let resolved_id = remap_2.get(&sr.paper_id).unwrap_or(&sr.paper_id);
+            assert!(
+                repo.get(resolved_id.as_str()).unwrap().is_some(),
+                "remapped paper_id should exist in DB"
+            );
+        }
+    }
 }
