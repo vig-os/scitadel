@@ -1,8 +1,10 @@
+use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 
 use scitadel_core::config::load_config;
+use scitadel_core::credentials;
 use scitadel_core::models::{ResearchQuestion, SearchTerm};
 use scitadel_core::ports::{
     AssessmentRepository, PaperRepository, QuestionRepository, SearchRepository,
@@ -106,10 +108,14 @@ pub async fn search(
     let query = query.context("Provide a QUERY argument or use --question")?;
     let source_list: Vec<String> = sources.split(',').map(|s| s.trim().to_string()).collect();
 
-    let adapters = scitadel_adapters::build_adapters(
+    let adapters = scitadel_adapters::build_adapters_full(
         &source_list,
         &config.pubmed.api_key,
         &config.openalex.api_key,
+        &config.patentsview.api_key,
+        &config.lens.api_key,
+        &config.epo.consumer_key,
+        &config.epo.consumer_secret,
     )
     .context("failed to build adapters")?;
 
@@ -447,6 +453,31 @@ pub async fn assess(
     Ok(())
 }
 
+pub async fn download(doi: &str, output_dir: Option<PathBuf>) -> Result<()> {
+    let config = load_config();
+    let out_dir = output_dir.unwrap_or_else(|| config.papers_dir());
+
+    let downloader = scitadel_adapters::download::PaperDownloader::new(
+        config.openalex.api_key.clone(),
+        60.0,
+    );
+
+    println!("Downloading paper: {doi}");
+    println!("  Output dir: {}", out_dir.display());
+
+    let result = downloader
+        .download(doi, &out_dir)
+        .await
+        .context("download failed")?;
+
+    println!("  Format: {}", result.format);
+    println!("  Source: {}", result.source);
+    println!("  Size: {} bytes", result.bytes);
+    println!("  Saved to: {}", result.path.display());
+
+    Ok(())
+}
+
 #[allow(clippy::unnecessary_wraps)]
 pub fn snowball(
     _search_id: &str,
@@ -461,4 +492,93 @@ pub fn snowball(
     println!("Snowball command is not yet implemented in the Rust version.");
     println!("Use the Python version for snowballing: python -m scitadel snowball ...");
     Ok(())
+}
+
+pub fn auth_login(source: &str) -> Result<()> {
+    let creds = find_source_credentials(source)?;
+
+    println!("Storing credentials for '{source}' in system keychain.");
+
+    for key in creds.keys {
+        let value = prompt_credential(key.label, key.secret)?;
+        credentials::store(key.keychain_key, &value)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        println!("  Stored: {}", key.keychain_key);
+    }
+
+    println!("Done. Credentials saved to system keychain.");
+    Ok(())
+}
+
+pub fn auth_logout(source: &str) -> Result<()> {
+    let creds = find_source_credentials(source)?;
+
+    for key in creds.keys {
+        match credentials::delete(key.keychain_key) {
+            Ok(()) => println!("  Removed: {}", key.keychain_key),
+            Err(e) => println!("  Skip: {} ({e})", key.keychain_key),
+        }
+    }
+
+    println!("Credentials for '{source}' removed.");
+    Ok(())
+}
+
+pub fn auth_status() -> Result<()> {
+    println!("Source credentials status:\n");
+
+    for creds in credentials::ALL_SOURCES {
+        let status = match credentials::check_source(creds) {
+            Ok(()) => "configured",
+            Err(_) => "not configured",
+        };
+
+        let icon = if status == "configured" { "+" } else { "-" };
+        println!("  [{icon}] {:<14} {status}", creds.source);
+
+        for key in creds.keys {
+            let loc = if credentials::get_keychain(key.keychain_key).is_some() {
+                "keychain"
+            } else if std::env::var(key.env_var).ok().filter(|v| !v.is_empty()).is_some() {
+                "env"
+            } else {
+                "missing"
+            };
+            println!("      {}: {loc}", key.label);
+        }
+    }
+
+    println!("\nSources without credentials (no auth needed):");
+    println!("  [+] arxiv");
+    Ok(())
+}
+
+fn find_source_credentials(source: &str) -> Result<&'static credentials::SourceCredentials> {
+    credentials::ALL_SOURCES
+        .iter()
+        .find(|c| c.source == source)
+        .copied()
+        .ok_or_else(|| {
+            let names: Vec<&str> = credentials::ALL_SOURCES.iter().map(|c| c.source).collect();
+            anyhow::anyhow!(
+                "Unknown source '{source}'. Available: {}",
+                names.join(", ")
+            )
+        })
+}
+
+fn prompt_credential(label: &str, secret: bool) -> Result<String> {
+    if secret {
+        // Read without echo
+        print!("  {label}: ");
+        std::io::stdout().flush()?;
+        let value = rpassword::read_password().context("failed to read password")?;
+        Ok(value)
+    } else {
+        print!("  {label}: ");
+        std::io::stdout().flush()?;
+        let mut value = String::new();
+        std::io::stdin().read_line(&mut value)?;
+        Ok(value.trim().to_string())
+    }
 }

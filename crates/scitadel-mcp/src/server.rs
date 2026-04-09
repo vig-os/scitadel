@@ -191,6 +191,19 @@ impl ScitadelServer {
         tools::save_assessment_tool(&req.paper_id, &req.question_id, req.score, &req.reasoning)
     }
 
+    #[tool(description = "Download a paper (PDF or HTML) by DOI via Unpaywall or publisher")]
+    async fn download_paper(
+        &self,
+        #[tool(param)]
+        #[schemars(description = "DOI of the paper to download")]
+        doi: String,
+        #[tool(param)]
+        #[schemars(description = "Output directory path (optional, defaults to .scitadel/papers/)")]
+        output_dir: Option<String>,
+    ) -> Result<String, String> {
+        tools::download_paper_tool(&doi, output_dir.as_deref()).await
+    }
+
     #[tool(description = "Prepare batch assessments for all papers in a search")]
     fn prepare_batch_assessments(
         &self,

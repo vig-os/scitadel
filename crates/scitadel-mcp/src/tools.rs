@@ -68,10 +68,14 @@ pub async fn search_tool(
 
     let query = query.ok_or("Provide a query or question_id with linked search terms.")?;
 
-    let adapters = scitadel_adapters::build_adapters(
+    let adapters = scitadel_adapters::build_adapters_full(
         &source_list,
         &config.pubmed.api_key,
         &config.openalex.api_key,
+        &config.patentsview.api_key,
+        &config.lens.api_key,
+        &config.epo.consumer_key,
+        &config.epo.consumer_secret,
     )
     .map_err(|e| e.to_string())?;
 
@@ -469,6 +473,32 @@ pub fn save_assessment_tool(
         &paper.title[..paper.title.len().min(60)],
         &question.text[..question.text.len().min(60)],
         &reasoning[..reasoning.len().min(200)]
+    ))
+}
+
+pub async fn download_paper_tool(doi: &str, output_dir: Option<&str>) -> Result<String, String> {
+    let config = load_config();
+    let out_dir = output_dir
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| config.papers_dir());
+
+    let downloader = scitadel_adapters::download::PaperDownloader::new(
+        config.openalex.api_key.clone(),
+        60.0,
+    );
+
+    let result = downloader
+        .download(doi, &out_dir)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(format!(
+        "Downloaded paper: {}\nFormat: {}\nSource: {}\nSize: {} bytes\nPath: {}",
+        result.doi,
+        result.format,
+        result.source,
+        result.bytes,
+        result.path.display()
     ))
 }
 

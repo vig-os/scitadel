@@ -46,6 +46,10 @@ r2d2_sqlite = "0.25"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Credentials
+keyring = { version = "3", features = ["apple-native", "sync-secret-service"] }
+rpassword = "7"
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 

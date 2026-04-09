@@ -3,8 +3,10 @@ mod search;
 mod question;
 mod assessment;
 mod citation;
+mod doi;
 
 pub use paper::{Paper, CandidatePaper};
+pub use doi::{validate_doi, normalize_doi, doi_to_filename};
 pub use search::{Search, SearchResult, SourceOutcome, SourceStatus};
 pub use question::{ResearchQuestion, SearchTerm};
 pub use assessment::Assessment;

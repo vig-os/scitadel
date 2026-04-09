@@ -86,6 +86,19 @@ enum Commands {
         #[arg(long, default_value = "auto")]
         scorer: String,
     },
+    /// Download a paper (PDF or HTML) by DOI
+    Download {
+        /// DOI of the paper to download
+        doi: String,
+        /// Output directory (default: .scitadel/papers/)
+        #[arg(short, long)]
+        output_dir: Option<PathBuf>,
+    },
+    /// Manage source credentials (keychain storage)
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
     /// Launch MCP server on stdio
     Mcp,
     /// Launch interactive TUI dashboard
@@ -110,6 +123,22 @@ enum Commands {
         #[arg(short, long, default_value = "claude-sonnet-4-6")]
         model: String,
     },
+}
+
+#[derive(Subcommand)]
+enum AuthCommands {
+    /// Store credentials for a source in the system keychain
+    Login {
+        /// Source name (pubmed, openalex, lens, epo)
+        source: String,
+    },
+    /// Remove stored credentials for a source
+    Logout {
+        /// Source name
+        source: String,
+    },
+    /// Show which sources have credentials configured
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -175,6 +204,12 @@ async fn main() -> Result<()> {
                 query,
             } => commands::question_add_terms(&question_id, &terms, query),
         },
+        Commands::Auth { command } => match command {
+            AuthCommands::Login { source } => commands::auth_login(&source),
+            AuthCommands::Logout { source } => commands::auth_logout(&source),
+            AuthCommands::Status => commands::auth_status(),
+        },
+        Commands::Download { doi, output_dir } => commands::download(&doi, output_dir).await,
         Commands::Mcp => commands::mcp().await,
         Commands::Tui => commands::tui(),
         Commands::Assess {
