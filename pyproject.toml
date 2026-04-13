@@ -28,7 +28,7 @@ dev = [
     "jupyter>=1.0",
 ]
 science = [
-    "numpy>=2.0",
+    "numpy>=2.4.4",
     "scipy>=1.14",
     "pandas>=2.2",
     "matplotlib>=3.9",
