@@ -31,7 +31,7 @@ science = [
     "numpy>=2.0",
     "scipy>=1.14",
     "pandas>=2.2",
-    "matplotlib>=3.9",
+    "matplotlib>=3.10.8",
 ]
 tui = [
     "textual>=1.0.0",
