@@ -10,7 +10,7 @@ dependencies = [
     "bibtexparser>=1.4",
     "pyalex>=0.14",
     "pydantic>=2.0",
-    "mcp>=1.26.0",
+    "mcp>=1.27.0",
     "anthropic>=0.84.0",
     "keyring>=25.0",
 ]
