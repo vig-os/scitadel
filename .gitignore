@@ -149,7 +149,6 @@ activemq-data/
 
 # Environments
 .env
-.envrc
 .venv
 env/
 venv/
@@ -234,3 +233,9 @@ results.bib
 
 # VS Code extension (separate project, has its own build artifacts)
 vscode-scitadel/
+
+# Nix / direnv
+.direnv/
+result
+result-*
+
