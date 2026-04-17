@@ -7,10 +7,13 @@ license.workspace = true
 [dependencies]
 scitadel-core = { path = "../scitadel-core" }
 scitadel-db = { path = "../scitadel-db" }
+scitadel-adapters = { path = "../scitadel-adapters" }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
 
 [lints]
 workspace = true

@@ -1,5 +1,5 @@
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
@@ -13,9 +13,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Tabs;
 use ratatui::Terminal;
+use tokio::sync::mpsc;
 
 use crate::data::DataStore;
-use crate::views::{detail, papers, questions, searches};
+use crate::tasks::{spawn_download_paper, Task, TaskUpdate};
+use crate::views::{detail, papers, questions, searches, tasks as tasks_view};
 use crate::widgets::status_bar;
 
 /// Active tab in the TUI.
@@ -57,9 +59,7 @@ impl Tab {
 /// Overlay view shown on top of the current tab.
 #[derive(Debug, Clone)]
 pub enum Overlay {
-    /// Showing a single paper's detail view.
     PaperDetail { paper_id: String, scroll: u16 },
-    /// Papers filtered by a search ID.
     SearchPapers { search_id: String, selected: usize },
 }
 
@@ -70,14 +70,21 @@ pub struct App {
     pub data: DataStore,
     pub overlay: Option<Overlay>,
 
-    // Per-tab selection indices
     pub search_selected: usize,
     pub paper_selected: usize,
     pub question_selected: usize,
+
+    pub tasks: Vec<Task>,
+    pub unpaywall_email: String,
+    pub papers_dir: PathBuf,
+
+    task_tx: mpsc::UnboundedSender<TaskUpdate>,
+    task_rx: mpsc::UnboundedReceiver<TaskUpdate>,
 }
 
 impl App {
-    fn new(data: DataStore) -> Self {
+    fn new(data: DataStore, unpaywall_email: String, papers_dir: PathBuf) -> Self {
+        let (task_tx, task_rx) = mpsc::unbounded_channel();
         Self {
             tab: Tab::Searches,
             running: true,
@@ -86,11 +93,33 @@ impl App {
             search_selected: 0,
             paper_selected: 0,
             question_selected: 0,
+            tasks: Vec::new(),
+            unpaywall_email,
+            papers_dir,
+            task_tx,
+            task_rx,
+        }
+    }
+
+    fn drain_task_updates(&mut self) {
+        while let Ok(update) = self.task_rx.try_recv() {
+            match update {
+                TaskUpdate::New(task) => {
+                    self.tasks.push(task);
+                    if self.tasks.len() > 10 {
+                        self.tasks.remove(0);
+                    }
+                }
+                TaskUpdate::Status { id, status } => {
+                    if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
+                        t.status = status;
+                    }
+                }
+            }
         }
     }
 
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
-        // Global quit
         if code == KeyCode::Char('q') && self.overlay.is_none() {
             self.running = false;
             return;
@@ -100,7 +129,6 @@ impl App {
             return;
         }
 
-        // Handle overlay input first
         if self.overlay.is_some() {
             self.handle_overlay_key(code);
             return;
@@ -116,13 +144,18 @@ impl App {
     fn handle_overlay_key(&mut self, code: KeyCode) {
         match self.overlay {
             Some(Overlay::PaperDetail {
-                ref mut scroll, ..
+                ref paper_id,
+                ref mut scroll,
             }) => match code {
                 KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
                 KeyCode::Char('j') | KeyCode::Down => *scroll = scroll.saturating_add(1),
                 KeyCode::Char('k') | KeyCode::Up => *scroll = scroll.saturating_sub(1),
                 KeyCode::Char('d') => *scroll = scroll.saturating_add(10),
                 KeyCode::Char('u') => *scroll = scroll.saturating_sub(10),
+                KeyCode::Char('D') => {
+                    let paper_id = paper_id.clone();
+                    self.queue_download(&paper_id);
+                }
                 _ => {}
             },
             Some(Overlay::SearchPapers {
@@ -159,6 +192,19 @@ impl App {
             },
             None => {}
         }
+    }
+
+    fn queue_download(&mut self, paper_id: &str) {
+        let paper = match self.data.load_paper(paper_id) {
+            Ok(Some(p)) => p,
+            _ => return,
+        };
+        spawn_download_paper(
+            self.task_tx.clone(),
+            paper,
+            self.unpaywall_email.clone(),
+            self.papers_dir.clone(),
+        );
     }
 
     fn handle_tab_key(&mut self, code: KeyCode) {
@@ -244,22 +290,18 @@ impl App {
     }
 }
 
-/// Entry point: set up terminal, run event loop, restore terminal.
-pub fn run(db_path: &Path) -> Result<()> {
+pub fn run(db_path: &Path, unpaywall_email: String, papers_dir: PathBuf) -> Result<()> {
     let data = DataStore::open(db_path)?;
-    let mut app = App::new(data);
+    let mut app = App::new(data, unpaywall_email, papers_dir);
 
-    // Set up terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Event loop
     let result = run_loop(&mut terminal, &mut app);
 
-    // Restore terminal
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
@@ -269,6 +311,7 @@ pub fn run(db_path: &Path) -> Result<()> {
 
 fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
     while app.running {
+        app.drain_task_updates();
         terminal.draw(|frame| draw(frame, app))?;
 
         if event::poll(std::time::Duration::from_millis(100))?
@@ -282,16 +325,17 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App
 }
 
 fn draw(frame: &mut ratatui::Frame, app: &mut App) {
+    let task_panel_height = tasks_view::panel_height(&app.tasks);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // tabs
-            Constraint::Min(0),   // content
-            Constraint::Length(1), // status bar
+            Constraint::Length(3),                // tabs
+            Constraint::Min(0),                   // content
+            Constraint::Length(task_panel_height),// task panel (0 when empty)
+            Constraint::Length(1),                // status bar
         ])
         .split(frame.area());
 
-    // Draw tab bar
     let tab_titles: Vec<Line<'_>> = Tab::ALL
         .iter()
         .map(|t| {
@@ -315,7 +359,6 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
 
     frame.render_widget(tabs, chunks[0]);
 
-    // Draw content (overlay takes precedence)
     match &app.overlay {
         Some(Overlay::PaperDetail { paper_id, scroll }) => {
             detail::draw(frame, chunks[1], &app.data, paper_id, *scroll);
@@ -335,11 +378,16 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         },
     }
 
-    // Draw status bar
-    let help_text = if app.overlay.is_some() {
-        "Esc: back | j/k: navigate | Enter: select | d/u: page down/up"
-    } else {
-        "Tab/Shift-Tab: switch tabs | j/k: navigate | Enter: select | q: quit"
+    if task_panel_height > 0 {
+        tasks_view::draw(frame, chunks[2], &app.tasks);
+    }
+
+    let help_text = match &app.overlay {
+        Some(Overlay::PaperDetail { .. }) => {
+            "Esc/q: back | j/k: scroll | d/u: page | D: download"
+        }
+        Some(Overlay::SearchPapers { .. }) => "Esc/q: back | j/k: navigate | Enter: open paper",
+        None => "Tab/Shift-Tab: switch tabs | j/k: navigate | Enter: select | q: quit",
     };
-    status_bar::draw(frame, chunks[2], help_text);
+    status_bar::draw(frame, chunks[3], help_text);
 }

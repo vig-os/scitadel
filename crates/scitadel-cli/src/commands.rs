@@ -42,7 +42,9 @@ pub async fn mcp() -> Result<()> {
 
 pub fn tui() -> Result<()> {
     let config = load_config();
-    scitadel_tui::run(&config.db_path)?;
+    let email = config.openalex.api_key.clone();
+    let papers_dir = config.papers_dir();
+    scitadel_tui::run(&config.db_path, email, papers_dir)?;
     Ok(())
 }
 
@@ -472,8 +474,9 @@ pub async fn download(doi: &str, output_dir: Option<PathBuf>) -> Result<()> {
 
     println!("  Format: {}", result.format);
     println!("  Source: {}", result.source);
-    println!("  Size: {} bytes", result.bytes);
-    println!("  Saved to: {}", result.path.display());
+    println!("  Access: {}", result.access);
+    println!("  Size:   {} bytes", result.bytes);
+    println!("  Saved:  {}", result.path.display());
 
     Ok(())
 }

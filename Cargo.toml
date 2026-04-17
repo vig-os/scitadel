@@ -61,6 +61,10 @@ crossterm = "0.28"
 rmcp = { version = "0.1", features = ["server", "transport-io"] }
 schemars = "0.8"
 
+# Content extraction (PDF / HTML → text)
+pdf-extract = "0.7"
+scraper = "0.20"
+
 # Testing
 insta = { version = "1", features = ["json"] }
 wiremock = "0.6"

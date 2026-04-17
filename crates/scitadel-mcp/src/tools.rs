@@ -476,7 +476,14 @@ pub fn save_assessment_tool(
     ))
 }
 
-pub async fn download_paper_tool(doi: &str, output_dir: Option<&str>) -> Result<String, String> {
+/// Download a paper. If `paper_id` is provided, uses the full multi-source chain
+/// (arxiv → openalex → doi/Unpaywall → publisher) against the stored Paper record.
+/// Otherwise falls back to DOI-only.
+pub async fn download_paper_tool(
+    paper_id: Option<&str>,
+    doi: Option<&str>,
+    output_dir: Option<&str>,
+) -> Result<String, String> {
     let config = load_config();
     let out_dir = output_dir
         .map(std::path::PathBuf::from)
@@ -487,19 +494,131 @@ pub async fn download_paper_tool(doi: &str, output_dir: Option<&str>) -> Result<
         60.0,
     );
 
-    let result = downloader
-        .download(doi, &out_dir)
-        .await
-        .map_err(|e| e.to_string())?;
+    let result = if let Some(pid) = paper_id {
+        let db = open_db()?;
+        let (paper_repo, _, _, _, _) = db.repositories();
+        let paper = paper_repo
+            .get(pid)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("paper not found: {pid}"))?;
+        downloader
+            .download_paper(&paper, &out_dir)
+            .await
+            .map_err(|e| e.to_string())?
+    } else if let Some(d) = doi {
+        downloader
+            .download(d, &out_dir)
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        return Err("need either paper_id or doi".into());
+    };
 
     Ok(format!(
-        "Downloaded paper: {}\nFormat: {}\nSource: {}\nSize: {} bytes\nPath: {}",
+        "Downloaded paper: {}\nFormat: {}\nSource: {}\nAccess: {}\nSize: {} bytes\nPath: {}",
         result.doi,
         result.format,
         result.source,
+        result.access,
         result.bytes,
         result.path.display()
     ))
+}
+
+/// Extract text from a paper's downloaded file (PDF or HTML).
+///
+/// Looks up the paper in the DB, locates its cached file under `papers_dir()`,
+/// and returns the extracted text. Truncated to `max_chars` (default 20_000) to
+/// keep responses manageable for the host LLM.
+pub async fn read_paper_tool(
+    paper_id: &str,
+    max_chars: Option<usize>,
+) -> Result<String, String> {
+    let config = load_config();
+    let db = open_db()?;
+    let (paper_repo, _, _, _, _) = db.repositories();
+    let paper = paper_repo
+        .get(paper_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("paper not found: {paper_id}"))?;
+
+    let path = scitadel_adapters::download::find_cached_file(&paper, &config.papers_dir())
+        .ok_or_else(|| {
+            "paper not downloaded yet. Call download_paper first.".to_string()
+        })?;
+
+    let text = match path.extension().and_then(|e| e.to_str()) {
+        Some("pdf") => {
+            let path_clone = path.clone();
+            tokio::task::spawn_blocking(move || pdf_extract::extract_text(&path_clone))
+                .await
+                .map_err(|e| format!("pdf extract task failed: {e}"))?
+                .map_err(|e| format!("pdf extract failed: {e}"))?
+        }
+        Some("html") => {
+            let bytes = tokio::fs::read(&path).await.map_err(|e| e.to_string())?;
+            let html = String::from_utf8_lossy(&bytes);
+            html_to_text(&html)
+        }
+        other => return Err(format!("unsupported file type: {other:?}")),
+    };
+
+    let limit = max_chars.unwrap_or(20_000);
+    let truncated = if text.chars().count() > limit {
+        let head: String = text.chars().take(limit).collect();
+        format!(
+            "{head}\n\n[... truncated, {} of {} chars shown ...]",
+            limit,
+            text.chars().count()
+        )
+    } else {
+        text
+    };
+
+    Ok(format!(
+        "Paper: {}\nPath: {}\n\n{}",
+        paper.title,
+        path.display(),
+        truncated
+    ))
+}
+
+fn html_to_text(html: &str) -> String {
+    let doc = scraper::Html::parse_document(html);
+    let mut text = String::new();
+    for node in doc.root_element().descendants() {
+        let Some(t) = node.value().as_text() else {
+            continue;
+        };
+        let skip_subtree = node.ancestors().any(|a| {
+            a.value()
+                .as_element()
+                .is_some_and(|el| matches!(el.name(), "script" | "style" | "noscript"))
+        });
+        if skip_subtree {
+            continue;
+        }
+        let trimmed = t.trim();
+        if !trimmed.is_empty() {
+            text.push_str(trimmed);
+            text.push(' ');
+        }
+    }
+    text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::html_to_text;
+
+    #[test]
+    fn strips_tags_and_script() {
+        let html = "<html><body><p>Hello <b>world</b>.</p><script>var x=1;</script></body></html>";
+        let out = html_to_text(html);
+        assert!(out.contains("Hello"));
+        assert!(out.contains("world"));
+        assert!(!out.contains("var x"));
+    }
 }
 
 /// Prepare batch assessments for all papers in a search.

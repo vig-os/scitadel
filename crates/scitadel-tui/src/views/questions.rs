@@ -4,6 +4,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 use ratatui::Frame;
 
 use crate::data::DataStore;
+use crate::views::util::truncate;
 
 pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, selected: usize) {
     let questions = data.load_questions().unwrap_or_default();
@@ -73,10 +74,3 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, selected: usize) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max.saturating_sub(3)])
-    }
-}

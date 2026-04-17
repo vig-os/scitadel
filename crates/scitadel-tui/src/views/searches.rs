@@ -6,6 +6,7 @@ use ratatui::Frame;
 use scitadel_core::models::SourceStatus;
 
 use crate::data::DataStore;
+use crate::views::util::truncate;
 
 pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, selected: usize) {
     let searches = data.load_searches(100).unwrap_or_default();
@@ -75,10 +76,3 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, selected: usize) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max.saturating_sub(3)])
-    }
-}

@@ -6,6 +6,7 @@ use ratatui::Frame;
 use scitadel_core::models::Paper;
 
 use crate::data::DataStore;
+use crate::views::util::truncate;
 
 pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, selected: usize) {
     let papers = data.load_papers(1000, 0).unwrap_or_default();
@@ -20,7 +21,10 @@ pub fn draw_for_search(
     selected: usize,
 ) {
     let papers = data.load_papers_for_search(search_id).unwrap_or_default();
-    let title = format!(" Papers for search {} ", &search_id[..search_id.len().min(8)]);
+    let title = format!(
+        " Papers for search {} ",
+        search_id.chars().take(8).collect::<String>()
+    );
     render_paper_table(frame, area, &papers, selected, &title);
 }
 
@@ -98,10 +102,3 @@ fn format_authors(authors: &[String]) -> String {
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max.saturating_sub(3)])
-    }
-}

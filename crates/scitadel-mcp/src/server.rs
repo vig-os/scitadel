@@ -191,17 +191,38 @@ impl ScitadelServer {
         tools::save_assessment_tool(&req.paper_id, &req.question_id, req.score, &req.reasoning)
     }
 
-    #[tool(description = "Download a paper (PDF or HTML) by DOI via Unpaywall or publisher")]
+    #[tool(description = "Download a paper (PDF or HTML). Prefer passing paper_id to leverage all stored identifiers (arxiv/openalex/doi); doi is a fallback for ad-hoc lookups.")]
     async fn download_paper(
         &self,
         #[tool(param)]
-        #[schemars(description = "DOI of the paper to download")]
-        doi: String,
+        #[schemars(description = "Paper ID from the scitadel DB (preferred — unlocks arxiv/openalex/Unpaywall chain)")]
+        paper_id: Option<String>,
         #[tool(param)]
-        #[schemars(description = "Output directory path (optional, defaults to .scitadel/papers/)")]
+        #[schemars(description = "DOI (used only if paper_id is not provided)")]
+        doi: Option<String>,
+        #[tool(param)]
+        #[schemars(description = "Output directory (optional, defaults to .scitadel/papers/)")]
         output_dir: Option<String>,
     ) -> Result<String, String> {
-        tools::download_paper_tool(&doi, output_dir.as_deref()).await
+        tools::download_paper_tool(
+            paper_id.as_deref(),
+            doi.as_deref(),
+            output_dir.as_deref(),
+        )
+        .await
+    }
+
+    #[tool(description = "Extract the text from an already-downloaded paper's PDF or HTML. Call download_paper first.")]
+    async fn read_paper(
+        &self,
+        #[tool(param)]
+        #[schemars(description = "Paper ID")]
+        paper_id: String,
+        #[tool(param)]
+        #[schemars(description = "Max characters to return (default 20000)")]
+        max_chars: Option<usize>,
+    ) -> Result<String, String> {
+        tools::read_paper_tool(&paper_id, max_chars).await
     }
 
     #[tool(description = "Prepare batch assessments for all papers in a search")]
