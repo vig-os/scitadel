@@ -10,26 +10,61 @@ Scientific literature retrieval is fragmented, manual, and non-reproducible. Res
 
 Scitadel fixes this: one query, all sources, deterministic results, full audit trail.
 
+## Install
+
+Scitadel is a Rust workspace. You need a Rust toolchain (`rustup`, stable channel).
+
+### From source (recommended today)
+
+```bash
+git clone https://github.com/vig-os/scitadel.git
+cd scitadel
+cargo install --path crates/scitadel-cli --locked
+```
+
+This drops a single `scitadel` binary into `~/.cargo/bin` (make sure that's on your `PATH`). CLI, TUI, and MCP server are all subcommands of the same binary.
+
+### As a Claude MCP server
+
+**User scope (available in every session, everywhere):**
+
+```bash
+claude mcp add --scope user scitadel -- scitadel mcp
+```
+
+**Project scope (committed to the repo, available when cwd is this project):**
+
+The repo ships a `.mcp.json` that registers the `scitadel` binary from `PATH`. Just run `cargo install --path crates/scitadel-cli` once and Claude Code will pick it up automatically.
+
+**Local/session scope (no commit, just this machine):**
+
+```bash
+claude mcp add --scope local scitadel -- scitadel mcp
+```
+
+Verify with `claude mcp list`.
+
 ## Quick start
 
 ```bash
-# Install (core)
-pip install -e .
-
-# Install with TUI
-pip install -e ".[tui]"
-
-# Initialize the database
+# Initialize the database (creates ./.scitadel/scitadel.db)
 scitadel init
 
+# Store credentials in your OS keychain (one-time, per source)
+scitadel auth login pubmed
+scitadel auth login openalex
+scitadel auth status
+
 # Run a federated search
-scitadel search "PET tracer development" --sources pubmed,arxiv,openalex,inspire --max-results 20
+scitadel search "PET tracer development" -s pubmed,arxiv,openalex,inspire -n 20
 
-# View past searches
+# View past searches / show a paper / export
 scitadel history
-
-# Export results
+scitadel show <paper-or-search-id>
 scitadel export <search-id> --format bibtex --output results.bib
+
+# Download a paper by DOI (OA PDF via Unpaywall, else publisher HTML)
+scitadel download 10.1038/s41586-020-2649-2
 
 # Launch the interactive TUI
 scitadel tui
@@ -140,26 +175,33 @@ From any paper, press `c` to view its citation tree (references and citing paper
 
 ### 5. Agent-driven workflow via MCP
 
-Connect scitadel as an MCP server and let an LLM agent drive the entire pipeline — from question formulation through search, scoring, and snowballing.
+Connect scitadel as an MCP server and let an LLM agent drive the pipeline — from question formulation through search, scoring, and snowballing.
 
 ```bash
-# Start the MCP server
-scitadel-mcp
+# Run the server manually (stdio transport)
+scitadel mcp
 ```
 
-Configure in Claude Desktop (`claude_desktop_config.json`):
+For Claude Code, register once (see [Install](#install) above):
+
+```bash
+claude mcp add --scope user scitadel -- scitadel mcp
+```
+
+For Claude Desktop, add to `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "scitadel": {
-      "command": "scitadel-mcp"
+      "command": "scitadel",
+      "args": ["mcp"]
     }
   }
 }
 ```
 
-The MCP server exposes 12 tools:
+The MCP server exposes 14 tools:
 
 | Tool | What it does |
 |------|-------------|
@@ -173,7 +215,10 @@ The MCP server exposes 12 tools:
 | `add_search_terms` | Link keywords to a question |
 | `assess_paper` | Record a relevance score with reasoning |
 | `get_assessments` | Retrieve scores for a paper or question |
-| `snowball_search` | Run citation chaining from a search |
+| `prepare_assessment` | Build a rubric + paper payload for host-LLM scoring |
+| `prepare_batch_assessments` | Same, for every paper in a search |
+| `save_assessment` | Persist a host-LLM-scored assessment |
+| `download_paper` | Fetch PDF (Unpaywall) or publisher HTML by DOI |
 
 This enables a workflow where the agent formulates a question, generates search terms, runs a search, scores each paper, snowballs relevant citations, and writes structured assessments — all through tool calls with no manual intervention.
 
@@ -217,9 +262,11 @@ scitadel question add-terms <qid> ...  Link search terms to a question
 scitadel assess <search-id>            Score papers against a question with Claude
 scitadel snowball <search-id>          Run citation chaining from a search
 scitadel tui                           Launch the interactive TUI
+scitadel mcp                           Start the MCP server (stdio)
+scitadel download <doi>                Fetch PDF (Unpaywall) or publisher HTML
+scitadel auth login <source>           Store credentials in OS keychain
+scitadel auth status                   List configured credentials
 scitadel init                          Initialize the database
-scitadel-mcp                           Start the MCP server
-scitadel-tui                           Launch TUI (standalone entry point)
 ```
 
 ### Search options
@@ -263,35 +310,44 @@ scitadel-tui                           Launch TUI (standalone entry point)
 
 ## Configuration
 
-All configuration is via environment variables:
+Credentials resolve in this order: **OS keychain → environment variable → `.scitadel/config.toml` → empty**. For most users the keychain path is best — `scitadel auth login <source>` prompts you and stores the secret securely.
+
+| Source | Keychain key | Env var | Notes |
+|--------|-------------|---------|-------|
+| PubMed | `pubmed.api_key` | `SCITADEL_PUBMED_API_KEY` | Optional, higher rate limits |
+| OpenAlex | `openalex.email` | `SCITADEL_OPENALEX_EMAIL` | Polite pool |
+| PatentsView | `patentsview.api_key` | `SCITADEL_PATENTSVIEW_KEY` | Free registration |
+| Lens | `lens.api_token` | `SCITADEL_LENS_TOKEN` | Free tier |
+| EPO OPS | `epo.consumer_key` + `epo.consumer_secret` | `SCITADEL_EPO_KEY`, `SCITADEL_EPO_SECRET` | Registered app |
+| Anthropic | _(not stored)_ | `ANTHROPIC_API_KEY` | Required for `assess`, `snowball`, MCP scoring |
+
+Other knobs:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SCITADEL_DB` | `~/.scitadel/scitadel.db` | Database path |
-| `SCITADEL_PUBMED_API_KEY` | _(none)_ | NCBI API key for PubMed |
-| `SCITADEL_OPENALEX_EMAIL` | _(none)_ | Email for OpenAlex polite pool |
-| `ANTHROPIC_API_KEY` | _(none)_ | Required for `assess`, `snowball`, and MCP scoring |
+| `SCITADEL_DB` | `./.scitadel/scitadel.db` | Database path |
+| `SCITADEL_CHAT_MODEL` | `claude-sonnet-4-6` | Model used for scoring |
+| `SCITADEL_CHAT_MAX_TOKENS` | `4096` | Max completion tokens |
+| `SCITADEL_SCORING_CONCURRENCY` | `5` | Parallel scoring requests |
 
 ## Architecture
 
-Hexagonal (ports and adapters):
+Hexagonal (ports and adapters), implemented as a Rust workspace:
 
 ```
-CLI (Click) / MCP server (FastMCP) / TUI (Textual)
-  -> Services (orchestrator, dedup, export, scoring, snowball)
-    -> Domain models (Pydantic)
-    -> Repository ports (Protocol interfaces)
-      -> SQLite adapters
-    -> Source adapters (async httpx)
-      -> PubMed, arXiv, OpenAlex, INSPIRE-HEP
-    -> Citation fetcher (OpenAlex via PyAlex)
-    -> Anthropic SDK (relevance scoring)
+scitadel-cli (clap) / scitadel-mcp (rmcp) / scitadel-tui (ratatui)
+  -> scitadel-core (services, domain, ports)
+    -> scitadel-db        (rusqlite adapters)
+    -> scitadel-adapters  (PubMed, arXiv, OpenAlex, INSPIRE-HEP,
+                           PatentsView, Lens, EPO OPS, Unpaywall)
+    -> scitadel-scoring   (Anthropic SDK)
+    -> scitadel-export    (BibTeX, JSON, CSV)
 ```
 
-- **Domain models** define Paper, Search, ResearchQuestion, Assessment, Citation, SnowballRun as Pydantic models
-- **Repository ports** are Python Protocol classes — swap SQLite for Postgres without touching services
+- **Domain models** define `Paper`, `Search`, `ResearchQuestion`, `Assessment`, `Citation`, `SnowballRun`
+- **Repository ports** are traits — SQLite today, swap for Postgres without touching services
 - **Source adapters** run in parallel with retry/backoff; partial failures don't abort the search
-- **Dedup engine** merges candidates by DOI (exact) then title similarity (Jaccard), filling metadata gaps across sources
+- **Dedup engine** validates and normalizes DOIs, merges by DOI (exact) then title similarity (Jaccard), filling metadata gaps across sources
 - **Snowball service** chains citations with relevance-gated traversal, depth limiting, and deduplication
 
 ## Data model
@@ -309,20 +365,22 @@ Paper -< Citation >- Paper
 
 ## Development
 
-Requires Python >= 3.12.
+Requires a stable Rust toolchain.
 
 ```bash
-# Set up
-pip install -e ".[dev,tui]"
+# Build
+cargo build
 
-# Run tests
-pytest
+# Run the binary without installing
+cargo run -- search "PET tracer"
 
-# Run tests with coverage
-pytest --cov=scitadel
+# Run tests (workspace-wide)
+cargo test --workspace
+
+# Lint
+cargo clippy --workspace --all-targets
+cargo fmt --all --check
 ```
-
-140 tests across domain models, config, repositories, adapters, services, scoring, snowball, TUI, MCP tools, and CLI integration. 13 additional contract tests hit real APIs (run with `pytest -m contract`).
 
 ## License
 

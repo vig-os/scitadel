@@ -2,11 +2,8 @@
   "mcpServers": {
     "scitadel": {
       "type": "stdio",
-      "command": "cargo",
-      "args": ["run", "--manifest-path", "/Users/larsgerchow/Projects/scitadel/Cargo.toml", "--", "mcp"],
-      "env": {
-        "LIBRARY_PATH": "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/lib"
-      }
+      "command": "scitadel",
+      "args": ["mcp"]
     }
   }
 }
