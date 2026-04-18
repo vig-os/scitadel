@@ -3,9 +3,16 @@ name = "scitadel-export"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "BibTeX, JSON, and CSV exporters for scitadel search results."
+readme = "../../README.md"
 
 [dependencies]
-scitadel-core = { path = "../scitadel-core" }
+scitadel-core = { path = "../scitadel-core", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 csv = "1"
