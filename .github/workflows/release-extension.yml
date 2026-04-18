@@ -1,0 +1,45 @@
+name: Release Extension
+
+on:  # yamllint disable-line rule:truthy
+  workflow_call:
+    inputs:
+      version:
+        description: "Release version"
+        required: true
+        type: string
+      finalize_sha:
+        description: "Finalized commit SHA"
+        required: true
+        type: string
+      release_date:
+        description: "Release date"
+        required: true
+        type: string
+      release_kind:
+        description: "Release kind (candidate or final)"
+        required: true
+        type: string
+      publish_version:
+        description: "Version tag that will be published (X.Y.Z or X.Y.Z-rcN)"
+        required: true
+        type: string
+
+jobs:
+  extension:
+    name: Extension Hook (Default No-op)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Default extension summary
+        env:
+          VERSION: ${{ inputs.version }}
+          FINALIZE_SHA: ${{ inputs.finalize_sha }}
+          RELEASE_DATE: ${{ inputs.release_date }}
+          RELEASE_KIND: ${{ inputs.release_kind }}
+          PUBLISH_VERSION: ${{ inputs.publish_version }}
+        run: |
+          echo "No release extension configured."
+          echo "Version: $VERSION"
+          echo "Release kind: $RELEASE_KIND"
+          echo "Publish version: $PUBLISH_VERSION"
+          echo "Finalize SHA: $FINALIZE_SHA"
+          echo "Release date: $RELEASE_DATE"

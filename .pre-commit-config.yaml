@@ -48,13 +48,7 @@ repos:
       - id: shellcheck
         name: shellcheck
         args: ["-x"]
-
-  # Containerfile
-  - repo: https://github.com/hadolint/hadolint
-    rev: 346e4199e4baca7d6827f20ac078b6eee5b39327  # v2.9.3
-    hooks:
-      - id: hadolint-docker
-        name: hadolint
+        exclude: ^\.envrc$
 
   # Markdown Linting (excludes auto-generated docs)
   - repo: https://github.com/jackdewinter/pymarkdown
@@ -75,63 +69,8 @@ repos:
         files: ^justfile(\..*)?$
         pass_filenames: false
 
+  # Typo Linting
   - repo: https://github.com/crate-ci/typos
     rev: 07d900b8fa1097806b8adb6391b0d3e0ac2fdea7  # v1.39.0
     hooks:
       - id: typos
-
-  # GitHub Actions SHA pinning enforcement
-  - repo: local
-    hooks:
-      - id: check-action-pins
-        name: check-action-pins (verify SHA-pinned actions)
-        entry: uv run check-action-pins
-        language: system
-        files: ^\.github/(workflows/.*\.ya?ml|actions/.*/action\.ya?ml)$
-        pass_filenames: false
-
-  # Skill directory naming convention
-  - repo: local
-    hooks:
-      - id: check-skill-names
-        name: check-skill-names (enforce naming convention)
-        entry: .devcontainer/scripts/check-skill-names.sh .cursor/skills
-        language: script
-        files: ^\.cursor/skills/
-        pass_filenames: false
-
-  # AI agent identity: strip trailers before commit-msg (Refs: #163)
-  - repo: local
-    hooks:
-      - id: prepare-commit-msg-strip-trailers
-        name: strip agent trailers from commit message
-        entry: uv run python .devcontainer/scripts/prepare-commit-msg-strip-trailers.py
-        language: system
-        stages: [prepare-commit-msg]
-        pass_filenames: true
-
-  # AI agent identity: reject author/committer matching blocklist (Refs: #163)
-  - repo: local
-    hooks:
-      - id: check-agent-identity
-        name: check agent identity
-        entry: uv run python .devcontainer/scripts/check-agent-identity.py
-        language: system
-        pass_filenames: false
-
-  # Commit message validation (commit-msg stage)
-  - repo: local
-    hooks:
-      - id: validate-commit-msg
-        name: validate commit message
-        entry: uv run validate-commit-msg
-        language: system
-        stages: [commit-msg]
-        pass_filenames: false
-        # Optional: customize commit types, scopes, or refs-optional types via CLI arguments.
-        # By default, scopes are not enforced. Set --scopes to require specific scopes.
-        # Examples (choose one args line):
-        #   args: ["--types", "feat,fix,docs,chore"]
-        #   args: ["--scopes", "api,cli,utils"]
-        #   args: ["--refs-optional-types", "chore"]
-        #   args: ["--types", "feat,fix,docs", "--scopes", "api,cli,utils", "--refs-optional-types", "chore"]

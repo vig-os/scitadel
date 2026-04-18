@@ -1,0 +1,98 @@
+# Append Keep-a-Changelog Unreleased entries for Renovate dependency PRs (Refs: #506).
+# Uses pull_request_target so the workflow definition always comes from the default branch.
+
+name: Renovate changelog
+
+on:  # yamllint disable-line rule:truthy
+  pull_request_target:
+    types: [opened, synchronize]
+
+permissions: {}
+
+jobs:
+  resolve-image:
+    name: Resolve image tag
+    if: >-
+      github.event.pull_request.user.login == 'renovate[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-22.04
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    outputs:
+      image-tag: ${{ steps.resolve.outputs.image-tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          sparse-checkout: |
+            .vig-os
+            .github/actions/resolve-image
+          sparse-checkout-cone-mode: false
+
+      - name: Resolve container image
+        id: resolve
+        uses: ./.github/actions/resolve-image
+
+  changelog:
+    if: >-
+      github.event.pull_request.user.login == 'renovate[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    needs: [resolve-image]
+    runs-on: ubuntu-22.04
+    container:
+      image: ghcr.io/vig-os/devcontainer:${{ needs.resolve-image.outputs.image-tag }}
+    timeout-minutes: 10
+    concurrency:
+      group: renovate-changelog-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    permissions:
+      contents: write
+      pull-requests: read
+
+    steps:
+      - name: Generate a token
+        id: generate-token
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859  # v3
+        with:
+          app-id: ${{ secrets.COMMIT_APP_ID }}
+          private-key: ${{ secrets.COMMIT_APP_PRIVATE_KEY }}
+
+      - name: Checkout PR head
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          token: ${{ steps.generate-token.outputs.token }}
+          persist-credentials: false
+
+      - name: Update CHANGELOG.md from Renovate PR metadata
+        id: update
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          GITHUB_REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          renovate-changelog-pr
+          if git diff --quiet CHANGELOG.md 2>/dev/null; then
+            echo "modified=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "modified=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit changelog via API
+        if: steps.update.outputs.modified == 'true'
+        uses: vig-os/commit-action@1bc004353d08d9332a0cb54920b148256220c8e0  # v0.2.0
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          TARGET_BRANCH: refs/heads/${{ github.event.pull_request.head.ref }}
+          MAX_ATTEMPTS: "3"
+          COMMIT_MESSAGE: |-
+            docs(changelog): add unreleased entry for renovate PR ${{ github.event.pull_request.number }}
+
+            Refs: #${{ github.event.pull_request.number }}
+          FILE_PATHS: CHANGELOG.md

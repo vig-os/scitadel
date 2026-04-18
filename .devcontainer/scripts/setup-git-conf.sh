@@ -18,9 +18,41 @@ if [ -f "$HOST_GITCONFIG_FILE" ]; then
 	echo "Applying git configuration from $HOST_GITCONFIG_FILE..."
 	cp "$HOST_GITCONFIG_FILE" "$CONTAINER_GITCONFIG_FILE"
 else
-	echo "No git config file found, skipping git setup"
+	echo "No host git config file found at $HOST_GITCONFIG_FILE"
+	echo "Skipping host git config copy; continuing setup"
 	echo "Run this from host's project root: .devcontainer/scripts/copy-host-user-conf.sh"
 fi
+
+ensure_git_editor_fallback() {
+	configured_editor=$(git config --global --get core.editor 2>/dev/null || true)
+	configured_editor_cmd=$(printf "%s" "$configured_editor" | awk '{print $1}')
+	configured_editor_cmd="${configured_editor_cmd#\"}"
+	configured_editor_cmd="${configured_editor_cmd%\"}"
+	configured_editor_cmd="${configured_editor_cmd#\'}"
+	configured_editor_cmd="${configured_editor_cmd%\'}"
+
+	if [ -n "$configured_editor" ] && ! command -v "$configured_editor_cmd" >/dev/null 2>&1; then
+		git config --global core.editor nano
+		echo "Configured git core.editor fallback to nano"
+		return
+	fi
+
+	effective_editor=$(git var GIT_EDITOR 2>/dev/null || true)
+	editor_cmd=$(printf "%s" "$effective_editor" | awk '{print $1}')
+	editor_cmd="${editor_cmd#\"}"
+	editor_cmd="${editor_cmd%\"}"
+	editor_cmd="${editor_cmd#\'}"
+	editor_cmd="${editor_cmd%\'}"
+
+	if [ -z "$editor_cmd" ] || ! command -v "$editor_cmd" >/dev/null 2>&1; then
+		git config --global core.editor nano
+		echo "Configured git core.editor fallback to nano"
+	else
+		echo "Using existing git editor: $effective_editor"
+	fi
+}
+
+ensure_git_editor_fallback
 
 # ── SSH public key for signing ─────────────────────────────────────────────────
 

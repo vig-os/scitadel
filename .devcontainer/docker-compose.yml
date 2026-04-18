@@ -1,7 +1,7 @@
 ---
 services:
   devcontainer:
-    image: ghcr.io/vig-os/devcontainer:dev
+    image: ghcr.io/vig-os/devcontainer:${DEVCONTAINER_VERSION:-latest}
     volumes:
       # Mount the project folder to a subdirectory of workspace
       - ..:/workspace/scitadel:cached
@@ -9,14 +9,7 @@ services:
       # Path is set by initialize.sh in .env, falls back to Docker default
       - "${CONTAINER_SOCKET_PATH:-/var/run/docker.sock}:/var/run/docker.sock"
     environment:
-      # Cursor API key for agent/conductor (from .env, populated by copy-host-user-conf.sh)
-      - CURSOR_API_KEY=${CURSOR_API_KEY:-}
-      # Use pre-built pre-commit cache from container image (instant, no download needed)
-      # The cache is baked into the image at /opt/pre-commit-cache via Containerfile
-      # Host users running pre-commit locally will use their own cache (~/.cache/pre-commit)
-      - PRE_COMMIT_HOME=/opt/pre-commit-cache
-      # Use pre-built Python venv from container image (instant, no install needed)
-      - UV_PROJECT_ENVIRONMENT=/root/assets/workspace/.venv
+      # PRE_COMMIT_HOME, UV_PROJECT_ENVIRONMENT, VIRTUAL_ENV are set in the image (Containerfile)
       # Tell Podman/Docker to use the mounted socket (for sidecars and container builds)
       - CONTAINER_HOST=unix:///var/run/docker.sock
       - DOCKER_HOST=unix:///var/run/docker.sock

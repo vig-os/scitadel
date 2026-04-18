@@ -1,0 +1,49 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "timezone": "Etc/UTC",
+  "schedule": ["before 9am on monday"],
+  "baseBranches": ["dev"],
+  "rebaseWhen": "conflicted",
+  "gitIgnoredAuthors": ["41898282+github-actions[bot]@users.noreply.github.com"],
+  "packageRules": [
+    {
+      "description": "GitHub Actions — semantic commit + group minor/patch",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "github-actions (minor and patch)",
+      "semanticCommitType": "ci",
+      "semanticCommitScope": "actions"
+    },
+    {
+      "description": "GitHub Actions — major updates stay separate",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["major"],
+      "semanticCommitType": "ci",
+      "semanticCommitScope": "actions"
+    },
+    {
+      "description": "Python (PEP 621 + uv) — pin ranges, group minor/patch",
+      "matchManagers": ["pep621", "uv"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "python (minor and patch)",
+      "rangeStrategy": "pin",
+      "semanticCommitType": "build",
+      "semanticCommitScope": "pip"
+    },
+    {
+      "description": "Python — major updates stay separate",
+      "matchManagers": ["pep621", "uv"],
+      "matchUpdateTypes": ["major"],
+      "rangeStrategy": "pin",
+      "semanticCommitType": "build",
+      "semanticCommitScope": "pip"
+    },
+    {
+      "description": "npm",
+      "matchManagers": ["npm"],
+      "semanticCommitType": "build",
+      "semanticCommitScope": "npm"
+    }
+  ]
+}

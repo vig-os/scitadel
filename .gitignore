@@ -214,6 +214,9 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# Personal justfile recipes
+justfile.local
+
 # Pre-commit cache
 .pre-commit-cache/
 
@@ -238,4 +241,3 @@ vscode-scitadel/
 .direnv/
 result
 result-*
-

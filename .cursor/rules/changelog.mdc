@@ -18,12 +18,13 @@ When making code changes, follow these rules for updating [CHANGELOG.md](CHANGEL
 
 ## Where to update
 
-- Edit **only** the `## Unreleased` section at the top of `CHANGELOG.md`.
+- **On `dev` and feature/bugfix branches targeting `dev`:** Edit the `## Unreleased` section at the top of `CHANGELOG.md`.
+- **On `release/*` branches:** There is no `## Unreleased` section. Edit the `## [X.Y.Z] - TBD` section directly. Place entries under the correct category heading within that section.
 - Place the entry under the correct category heading. Create the heading if it doesn't exist yet.
-- **Never** modify entries below `## Unreleased` (those are released versions).
+- **Never** modify entries below the active section (released versions with dates).
 - **Never** change the release date or version number of any section.
-- **Sort order:** within `## Unreleased`, add new entries chronologically (newest at the bottom of each category). Entries are reordered by issue on release.
-- **Editing unreleased entries:** entries in `## Unreleased` represent the atomic user-facing state between versions, not a copy of commit history. You may update or consolidate existing unreleased entries across PRs (e.g. fixing a bug introduced in an earlier unreleased PR).
+- **Sort order:** add new entries chronologically (newest at the bottom of each category). Entries are reordered by issue on release.
+- **Editing unreleased entries:** entries in the active section represent the atomic user-facing state between versions, not a copy of commit history. You may update or consolidate existing entries across PRs (e.g. fixing a bug introduced in an earlier unreleased PR).
 
 ## Category headings (in order)
 

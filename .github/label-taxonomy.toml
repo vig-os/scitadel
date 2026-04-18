@@ -1,12 +1,13 @@
 # Canonical repository labels.
 # Single source of truth — referenced by:
-#   - scripts/setup-labels.sh               (provision labels on a repo)
+#   - uv run setup-labels                   (provision labels on a repo)
 #   - .cursor/skills/issue_triage/SKILL.md  (triage label check)
 #   - .cursor/skills/issue_create/SKILL.md  (agent label mapping)
 #   - .github/ISSUE_TEMPLATE/*.yml          (template label values)
 #
 # Label reconciliation:
-#   Run `scripts/setup-labels.sh` after repo creation to create/update labels
+#   Run `uv run setup-labels` after repo creation to create/update labels
+#   The `setup-labels` command is provided by devcontainer bootstrap tooling.
 #   from this taxonomy. Use `--prune` to remove org-default labels that don't
 #   match the taxonomy. Use `--dry-run` to preview changes first.
 

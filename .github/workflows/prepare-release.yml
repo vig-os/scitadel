@@ -1,0 +1,371 @@
+name: Prepare Release
+
+on:  # yamllint disable-line rule:truthy
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Semantic version to prepare (e.g., 1.2.3)"
+        required: true
+        type: string
+      dry-run:
+        description: "Validate without making changes"
+        required: false
+        default: false
+        type: boolean
+      git-user-name:
+        description: "Git user name for commits"
+        required: false
+        default: "github-actions[bot]"
+        type: string
+      git-user-email:
+        description: "Git user email for commits"
+        required: false
+        default: "41898282+github-actions[bot]@users.noreply.github.com"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate Release Preparation
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.vars.outputs.version }}
+      release_branch: ${{ steps.vars.outputs.release_branch }}
+      image_tag: ${{ steps.resolve_image.outputs.image_tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      - name: Validate and prepare variables
+        id: vars
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          VERSION="$INPUT_VERSION"
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "ERROR: Invalid version format '$VERSION'"
+            echo "Version must follow semantic versioning format: MAJOR.MINOR.PATCH (e.g., 1.2.3)"
+            exit 1
+          fi
+          RELEASE_BRANCH="release/$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "release_branch=$RELEASE_BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve container image tag
+        id: resolve_image
+        run: |
+          set -euo pipefail
+          TAG=""
+          if [ -f ".vig-os" ]; then
+            TAG=$(awk -F= '/^DEVCONTAINER_VERSION=/{gsub(/^[ \t"]+|[ \t"]+$/, "", $2); print $2; exit}' .vig-os || true)
+          fi
+          if [ -z "${TAG:-}" ]; then
+            TAG="latest"
+          fi
+          echo "image_tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Validate image accessibility
+        env:
+          IMAGE_TAG: ${{ steps.resolve_image.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/vig-os/devcontainer:${IMAGE_TAG}"
+          if ! docker manifest inspect "$IMAGE" > /dev/null 2>&1; then
+            echo "ERROR: Cannot access image manifest: $IMAGE"
+            exit 1
+          fi
+
+      - name: Verify release branch does not exist
+        env:
+          RELEASE_BRANCH: ${{ steps.vars.outputs.release_branch }}
+        run: |
+          set -euo pipefail
+          if git show-ref --verify --quiet "refs/heads/$RELEASE_BRANCH"; then
+            echo "ERROR: Release branch already exists locally: $RELEASE_BRANCH"
+            exit 1
+          fi
+          if git ls-remote --exit-code --heads origin "$RELEASE_BRANCH" > /dev/null 2>&1; then
+            echo "ERROR: Release branch already exists on remote: $RELEASE_BRANCH"
+            exit 1
+          fi
+
+      - name: Verify tag does not exist
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify "refs/tags/$VERSION" > /dev/null; then
+            echo "ERROR: Tag $VERSION already exists"
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags --refs origin "refs/tags/$VERSION" > /dev/null 2>&1; then
+            echo "ERROR: Tag $VERSION already exists on remote"
+            exit 1
+          fi
+
+      - name: Verify CHANGELOG has Unreleased section entries
+        run: |
+          set -euo pipefail
+          if ! grep -q "^## Unreleased" CHANGELOG.md; then
+            echo "ERROR: CHANGELOG.md is missing '## Unreleased' section"
+            exit 1
+          fi
+          if ! awk '
+            /^## Unreleased$/ {in_unreleased=1; next}
+            /^## \[/ && in_unreleased {exit 1}
+            in_unreleased && /^[[:space:]]*-[[:space:]]/ {found_entry=1}
+            END {exit(found_entry ? 0 : 1)}
+          ' CHANGELOG.md; then
+            echo "ERROR: CHANGELOG.md Unreleased section has no entries"
+            exit 1
+          fi
+
+      - name: Summary
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+          RELEASE_BRANCH: ${{ steps.vars.outputs.release_branch }}
+          IMAGE_TAG: ${{ steps.resolve_image.outputs.image_tag }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          echo "Validation passed"
+          echo "Version: $VERSION"
+          echo "Release branch: $RELEASE_BRANCH"
+          echo "Image tag: $IMAGE_TAG"
+          echo "Dry-run: $DRY_RUN"
+
+  prepare:
+    name: Prepare Release Branch
+    needs: validate
+    runs-on: ubuntu-22.04
+    container:
+      image: ghcr.io/vig-os/devcontainer:${{ needs.validate.outputs.image_tag }}
+      env:
+        UV_PROJECT_ENVIRONMENT: /root/assets/workspace/.venv
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    if: ${{ inputs.dry-run != true }}
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Generate Commit App Token
+        id: commit_app_token
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859  # v3
+        with:
+          app-id: ${{ secrets.COMMIT_APP_ID }}
+          private-key: ${{ secrets.COMMIT_APP_PRIVATE_KEY }}
+
+      - name: Generate Release App Token
+        id: release_app_token
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859  # v3
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - name: Checkout dev branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      - name: Fix git safe.directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Capture pre-prepare dev SHA
+        id: pre_state
+        env:
+          GH_TOKEN: ${{ steps.commit_app_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          PREPARE_START_SHA=$(retry --retries 3 --backoff 5 --max-backoff 60 -- \
+            gh api "repos/${{ github.repository }}/git/ref/heads/dev" --jq '.object.sha')
+          echo "prepare_start_sha=$PREPARE_START_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare CHANGELOG (freeze + reset)
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          prepare-changelog prepare "$VERSION" CHANGELOG.md
+
+      - name: Extract CHANGELOG content for PR body
+        id: changelog
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          CHANGELOG_CONTENT=$(sed -n "/## \[$VERSION\]/,/## \[/p" CHANGELOG.md | sed '$d')
+          {
+            echo "changelog<<CHANGELOGEOF"
+            echo "$CHANGELOG_CONTENT"
+            echo "CHANGELOGEOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Commit prepared CHANGELOG to dev via API
+        uses: vig-os/commit-action@1bc004353d08d9332a0cb54920b148256220c8e0  # v0.2.0
+        env:
+          GH_TOKEN: ${{ steps.commit_app_token.outputs.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          TARGET_BRANCH: refs/heads/dev
+          MAX_ATTEMPTS: "3"
+          COMMIT_MESSAGE: |-
+            chore: freeze changelog for release ${{ needs.validate.outputs.version }}
+
+            Move Unreleased content to [${{ needs.validate.outputs.version }}] - TBD
+            and create fresh empty Unreleased section for continued development.
+          FILE_PATHS: CHANGELOG.md
+
+      - name: Create release branch from dev
+        id: create_branch
+        env:
+          GH_TOKEN: ${{ steps.commit_app_token.outputs.token }}
+          RELEASE_BRANCH: ${{ needs.validate.outputs.release_branch }}
+        run: |
+          set -euo pipefail
+          DEV_SHA=$(retry --retries 3 --backoff 5 --max-backoff 60 -- \
+            gh api "repos/${{ github.repository }}/git/ref/heads/dev" --jq '.object.sha')
+          retry --retries 3 --backoff 5 --max-backoff 60 -- \
+            gh api "repos/${{ github.repository }}/git/refs" \
+            -f ref="refs/heads/$RELEASE_BRANCH" \
+            -f sha="$DEV_SHA" || {
+              if retry --retries 2 --backoff 5 --max-backoff 20 -- \
+                gh api "repos/${{ github.repository }}/git/ref/heads/$RELEASE_BRANCH" >/dev/null 2>&1; then
+                echo "Release branch already exists: $RELEASE_BRANCH"
+              else
+                exit 1
+              fi
+            }
+          echo "dev_sha=$DEV_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Verify release branch is resolvable
+        env:
+          GH_TOKEN: ${{ steps.commit_app_token.outputs.token }}
+          RELEASE_BRANCH: ${{ needs.validate.outputs.release_branch }}
+        run: |
+          set -euo pipefail
+          retry --retries 10 --backoff 2 --max-backoff 30 -- \
+            gh api "repos/${{ github.repository }}/git/ref/heads/$RELEASE_BRANCH" --jq '.object.sha'
+          echo "✓ Release branch ref verified as resolvable"
+
+      - name: Strip empty Unreleased section for release branch
+        run: |
+          set -euo pipefail
+          python3 -c "
+          import re
+          from pathlib import Path
+          content = Path('CHANGELOG.md').read_text()
+          content = re.sub(
+              r'## Unreleased\s*\n(?:### \w+\s*\n\s*)*\n*(?=## \[)',
+              '',
+              content,
+          )
+          Path('CHANGELOG.md').write_text(content)
+          "
+
+      - name: Commit stripped CHANGELOG to release branch via API
+        uses: vig-os/commit-action@1bc004353d08d9332a0cb54920b148256220c8e0  # v0.2.0
+        env:
+          GH_TOKEN: ${{ steps.commit_app_token.outputs.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          TARGET_BRANCH: refs/heads/${{ needs.validate.outputs.release_branch }}
+          MAX_ATTEMPTS: "3"
+          COMMIT_MESSAGE: |-
+            chore: prepare release ${{ needs.validate.outputs.version }}
+
+            Strip empty Unreleased section from release branch.
+            Release date TBD (set during finalization).
+          FILE_PATHS: CHANGELOG.md
+
+      - name: Create draft PR to main
+        id: pr
+        env:
+          GH_TOKEN: ${{ steps.release_app_token.outputs.token }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          RELEASE_BRANCH: ${{ needs.validate.outputs.release_branch }}
+          CHANGELOG_CONTENT: ${{ steps.changelog.outputs.changelog }}
+        run: |
+          set -euo pipefail
+          PR_BODY="# Release $VERSION
+
+          This PR prepares release $VERSION for merge to main.
+
+          $CHANGELOG_CONTENT
+          "
+
+          EXISTING_PR_URL=$(retry --retries 3 --backoff 5 --max-backoff 60 -- \
+            gh pr list --head "$RELEASE_BRANCH" --base main --state open --json url --jq '.[0].url // empty')
+          if [ -n "$EXISTING_PR_URL" ]; then
+            PR_URL="$EXISTING_PR_URL"
+          else
+            PR_URL=$(retry --retries 3 --backoff 5 --max-backoff 60 -- \
+              gh pr create \
+                --base main \
+                --head "$RELEASE_BRANCH" \
+                --title "chore: release $VERSION" \
+                --body "$PR_BODY" \
+                --draft)
+          fi
+
+          PR_NUMBER=$(echo "$PR_URL" | grep -oE '[0-9]+$')
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Roll back prepare-release side effects on failure
+        id: rollback_prepare
+        if: ${{ failure() }}
+        env:
+          GH_TOKEN: ${{ steps.commit_app_token.outputs.token }}
+          RELEASE_BRANCH: ${{ needs.validate.outputs.release_branch }}
+          PREPARE_START_SHA: ${{ steps.pre_state.outputs.prepare_start_sha }}
+          POST_FREEZE_DEV_SHA: ${{ steps.create_branch.outputs.dev_sha }}
+        run: |
+          set -euo pipefail
+          CHANGELOG_ROLLBACK_NEEDED=false
+          retry --retries 3 --backoff 5 --max-backoff 60 -- \
+            gh api -X DELETE "repos/${{ github.repository }}/git/refs/heads/$RELEASE_BRANCH" || true
+
+          if [ -z "${PREPARE_START_SHA:-}" ] || [ -z "${POST_FREEZE_DEV_SHA:-}" ]; then
+            echo "changelog_rollback_needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CURRENT_DEV_SHA=$(retry --retries 3 --backoff 5 --max-backoff 60 -- \
+            gh api "repos/${{ github.repository }}/git/ref/heads/dev" --jq '.object.sha')
+          if [ "$CURRENT_DEV_SHA" != "$POST_FREEZE_DEV_SHA" ]; then
+            echo "changelog_rollback_needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          retry --retries 3 --backoff 5 --max-backoff 60 -- \
+            gh api "repos/${{ github.repository }}/contents/CHANGELOG.md?ref=$PREPARE_START_SHA" --jq '.content' | tr -d '\n' | base64 -d > /tmp/changelog.pre.md
+          retry --retries 3 --backoff 5 --max-backoff 60 -- \
+            gh api "repos/${{ github.repository }}/contents/CHANGELOG.md?ref=$CURRENT_DEV_SHA" --jq '.content' | tr -d '\n' | base64 -d > /tmp/changelog.current.md
+          if ! cmp -s /tmp/changelog.pre.md /tmp/changelog.current.md; then
+            cp /tmp/changelog.pre.md CHANGELOG.md
+            CHANGELOG_ROLLBACK_NEEDED=true
+          fi
+          echo "changelog_rollback_needed=$CHANGELOG_ROLLBACK_NEEDED" >> "$GITHUB_OUTPUT"
+
+      - name: Commit CHANGELOG rollback to dev via API
+        if: ${{ failure() && steps.rollback_prepare.outputs.changelog_rollback_needed == 'true' }}
+        uses: vig-os/commit-action@1bc004353d08d9332a0cb54920b148256220c8e0  # v0.2.0
+        env:
+          GH_TOKEN: ${{ steps.commit_app_token.outputs.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          TARGET_BRANCH: refs/heads/dev
+          MAX_ATTEMPTS: "3"
+          COMMIT_MESSAGE: |-
+            chore: rollback failed prepare-release ${{ needs.validate.outputs.version }}
+
+            Restore CHANGELOG.md on dev to pre-prepare state after prepare-release failed.
+          FILE_PATHS: CHANGELOG.md
