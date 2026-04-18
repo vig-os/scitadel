@@ -724,6 +724,150 @@ pub fn prepare_batch_assessments_tool(
     Ok(out.join("\n"))
 }
 
+// ---------- Annotations (#49 iter 4) ----------
+
+/// Create a root-level annotation anchored to a passage in a paper.
+/// Replies use `reply_annotation_tool` since they inherit the anchor.
+#[allow(clippy::too_many_arguments)]
+pub fn create_annotation_tool(
+    paper_id: &str,
+    quote: &str,
+    note: &str,
+    author: &str,
+    prefix: Option<&str>,
+    suffix: Option<&str>,
+    question_id: Option<&str>,
+    color: Option<&str>,
+    tags: Option<Vec<String>>,
+) -> Result<String, String> {
+    if author.trim().is_empty() {
+        return Err("author is required (pass an identity string)".into());
+    }
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+
+    let anchor = scitadel_core::models::Anchor {
+        quote: Some(quote.to_string()),
+        prefix: prefix.map(str::to_string),
+        suffix: suffix.map(str::to_string),
+        status: scitadel_core::models::AnchorStatus::Ok,
+        ..Default::default()
+    };
+
+    let mut ann = scitadel_core::models::Annotation::new_root(
+        scitadel_core::models::PaperId::from(paper_id),
+        author.to_string(),
+        note.to_string(),
+        anchor,
+    );
+    if let Some(qid) = question_id {
+        ann.question_id = Some(scitadel_core::models::QuestionId::from(qid));
+    }
+    if let Some(c) = color {
+        ann.color = Some(c.to_string());
+    }
+    if let Some(t) = tags {
+        ann.tags = t;
+    }
+
+    repo.create(&ann).map_err(|e| e.to_string())?;
+    Ok(ann.id.as_str().to_string())
+}
+
+/// Add a reply to an existing annotation. Inherits paper_id and
+/// question_id from the parent.
+pub fn reply_annotation_tool(parent_id: &str, note: &str, author: &str) -> Result<String, String> {
+    if author.trim().is_empty() {
+        return Err("author is required".into());
+    }
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+    let parent = repo
+        .get(parent_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Annotation '{parent_id}' not found."))?;
+    let reply =
+        scitadel_core::models::Annotation::new_reply(&parent, author.to_string(), note.to_string());
+    repo.create(&reply).map_err(|e| e.to_string())?;
+    Ok(reply.id.as_str().to_string())
+}
+
+/// Update mutable fields on an existing annotation.
+pub fn update_annotation_tool(
+    id: &str,
+    note: Option<&str>,
+    color: Option<&str>,
+    tags: Option<Vec<String>>,
+) -> Result<String, String> {
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+    let existing = repo
+        .get(id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Annotation '{id}' not found."))?;
+    let new_note = note.unwrap_or(&existing.note);
+    let new_color = color.or(existing.color.as_deref());
+    let new_tags = tags.unwrap_or(existing.tags);
+    repo.update_note(id, new_note, new_color, &new_tags)
+        .map_err(|e| e.to_string())?;
+    Ok(format!("Annotation {id} updated."))
+}
+
+/// Soft-delete an annotation. Keeps the row so threads are preserved;
+/// `list_annotations` hides it.
+pub fn delete_annotation_tool(id: &str) -> Result<String, String> {
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+    repo.soft_delete(id).map_err(|e| e.to_string())?;
+    Ok(format!("Annotation {id} deleted (soft)."))
+}
+
+/// List annotations filtered by paper / question / author. Returns a
+/// JSON array with id, parent_id, anchor, note, tags, author,
+/// timestamps, and anchor_status.
+pub fn list_annotations_tool(
+    paper_id: Option<&str>,
+    author: Option<&str>,
+) -> Result<String, String> {
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+    let rows = match paper_id {
+        Some(pid) => repo.list_by_paper(pid).map_err(|e| e.to_string())?,
+        None => return Err("paper_id is required for now (cross-paper lists come later)".into()),
+    };
+    let filtered: Vec<_> = rows
+        .into_iter()
+        .filter(|a| author.is_none_or(|want| a.author == want))
+        .collect();
+
+    let entries: Vec<serde_json::Value> = filtered
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "id": a.id.as_str(),
+                "parent_id": a.parent_id.as_ref().map(|p| p.as_str()),
+                "paper_id": a.paper_id.as_str(),
+                "question_id": a.question_id.as_ref().map(|q| q.as_str()),
+                "anchor": {
+                    "char_range": a.anchor.char_range,
+                    "quote": a.anchor.quote,
+                    "prefix": a.anchor.prefix,
+                    "suffix": a.anchor.suffix,
+                    "status": a.anchor.status.as_str(),
+                },
+                "note": a.note,
+                "color": a.color,
+                "tags": a.tags,
+                "author": a.author,
+                "created_at": a.created_at.to_rfc3339(),
+                "updated_at": a.updated_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())
+}
+
 /// Full-text search over stored search queries. Returns a JSON array of
 /// past searches matching `query` (lower `rank` = more relevant per
 /// BM25). Agents should call this before running a fresh search to
