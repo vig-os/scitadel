@@ -19,11 +19,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize the scitadel database
+    /// Initialize scitadel: write a config and create the database.
+    /// Runs as an interactive wizard unless --yes or stdin is non-interactive.
     Init {
         /// Database path
         #[arg(long)]
         db: Option<PathBuf>,
+        /// OpenAlex / Unpaywall email (used for OA PDF lookups)
+        #[arg(long)]
+        email: Option<String>,
+        /// Comma-separated sources to enable (e.g. pubmed,arxiv,openalex)
+        #[arg(long)]
+        sources: Option<String>,
+        /// Non-interactive: use provided flags + defaults, never prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
     /// Run a federated literature search
     Search {
@@ -179,7 +189,23 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Init { db } => commands::init(db),
+        Commands::Init {
+            db,
+            email,
+            sources,
+            yes,
+        } => commands::init(commands::InitOptions {
+            db_path: db,
+            email,
+            sources: sources.map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            }),
+            yes,
+        }),
         Commands::Search {
             query,
             sources,
