@@ -17,6 +17,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [0.3.0] - 2026-04-19
+
+Agent DX polish + annotations. 14 PRs merged to `dev` under a
+loop-driven autonomous execution session (ADR-003). Everything behind
+the VHS coverage gate and the existing Rust CI bar.
+
+Note on scope: #58 (MCP progress notifications) was deferred to 0.4.0
+after discovering rmcp 0.1.5's tool macro doesn't inject a `Peer`
+reference into handlers — see ADR-003 for the rationale.
+
+### Added
+
+- **MCP `list_sources`** (#54): per-source metadata (name, description,
+  required credential fields, configured-in-this-env flag, rate-limit
+  hint) so agents can introspect instead of guessing.
+- **MCP `summarize_search`** (#53): one-call JSON digest of every
+  paper in a search with truncated abstracts, saves N round-trips.
+- **MCP `get_rubric`** (#56): cacheable access to the static scoring
+  rubric so agents don't pay for it per-paper via
+  `prepare_assessment`.
+- **MCP `search` returns structured JSON** (#55): per-source
+  `status / result_count / latency_ms / error` alongside a
+  `summary` string for back-compat with human readers.
+- **MCP `find_similar_searches`** (#57): FTS5 (porter + unicode61)
+  over stored query strings; backed by new migration 006 with a
+  trigger-based sync. FTS5-operator sanitizer so arbitrary user
+  input doesn't raise syntax errors.
+- **Annotations** (#49) — shipped across 5 iterations:
+  - **iter 1 — data model + schema**: `annotations` +
+    `annotation_reads` tables (migration 005), W3C-style multi-
+    selector anchor (position, quote + context, sentence-id),
+    threaded replies, soft-delete tombstones.
+  - **iter 2 — repo + anchoring resolver**:
+    `SqliteAnnotationRepository` with CRUD + thread loading;
+    `resolve_anchor` tries position → quote-substring → orphan
+    (fuzzy + sentence-id deferred to 3b).
+  - **iter 3 — TUI view-only rendering**: annotations listed in
+    the paper detail overlay; threaded replies indented.
+  - **iter 4 — MCP CRUD**: `create_annotation`, `reply_annotation`,
+    `update_annotation`, `delete_annotation`, `list_annotations`.
+    Author identity is mandatory on writes.
+  - **iter 5 — read receipts**: `mark_seen`, `mark_thread_seen`,
+    `list_unread`. Edits auto-resurface rows as unread.
+- **ADR-003** — 0.3.0 execution tracker + decision log.
+
+### Changed
+
+- **`search` tool response shape** is now JSON (still carries a
+  `summary` string for back-compat). External clients that parsed
+  the old string should read `summary` or pivot to the structured
+  fields.
+- `get_papers_tool` + `prepare_batch_assessments_tool` now use
+  `truncate_abstract` (char-safe) instead of the byte-slice
+  `&s[..300]` that panicked on non-ASCII content.
+- `list_sources` OpenAlex credential field renamed from `email` to
+  `polite_pool_email` to match how config actually stores it.
+
+### Removed
+
+- Python-era release workflows (`release.yml`, `release-core.yml`,
+  `release-publish.yml`, `release-extension.yml`,
+  `prepare-release.yml`, `promote-release.yml`) — all superseded by
+  the Rust-native `binaries.yml` + `publish-crates.yml` shipped in
+  0.2.0.
+
+### Deferred to later milestones
+
+- **MCP progress notifications (#58)** — 0.4.0. Waits for rmcp
+  upgrade or custom tool-handler wrapper.
+- **TUI-native annotation create/edit/delete (#92)** — 0.4.0.
+  MCP CRUD covers it for now.
+- **Fuzzy anchor matching + sentence-id resolver** — follow-up
+  once the TUI surfaces orphans.
+- **`get_annotated_paper` composite endpoint** — waits for the
+  two-pane reader design.
+
 ## [0.2.0] - 2026-04-18
 
 Onboarding and reading workflow. Eight PRs, every UX/TUI change backed
