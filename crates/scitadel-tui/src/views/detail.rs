@@ -107,6 +107,48 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, paper_id: &str, scr
         }
     }
 
+    // Annotations panel — view-only in iter 3. Create/edit happen via MCP
+    // (`create_annotation` etc.) until iter 3b wires in-TUI writes.
+    let annotations = data
+        .load_annotations_for_paper(paper_id)
+        .unwrap_or_default();
+    if !annotations.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("Annotations ({}):", annotations.len()),
+            label_style,
+        )));
+        for ann in &annotations {
+            let prefix = if ann.is_reply() { "  └ " } else { "  • " };
+            if let Some(quote) = ann.anchor.quote.as_deref() {
+                lines.push(Line::from(vec![
+                    Span::raw(prefix),
+                    Span::styled(format!("\"{quote}\" "), Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        format!("— {}", ann.anchor.status.as_str()),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+                lines.push(Line::from(format!(
+                    "    {} ({}): {}",
+                    ann.author,
+                    ann.created_at.format("%Y-%m-%d"),
+                    ann.note
+                )));
+            } else {
+                // Reply — no anchor, just author + note, indented.
+                lines.push(Line::from(vec![
+                    Span::raw(prefix),
+                    Span::styled(
+                        format!("{}: ", ann.author),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::raw(ann.note.clone()),
+                ]));
+            }
+        }
+    }
+
     let paragraph = Paragraph::new(lines)
         .block(
             Block::default()
