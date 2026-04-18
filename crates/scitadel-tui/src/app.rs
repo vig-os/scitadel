@@ -78,6 +78,8 @@ pub struct App {
     pub unpaywall_email: String,
     pub papers_dir: PathBuf,
     pub show_institutional_hint: bool,
+    pub reader: String,
+    pub starred: std::collections::HashSet<String>,
 
     task_tx: mpsc::UnboundedSender<TaskUpdate>,
     task_rx: mpsc::UnboundedReceiver<TaskUpdate>,
@@ -89,8 +91,10 @@ impl App {
         unpaywall_email: String,
         papers_dir: PathBuf,
         show_institutional_hint: bool,
+        reader: String,
     ) -> Self {
         let (task_tx, task_rx) = mpsc::unbounded_channel();
+        let starred = data.load_starred_ids(&reader).unwrap_or_default();
         Self {
             tab: Tab::Searches,
             running: true,
@@ -103,8 +107,21 @@ impl App {
             unpaywall_email,
             papers_dir,
             show_institutional_hint,
+            reader,
+            starred,
             task_tx,
             task_rx,
+        }
+    }
+
+    /// Toggle the starred state for a paper and refresh the cached set.
+    fn toggle_star(&mut self, paper_id: &str) {
+        if let Ok(now_starred) = self.data.toggle_starred(paper_id, &self.reader) {
+            if now_starred {
+                self.starred.insert(paper_id.to_string());
+            } else {
+                self.starred.remove(paper_id);
+            }
         }
     }
 
@@ -256,6 +273,14 @@ impl App {
                             });
                         }
                     }
+                    KeyCode::Char('s') => {
+                        if let Ok(papers) = self.data.load_papers(1000, 0)
+                            && let Some(paper) = papers.get(self.paper_selected)
+                        {
+                            let pid = paper.id.as_str().to_string();
+                            self.toggle_star(&pid);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -280,9 +305,16 @@ pub fn run(
     unpaywall_email: String,
     papers_dir: PathBuf,
     show_institutional_hint: bool,
+    reader: String,
 ) -> Result<()> {
     let data = DataStore::open(db_path)?;
-    let mut app = App::new(data, unpaywall_email, papers_dir, show_institutional_hint);
+    let mut app = App::new(
+        data,
+        unpaywall_email,
+        papers_dir,
+        show_institutional_hint,
+        reader,
+    );
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -357,11 +389,24 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             search_id,
             selected,
         }) => {
-            papers::draw_for_search(frame, chunks[1], &app.data, search_id, *selected);
+            papers::draw_for_search(
+                frame,
+                chunks[1],
+                &app.data,
+                search_id,
+                *selected,
+                &app.starred,
+            );
         }
         None => match app.tab {
             Tab::Searches => searches::draw(frame, chunks[1], &app.data, app.search_selected),
-            Tab::Papers => papers::draw(frame, chunks[1], &app.data, app.paper_selected),
+            Tab::Papers => papers::draw(
+                frame,
+                chunks[1],
+                &app.data,
+                app.paper_selected,
+                &app.starred,
+            ),
             Tab::Questions => {
                 questions::draw(frame, chunks[1], &app.data, app.question_selected);
             }
@@ -372,10 +417,15 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         tasks_view::draw(frame, chunks[2], &app.tasks, app.show_institutional_hint);
     }
 
-    let help_text = match &app.overlay {
-        Some(Overlay::PaperDetail { .. }) => "Esc/q: back | j/k: scroll | d/u: page | D: download",
-        Some(Overlay::SearchPapers { .. }) => "Esc/q: back | j/k: navigate | Enter: open paper",
-        None => "Tab/Shift-Tab: switch tabs | j/k: navigate | Enter: select | q: quit",
+    let help_text = match (&app.overlay, app.tab) {
+        (Some(Overlay::PaperDetail { .. }), _) => {
+            "Esc/q: back | j/k: scroll | d/u: page | D: download"
+        }
+        (Some(Overlay::SearchPapers { .. }), _) => {
+            "Esc/q: back | j/k: navigate | Enter: open paper"
+        }
+        (None, Tab::Papers) => "Tab: switch tabs | j/k: navigate | Enter: open | s: star | q: quit",
+        (None, _) => "Tab/Shift-Tab: switch tabs | j/k: navigate | Enter: select | q: quit",
     };
     status_bar::draw(frame, chunks[3], help_text);
 }

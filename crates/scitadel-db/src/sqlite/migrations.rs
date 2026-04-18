@@ -5,8 +5,14 @@ use crate::error::DbError;
 const MIGRATION_001: &str = include_str!("../../migrations/001_initial.sql");
 const MIGRATION_002: &str = include_str!("../../migrations/002_citations.sql");
 const MIGRATION_003: &str = include_str!("../../migrations/003_full_text.sql");
+const MIGRATION_004: &str = include_str!("../../migrations/004_paper_state.sql");
 
-const MIGRATIONS: &[(i64, &str)] = &[(1, MIGRATION_001), (2, MIGRATION_002), (3, MIGRATION_003)];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, MIGRATION_001),
+    (2, MIGRATION_002),
+    (3, MIGRATION_003),
+    (4, MIGRATION_004),
+];
 
 /// Run all pending migrations, skipping already-applied ones.
 pub fn run_migrations(conn: &Connection) -> Result<(), DbError> {
@@ -73,6 +79,7 @@ mod tests {
         assert!(tables.contains(&"assessments".to_string()));
         assert!(tables.contains(&"citations".to_string()));
         assert!(tables.contains(&"snowball_runs".to_string()));
+        assert!(tables.contains(&"paper_state".to_string()));
         assert!(tables.contains(&"schema_version".to_string()));
     }
 }

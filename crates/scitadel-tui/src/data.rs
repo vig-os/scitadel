@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -6,7 +7,7 @@ use scitadel_core::models::{Assessment, Paper, ResearchQuestion, Search, SearchT
 use scitadel_core::ports::{
     AssessmentRepository, PaperRepository, QuestionRepository, SearchRepository,
 };
-use scitadel_db::sqlite::Database;
+use scitadel_db::sqlite::{Database, SqlitePaperStateRepository};
 
 /// Wrapper around the database that loads data for each TUI view.
 pub struct DataStore {
@@ -64,5 +65,15 @@ impl DataStore {
     ) -> Result<Vec<Assessment>> {
         let (_, _, _, a_repo, _) = self.db.repositories();
         Ok(a_repo.get_for_paper(paper_id, question_id)?)
+    }
+
+    /// Load the set of paper IDs this reader has starred.
+    pub fn load_starred_ids(&self, reader: &str) -> Result<HashSet<String>> {
+        Ok(SqlitePaperStateRepository::new(self.db.clone()).starred_ids(reader)?)
+    }
+
+    /// Toggle the starred flag for a paper and return the new value.
+    pub fn toggle_starred(&self, paper_id: &str, reader: &str) -> Result<bool> {
+        Ok(SqlitePaperStateRepository::new(self.db.clone()).toggle_starred(paper_id, reader)?)
     }
 }

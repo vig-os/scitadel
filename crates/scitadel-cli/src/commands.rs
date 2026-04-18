@@ -47,11 +47,13 @@ pub fn tui() -> Result<()> {
     let config = load_config();
     let email = config.openalex.api_key.clone();
     let papers_dir = config.papers_dir();
+    let reader = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
     scitadel_tui::run(
         &config.db_path,
         email,
         papers_dir,
         config.ui.show_institutional_hint,
+        reader,
     )?;
     Ok(())
 }
