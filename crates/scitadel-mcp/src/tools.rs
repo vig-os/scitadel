@@ -215,11 +215,7 @@ pub fn get_papers_tool(search_id: &str) -> Result<String, String> {
         } else {
             String::new()
         };
-        let abstract_preview = if p.r#abstract.len() > 300 {
-            format!("{}...", &p.r#abstract[..300])
-        } else {
-            p.r#abstract.clone()
-        };
+        let (abstract_preview, _) = truncate_abstract(&p.r#abstract, 300);
 
         out.push(format!(
             "[{}] {}\n    Authors: {}{}\n    Year: {}  Journal: {}\n    DOI: {}  ID: {}\n    Abstract: {}\n",
@@ -696,11 +692,7 @@ pub fn prepare_batch_assessments_tool(
         } else {
             String::new()
         };
-        let abstract_preview = if p.r#abstract.len() > 300 {
-            format!("{}...", &p.r#abstract[..300])
-        } else {
-            p.r#abstract.clone()
-        };
+        let (abstract_preview, _) = truncate_abstract(&p.r#abstract, 300);
 
         out.push(format!(
             "[{}] {}\n\
@@ -851,9 +843,11 @@ const SOURCE_REGISTRY: &[SourceInfo] = &[
     },
     SourceInfo {
         name: "openalex",
-        description: "Open scholarly-works graph covering most disciplines. Email polite-pool recommended.",
-        credential_fields: &["email"],
-        rate_limit_hint: "10 req/s in the polite pool (with email).",
+        description: "Open scholarly-works graph covering most disciplines. The polite-pool email gets 10 req/s; without it you share the global 10 req/s pool.",
+        // Stored under `openalex.api_key` in config for historical reasons;
+        // users authenticate by putting their contact email there, not a real key.
+        credential_fields: &["polite_pool_email"],
+        rate_limit_hint: "10 req/s in the polite pool (with email), otherwise shared.",
     },
     SourceInfo {
         name: "inspire",
