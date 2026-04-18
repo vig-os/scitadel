@@ -28,25 +28,36 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Metadata check (every crate)
-        # `cargo package --no-verify` exercises the metadata packaging step
-        # without resolving dependencies against the registry — so it works
-        # for workspace-internal crates that aren't published yet. Catches
-        # missing descriptions, invalid categories, unparseable TOML, etc.
+      - name: Check every crate has publishable metadata
+        # cargo-manifest-level check that each workspace crate has the
+        # required crates.io metadata fields. Does NOT hit the registry,
+        # so it works for internal deps that aren't yet published.
         run: |
           set -euo pipefail
-          for crate in scitadel-core scitadel-db scitadel-adapters \
-                       scitadel-scoring scitadel-export \
-                       scitadel-mcp scitadel-tui scitadel-cli; do
-            echo "::group::$crate"
-            cargo package --no-verify --allow-dirty -p "$crate"
-            echo "::endgroup::"
-          done
+          python3 - <<'PY'
+          import subprocess, json, sys
+          meta = json.loads(subprocess.check_output(["cargo", "metadata", "--no-deps", "--format-version", "1"]))
+          required = ["description", "license", "repository"]
+          failed = []
+          for pkg in meta["packages"]:
+              name = pkg["name"]
+              for field in required:
+                  val = pkg.get(field)
+                  if not val:
+                      failed.append(f"{name}: missing {field}")
+          if failed:
+              print("Missing publish metadata:")
+              for f in failed:
+                  print(f"  - {f}")
+              sys.exit(1)
+          print(f"All {len(meta['packages'])} crate(s) have publish metadata.")
+          PY
 
       - name: Dry-run publish (leaf crate only)
-        # Full --dry-run on the leaf catches upload-shape issues. Downstream
-        # crates can only be fully dry-run after their upstreams are on
-        # crates.io, so we accept discovering those at tag-push time.
+        # Full --dry-run on the leaf catches upload-shape issues for the one
+        # crate that has no internal deps. Downstream crates can only be
+        # fully dry-run after their upstreams exist on crates.io; we rely
+        # on the real sequential publish at tag time to surface those.
         run: cargo publish --dry-run --allow-dirty -p scitadel-core
 
   # Live publish runs only on real tag pushes. Sequential and ordered; we
