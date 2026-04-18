@@ -80,9 +80,14 @@ pub struct App {
     pub show_institutional_hint: bool,
     pub reader: String,
     pub starred: std::collections::HashSet<String>,
+    /// True when the startup network probe failed. Purely advisory — reads
+    /// always work from SQLite; downloads still run (and can succeed via
+    /// cache layers), but the status bar shows a visible OFFLINE badge.
+    pub offline: bool,
 
     task_tx: mpsc::UnboundedSender<TaskUpdate>,
     task_rx: mpsc::UnboundedReceiver<TaskUpdate>,
+    offline_rx: mpsc::UnboundedReceiver<bool>,
 }
 
 impl App {
@@ -94,7 +99,16 @@ impl App {
         reader: String,
     ) -> Self {
         let (task_tx, task_rx) = mpsc::unbounded_channel();
+        let (offline_tx, offline_rx) = mpsc::unbounded_channel();
         let starred = data.load_starred_ids(&reader).unwrap_or_default();
+
+        // Kick off a one-shot network probe. The result arrives on
+        // `offline_rx` and we flip the status-bar badge on first draw.
+        tokio::spawn(async move {
+            let online = probe_network().await;
+            let _ = offline_tx.send(!online);
+        });
+
         Self {
             tab: Tab::Searches,
             running: true,
@@ -109,8 +123,16 @@ impl App {
             show_institutional_hint,
             reader,
             starred,
+            offline: false,
             task_tx,
             task_rx,
+            offline_rx,
+        }
+    }
+
+    fn drain_offline(&mut self) {
+        while let Ok(value) = self.offline_rx.try_recv() {
+            self.offline = value;
         }
     }
 
@@ -123,6 +145,11 @@ impl App {
                 self.starred.remove(paper_id);
             }
         }
+    }
+
+    fn drain_all_channels(&mut self) {
+        self.drain_task_updates();
+        self.drain_offline();
     }
 
     fn drain_task_updates(&mut self) {
@@ -333,7 +360,7 @@ pub fn run(
 
 fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
     while app.running {
-        app.drain_task_updates();
+        app.drain_all_channels();
         terminal.draw(|frame| draw(frame, app))?;
 
         if event::poll(std::time::Duration::from_millis(100))?
@@ -427,5 +454,31 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         (None, Tab::Papers) => "Tab: switch tabs | j/k: navigate | Enter: open | s: star | q: quit",
         (None, _) => "Tab/Shift-Tab: switch tabs | j/k: navigate | Enter: select | q: quit",
     };
-    status_bar::draw(frame, chunks[3], help_text);
+    status_bar::draw(frame, chunks[3], help_text, app.offline);
+}
+
+/// One-shot check: is the internet reachable? Uses a 3s HEAD to a stable
+/// endpoint. Any failure (DNS, timeout, non-2xx) is treated as offline.
+///
+/// Tests and tape runs can force the offline branch by setting
+/// `SCITADEL_FORCE_OFFLINE=1`.
+async fn probe_network() -> bool {
+    if std::env::var("SCITADEL_FORCE_OFFLINE")
+        .ok()
+        .is_some_and(|v| !v.is_empty() && v != "0")
+    {
+        return false;
+    }
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    client
+        .head("https://api.openalex.org/")
+        .send()
+        .await
+        .is_ok_and(|r| r.status().is_success() || r.status().is_redirection())
 }
