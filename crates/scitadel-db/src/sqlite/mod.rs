@@ -1,3 +1,4 @@
+mod annotations;
 mod assessments;
 mod citations;
 mod migrations;
@@ -6,6 +7,7 @@ mod papers;
 mod questions;
 mod searches;
 
+pub use annotations::{SqliteAnnotationRepository, resolve_anchor};
 pub use assessments::SqliteAssessmentRepository;
 pub use citations::SqliteCitationRepository;
 pub use migrations::run_migrations;
