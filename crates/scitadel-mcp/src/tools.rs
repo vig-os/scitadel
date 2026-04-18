@@ -718,6 +718,89 @@ pub fn prepare_batch_assessments_tool(
     Ok(out.join("\n"))
 }
 
+/// Summarize every paper in a search as JSON — title, abstract, access
+/// status, identifiers — in a single call. Saves round-trips vs. the
+/// agent iterating `get_paper` per result.
+///
+/// `max_papers` caps the output (default 50). Abstracts are truncated
+/// at `abstract_char_limit` (default 500) with an ellipsis if cut.
+pub fn summarize_search_tool(
+    search_id: &str,
+    max_papers: Option<usize>,
+    abstract_char_limit: Option<usize>,
+) -> Result<String, String> {
+    let max_papers = max_papers.unwrap_or(50);
+    let abstract_char_limit = abstract_char_limit.unwrap_or(500);
+
+    let db = open_db()?;
+    let (paper_repo, search_repo, _, _, _) = db.repositories();
+
+    let search = search_repo
+        .get(search_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Search '{search_id}' not found."))?;
+
+    let results = search_repo
+        .get_results(search.id.as_str())
+        .map_err(|e| e.to_string())?;
+
+    // Unique paper IDs in the order they were returned by the adapters.
+    let mut seen = std::collections::HashSet::new();
+    let mut ordered_ids: Vec<&str> = Vec::new();
+    for r in &results {
+        if seen.insert(r.paper_id.as_str()) {
+            ordered_ids.push(r.paper_id.as_str());
+        }
+    }
+    ordered_ids.truncate(max_papers);
+
+    let papers: Vec<Paper> = ordered_ids
+        .iter()
+        .filter_map(|id| paper_repo.get(id).ok().flatten())
+        .collect();
+
+    let summaries: Vec<serde_json::Value> = papers
+        .iter()
+        .map(|p| {
+            let (abstract_text, truncated) = truncate_abstract(&p.r#abstract, abstract_char_limit);
+            serde_json::json!({
+                "paper_id": p.id.as_str(),
+                "title": p.title,
+                "authors": p.authors,
+                "year": p.year,
+                "journal": p.journal,
+                "doi": p.doi,
+                "arxiv_id": p.arxiv_id,
+                "openalex_id": p.openalex_id,
+                "abstract": abstract_text,
+                "abstract_truncated": truncated,
+            })
+        })
+        .collect();
+
+    let payload = serde_json::json!({
+        "search_id": search.id.as_str(),
+        "query": search.query,
+        "total_papers": search.total_papers,
+        "returned": summaries.len(),
+        "papers": summaries,
+    });
+
+    serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())
+}
+
+/// Truncate an abstract at a char boundary. Returns `(text, was_truncated)`
+/// so the caller can signal truncation in the JSON payload. Appends an
+/// ellipsis only when actually cut.
+fn truncate_abstract(text: &str, max_chars: usize) -> (String, bool) {
+    if text.chars().count() <= max_chars {
+        return (text.to_string(), false);
+    }
+    let mut out: String = text.chars().take(max_chars).collect();
+    out.push_str("...");
+    (out, true)
+}
+
 /// Static descriptor for one source adapter — used by `list_sources_tool`.
 struct SourceInfo {
     name: &'static str,
@@ -816,8 +899,32 @@ fn is_source_configured(src: &SourceInfo, config: &scitadel_core::config::Config
 
 #[cfg(test)]
 mod tests {
-    use super::{SOURCE_REGISTRY, html_to_text, is_source_configured};
+    use super::{SOURCE_REGISTRY, html_to_text, is_source_configured, truncate_abstract};
     use scitadel_core::config::Config;
+
+    #[test]
+    fn truncate_abstract_shorter_than_limit_untouched() {
+        let (out, truncated) = truncate_abstract("short text", 100);
+        assert_eq!(out, "short text");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn truncate_abstract_over_limit_appends_ellipsis() {
+        let input = "a".repeat(120);
+        let (out, truncated) = truncate_abstract(&input, 100);
+        assert!(truncated);
+        assert!(out.ends_with("..."));
+        assert_eq!(out.chars().count(), 103);
+    }
+
+    #[test]
+    fn truncate_abstract_respects_multibyte_boundary() {
+        // U+2019 is 3 bytes; the truncation must slice on char boundaries.
+        let input = "D\u{2019}Ippolito ".repeat(60);
+        let (out, _) = truncate_abstract(&input, 50);
+        assert_eq!(out.chars().count(), 53);
+    }
 
     #[test]
     fn strips_tags_and_script() {

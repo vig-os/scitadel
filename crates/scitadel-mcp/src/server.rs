@@ -79,6 +79,24 @@ impl ScitadelServer {
         tools::list_sources_tool()
     }
 
+    #[tool(
+        description = "Summarize every paper in a search as JSON in one call: title, authors, year, abstract (truncated), DOI, identifiers. Preferred over iterating `get_paper` per result when scanning a corpus."
+    )]
+    fn summarize_search(
+        &self,
+        #[tool(param)]
+        #[schemars(description = "Search ID")]
+        search_id: String,
+        #[tool(param)]
+        #[schemars(description = "Max papers to return (default 50)")]
+        max_papers: Option<usize>,
+        #[tool(param)]
+        #[schemars(description = "Max chars per abstract before truncation (default 500)")]
+        abstract_char_limit: Option<usize>,
+    ) -> Result<String, String> {
+        tools::summarize_search_tool(&search_id, max_papers, abstract_char_limit)
+    }
+
     #[tool(description = "List recent search runs")]
     fn list_searches(
         &self,
