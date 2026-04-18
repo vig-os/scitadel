@@ -87,6 +87,21 @@ impl ScitadelServer {
     }
 
     #[tool(
+        description = "Full-text search over stored past searches (FTS5 + Porter stemming). Returns JSON array of matching prior searches sorted by relevance (lower rank = more relevant). Call before running a fresh `search` to detect redundant work."
+    )]
+    fn find_similar_searches(
+        &self,
+        #[tool(param)]
+        #[schemars(description = "Free-text query — FTS5 operators are stripped automatically")]
+        query: String,
+        #[tool(param)]
+        #[schemars(description = "Max hits to return (default 10)")]
+        limit: Option<i64>,
+    ) -> Result<String, String> {
+        tools::find_similar_searches_tool(&query, limit)
+    }
+
+    #[tool(
         description = "Summarize every paper in a search as JSON in one call: title, authors, year, abstract (truncated), DOI, identifiers. Preferred over iterating `get_paper` per result when scanning a corpus."
     )]
     fn summarize_search(
