@@ -224,8 +224,10 @@ justfile.local
 .scitadel/
 results.bib
 
-# Claude Code (keep CLAUDE.md, ignore local settings)
+# Claude Code (keep CLAUDE.md, ignore local settings + loop state)
 .claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/scheduled_tasks.json
 
 # Conductor orchestration state
 .conductor/

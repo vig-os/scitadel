@@ -1,3 +1,4 @@
+mod annotation;
 mod assessment;
 mod citation;
 mod doi;
@@ -5,6 +6,7 @@ mod paper;
 mod question;
 mod search;
 
+pub use annotation::{Anchor, AnchorStatus, Annotation, AnnotationRead};
 pub use assessment::Assessment;
 pub use citation::{Citation, CitationDirection, SnowballRun};
 pub use doi::{doi_to_filename, normalize_doi, validate_doi};
@@ -82,3 +84,4 @@ newtype_id!(QuestionId);
 newtype_id!(AssessmentId);
 newtype_id!(SearchTermId);
 newtype_id!(SnowballRunId);
+newtype_id!(AnnotationId);

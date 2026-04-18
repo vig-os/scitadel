@@ -106,7 +106,7 @@ pub async fn search_tool(
         .save_results(&search_results)
         .map_err(|e| e.to_string())?;
 
-    let outcomes: Vec<String> = search_record
+    let outcome_lines: Vec<String> = search_record
         .source_outcomes
         .iter()
         .map(|o| {
@@ -117,14 +117,28 @@ pub async fn search_tool(
         })
         .collect();
 
-    Ok(format!(
+    let summary = format!(
         "Search ID: {}\nQuery: {query}\nSources: {}\nTotal candidates: {}\nUnique papers after dedup: {}\n{}",
         search_record.id,
         source_list.join(", "),
         search_record.total_candidates,
         papers.len(),
-        outcomes.join("\n")
-    ))
+        outcome_lines.join("\n")
+    );
+
+    // Structured payload: agents introspect per-source status + counts
+    // without parsing the summary string. `summary` field kept so
+    // existing string-consuming clients keep working.
+    let payload = serde_json::json!({
+        "search_id": search_record.id.as_str(),
+        "query": search_record.query,
+        "sources": search_record.source_outcomes,
+        "total_candidates": search_record.total_candidates,
+        "total_unique_papers": papers.len(),
+        "summary": summary,
+    });
+
+    serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())
 }
 
 pub fn list_searches_tool(limit: i64) -> Result<String, String> {
@@ -201,11 +215,7 @@ pub fn get_papers_tool(search_id: &str) -> Result<String, String> {
         } else {
             String::new()
         };
-        let abstract_preview = if p.r#abstract.len() > 300 {
-            format!("{}...", &p.r#abstract[..300])
-        } else {
-            p.r#abstract.clone()
-        };
+        let (abstract_preview, _) = truncate_abstract(&p.r#abstract, 300);
 
         out.push(format!(
             "[{}] {}\n    Authors: {}{}\n    Year: {}  Journal: {}\n    DOI: {}  ID: {}\n    Abstract: {}\n",
@@ -682,11 +692,7 @@ pub fn prepare_batch_assessments_tool(
         } else {
             String::new()
         };
-        let abstract_preview = if p.r#abstract.len() > 300 {
-            format!("{}...", &p.r#abstract[..300])
-        } else {
-            p.r#abstract.clone()
-        };
+        let (abstract_preview, _) = truncate_abstract(&p.r#abstract, 300);
 
         out.push(format!(
             "[{}] {}\n\
@@ -718,9 +724,463 @@ pub fn prepare_batch_assessments_tool(
     Ok(out.join("\n"))
 }
 
+// ---------- Annotations (#49 iter 4 + 5) ----------
+
+/// Record that `reader` has seen the current state of one or more
+/// annotations. Idempotent: repeat calls just bump the `seen_at`.
+pub fn mark_seen_tool(annotation_ids: Vec<String>, reader: &str) -> Result<String, String> {
+    if reader.trim().is_empty() {
+        return Err("reader is required".into());
+    }
+    let refs: Vec<&str> = annotation_ids.iter().map(String::as_str).collect();
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+    repo.mark_seen(&refs, reader).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "Marked {} annotation(s) seen for '{reader}'.",
+        refs.len()
+    ))
+}
+
+/// Mark a whole thread (root + all replies) as seen by `reader`.
+pub fn mark_thread_seen_tool(root_id: &str, reader: &str) -> Result<String, String> {
+    if reader.trim().is_empty() {
+        return Err("reader is required".into());
+    }
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+    repo.mark_thread_seen(root_id, reader)
+        .map_err(|e| e.to_string())?;
+    Ok(format!("Thread {root_id} marked seen for '{reader}'."))
+}
+
+/// List annotations `reader` hasn't seen since the last modification.
+/// Optional `paper_id` scopes the query. Returns the same JSON shape as
+/// `list_annotations` for easy consumption.
+pub fn list_unread_tool(reader: &str, paper_id: Option<&str>) -> Result<String, String> {
+    if reader.trim().is_empty() {
+        return Err("reader is required".into());
+    }
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+    let rows = repo
+        .list_unread(reader, paper_id)
+        .map_err(|e| e.to_string())?;
+
+    let entries: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "id": a.id.as_str(),
+                "parent_id": a.parent_id.as_ref().map(|p| p.as_str()),
+                "paper_id": a.paper_id.as_str(),
+                "question_id": a.question_id.as_ref().map(|q| q.as_str()),
+                "anchor": {
+                    "char_range": a.anchor.char_range,
+                    "quote": a.anchor.quote,
+                    "status": a.anchor.status.as_str(),
+                },
+                "note": a.note,
+                "author": a.author,
+                "updated_at": a.updated_at.to_rfc3339(),
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())
+}
+
+// ---------- Annotations (#49 iter 4) ----------
+
+/// Create a root-level annotation anchored to a passage in a paper.
+/// Replies use `reply_annotation_tool` since they inherit the anchor.
+#[allow(clippy::too_many_arguments)]
+pub fn create_annotation_tool(
+    paper_id: &str,
+    quote: &str,
+    note: &str,
+    author: &str,
+    prefix: Option<&str>,
+    suffix: Option<&str>,
+    question_id: Option<&str>,
+    color: Option<&str>,
+    tags: Option<Vec<String>>,
+) -> Result<String, String> {
+    if author.trim().is_empty() {
+        return Err("author is required (pass an identity string)".into());
+    }
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+
+    let anchor = scitadel_core::models::Anchor {
+        quote: Some(quote.to_string()),
+        prefix: prefix.map(str::to_string),
+        suffix: suffix.map(str::to_string),
+        status: scitadel_core::models::AnchorStatus::Ok,
+        ..Default::default()
+    };
+
+    let mut ann = scitadel_core::models::Annotation::new_root(
+        scitadel_core::models::PaperId::from(paper_id),
+        author.to_string(),
+        note.to_string(),
+        anchor,
+    );
+    if let Some(qid) = question_id {
+        ann.question_id = Some(scitadel_core::models::QuestionId::from(qid));
+    }
+    if let Some(c) = color {
+        ann.color = Some(c.to_string());
+    }
+    if let Some(t) = tags {
+        ann.tags = t;
+    }
+
+    repo.create(&ann).map_err(|e| e.to_string())?;
+    Ok(ann.id.as_str().to_string())
+}
+
+/// Add a reply to an existing annotation. Inherits paper_id and
+/// question_id from the parent.
+pub fn reply_annotation_tool(parent_id: &str, note: &str, author: &str) -> Result<String, String> {
+    if author.trim().is_empty() {
+        return Err("author is required".into());
+    }
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+    let parent = repo
+        .get(parent_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Annotation '{parent_id}' not found."))?;
+    let reply =
+        scitadel_core::models::Annotation::new_reply(&parent, author.to_string(), note.to_string());
+    repo.create(&reply).map_err(|e| e.to_string())?;
+    Ok(reply.id.as_str().to_string())
+}
+
+/// Update mutable fields on an existing annotation.
+pub fn update_annotation_tool(
+    id: &str,
+    note: Option<&str>,
+    color: Option<&str>,
+    tags: Option<Vec<String>>,
+) -> Result<String, String> {
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+    let existing = repo
+        .get(id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Annotation '{id}' not found."))?;
+    let new_note = note.unwrap_or(&existing.note);
+    let new_color = color.or(existing.color.as_deref());
+    let new_tags = tags.unwrap_or(existing.tags);
+    repo.update_note(id, new_note, new_color, &new_tags)
+        .map_err(|e| e.to_string())?;
+    Ok(format!("Annotation {id} updated."))
+}
+
+/// Soft-delete an annotation. Keeps the row so threads are preserved;
+/// `list_annotations` hides it.
+pub fn delete_annotation_tool(id: &str) -> Result<String, String> {
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+    repo.soft_delete(id).map_err(|e| e.to_string())?;
+    Ok(format!("Annotation {id} deleted (soft)."))
+}
+
+/// List annotations filtered by paper / question / author. Returns a
+/// JSON array with id, parent_id, anchor, note, tags, author,
+/// timestamps, and anchor_status.
+pub fn list_annotations_tool(
+    paper_id: Option<&str>,
+    author: Option<&str>,
+) -> Result<String, String> {
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+    let rows = match paper_id {
+        Some(pid) => repo.list_by_paper(pid).map_err(|e| e.to_string())?,
+        None => return Err("paper_id is required for now (cross-paper lists come later)".into()),
+    };
+    let filtered: Vec<_> = rows
+        .into_iter()
+        .filter(|a| author.is_none_or(|want| a.author == want))
+        .collect();
+
+    let entries: Vec<serde_json::Value> = filtered
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "id": a.id.as_str(),
+                "parent_id": a.parent_id.as_ref().map(|p| p.as_str()),
+                "paper_id": a.paper_id.as_str(),
+                "question_id": a.question_id.as_ref().map(|q| q.as_str()),
+                "anchor": {
+                    "char_range": a.anchor.char_range,
+                    "quote": a.anchor.quote,
+                    "prefix": a.anchor.prefix,
+                    "suffix": a.anchor.suffix,
+                    "status": a.anchor.status.as_str(),
+                },
+                "note": a.note,
+                "color": a.color,
+                "tags": a.tags,
+                "author": a.author,
+                "created_at": a.created_at.to_rfc3339(),
+                "updated_at": a.updated_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())
+}
+
+/// Full-text search over stored search queries. Returns a JSON array of
+/// past searches matching `query` (lower `rank` = more relevant per
+/// BM25). Agents should call this before running a fresh search to
+/// avoid re-doing work that's already in the DB.
+pub fn find_similar_searches_tool(query: &str, limit: Option<i64>) -> Result<String, String> {
+    let limit = limit.unwrap_or(10).max(1);
+    let db = open_db()?;
+    let (_, search_repo, _, _, _) = db.repositories();
+    let hits = search_repo
+        .find_similar(query, limit)
+        .map_err(|e| e.to_string())?;
+
+    let entries: Vec<serde_json::Value> = hits
+        .into_iter()
+        .map(|(s, rank)| {
+            serde_json::json!({
+                "search_id": s.id.as_str(),
+                "query": s.query,
+                "total_papers": s.total_papers,
+                "created_at": s.created_at.to_rfc3339(),
+                "rank": rank,
+            })
+        })
+        .collect();
+
+    serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())
+}
+
+/// Return the scitadel assessment rubric (scoring criteria, score scale,
+/// response format) so an agent can fetch it once and cache, rather than
+/// re-fetching via `prepare_assessment` for every paper it evaluates.
+///
+/// Today the rubric is a static prompt shared across all questions;
+/// if per-question rubrics ever land, this function becomes the
+/// customization point.
+pub fn get_rubric_tool() -> Result<String, String> {
+    Ok(scitadel_scoring::SCORING_SYSTEM_PROMPT.to_string())
+}
+
+/// Summarize every paper in a search as JSON — title, abstract, access
+/// status, identifiers — in a single call. Saves round-trips vs. the
+/// agent iterating `get_paper` per result.
+///
+/// `max_papers` caps the output (default 50). Abstracts are truncated
+/// at `abstract_char_limit` (default 500) with an ellipsis if cut.
+pub fn summarize_search_tool(
+    search_id: &str,
+    max_papers: Option<usize>,
+    abstract_char_limit: Option<usize>,
+) -> Result<String, String> {
+    let max_papers = max_papers.unwrap_or(50);
+    let abstract_char_limit = abstract_char_limit.unwrap_or(500);
+
+    let db = open_db()?;
+    let (paper_repo, search_repo, _, _, _) = db.repositories();
+
+    let search = search_repo
+        .get(search_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Search '{search_id}' not found."))?;
+
+    let results = search_repo
+        .get_results(search.id.as_str())
+        .map_err(|e| e.to_string())?;
+
+    // Unique paper IDs in the order they were returned by the adapters.
+    let mut seen = std::collections::HashSet::new();
+    let mut ordered_ids: Vec<&str> = Vec::new();
+    for r in &results {
+        if seen.insert(r.paper_id.as_str()) {
+            ordered_ids.push(r.paper_id.as_str());
+        }
+    }
+    ordered_ids.truncate(max_papers);
+
+    let papers: Vec<Paper> = ordered_ids
+        .iter()
+        .filter_map(|id| paper_repo.get(id).ok().flatten())
+        .collect();
+
+    let summaries: Vec<serde_json::Value> = papers
+        .iter()
+        .map(|p| {
+            let (abstract_text, truncated) = truncate_abstract(&p.r#abstract, abstract_char_limit);
+            serde_json::json!({
+                "paper_id": p.id.as_str(),
+                "title": p.title,
+                "authors": p.authors,
+                "year": p.year,
+                "journal": p.journal,
+                "doi": p.doi,
+                "arxiv_id": p.arxiv_id,
+                "openalex_id": p.openalex_id,
+                "abstract": abstract_text,
+                "abstract_truncated": truncated,
+            })
+        })
+        .collect();
+
+    let payload = serde_json::json!({
+        "search_id": search.id.as_str(),
+        "query": search.query,
+        "total_papers": search.total_papers,
+        "returned": summaries.len(),
+        "papers": summaries,
+    });
+
+    serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())
+}
+
+/// Truncate an abstract at a char boundary. Returns `(text, was_truncated)`
+/// so the caller can signal truncation in the JSON payload. Appends an
+/// ellipsis only when actually cut.
+fn truncate_abstract(text: &str, max_chars: usize) -> (String, bool) {
+    if text.chars().count() <= max_chars {
+        return (text.to_string(), false);
+    }
+    let mut out: String = text.chars().take(max_chars).collect();
+    out.push_str("...");
+    (out, true)
+}
+
+/// Static descriptor for one source adapter — used by `list_sources_tool`.
+struct SourceInfo {
+    name: &'static str,
+    description: &'static str,
+    /// Which keychain / env fields need to be populated before this
+    /// adapter can actually make requests. Empty = no credentials needed.
+    credential_fields: &'static [&'static str],
+    rate_limit_hint: &'static str,
+}
+
+const SOURCE_REGISTRY: &[SourceInfo] = &[
+    SourceInfo {
+        name: "pubmed",
+        description: "US NLM biomedical/life-sciences literature via the NCBI E-utilities API.",
+        credential_fields: &["api_key"],
+        rate_limit_hint: "3 req/s without key, 10 req/s with key.",
+    },
+    SourceInfo {
+        name: "arxiv",
+        description: "Preprint server for physics, CS, math, and adjacent fields.",
+        credential_fields: &[],
+        rate_limit_hint: "1 req every 3s per the arXiv API terms.",
+    },
+    SourceInfo {
+        name: "openalex",
+        description: "Open scholarly-works graph covering most disciplines. The polite-pool email gets 10 req/s; without it you share the global 10 req/s pool.",
+        // Stored under `openalex.api_key` in config for historical reasons;
+        // users authenticate by putting their contact email there, not a real key.
+        credential_fields: &["polite_pool_email"],
+        rate_limit_hint: "10 req/s in the polite pool (with email), otherwise shared.",
+    },
+    SourceInfo {
+        name: "inspire",
+        description: "INSPIRE-HEP: high-energy physics literature and preprints.",
+        credential_fields: &[],
+        rate_limit_hint: "15 req/5s per their API guidelines.",
+    },
+    SourceInfo {
+        name: "patentsview",
+        description: "USPTO PatentsView API — US patent metadata.",
+        credential_fields: &["api_key"],
+        rate_limit_hint: "45 req/min (documented).",
+    },
+    SourceInfo {
+        name: "lens",
+        description: "Lens.org scholarly + patent metadata.",
+        credential_fields: &["api_token"],
+        rate_limit_hint: "Varies by plan; monthly quota enforced.",
+    },
+    SourceInfo {
+        name: "epo",
+        description: "European Patent Office OPS API (consumer_key + consumer_secret).",
+        credential_fields: &["consumer_key", "consumer_secret"],
+        rate_limit_hint: "10 req/min per OPS free tier.",
+    },
+];
+
+/// Return a JSON array describing every source scitadel knows about, with
+/// each one's credential requirements and whether they're configured in
+/// the current environment. Read-only; safe to call freely.
+pub fn list_sources_tool() -> Result<String, String> {
+    let config = load_config();
+
+    let entries: Vec<serde_json::Value> = SOURCE_REGISTRY
+        .iter()
+        .map(|src| {
+            let configured = is_source_configured(src, &config);
+            serde_json::json!({
+                "name": src.name,
+                "description": src.description,
+                "requires_credentials": !src.credential_fields.is_empty(),
+                "credential_fields": src.credential_fields,
+                "configured": configured,
+                "rate_limit_hint": src.rate_limit_hint,
+            })
+        })
+        .collect();
+
+    serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())
+}
+
+fn is_source_configured(src: &SourceInfo, config: &scitadel_core::config::Config) -> bool {
+    match src.name {
+        // Sources with no credentials are always considered configured.
+        "arxiv" | "inspire" => true,
+        "pubmed" => !config.pubmed.api_key.is_empty(),
+        // OpenAlex stores the polite-pool email under `openalex.api_key`
+        // (historical naming); an empty string means polite pool is off
+        // but the adapter still works, so we report configured only when
+        // the email is actually present.
+        "openalex" => !config.openalex.api_key.is_empty(),
+        "patentsview" => !config.patentsview.api_key.is_empty(),
+        "lens" => !config.lens.api_key.is_empty(),
+        "epo" => !config.epo.consumer_key.is_empty() && !config.epo.consumer_secret.is_empty(),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::html_to_text;
+    use super::{SOURCE_REGISTRY, html_to_text, is_source_configured, truncate_abstract};
+    use scitadel_core::config::Config;
+
+    #[test]
+    fn truncate_abstract_shorter_than_limit_untouched() {
+        let (out, truncated) = truncate_abstract("short text", 100);
+        assert_eq!(out, "short text");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn truncate_abstract_over_limit_appends_ellipsis() {
+        let input = "a".repeat(120);
+        let (out, truncated) = truncate_abstract(&input, 100);
+        assert!(truncated);
+        assert!(out.ends_with("..."));
+        assert_eq!(out.chars().count(), 103);
+    }
+
+    #[test]
+    fn truncate_abstract_respects_multibyte_boundary() {
+        // U+2019 is 3 bytes; the truncation must slice on char boundaries.
+        let input = "D\u{2019}Ippolito ".repeat(60);
+        let (out, _) = truncate_abstract(&input, 50);
+        assert_eq!(out.chars().count(), 53);
+    }
 
     #[test]
     fn strips_tags_and_script() {
@@ -729,5 +1189,51 @@ mod tests {
         assert!(out.contains("Hello"));
         assert!(out.contains("world"));
         assert!(!out.contains("var x"));
+    }
+
+    #[test]
+    fn source_registry_covers_every_adapter_name_used_by_build_adapters_full() {
+        // These are the names accepted by scitadel_adapters::build_adapters_full;
+        // the registry must stay in lockstep so the MCP tool stays honest.
+        let expected = [
+            "pubmed",
+            "arxiv",
+            "openalex",
+            "inspire",
+            "patentsview",
+            "lens",
+            "epo",
+        ];
+        for name in expected {
+            assert!(
+                SOURCE_REGISTRY.iter().any(|s| s.name == name),
+                "missing registry entry for adapter {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_flips_on_credential_presence() {
+        let mut config = Config::default();
+        config.openalex.api_key.clear();
+        let oa = SOURCE_REGISTRY
+            .iter()
+            .find(|s| s.name == "openalex")
+            .unwrap();
+        assert!(!is_source_configured(oa, &config));
+        config.openalex.api_key = "lars@example.org".into();
+        assert!(is_source_configured(oa, &config));
+    }
+
+    #[test]
+    fn sources_without_credentials_are_always_configured() {
+        let config = Config::default();
+        for name in ["arxiv", "inspire"] {
+            let src = SOURCE_REGISTRY.iter().find(|s| s.name == name).unwrap();
+            assert!(
+                is_source_configured(src, &config),
+                "{name} should always be configured"
+            );
+        }
     }
 }

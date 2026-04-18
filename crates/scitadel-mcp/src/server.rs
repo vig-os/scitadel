@@ -49,6 +49,40 @@ pub struct AssessPaperRequest {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct CreateAnnotationRequest {
+    #[schemars(description = "Paper ID the annotation anchors to")]
+    pub paper_id: String,
+    #[schemars(description = "Exact quoted passage (TextQuoteSelector body)")]
+    pub quote: String,
+    #[schemars(description = "Note body — markdown allowed")]
+    pub note: String,
+    #[schemars(description = "Identity of the author (e.g. lars, claude-opus-4-7)")]
+    pub author: String,
+    #[schemars(description = "Text immediately before the quote, for anchor disambiguation")]
+    pub prefix: Option<String>,
+    #[schemars(description = "Text immediately after the quote")]
+    pub suffix: Option<String>,
+    #[schemars(description = "Optional research-question ID to link the annotation")]
+    pub question_id: Option<String>,
+    #[schemars(description = "Optional color label (hex or name)")]
+    pub color: Option<String>,
+    #[schemars(description = "Optional tag list")]
+    pub tags: Option<Vec<String>>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct UpdateAnnotationRequest {
+    #[schemars(description = "Annotation ID")]
+    pub id: String,
+    #[schemars(description = "New note body")]
+    pub note: Option<String>,
+    #[schemars(description = "New color")]
+    pub color: Option<String>,
+    #[schemars(description = "Replace tag list wholesale")]
+    pub tags: Option<Vec<String>>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct SaveAssessmentRequest {
     #[schemars(description = "Paper ID")]
     pub paper_id: String,
@@ -70,6 +104,171 @@ impl ScitadelServer {
     #[tool(description = "Search scientific literature across multiple sources")]
     async fn search(&self, #[tool(aggr)] req: SearchRequest) -> Result<String, String> {
         tools::search_tool(req.query, req.sources, req.max_results, req.question_id).await
+    }
+
+    #[tool(
+        description = "List every source scitadel knows about (pubmed, arxiv, openalex, inspire, patentsview, lens, epo) with per-source description, required credential fields, whether credentials are configured in this environment, and rate-limit hints. Read-only; call first to decide which sources to pass to `search`."
+    )]
+    fn list_sources(&self) -> Result<String, String> {
+        tools::list_sources_tool()
+    }
+
+    #[tool(
+        description = "Return the scoring rubric (criteria, 0.0-1.0 scale, response format) as a string. Fetch once at the start of a scoring session and cache; use with `save_assessment` or `assess_paper` for each paper. Avoids the per-paper rubric fetch that `prepare_assessment` does."
+    )]
+    fn get_rubric(&self) -> Result<String, String> {
+        tools::get_rubric_tool()
+    }
+
+    #[tool(
+        description = "Create an annotation anchored to a passage in a paper. Root-level; use `reply_annotation` for replies. `author` is required — pass your identity string (e.g. agent slug)."
+    )]
+    fn create_annotation(
+        &self,
+        #[tool(aggr)] req: CreateAnnotationRequest,
+    ) -> Result<String, String> {
+        tools::create_annotation_tool(
+            &req.paper_id,
+            &req.quote,
+            &req.note,
+            &req.author,
+            req.prefix.as_deref(),
+            req.suffix.as_deref(),
+            req.question_id.as_deref(),
+            req.color.as_deref(),
+            req.tags,
+        )
+    }
+
+    #[tool(
+        description = "Reply to an existing annotation. Inherits paper_id + question_id from the parent; the reply has no anchor of its own."
+    )]
+    fn reply_annotation(
+        &self,
+        #[tool(param)]
+        #[schemars(description = "Parent annotation ID")]
+        parent_id: String,
+        #[tool(param)]
+        #[schemars(description = "Reply body")]
+        note: String,
+        #[tool(param)]
+        #[schemars(description = "Author identity")]
+        author: String,
+    ) -> Result<String, String> {
+        tools::reply_annotation_tool(&parent_id, &note, &author)
+    }
+
+    #[tool(description = "Update note / color / tags on an existing annotation.")]
+    fn update_annotation(
+        &self,
+        #[tool(aggr)] req: UpdateAnnotationRequest,
+    ) -> Result<String, String> {
+        tools::update_annotation_tool(&req.id, req.note.as_deref(), req.color.as_deref(), req.tags)
+    }
+
+    #[tool(
+        description = "Soft-delete an annotation (tombstone). Threads stay intact; list_annotations hides the row."
+    )]
+    fn delete_annotation(
+        &self,
+        #[tool(param)]
+        #[schemars(description = "Annotation ID")]
+        id: String,
+    ) -> Result<String, String> {
+        tools::delete_annotation_tool(&id)
+    }
+
+    #[tool(
+        description = "List annotations for a paper (required). Optional author filter. Returns JSON array with id, parent_id, anchor, note, tags, author, timestamps, and anchor_status."
+    )]
+    fn list_annotations(
+        &self,
+        #[tool(param)]
+        #[schemars(description = "Paper ID to list annotations for")]
+        paper_id: String,
+        #[tool(param)]
+        #[schemars(description = "Optional — only annotations by this author")]
+        author: Option<String>,
+    ) -> Result<String, String> {
+        tools::list_annotations_tool(Some(&paper_id), author.as_deref())
+    }
+
+    #[tool(
+        description = "Mark one or more annotations as seen by `reader`. Repeat calls just update seen_at. Used so an agent can stop re-processing notes it already handled."
+    )]
+    fn mark_seen(
+        &self,
+        #[tool(param)]
+        #[schemars(description = "Annotation IDs to mark seen")]
+        annotation_ids: Vec<String>,
+        #[tool(param)]
+        #[schemars(description = "Reader identity (e.g. agent slug)")]
+        reader: String,
+    ) -> Result<String, String> {
+        tools::mark_seen_tool(annotation_ids, &reader)
+    }
+
+    #[tool(
+        description = "Mark a whole annotation thread (root + replies) as seen by `reader` in one call."
+    )]
+    fn mark_thread_seen(
+        &self,
+        #[tool(param)]
+        #[schemars(description = "Root annotation ID")]
+        root_id: String,
+        #[tool(param)]
+        #[schemars(description = "Reader identity")]
+        reader: String,
+    ) -> Result<String, String> {
+        tools::mark_thread_seen_tool(&root_id, &reader)
+    }
+
+    #[tool(
+        description = "List annotations `reader` has not yet seen (or that were edited since last seen). Optional paper_id scopes the query. Use at session start to pick up human replies from the previous turn."
+    )]
+    fn list_unread(
+        &self,
+        #[tool(param)]
+        #[schemars(description = "Reader identity")]
+        reader: String,
+        #[tool(param)]
+        #[schemars(description = "Optional paper ID filter")]
+        paper_id: Option<String>,
+    ) -> Result<String, String> {
+        tools::list_unread_tool(&reader, paper_id.as_deref())
+    }
+
+    #[tool(
+        description = "Full-text search over stored past searches (FTS5 + Porter stemming). Returns JSON array of matching prior searches sorted by relevance (lower rank = more relevant). Call before running a fresh `search` to detect redundant work."
+    )]
+    fn find_similar_searches(
+        &self,
+        #[tool(param)]
+        #[schemars(description = "Free-text query — FTS5 operators are stripped automatically")]
+        query: String,
+        #[tool(param)]
+        #[schemars(description = "Max hits to return (default 10)")]
+        limit: Option<i64>,
+    ) -> Result<String, String> {
+        tools::find_similar_searches_tool(&query, limit)
+    }
+
+    #[tool(
+        description = "Summarize every paper in a search as JSON in one call: title, authors, year, abstract (truncated), DOI, identifiers. Preferred over iterating `get_paper` per result when scanning a corpus."
+    )]
+    fn summarize_search(
+        &self,
+        #[tool(param)]
+        #[schemars(description = "Search ID")]
+        search_id: String,
+        #[tool(param)]
+        #[schemars(description = "Max papers to return (default 50)")]
+        max_papers: Option<usize>,
+        #[tool(param)]
+        #[schemars(description = "Max chars per abstract before truncation (default 500)")]
+        abstract_char_limit: Option<usize>,
+    ) -> Result<String, String> {
+        tools::summarize_search_tool(&search_id, max_papers, abstract_char_limit)
     }
 
     #[tool(description = "List recent search runs")]
