@@ -152,6 +152,81 @@ impl SqliteAnnotationRepository {
         )?;
         Ok(())
     }
+
+    /// Record that `reader` has seen the current state of each annotation.
+    /// Upserts so repeat calls bump `seen_at`.
+    pub fn mark_seen(&self, annotation_ids: &[&str], reader: &str) -> Result<(), DbError> {
+        if annotation_ids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.db.conn()?;
+        let tx = conn.transaction()?;
+        let now = Utc::now().to_rfc3339();
+        for id in annotation_ids {
+            tx.execute(
+                "INSERT INTO annotation_reads (annotation_id, reader, seen_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(annotation_id, reader) DO UPDATE SET seen_at = excluded.seen_at",
+                params![id, reader, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Mark the thread rooted at `root_id` (root + all live replies) as
+    /// seen by `reader`.
+    pub fn mark_thread_seen(&self, root_id: &str, reader: &str) -> Result<(), DbError> {
+        let replies = self.list_replies(root_id)?;
+        let mut ids: Vec<&str> = replies.iter().map(|a| a.id.as_str()).collect();
+        ids.push(root_id);
+        self.mark_seen(&ids, reader)
+    }
+
+    /// Annotations the `reader` hasn't seen since the last modification.
+    /// Optional `paper_id` scopes the query. Uses a LEFT JOIN so rows
+    /// with no receipt count as unread; rows whose `seen_at` is older
+    /// than `updated_at` also count (the annotation changed since last
+    /// view).
+    pub fn list_unread(
+        &self,
+        reader: &str,
+        paper_id: Option<&str>,
+    ) -> Result<Vec<Annotation>, DbError> {
+        let conn = self.db.conn()?;
+        let (sql, rows) = if let Some(pid) = paper_id {
+            let mut stmt = conn.prepare(
+                "SELECT a.* FROM annotations a
+                 LEFT JOIN annotation_reads r
+                   ON r.annotation_id = a.id AND r.reader = ?1
+                 WHERE a.paper_id = ?2
+                   AND a.deleted_at IS NULL
+                   AND (r.seen_at IS NULL OR r.seen_at < a.updated_at)
+                 ORDER BY a.created_at ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![reader, pid], row_to_annotation)?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>();
+            ("scoped", rows)
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT a.* FROM annotations a
+                 LEFT JOIN annotation_reads r
+                   ON r.annotation_id = a.id AND r.reader = ?1
+                 WHERE a.deleted_at IS NULL
+                   AND (r.seen_at IS NULL OR r.seen_at < a.updated_at)
+                 ORDER BY a.created_at ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![reader], row_to_annotation)?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>();
+            ("all", rows)
+        };
+        let _ = sql; // kept for potential future logging
+        Ok(rows)
+    }
 }
 
 fn row_to_annotation(row: &rusqlite::Row) -> rusqlite::Result<Annotation> {
@@ -380,6 +455,69 @@ mod tests {
             resolve_anchor(&mut a, "nothing to see"),
             AnchorStatus::Orphan
         );
+    }
+
+    // ---- Read-receipt tests ----
+
+    #[test]
+    fn unread_includes_rows_never_seen() {
+        let db = fresh_db_with_paper();
+        let repo = SqliteAnnotationRepository::new(db);
+        let a = sample_root();
+        repo.create(&a).unwrap();
+        let unread = repo.list_unread("lars", Some("p1")).unwrap();
+        assert_eq!(unread.len(), 1);
+    }
+
+    #[test]
+    fn unread_excludes_rows_seen_after_update() {
+        let db = fresh_db_with_paper();
+        let repo = SqliteAnnotationRepository::new(db);
+        let a = sample_root();
+        repo.create(&a).unwrap();
+        repo.mark_seen(&[a.id.as_str()], "lars").unwrap();
+        let unread = repo.list_unread("lars", Some("p1")).unwrap();
+        assert!(unread.is_empty(), "should be no unread after mark_seen");
+    }
+
+    #[test]
+    fn unread_reappears_after_annotation_is_updated() {
+        let db = fresh_db_with_paper();
+        let repo = SqliteAnnotationRepository::new(db);
+        let a = sample_root();
+        repo.create(&a).unwrap();
+        repo.mark_seen(&[a.id.as_str()], "lars").unwrap();
+        // Pause past the 1-second rfc3339 resolution the repo uses.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        repo.update_note(a.id.as_str(), "edited note", None, &[])
+            .unwrap();
+        let unread = repo.list_unread("lars", Some("p1")).unwrap();
+        assert_eq!(unread.len(), 1, "edit should resurface the row as unread");
+    }
+
+    #[test]
+    fn mark_thread_seen_covers_root_and_replies() {
+        let db = fresh_db_with_paper();
+        let repo = SqliteAnnotationRepository::new(db);
+        let root = sample_root();
+        repo.create(&root).unwrap();
+        let reply = Annotation::new_reply(&root, "claude".into(), "follow-up".into());
+        repo.create(&reply).unwrap();
+
+        repo.mark_thread_seen(root.id.as_str(), "lars").unwrap();
+        let unread = repo.list_unread("lars", Some("p1")).unwrap();
+        assert!(unread.is_empty());
+    }
+
+    #[test]
+    fn independent_readers_track_state_independently() {
+        let db = fresh_db_with_paper();
+        let repo = SqliteAnnotationRepository::new(db);
+        let a = sample_root();
+        repo.create(&a).unwrap();
+        repo.mark_seen(&[a.id.as_str()], "lars").unwrap();
+        assert!(repo.list_unread("lars", Some("p1")).unwrap().is_empty());
+        assert_eq!(repo.list_unread("claude", Some("p1")).unwrap().len(), 1);
     }
 
     #[test]

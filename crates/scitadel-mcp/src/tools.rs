@@ -724,6 +724,71 @@ pub fn prepare_batch_assessments_tool(
     Ok(out.join("\n"))
 }
 
+// ---------- Annotations (#49 iter 4 + 5) ----------
+
+/// Record that `reader` has seen the current state of one or more
+/// annotations. Idempotent: repeat calls just bump the `seen_at`.
+pub fn mark_seen_tool(annotation_ids: Vec<String>, reader: &str) -> Result<String, String> {
+    if reader.trim().is_empty() {
+        return Err("reader is required".into());
+    }
+    let refs: Vec<&str> = annotation_ids.iter().map(String::as_str).collect();
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+    repo.mark_seen(&refs, reader).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "Marked {} annotation(s) seen for '{reader}'.",
+        refs.len()
+    ))
+}
+
+/// Mark a whole thread (root + all replies) as seen by `reader`.
+pub fn mark_thread_seen_tool(root_id: &str, reader: &str) -> Result<String, String> {
+    if reader.trim().is_empty() {
+        return Err("reader is required".into());
+    }
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+    repo.mark_thread_seen(root_id, reader)
+        .map_err(|e| e.to_string())?;
+    Ok(format!("Thread {root_id} marked seen for '{reader}'."))
+}
+
+/// List annotations `reader` hasn't seen since the last modification.
+/// Optional `paper_id` scopes the query. Returns the same JSON shape as
+/// `list_annotations` for easy consumption.
+pub fn list_unread_tool(reader: &str, paper_id: Option<&str>) -> Result<String, String> {
+    if reader.trim().is_empty() {
+        return Err("reader is required".into());
+    }
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+    let rows = repo
+        .list_unread(reader, paper_id)
+        .map_err(|e| e.to_string())?;
+
+    let entries: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "id": a.id.as_str(),
+                "parent_id": a.parent_id.as_ref().map(|p| p.as_str()),
+                "paper_id": a.paper_id.as_str(),
+                "question_id": a.question_id.as_ref().map(|q| q.as_str()),
+                "anchor": {
+                    "char_range": a.anchor.char_range,
+                    "quote": a.anchor.quote,
+                    "status": a.anchor.status.as_str(),
+                },
+                "note": a.note,
+                "author": a.author,
+                "updated_at": a.updated_at.to_rfc3339(),
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())
+}
+
 // ---------- Annotations (#49 iter 4) ----------
 
 /// Create a root-level annotation anchored to a passage in a paper.
