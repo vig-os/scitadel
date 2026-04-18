@@ -1,0 +1,122 @@
+name: VHS
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev, main]
+
+env:
+  CARGO_TERM_COLOR: always
+  VHS_VERSION: "0.11.0"
+
+jobs:
+  tapes:
+    name: Run tapes
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install ffmpeg + ttyd
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg ttyd
+
+      - name: Install vhs
+        run: |
+          curl -fsSL \
+            "https://github.com/charmbracelet/vhs/releases/download/v${VHS_VERSION}/vhs_${VHS_VERSION}_amd64.deb" \
+            -o vhs.deb
+          sudo dpkg -i vhs.deb
+          vhs --version
+
+      - name: Build scitadel
+        run: cargo build --release -p scitadel-cli
+
+      - name: Run all tapes
+        run: |
+          set -euo pipefail
+          export PATH="$PWD/target/release:$PATH"
+          shopt -s nullglob
+          tapes=(tests/vhs/*.tape)
+          if [ ${#tapes[@]} -eq 0 ]; then
+            echo "No tapes under tests/vhs/. Nothing to run."
+            exit 0
+          fi
+          mkdir -p tests/vhs/snapshots
+          failed=()
+          for tape in "${tapes[@]}"; do
+            echo "::group::$tape"
+            if vhs "$tape"; then
+              echo "::endgroup::"
+            else
+              echo "::endgroup::"
+              failed+=("$tape")
+            fi
+          done
+          if [ ${#failed[@]} -gt 0 ]; then
+            echo "::error::${#failed[@]} tape(s) failed: ${failed[*]}"
+            exit 1
+          fi
+          echo "All ${#tapes[@]} tape(s) ran cleanly."
+
+      - name: Upload tape artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vhs-snapshots
+          path: tests/vhs/snapshots/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  coverage:
+    name: Tape coverage
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch base ref
+        run: git fetch origin "${{ github.base_ref }}"
+
+      - name: Check that TUI/CLI changes include a VHS tape
+        run: |
+          set -euo pipefail
+          BASE="origin/${{ github.base_ref }}"
+          CHANGED=$(git diff --name-only "$BASE"...HEAD)
+          echo "Changed files:"
+          echo "$CHANGED" | sed 's/^/  /'
+
+          TUI_CHANGED=$(echo "$CHANGED" | grep -E '^crates/scitadel-(tui|cli)/src/' || true)
+          TAPE_CHANGED=$(echo "$CHANGED" | grep -E '^tests/vhs/.*\.tape$' || true)
+
+          if [ -z "$TUI_CHANGED" ]; then
+            echo "No TUI/CLI source touched — tape coverage gate skipped."
+            exit 0
+          fi
+
+          if [ -n "$TAPE_CHANGED" ]; then
+            echo "TUI/CLI changed and at least one tape was added/updated:"
+            echo "$TAPE_CHANGED" | sed 's/^/  /'
+            exit 0
+          fi
+
+          # Escape hatch for infra-only PRs that legitimately don't need a tape.
+          if git log --format=%B "$BASE"..HEAD | grep -qE '\[tape-exempt:'; then
+            echo "Tape exemption found in commit message — allowing:"
+            git log --format=%B "$BASE"..HEAD | grep -E '\[tape-exempt:' | sed 's/^/  /'
+            exit 0
+          fi
+
+          echo "::error::TUI or CLI source changed but no VHS tape was added or updated."
+          echo "Add a tape under tests/vhs/ that exercises the change, or include"
+          echo '[tape-exempt: <reason>] in a commit message if the change is'
+          echo "genuinely not user-visible (refactor, internal helper, etc.)."
+          exit 1
