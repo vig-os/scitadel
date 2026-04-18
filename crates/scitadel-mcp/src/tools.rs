@@ -724,6 +724,34 @@ pub fn prepare_batch_assessments_tool(
     Ok(out.join("\n"))
 }
 
+/// Full-text search over stored search queries. Returns a JSON array of
+/// past searches matching `query` (lower `rank` = more relevant per
+/// BM25). Agents should call this before running a fresh search to
+/// avoid re-doing work that's already in the DB.
+pub fn find_similar_searches_tool(query: &str, limit: Option<i64>) -> Result<String, String> {
+    let limit = limit.unwrap_or(10).max(1);
+    let db = open_db()?;
+    let (_, search_repo, _, _, _) = db.repositories();
+    let hits = search_repo
+        .find_similar(query, limit)
+        .map_err(|e| e.to_string())?;
+
+    let entries: Vec<serde_json::Value> = hits
+        .into_iter()
+        .map(|(s, rank)| {
+            serde_json::json!({
+                "search_id": s.id.as_str(),
+                "query": s.query,
+                "total_papers": s.total_papers,
+                "created_at": s.created_at.to_rfc3339(),
+                "rank": rank,
+            })
+        })
+        .collect();
+
+    serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())
+}
+
 /// Return the scitadel assessment rubric (scoring criteria, score scale,
 /// response format) so an agent can fetch it once and cache, rather than
 /// re-fetching via `prepare_assessment` for every paper it evaluates.
