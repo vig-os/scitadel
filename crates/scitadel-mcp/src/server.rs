@@ -49,6 +49,40 @@ pub struct AssessPaperRequest {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct CreateAnnotationRequest {
+    #[schemars(description = "Paper ID the annotation anchors to")]
+    pub paper_id: String,
+    #[schemars(description = "Exact quoted passage (TextQuoteSelector body)")]
+    pub quote: String,
+    #[schemars(description = "Note body — markdown allowed")]
+    pub note: String,
+    #[schemars(description = "Identity of the author (e.g. lars, claude-opus-4-7)")]
+    pub author: String,
+    #[schemars(description = "Text immediately before the quote, for anchor disambiguation")]
+    pub prefix: Option<String>,
+    #[schemars(description = "Text immediately after the quote")]
+    pub suffix: Option<String>,
+    #[schemars(description = "Optional research-question ID to link the annotation")]
+    pub question_id: Option<String>,
+    #[schemars(description = "Optional color label (hex or name)")]
+    pub color: Option<String>,
+    #[schemars(description = "Optional tag list")]
+    pub tags: Option<Vec<String>>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct UpdateAnnotationRequest {
+    #[schemars(description = "Annotation ID")]
+    pub id: String,
+    #[schemars(description = "New note body")]
+    pub note: Option<String>,
+    #[schemars(description = "New color")]
+    pub color: Option<String>,
+    #[schemars(description = "Replace tag list wholesale")]
+    pub tags: Option<Vec<String>>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct SaveAssessmentRequest {
     #[schemars(description = "Paper ID")]
     pub paper_id: String,
@@ -84,6 +118,79 @@ impl ScitadelServer {
     )]
     fn get_rubric(&self) -> Result<String, String> {
         tools::get_rubric_tool()
+    }
+
+    #[tool(
+        description = "Create an annotation anchored to a passage in a paper. Root-level; use `reply_annotation` for replies. `author` is required — pass your identity string (e.g. agent slug)."
+    )]
+    fn create_annotation(
+        &self,
+        #[tool(aggr)] req: CreateAnnotationRequest,
+    ) -> Result<String, String> {
+        tools::create_annotation_tool(
+            &req.paper_id,
+            &req.quote,
+            &req.note,
+            &req.author,
+            req.prefix.as_deref(),
+            req.suffix.as_deref(),
+            req.question_id.as_deref(),
+            req.color.as_deref(),
+            req.tags,
+        )
+    }
+
+    #[tool(
+        description = "Reply to an existing annotation. Inherits paper_id + question_id from the parent; the reply has no anchor of its own."
+    )]
+    fn reply_annotation(
+        &self,
+        #[tool(param)]
+        #[schemars(description = "Parent annotation ID")]
+        parent_id: String,
+        #[tool(param)]
+        #[schemars(description = "Reply body")]
+        note: String,
+        #[tool(param)]
+        #[schemars(description = "Author identity")]
+        author: String,
+    ) -> Result<String, String> {
+        tools::reply_annotation_tool(&parent_id, &note, &author)
+    }
+
+    #[tool(description = "Update note / color / tags on an existing annotation.")]
+    fn update_annotation(
+        &self,
+        #[tool(aggr)] req: UpdateAnnotationRequest,
+    ) -> Result<String, String> {
+        tools::update_annotation_tool(&req.id, req.note.as_deref(), req.color.as_deref(), req.tags)
+    }
+
+    #[tool(
+        description = "Soft-delete an annotation (tombstone). Threads stay intact; list_annotations hides the row."
+    )]
+    fn delete_annotation(
+        &self,
+        #[tool(param)]
+        #[schemars(description = "Annotation ID")]
+        id: String,
+    ) -> Result<String, String> {
+        tools::delete_annotation_tool(&id)
+    }
+
+    #[tool(
+        description = "List annotations for a paper (required). Optional author filter. Returns JSON array with id, parent_id, anchor, note, tags, author, timestamps, and anchor_status."
+    )]
+    fn list_annotations(
+        &self,
+        #[tool(param)]
+        #[schemars(description = "Paper ID to list annotations for")]
+        paper_id: String,
+        #[tool(param)]
+        #[schemars(description = "Optional — only annotations by this author")]
+        author: Option<String>,
+    ) -> Result<String, String> {
+        tools::list_annotations_tool(Some(&paper_id), author.as_deref())
     }
 
     #[tool(
