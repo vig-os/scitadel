@@ -194,6 +194,51 @@ impl ScitadelServer {
     }
 
     #[tool(
+        description = "Mark one or more annotations as seen by `reader`. Repeat calls just update seen_at. Used so an agent can stop re-processing notes it already handled."
+    )]
+    fn mark_seen(
+        &self,
+        #[tool(param)]
+        #[schemars(description = "Annotation IDs to mark seen")]
+        annotation_ids: Vec<String>,
+        #[tool(param)]
+        #[schemars(description = "Reader identity (e.g. agent slug)")]
+        reader: String,
+    ) -> Result<String, String> {
+        tools::mark_seen_tool(annotation_ids, &reader)
+    }
+
+    #[tool(
+        description = "Mark a whole annotation thread (root + replies) as seen by `reader` in one call."
+    )]
+    fn mark_thread_seen(
+        &self,
+        #[tool(param)]
+        #[schemars(description = "Root annotation ID")]
+        root_id: String,
+        #[tool(param)]
+        #[schemars(description = "Reader identity")]
+        reader: String,
+    ) -> Result<String, String> {
+        tools::mark_thread_seen_tool(&root_id, &reader)
+    }
+
+    #[tool(
+        description = "List annotations `reader` has not yet seen (or that were edited since last seen). Optional paper_id scopes the query. Use at session start to pick up human replies from the previous turn."
+    )]
+    fn list_unread(
+        &self,
+        #[tool(param)]
+        #[schemars(description = "Reader identity")]
+        reader: String,
+        #[tool(param)]
+        #[schemars(description = "Optional paper ID filter")]
+        paper_id: Option<String>,
+    ) -> Result<String, String> {
+        tools::list_unread_tool(&reader, paper_id.as_deref())
+    }
+
+    #[tool(
         description = "Full-text search over stored past searches (FTS5 + Porter stemming). Returns JSON array of matching prior searches sorted by relevance (lower rank = more relevant). Call before running a fresh `search` to detect redundant work."
     )]
     fn find_similar_searches(
