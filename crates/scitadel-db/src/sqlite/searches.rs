@@ -1,8 +1,6 @@
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use scitadel_core::error::CoreError;
-use scitadel_core::models::{
-    PaperId, Search, SearchId, SearchResult, SourceOutcome,
-};
+use scitadel_core::models::{PaperId, Search, SearchId, SearchResult, SourceOutcome};
 use scitadel_core::ports::SearchRepository;
 
 use super::Database;
@@ -154,17 +152,18 @@ impl SearchRepository for SqliteSearchRepository {
     ) -> Result<(Vec<String>, Vec<String>), CoreError> {
         let conn = self.db.conn()?;
 
-        let get_paper_ids = |search_id: &str| -> Result<std::collections::HashSet<String>, DbError> {
-            let mut stmt = conn
-                .prepare("SELECT DISTINCT paper_id FROM search_results WHERE search_id = ?1")
-                .map_err(DbError::Sqlite)?;
-            let ids: std::collections::HashSet<String> = stmt
-                .query_map(params![search_id], |row| row.get(0))
-                .map_err(DbError::Sqlite)?
-                .filter_map(Result::ok)
-                .collect();
-            Ok(ids)
-        };
+        let get_paper_ids =
+            |search_id: &str| -> Result<std::collections::HashSet<String>, DbError> {
+                let mut stmt = conn
+                    .prepare("SELECT DISTINCT paper_id FROM search_results WHERE search_id = ?1")
+                    .map_err(DbError::Sqlite)?;
+                let ids: std::collections::HashSet<String> = stmt
+                    .query_map(params![search_id], |row| row.get(0))
+                    .map_err(DbError::Sqlite)?
+                    .filter_map(Result::ok)
+                    .collect();
+                Ok(ids)
+            };
 
         let papers_a = get_paper_ids(search_id_a).map_err(Into::<CoreError>::into)?;
         let papers_b = get_paper_ids(search_id_b).map_err(Into::<CoreError>::into)?;

@@ -1,8 +1,8 @@
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem};
-use ratatui::Frame;
 
 use crate::tasks::{Task, TaskKind, TaskStatus};
 use crate::views::util::truncate;
@@ -19,8 +19,7 @@ pub fn panel_height(tasks: &[Task]) -> u16 {
 
 pub fn draw(frame: &mut Frame, area: Rect, tasks: &[Task]) {
     let items: Vec<ListItem<'_>> = tasks.iter().map(render_row).collect();
-    let list = List::new(items)
-        .block(Block::default().title(" Tasks ").borders(Borders::ALL));
+    let list = List::new(items).block(Block::default().title(" Tasks ").borders(Borders::ALL));
     frame.render_widget(list, area);
 }
 
@@ -44,10 +43,7 @@ fn render_row(task: &Task) -> ListItem<'_> {
             access,
             path,
         } => {
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("saved");
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("saved");
             format!("{format} · {access} · {name}")
         }
         TaskStatus::Failed(e) => format!("failed: {}", truncate(e, 60)),
@@ -60,10 +56,7 @@ fn render_row(task: &Task) -> ListItem<'_> {
         ),
         Span::raw(title),
         Span::raw("  "),
-        Span::styled(
-            format!("[{ref_id}] "),
-            Style::default().fg(Color::Blue),
-        ),
+        Span::styled(format!("[{ref_id}] "), Style::default().fg(Color::Blue)),
         Span::styled(status_tail, Style::default().fg(Color::DarkGray)),
     ]))
 }

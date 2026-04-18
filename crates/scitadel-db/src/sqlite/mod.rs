@@ -1,20 +1,20 @@
-mod migrations;
-mod papers;
-mod searches;
-mod questions;
 mod assessments;
 mod citations;
+mod migrations;
+mod papers;
+mod questions;
+mod searches;
 
-pub use migrations::run_migrations;
-pub use papers::SqlitePaperRepository;
-pub use searches::SqliteSearchRepository;
-pub use questions::SqliteQuestionRepository;
 pub use assessments::SqliteAssessmentRepository;
 pub use citations::SqliteCitationRepository;
+pub use migrations::run_migrations;
+pub use papers::SqlitePaperRepository;
+pub use questions::SqliteQuestionRepository;
+pub use searches::SqliteSearchRepository;
 
-use std::path::Path;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
+use std::path::Path;
 
 use crate::error::DbError;
 
@@ -38,37 +38,31 @@ impl Database {
                 .map_err(|e| DbError::Migration(format!("failed to create db directory: {e}")))?;
         }
 
-        let manager = SqliteConnectionManager::file(path)
-            .with_init(|conn| {
-                conn.execute_batch(
-                    "PRAGMA journal_mode=WAL;
+        let manager = SqliteConnectionManager::file(path).with_init(|conn| {
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL;
                      PRAGMA foreign_keys=ON;
                      PRAGMA busy_timeout=5000;",
-                )?;
-                Ok(())
-            });
+            )?;
+            Ok(())
+        });
 
-        let pool = Pool::builder()
-            .max_size(4)
-            .build(manager)?;
+        let pool = Pool::builder().max_size(4).build(manager)?;
 
         Ok(Self { pool })
     }
 
     /// Open an in-memory database (for testing).
     pub fn open_in_memory() -> Result<Self, DbError> {
-        let manager = SqliteConnectionManager::memory()
-            .with_init(|conn| {
-                conn.execute_batch(
-                    "PRAGMA journal_mode=WAL;
+        let manager = SqliteConnectionManager::memory().with_init(|conn| {
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL;
                      PRAGMA foreign_keys=ON;",
-                )?;
-                Ok(())
-            });
+            )?;
+            Ok(())
+        });
 
-        let pool = Pool::builder()
-            .max_size(1)
-            .build(manager)?;
+        let pool = Pool::builder().max_size(1).build(manager)?;
 
         Ok(Self { pool })
     }
@@ -85,7 +79,9 @@ impl Database {
     }
 
     /// Create all repository instances sharing this database.
-    pub fn repositories(&self) -> (
+    pub fn repositories(
+        &self,
+    ) -> (
         SqlitePaperRepository,
         SqliteSearchRepository,
         SqliteQuestionRepository,

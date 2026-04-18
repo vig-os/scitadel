@@ -143,8 +143,7 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Self {
-        let workspace =
-            find_workspace_root().unwrap_or_else(|| std::env::current_dir().unwrap());
+        let workspace = find_workspace_root().unwrap_or_else(|| std::env::current_dir().unwrap());
         Self {
             db_path: default_db_path(&workspace),
             default_sources: default_sources(),
@@ -199,8 +198,7 @@ fn default_db_path(workspace: &Path) -> PathBuf {
 pub fn load_config() -> Config {
     use crate::credentials::resolve;
 
-    let workspace =
-        find_workspace_root().unwrap_or_else(|| std::env::current_dir().unwrap());
+    let workspace = find_workspace_root().unwrap_or_else(|| std::env::current_dir().unwrap());
     let db_path = default_db_path(&workspace);
 
     // Try loading TOML config file as base
@@ -259,15 +257,15 @@ pub fn load_config() -> Config {
     if let Ok(model) = std::env::var("SCITADEL_CHAT_MODEL") {
         config.chat.model = model;
     }
-    if let Ok(tokens) = std::env::var("SCITADEL_CHAT_MAX_TOKENS") {
-        if let Ok(v) = tokens.parse() {
-            config.chat.max_tokens = v;
-        }
+    if let Ok(tokens) = std::env::var("SCITADEL_CHAT_MAX_TOKENS")
+        && let Ok(v) = tokens.parse()
+    {
+        config.chat.max_tokens = v;
     }
-    if let Ok(conc) = std::env::var("SCITADEL_SCORING_CONCURRENCY") {
-        if let Ok(v) = conc.parse() {
-            config.chat.scoring_concurrency = v;
-        }
+    if let Ok(conc) = std::env::var("SCITADEL_SCORING_CONCURRENCY")
+        && let Ok(v) = conc.parse()
+    {
+        config.chat.scoring_concurrency = v;
     }
 
     config

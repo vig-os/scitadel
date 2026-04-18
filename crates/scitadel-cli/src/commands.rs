@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use scitadel_core::config::load_config;
 use scitadel_core::credentials;
@@ -23,7 +23,10 @@ fn resolve_prefix<'a, T, F>(items: &'a [T], prefix: &str, get_id: F) -> Result<&
 where
     F: Fn(&T) -> &str,
 {
-    let matches: Vec<&T> = items.iter().filter(|item| get_id(item).starts_with(prefix)).collect();
+    let matches: Vec<&T> = items
+        .iter()
+        .filter(|item| get_id(item).starts_with(prefix))
+        .collect();
     match matches.len() {
         0 => bail!("no match for prefix '{prefix}'"),
         1 => Ok(matches[0]),
@@ -167,7 +170,10 @@ pub async fn search(
             && let Ok(Some(existing)) = paper_repo.find_by_doi(doi)
             && existing.id != paper.id
         {
-            id_map.insert(paper.id.as_str().to_string(), existing.id.as_str().to_string());
+            id_map.insert(
+                paper.id.as_str().to_string(),
+                existing.id.as_str().to_string(),
+            );
         }
     }
 
@@ -347,7 +353,11 @@ pub fn question_add_terms(
     term.query_string.clone_from(&query_str);
     q_repo.save_term(&term)?;
 
-    println!("  Terms added to question {}: {:?}", question.id.short(), terms);
+    println!(
+        "  Terms added to question {}: {:?}",
+        question.id.short(),
+        terms
+    );
     println!("  Query string: {query_str}");
     Ok(())
 }
@@ -384,7 +394,11 @@ pub async fn assess(
         .filter_map(|id| paper_repo.get(id).ok().flatten())
         .collect();
 
-    println!("Scoring {} papers against: \"{}\"", papers.len(), question.text);
+    println!(
+        "Scoring {} papers against: \"{}\"",
+        papers.len(),
+        question.text
+    );
     println!("  Model: {model}  Temperature: {temperature}  Backend: {scorer_backend}");
 
     let backend = match scorer_backend {
@@ -459,10 +473,8 @@ pub async fn download(doi: &str, output_dir: Option<PathBuf>) -> Result<()> {
     let config = load_config();
     let out_dir = output_dir.unwrap_or_else(|| config.papers_dir());
 
-    let downloader = scitadel_adapters::download::PaperDownloader::new(
-        config.openalex.api_key.clone(),
-        60.0,
-    );
+    let downloader =
+        scitadel_adapters::download::PaperDownloader::new(config.openalex.api_key.clone(), 60.0);
 
     println!("Downloading paper: {doi}");
     println!("  Output dir: {}", out_dir.display());
@@ -504,8 +516,7 @@ pub fn auth_login(source: &str) -> Result<()> {
 
     for key in creds.keys {
         let value = prompt_credential(key.label, key.secret)?;
-        credentials::store(key.keychain_key, &value)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        credentials::store(key.keychain_key, &value).map_err(|e| anyhow::anyhow!("{e}"))?;
         println!("  Stored: {}", key.keychain_key);
     }
 
@@ -542,7 +553,11 @@ pub fn auth_status() -> Result<()> {
         for key in creds.keys {
             let loc = if credentials::get_keychain(key.keychain_key).is_some() {
                 "keychain"
-            } else if std::env::var(key.env_var).ok().filter(|v| !v.is_empty()).is_some() {
+            } else if std::env::var(key.env_var)
+                .ok()
+                .as_ref()
+                .is_some_and(|v| !v.is_empty())
+            {
                 "env"
             } else {
                 "missing"
@@ -563,10 +578,7 @@ fn find_source_credentials(source: &str) -> Result<&'static credentials::SourceC
         .copied()
         .ok_or_else(|| {
             let names: Vec<&str> = credentials::ALL_SOURCES.iter().map(|c| c.source).collect();
-            anyhow::anyhow!(
-                "Unknown source '{source}'. Available: {}",
-                names.join(", ")
-            )
+            anyhow::anyhow!("Unknown source '{source}'. Available: {}", names.join(", "))
         })
 }
 

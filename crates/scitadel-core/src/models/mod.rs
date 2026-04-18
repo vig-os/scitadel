@@ -1,16 +1,16 @@
-mod paper;
-mod search;
-mod question;
 mod assessment;
 mod citation;
 mod doi;
+mod paper;
+mod question;
+mod search;
 
-pub use paper::{Paper, CandidatePaper};
-pub use doi::{validate_doi, normalize_doi, doi_to_filename};
-pub use search::{Search, SearchResult, SourceOutcome, SourceStatus};
-pub use question::{ResearchQuestion, SearchTerm};
 pub use assessment::Assessment;
 pub use citation::{Citation, CitationDirection, SnowballRun};
+pub use doi::{doi_to_filename, normalize_doi, validate_doi};
+pub use paper::{CandidatePaper, Paper};
+pub use question::{ResearchQuestion, SearchTerm};
+pub use search::{Search, SearchResult, SourceOutcome, SourceStatus};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

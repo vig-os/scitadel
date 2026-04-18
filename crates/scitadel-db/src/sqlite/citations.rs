@@ -1,4 +1,4 @@
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use scitadel_core::error::CoreError;
 use scitadel_core::models::{
     Citation, CitationDirection, PaperId, QuestionId, SearchId, SnowballRun, SnowballRunId,
@@ -75,7 +75,10 @@ impl CitationRepository for SqliteCitationRepository {
                 citation.direction.to_string(),
                 citation.discovered_by,
                 citation.depth,
-                citation.snowball_run_id.as_ref().map(|id| id.as_str().to_string()),
+                citation
+                    .snowball_run_id
+                    .as_ref()
+                    .map(|id| id.as_str().to_string()),
             ],
         )
         .map_err(DbError::Sqlite)?;
@@ -104,9 +107,7 @@ impl CitationRepository for SqliteCitationRepository {
     fn get_references(&self, paper_id: &str) -> Result<Vec<Citation>, CoreError> {
         let conn = self.db.conn()?;
         let mut stmt = conn
-            .prepare(
-                "SELECT * FROM citations WHERE source_paper_id = ?1 AND direction = ?2",
-            )
+            .prepare("SELECT * FROM citations WHERE source_paper_id = ?1 AND direction = ?2")
             .map_err(DbError::Sqlite)?;
         let citations = stmt
             .query_map(
@@ -122,9 +123,7 @@ impl CitationRepository for SqliteCitationRepository {
     fn get_citations(&self, paper_id: &str) -> Result<Vec<Citation>, CoreError> {
         let conn = self.db.conn()?;
         let mut stmt = conn
-            .prepare(
-                "SELECT * FROM citations WHERE target_paper_id = ?1 AND direction = ?2",
-            )
+            .prepare("SELECT * FROM citations WHERE target_paper_id = ?1 AND direction = ?2")
             .map_err(DbError::Sqlite)?;
         let citations = stmt
             .query_map(
@@ -236,9 +235,11 @@ mod tests {
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].target_paper_id, paper_b.id);
 
-        assert!(citation_repo
-            .exists(paper_a.id.as_str(), paper_b.id.as_str(), "references")
-            .unwrap());
+        assert!(
+            citation_repo
+                .exists(paper_a.id.as_str(), paper_b.id.as_str(), "references")
+                .unwrap()
+        );
     }
 
     #[test]

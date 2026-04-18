@@ -1,12 +1,12 @@
-pub mod error;
-pub mod pubmed;
 pub mod arxiv;
-pub mod openalex;
-pub mod inspire;
-pub mod patentsview;
-pub mod lens;
-pub mod epo;
 pub mod download;
+pub mod epo;
+pub mod error;
+pub mod inspire;
+pub mod lens;
+pub mod openalex;
+pub mod patentsview;
+pub mod pubmed;
 
 use scitadel_core::ports::SourceAdapter;
 

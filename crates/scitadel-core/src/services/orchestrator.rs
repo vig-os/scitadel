@@ -22,9 +22,7 @@ async fn run_adapter(
                 let count = candidates.len() as i32;
                 info!(
                     source = adapter.name(),
-                    count,
-                    elapsed_ms,
-                    "Adapter returned results"
+                    count, elapsed_ms, "Adapter returned results"
                 );
                 return (
                     candidates,
@@ -149,8 +147,7 @@ mod tests {
             _max_results: usize,
         ) -> Result<Vec<CandidatePaper>, CoreError> {
             if self.should_fail {
-                Err(CoreError::Adapter(self.name.clone(), "mock failure".into(),
-                ))
+                Err(CoreError::Adapter(self.name.clone(), "mock failure".into()))
             } else {
                 Ok(self.results.clone())
             }
@@ -190,8 +187,16 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(search.source_outcomes.len(), 2);
 
-        let good = search.source_outcomes.iter().find(|o| o.source == "good").unwrap();
-        let bad = search.source_outcomes.iter().find(|o| o.source == "bad").unwrap();
+        let good = search
+            .source_outcomes
+            .iter()
+            .find(|o| o.source == "good")
+            .unwrap();
+        let bad = search
+            .source_outcomes
+            .iter()
+            .find(|o| o.source == "bad")
+            .unwrap();
         assert_eq!(good.status, SourceStatus::Success);
         assert_eq!(bad.status, SourceStatus::Failed);
     }

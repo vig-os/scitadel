@@ -1,7 +1,7 @@
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
-use ratatui::Frame;
 
 use scitadel_core::models::Paper;
 
@@ -36,7 +36,9 @@ fn render_paper_table(
     title: &str,
 ) {
     if papers.is_empty() {
-        let block = Block::default().title(title.to_string()).borders(Borders::ALL);
+        let block = Block::default()
+            .title(title.to_string())
+            .borders(Borders::ALL);
         let empty = Paragraph::new("No papers found.").block(block);
         frame.render_widget(empty, area);
         return;
@@ -59,9 +61,7 @@ fn render_paper_table(
         .enumerate()
         .map(|(i, p)| {
             let authors = format_authors(&p.authors);
-            let year = p
-                .year
-                .map_or_else(|| "—".to_string(), |y| y.to_string());
+            let year = p.year.map_or_else(|| "—".to_string(), |y| y.to_string());
 
             Row::new(vec![
                 Cell::from((i + 1).to_string()),
@@ -81,7 +81,11 @@ fn render_paper_table(
 
     let table = Table::new(rows, widths)
         .header(header)
-        .block(Block::default().title(title.to_string()).borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(title.to_string())
+                .borders(Borders::ALL),
+        )
         .row_highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
@@ -101,4 +105,3 @@ fn format_authors(authors: &[String]) -> String {
         _ => format!("{}, {} et al.", authors[0], authors[1]),
     }
 }
-

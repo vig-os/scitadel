@@ -221,7 +221,10 @@ mod tests {
         assert_eq!(c.year, Some(2023));
         assert_eq!(c.authors, vec!["Alice Smith", "Bob Jones"]);
         assert_eq!(c.journal, Some("Quantum Corp (utility B2)".to_string()));
-        assert_eq!(c.url, Some("https://patents.google.com/patent/US11234567".to_string()));
+        assert_eq!(
+            c.url,
+            Some("https://patents.google.com/patent/US11234567".to_string())
+        );
         assert_eq!(c.rank, Some(1));
     }
 

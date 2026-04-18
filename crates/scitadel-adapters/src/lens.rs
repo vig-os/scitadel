@@ -107,10 +107,7 @@ impl SourceAdapter for LensAdapter {
 }
 
 fn patent_to_candidate(patent: &serde_json::Value, rank: i32) -> CandidatePaper {
-    let lens_id = patent
-        .get("lens_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let lens_id = patent.get("lens_id").and_then(|v| v.as_str()).unwrap_or("");
 
     let doc_number = patent
         .get("doc_number")
@@ -148,31 +145,31 @@ fn patent_to_candidate(patent: &serde_json::Value, rank: i32) -> CandidatePaper 
     // Extract non-patent literature citations (links patents to scholarly papers)
     let npl_citations = extract_npl_citations(patent);
 
-    let source_id = if !lens_id.is_empty() {
-        lens_id.to_string()
-    } else {
+    let source_id = if lens_id.is_empty() {
         doc_number.to_string()
+    } else {
+        lens_id.to_string()
     };
 
-    let url = if !lens_id.is_empty() {
-        Some(format!("https://www.lens.org/lens/patent/{lens_id}"))
-    } else {
+    let url = if lens_id.is_empty() {
         None
+    } else {
+        Some(format!("https://www.lens.org/lens/patent/{lens_id}"))
     };
 
     let mut raw = patent.clone();
-    if !npl_citations.is_empty() {
-        if let Some(obj) = raw.as_object_mut() {
-            obj.insert(
-                "npl_citations".into(),
-                serde_json::Value::Array(
-                    npl_citations
-                        .iter()
-                        .map(|c| serde_json::Value::String(c.clone()))
-                        .collect(),
-                ),
-            );
-        }
+    if !npl_citations.is_empty()
+        && let Some(obj) = raw.as_object_mut()
+    {
+        obj.insert(
+            "npl_citations".into(),
+            serde_json::Value::Array(
+                npl_citations
+                    .iter()
+                    .map(|c| serde_json::Value::String(c.clone()))
+                    .collect(),
+            ),
+        );
     }
 
     CandidatePaper {

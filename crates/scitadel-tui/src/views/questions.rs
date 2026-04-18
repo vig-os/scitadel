@@ -1,7 +1,7 @@
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
-use ratatui::Frame;
 
 use crate::data::DataStore;
 use crate::views::util::truncate;
@@ -35,10 +35,7 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, selected: usize) {
     let rows: Vec<Row<'_>> = questions
         .iter()
         .map(|q| {
-            let term_count = data
-                .load_terms(q.id.as_str())
-                .map(|t| t.len())
-                .unwrap_or(0);
+            let term_count = data.load_terms(q.id.as_str()).map_or(0, |t| t.len());
 
             Row::new(vec![
                 Cell::from(q.id.short().to_string()),
@@ -73,4 +70,3 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, selected: usize) {
     state.select(Some(selected));
     frame.render_stateful_widget(table, area, &mut state);
 }
-

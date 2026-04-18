@@ -32,8 +32,7 @@ impl SourceAdapter for OpenAlexAdapter {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs_f64(self.timeout))
             .build()
-            .map_err(|e| CoreError::Adapter("openalex".into(), e.to_string(),
-            ))?;
+            .map_err(|e| CoreError::Adapter("openalex".into(), e.to_string()))?;
 
         let mut params = vec![
             ("search", query.to_string()),
@@ -48,11 +47,12 @@ impl SourceAdapter for OpenAlexAdapter {
             .query(&params)
             .send()
             .await
-            .map_err(|e| CoreError::Adapter("openalex".into(), e.to_string(),
-            ))?;
+            .map_err(|e| CoreError::Adapter("openalex".into(), e.to_string()))?;
 
-        let data: serde_json::Value = resp.json().await.map_err(|e| CoreError::Adapter("openalex".into(), e.to_string(),
-        ))?;
+        let data: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| CoreError::Adapter("openalex".into(), e.to_string()))?;
 
         let works = data
             .get("results")

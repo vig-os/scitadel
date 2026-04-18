@@ -43,7 +43,10 @@ impl SqlitePaperRepository {
 
     /// If a paper with the same DOI already exists, return a clone with the existing ID
     /// so the upsert merges into the existing row instead of violating the DOI unique index.
-    fn resolve_doi_conflict(conn: &rusqlite::Connection, paper: &Paper) -> Result<Paper, CoreError> {
+    fn resolve_doi_conflict(
+        conn: &rusqlite::Connection,
+        paper: &Paper,
+    ) -> Result<Paper, CoreError> {
         if let Some(doi) = &paper.doi {
             let existing_id: Option<String> = conn
                 .query_row(
@@ -62,7 +65,10 @@ impl SqlitePaperRepository {
         Ok(paper.clone())
     }
 
-    fn resolve_doi_conflict_tx(tx: &rusqlite::Transaction<'_>, paper: &Paper) -> Result<Paper, CoreError> {
+    fn resolve_doi_conflict_tx(
+        tx: &rusqlite::Transaction<'_>,
+        paper: &Paper,
+    ) -> Result<Paper, CoreError> {
         if let Some(doi) = &paper.doi {
             let existing_id: Option<String> = tx
                 .query_row(
@@ -338,7 +344,11 @@ mod tests {
         let loaded = repo.find_by_doi("10.1234/conflict").unwrap().unwrap();
         assert_eq!(loaded.id, paper1.id, "should reuse original paper ID");
         assert_eq!(loaded.title, "Updated Title", "should update title");
-        assert_eq!(loaded.arxiv_id, Some("2301.99999".to_string()), "should merge arxiv_id");
+        assert_eq!(
+            loaded.arxiv_id,
+            Some("2301.99999".to_string()),
+            "should merge arxiv_id"
+        );
     }
 
     #[test]
@@ -419,14 +429,28 @@ mod tests {
             },
         ];
         let (papers_2, results_2) = deduplicate(&candidates_2, 0.85);
-        assert_eq!(papers_2.len(), 3, "dedup sees them as distinct (different IDs)");
+        assert_eq!(
+            papers_2.len(),
+            3,
+            "dedup sees them as distinct (different IDs)"
+        );
 
         let remap_2 = repo.save_many(&papers_2).unwrap();
-        assert_eq!(remap_2.len(), 2, "alpha and gamma should remap to existing IDs");
+        assert_eq!(
+            remap_2.len(),
+            2,
+            "alpha and gamma should remap to existing IDs"
+        );
 
         // Verify the remap points to the original paper IDs
-        let alpha_original = papers_1.iter().find(|p| p.doi.as_deref() == Some("10.1000/alpha")).unwrap();
-        let alpha_new = papers_2.iter().find(|p| p.doi.as_deref() == Some("10.1000/alpha")).unwrap();
+        let alpha_original = papers_1
+            .iter()
+            .find(|p| p.doi.as_deref() == Some("10.1000/alpha"))
+            .unwrap();
+        let alpha_new = papers_2
+            .iter()
+            .find(|p| p.doi.as_deref() == Some("10.1000/alpha"))
+            .unwrap();
         assert_eq!(remap_2[&alpha_new.id], alpha_original.id);
 
         // Verify DB state: should have 4 papers total, not 6
@@ -436,7 +460,11 @@ mod tests {
         // Verify metadata was merged
         let alpha = repo.find_by_doi("10.1000/alpha").unwrap().unwrap();
         assert_eq!(alpha.id, alpha_original.id, "kept original ID");
-        assert_eq!(alpha.arxiv_id, Some("2301.00001".into()), "merged arxiv_id from second search");
+        assert_eq!(
+            alpha.arxiv_id,
+            Some("2301.00001".into()),
+            "merged arxiv_id from second search"
+        );
 
         // Verify search_results can be remapped correctly
         for sr in &results_2 {
