@@ -6,12 +6,14 @@ const MIGRATION_001: &str = include_str!("../../migrations/001_initial.sql");
 const MIGRATION_002: &str = include_str!("../../migrations/002_citations.sql");
 const MIGRATION_003: &str = include_str!("../../migrations/003_full_text.sql");
 const MIGRATION_004: &str = include_str!("../../migrations/004_paper_state.sql");
+const MIGRATION_005: &str = include_str!("../../migrations/005_annotations.sql");
 
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, MIGRATION_001),
     (2, MIGRATION_002),
     (3, MIGRATION_003),
     (4, MIGRATION_004),
+    (5, MIGRATION_005),
 ];
 
 /// Run all pending migrations, skipping already-applied ones.
@@ -80,6 +82,8 @@ mod tests {
         assert!(tables.contains(&"citations".to_string()));
         assert!(tables.contains(&"snowball_runs".to_string()));
         assert!(tables.contains(&"paper_state".to_string()));
+        assert!(tables.contains(&"annotations".to_string()));
+        assert!(tables.contains(&"annotation_reads".to_string()));
         assert!(tables.contains(&"schema_version".to_string()));
     }
 }
