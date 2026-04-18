@@ -26,6 +26,9 @@ pub enum TaskStatus {
         path: PathBuf,
         format: DownloadFormat,
         access: AccessStatus,
+        /// Live publisher URL if the download went through one; used by the
+        /// view to show a "try publisher" hint when the result is paywalled.
+        publisher_url: Option<String>,
     },
     Failed(String),
 }
@@ -75,6 +78,7 @@ pub fn spawn_download_paper(
                 path: result.path,
                 format: result.format,
                 access: result.access,
+                publisher_url: result.publisher_url,
             },
             Err(e) => TaskStatus::Failed(e.to_string()),
         };

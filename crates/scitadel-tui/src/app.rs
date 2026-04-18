@@ -77,13 +77,19 @@ pub struct App {
     pub tasks: Vec<Task>,
     pub unpaywall_email: String,
     pub papers_dir: PathBuf,
+    pub show_institutional_hint: bool,
 
     task_tx: mpsc::UnboundedSender<TaskUpdate>,
     task_rx: mpsc::UnboundedReceiver<TaskUpdate>,
 }
 
 impl App {
-    fn new(data: DataStore, unpaywall_email: String, papers_dir: PathBuf) -> Self {
+    fn new(
+        data: DataStore,
+        unpaywall_email: String,
+        papers_dir: PathBuf,
+        show_institutional_hint: bool,
+    ) -> Self {
         let (task_tx, task_rx) = mpsc::unbounded_channel();
         Self {
             tab: Tab::Searches,
@@ -96,6 +102,7 @@ impl App {
             tasks: Vec::new(),
             unpaywall_email,
             papers_dir,
+            show_institutional_hint,
             task_tx,
             task_rx,
         }
@@ -268,9 +275,14 @@ impl App {
     }
 }
 
-pub fn run(db_path: &Path, unpaywall_email: String, papers_dir: PathBuf) -> Result<()> {
+pub fn run(
+    db_path: &Path,
+    unpaywall_email: String,
+    papers_dir: PathBuf,
+    show_institutional_hint: bool,
+) -> Result<()> {
     let data = DataStore::open(db_path)?;
-    let mut app = App::new(data, unpaywall_email, papers_dir);
+    let mut app = App::new(data, unpaywall_email, papers_dir, show_institutional_hint);
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -357,7 +369,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     }
 
     if task_panel_height > 0 {
-        tasks_view::draw(frame, chunks[2], &app.tasks);
+        tasks_view::draw(frame, chunks[2], &app.tasks, app.show_institutional_hint);
     }
 
     let help_text = match &app.overlay {

@@ -98,6 +98,24 @@ fn default_scoring_concurrency() -> u32 {
     5
 }
 
+/// UI/UX preferences (TUI-only today; extensible for future surfaces).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiConfig {
+    /// When a download lands on a paywalled publisher page, show the live URL
+    /// plus a note that an institutional IP range (e.g. university VPN) may
+    /// grant access. Disable for headless / CI runs.
+    #[serde(default = "default_true")]
+    pub show_institutional_hint: bool,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            show_institutional_hint: true,
+        }
+    }
+}
+
 /// Top-level application configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -120,6 +138,8 @@ pub struct Config {
     pub epo: EpoConfig,
     #[serde(default)]
     pub chat: ChatConfig,
+    #[serde(default)]
+    pub ui: UiConfig,
 }
 
 fn default_sources() -> Vec<String> {
@@ -155,6 +175,7 @@ impl Default for Config {
             lens: SourceConfig::default(),
             epo: EpoConfig::default(),
             chat: ChatConfig::default(),
+            ui: UiConfig::default(),
         }
     }
 }
