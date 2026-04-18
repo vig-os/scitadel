@@ -3,16 +3,8 @@ name: Rust CI
 on:
   push:
     branches: [main, dev, "rust-rewrite*"]
-    paths:
-      - 'crates/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
   pull_request:
     branches: [main, dev]
-    paths:
-      - 'crates/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
 
 env:
   CARGO_TERM_COLOR: always
