@@ -241,3 +241,7 @@ vscode-scitadel/
 .direnv/
 result
 result-*
+
+# VHS tape outputs (v1 has no golden-file comparison; tapes are run locally).
+# Re-enable when structural-similarity snapshotting lands.
+tests/vhs/snapshots/

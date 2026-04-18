@@ -35,6 +35,37 @@ security:
     cargo deny check
 
 # ===============================================================================
+# VHS TAPES (TUI walkthrough tests)
+# ===============================================================================
+
+# Run every tape in tests/vhs/ (requires vhs binary; available in nix devshell).
+[group('vhs')]
+vhs:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    shopt -s nullglob
+    tapes=(tests/vhs/*.tape)
+    if [ ${#tapes[@]} -eq 0 ]; then
+        echo "no tapes found under tests/vhs/"
+        exit 0
+    fi
+    mkdir -p tests/vhs/snapshots
+    for tape in "${tapes[@]}"; do
+        echo "=== $(basename "$tape") ==="
+        vhs "$tape"
+    done
+
+# Run a single tape by name (without .tape suffix). Example: just vhs-one example
+[group('vhs')]
+vhs-one name:
+    vhs tests/vhs/{{ name }}.tape
+
+# Alias for rerunning tapes and overwriting committed snapshots.
+[group('vhs')]
+vhs-update: vhs
+    @echo "Snapshots updated. Review with: git diff tests/vhs/snapshots/"
+
+# ===============================================================================
 # CONDUCTOR (agent orchestrator)
 # ===============================================================================
 

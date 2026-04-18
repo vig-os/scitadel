@@ -16,6 +16,10 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/vig-os/scitadel"
+homepage = "https://github.com/vig-os/scitadel"
+authors = ["scitadel contributors"]
+keywords = ["literature", "science", "research", "bibtex", "cli"]
+categories = ["command-line-utilities", "science"]
 
 [workspace.dependencies]
 # Core

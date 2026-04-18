@@ -40,6 +40,7 @@
 <!-- Describe the tests you ran and how to verify your changes -->
 - [ ] Tests pass locally (`just test`)
 - [ ] Manual testing performed (describe below)
+- [ ] VHS tape added or updated for user-visible TUI/CLI changes (`just vhs`) — or `[tape-exempt: <reason>]` is included in a commit message for non-user-visible internal work
 
 ### Manual Testing Details
 

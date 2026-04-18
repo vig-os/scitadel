@@ -47,16 +47,178 @@ pub fn tui() -> Result<()> {
     let config = load_config();
     let email = config.openalex.api_key.clone();
     let papers_dir = config.papers_dir();
-    scitadel_tui::run(&config.db_path, email, papers_dir)?;
+    let reader = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
+    scitadel_tui::run(
+        &config.db_path,
+        email,
+        papers_dir,
+        config.ui.show_institutional_hint,
+        reader,
+    )?;
     Ok(())
 }
 
-pub fn init(db_path: Option<PathBuf>) -> Result<()> {
-    let config = load_config();
-    let path = db_path.unwrap_or(config.db_path);
-    let db = Database::open(&path).context("failed to open database")?;
+/// Options for the `init` wizard — forwarded from the CLI.
+#[derive(Debug, Default)]
+pub struct InitOptions {
+    pub db_path: Option<PathBuf>,
+    pub email: Option<String>,
+    pub sources: Option<Vec<String>>,
+    /// Non-interactive: never prompt. Missing values keep their existing
+    /// or default config value silently.
+    pub yes: bool,
+}
+
+pub fn init(opts: InitOptions) -> Result<()> {
+    let mut config = load_config();
+
+    // Resolve db path early so we can report it at the end.
+    if let Some(p) = opts.db_path.clone() {
+        config.db_path = p;
+    }
+
+    // Collect values to write: CLI flags first, then interactive prompts,
+    // then fall back to whatever load_config() resolved.
+    let interactive = !opts.yes && std::io::IsTerminal::is_terminal(&std::io::stdin());
+
+    let email = opts
+        .email
+        .or_else(|| {
+            if interactive && config.openalex.api_key.is_empty() {
+                prompt_line(
+                    "OpenAlex / Unpaywall email (used for OA PDF lookups, recommended)",
+                    "",
+                )
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| config.openalex.api_key.clone());
+
+    let sources = opts
+        .sources
+        .or_else(|| {
+            if interactive {
+                let joined = config.default_sources.join(",");
+                prompt_line("Enabled sources (comma-separated)", &joined).map(parse_sources_csv)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| config.default_sources.clone());
+
+    config.openalex.api_key.clone_from(&email);
+    config.default_sources.clone_from(&sources);
+
+    let config_path = config_path_for_db(&config.db_path);
+    write_config_toml(&config_path, &config)
+        .with_context(|| format!("failed to write config to {}", config_path.display()))?;
+
+    // Always init the DB last so the config points at something real.
+    let db = Database::open(&config.db_path).context("failed to open database")?;
     db.migrate().context("migration failed")?;
-    println!("Database initialized at: {}", path.display());
+
+    println!();
+    println!("  Config written: {}", config_path.display());
+    println!("  Database:       {}", config.db_path.display());
+    if !email.is_empty() {
+        println!("  OA email:       {email}");
+    }
+    println!("  Sources:        {}", sources.join(", "));
+
+    let keyed_sources_needed: Vec<&str> = sources
+        .iter()
+        .filter_map(|s| match s.as_str() {
+            "patentsview" | "lens" | "epo" => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    if !keyed_sources_needed.is_empty() {
+        println!();
+        println!("  Credentials still needed for:");
+        for s in &keyed_sources_needed {
+            println!("    - {s} (run: scitadel auth login {s})");
+        }
+    }
+
+    println!();
+    println!(
+        "  Try it: scitadel search \"machine learning\" --sources {}",
+        sources.join(",")
+    );
+    Ok(())
+}
+
+/// Read one line from stdin, showing `prompt [default]:`. Returns `None` if
+/// the user hits enter without input and `default` is empty; otherwise the
+/// trimmed input or the default.
+fn prompt_line(prompt: &str, default: &str) -> Option<String> {
+    use std::io::{BufRead, Write};
+    let mut out = std::io::stdout();
+    if default.is_empty() {
+        let _ = write!(out, "  {prompt}: ");
+    } else {
+        let _ = write!(out, "  {prompt} [{default}]: ");
+    }
+    let _ = out.flush();
+
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    if stdin.lock().read_line(&mut line).is_err() {
+        return None;
+    }
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        if default.is_empty() {
+            None
+        } else {
+            Some(default.to_string())
+        }
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Parse a comma-separated source list, trimming whitespace and dropping blanks.
+fn parse_sources_csv(s: String) -> Vec<String> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Config file lives next to the DB under a `.scitadel/` directory.
+fn config_path_for_db(db_path: &std::path::Path) -> PathBuf {
+    db_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("config.toml")
+}
+
+/// Write a minimal, human-editable config.toml. We only write the fields
+/// the user explicitly set so defaults can continue to evolve in-code.
+fn write_config_toml(path: &std::path::Path, config: &scitadel_core::config::Config) -> Result<()> {
+    use std::fmt::Write as _;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut out = String::new();
+    out.push_str("# scitadel config — generated by `scitadel init`. Edit freely.\n\n");
+    let sources = config
+        .default_sources
+        .iter()
+        .map(|s| format!("\"{s}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    writeln!(out, "default_sources = [{sources}]").unwrap();
+    if !config.openalex.api_key.is_empty() {
+        out.push_str("\n[openalex]\n");
+        writeln!(out, "api_key = \"{}\"", config.openalex.api_key).unwrap();
+    }
+    std::fs::write(path, out)?;
     Ok(())
 }
 

@@ -382,6 +382,24 @@ cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```
 
+## Prebuilt binaries
+
+Every tagged release attaches tarballs for Linux x86_64, macOS x86_64, and
+macOS arm64 to the [Releases page](https://github.com/vig-os/scitadel/releases).
+Download the one for your platform, extract, and put the `scitadel` binary on
+your `$PATH`:
+
+```sh
+# Example for macOS arm64 (Apple Silicon)
+curl -L https://github.com/vig-os/scitadel/releases/latest/download/scitadel-X.Y.Z-aarch64-apple-darwin.tar.gz \
+  | tar xz
+sudo mv scitadel-X.Y.Z-aarch64-apple-darwin/scitadel /usr/local/bin/
+scitadel --version
+```
+
+Each release also ships a `.sha256` file next to each tarball — verify with
+`shasum -a 256 -c <file>.sha256`.
+
 ## License
 
 Dual-licensed under either of

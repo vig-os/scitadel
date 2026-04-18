@@ -3,17 +3,25 @@ name = "scitadel-tui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Interactive TUI for browsing scitadel searches, papers, and assessments."
+readme = "../../README.md"
 
 [dependencies]
-scitadel-core = { path = "../scitadel-core" }
-scitadel-db = { path = "../scitadel-db" }
-scitadel-adapters = { path = "../scitadel-adapters" }
+scitadel-core = { path = "../scitadel-core", version = "0.1.0" }
+scitadel-db = { path = "../scitadel-db", version = "0.1.0" }
+scitadel-adapters = { path = "../scitadel-adapters", version = "0.1.0" }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
+reqwest = { workspace = true }
 
 [lints]
 workspace = true
