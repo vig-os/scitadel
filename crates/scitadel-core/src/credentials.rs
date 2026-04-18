@@ -68,9 +68,12 @@ pub fn store(key: &str, value: &str) -> Result<(), String> {
     let output = std::process::Command::new("security")
         .args([
             "add-generic-password",
-            "-s", SERVICE,
-            "-a", key,
-            "-w", value,
+            "-s",
+            SERVICE,
+            "-a",
+            key,
+            "-w",
+            value,
             "-U", // update if exists
         ])
         .output()

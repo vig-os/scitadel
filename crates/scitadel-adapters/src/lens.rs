@@ -107,10 +107,7 @@ impl SourceAdapter for LensAdapter {
 }
 
 fn patent_to_candidate(patent: &serde_json::Value, rank: i32) -> CandidatePaper {
-    let lens_id = patent
-        .get("lens_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let lens_id = patent.get("lens_id").and_then(|v| v.as_str()).unwrap_or("");
 
     let doc_number = patent
         .get("doc_number")

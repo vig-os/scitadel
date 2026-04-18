@@ -13,7 +13,7 @@ use scitadel_core::ports::{
     AssessmentRepository, PaperRepository, QuestionRepository, SearchRepository,
 };
 use scitadel_db::sqlite::Database;
-use scitadel_scoring::{build_user_prompt, SCORING_SYSTEM_PROMPT};
+use scitadel_scoring::{SCORING_SYSTEM_PROMPT, build_user_prompt};
 
 fn open_db() -> Result<Database, String> {
     let config = load_config();
@@ -48,7 +48,9 @@ pub async fn search_tool(
         );
 
         if query.is_none() {
-            let terms = q_repo.get_terms(question.id.as_str()).map_err(|e| e.to_string())?;
+            let terms = q_repo
+                .get_terms(question.id.as_str())
+                .map_err(|e| e.to_string())?;
             if terms.is_empty() {
                 return Err(format!(
                     "No search terms linked to question '{}'.",
@@ -90,7 +92,9 @@ pub async fn search_tool(
     let (paper_repo, search_repo, _, _, _) = db.repositories();
 
     let id_remap = paper_repo.save_many(&papers).map_err(|e| e.to_string())?;
-    search_repo.save(&search_record).map_err(|e| e.to_string())?;
+    search_repo
+        .save(&search_record)
+        .map_err(|e| e.to_string())?;
 
     for sr in &mut search_results {
         sr.search_id = search_record.id.clone();
@@ -126,7 +130,9 @@ pub async fn search_tool(
 pub fn list_searches_tool(limit: i64) -> Result<String, String> {
     let db = open_db()?;
     let (_, search_repo, _, _, _) = db.repositories();
-    let searches = search_repo.list_searches(limit).map_err(|e| e.to_string())?;
+    let searches = search_repo
+        .list_searches(limit)
+        .map_err(|e| e.to_string())?;
 
     if searches.is_empty() {
         return Ok("No search history found.".into());
@@ -183,7 +189,13 @@ pub fn get_papers_tool(search_id: &str) -> Result<String, String> {
     )];
 
     for (i, p) in papers.iter().enumerate() {
-        let authors = p.authors.iter().take(3).cloned().collect::<Vec<_>>().join("; ");
+        let authors = p
+            .authors
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ");
         let authors_suffix = if p.authors.len() > 3 {
             format!(" et al. ({} total)", p.authors.len())
         } else {
@@ -259,7 +271,10 @@ pub fn create_question_tool(text: &str, description: &str) -> Result<String, Str
     question.description = description.to_string();
     q_repo.save_question(&question).map_err(|e| e.to_string())?;
 
-    Ok(format!("Question created: {}\nText: {text}", question.id.short()))
+    Ok(format!(
+        "Question created: {}\nText: {text}",
+        question.id.short()
+    ))
 }
 
 pub fn list_questions_tool() -> Result<String, String> {
@@ -382,7 +397,10 @@ pub fn get_assessments_tool(
                 .get(a.paper_id.as_str())
                 .ok()
                 .flatten()
-                .map_or_else(|| "Unknown".into(), |p| p.title[..p.title.len().min(50)].to_string());
+                .map_or_else(
+                    || "Unknown".into(),
+                    |p| p.title[..p.title.len().min(50)].to_string(),
+                );
             format!(
                 "Score: {:.2}  Paper: {}  Assessor: {}  {}\n  Reasoning: {}",
                 a.score,
@@ -442,9 +460,7 @@ pub fn save_assessment_tool(
     reasoning: &str,
 ) -> Result<String, String> {
     if !(0.0..=1.0).contains(&score) {
-        return Err(format!(
-            "Score must be between 0.0 and 1.0, got {score:.2}"
-        ));
+        return Err(format!("Score must be between 0.0 and 1.0, got {score:.2}"));
     }
 
     let db = open_db()?;
@@ -489,10 +505,8 @@ pub async fn download_paper_tool(
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| config.papers_dir());
 
-    let downloader = scitadel_adapters::download::PaperDownloader::new(
-        config.openalex.api_key.clone(),
-        60.0,
-    );
+    let downloader =
+        scitadel_adapters::download::PaperDownloader::new(config.openalex.api_key.clone(), 60.0);
 
     let result = if let Some(pid) = paper_id {
         let db = open_db()?;
@@ -530,10 +544,7 @@ pub async fn download_paper_tool(
 /// Looks up the paper in the DB, locates its cached file under `papers_dir()`,
 /// and returns the extracted text. Truncated to `max_chars` (default 20_000) to
 /// keep responses manageable for the host LLM.
-pub async fn read_paper_tool(
-    paper_id: &str,
-    max_chars: Option<usize>,
-) -> Result<String, String> {
+pub async fn read_paper_tool(paper_id: &str, max_chars: Option<usize>) -> Result<String, String> {
     let config = load_config();
     let db = open_db()?;
     let (paper_repo, _, _, _, _) = db.repositories();
@@ -543,9 +554,7 @@ pub async fn read_paper_tool(
         .ok_or_else(|| format!("paper not found: {paper_id}"))?;
 
     let path = scitadel_adapters::download::find_cached_file(&paper, &config.papers_dir())
-        .ok_or_else(|| {
-            "paper not downloaded yet. Call download_paper first.".to_string()
-        })?;
+        .ok_or_else(|| "paper not downloaded yet. Call download_paper first.".to_string())?;
 
     let text = match path.extension().and_then(|e| e.to_str()) {
         Some("pdf") => {

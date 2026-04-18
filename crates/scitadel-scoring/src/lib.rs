@@ -9,10 +9,10 @@ pub mod scorer;
 
 #[cfg(feature = "scoring")]
 pub use claude::{
-    build_user_prompt, parse_scoring_response, ClaudeScorer, ScoringConfig,
-    SCORING_SYSTEM_PROMPT, SCORING_USER_PROMPT,
+    ClaudeScorer, SCORING_SYSTEM_PROMPT, SCORING_USER_PROMPT, ScoringConfig, build_user_prompt,
+    parse_scoring_response,
 };
 #[cfg(feature = "scoring")]
 pub use cli::CliScorer;
 #[cfg(feature = "scoring")]
-pub use scorer::{create_scorer, Scorer, ScorerBackend, ScoringOptions};
+pub use scorer::{Scorer, ScorerBackend, ScoringOptions, create_scorer};

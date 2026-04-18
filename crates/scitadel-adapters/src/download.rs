@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use scitadel_core::models::{doi_to_filename, validate_doi, Paper};
+use scitadel_core::models::{Paper, doi_to_filename, validate_doi};
 
 use crate::error::AdapterError;
 
@@ -150,7 +150,10 @@ impl PaperDownloader {
         let normalized = scitadel_core::models::normalize_doi(doi);
 
         tokio::fs::create_dir_all(output_dir).await.map_err(|e| {
-            AdapterError::Io(format!("failed to create output dir {}: {e}", output_dir.display()))
+            AdapterError::Io(format!(
+                "failed to create output dir {}: {e}",
+                output_dir.display()
+            ))
         })?;
 
         match self.try_unpaywall(&normalized, output_dir).await {
@@ -176,7 +179,10 @@ impl PaperDownloader {
         output_dir: &Path,
     ) -> Result<DownloadResult, AdapterError> {
         tokio::fs::create_dir_all(output_dir).await.map_err(|e| {
-            AdapterError::Io(format!("failed to create output dir {}: {e}", output_dir.display()))
+            AdapterError::Io(format!(
+                "failed to create output dir {}: {e}",
+                output_dir.display()
+            ))
         })?;
 
         let stem = file_stem_for(paper);
@@ -199,11 +205,15 @@ impl PaperDownloader {
             let normalized = scitadel_core::models::normalize_doi(doi);
             match self.try_unpaywall(&normalized, output_dir).await {
                 Ok(r) => return Ok(r),
-                Err(e) => tracing::info!(doi = %normalized, error = %e, "unpaywall fallback failed"),
+                Err(e) => {
+                    tracing::info!(doi = %normalized, error = %e, "unpaywall fallback failed")
+                }
             }
             match self.download_publisher_html(&normalized, output_dir).await {
                 Ok(r) => return Ok(r),
-                Err(e) => tracing::info!(doi = %normalized, error = %e, "publisher html fallback failed"),
+                Err(e) => {
+                    tracing::info!(doi = %normalized, error = %e, "publisher html fallback failed")
+                }
             }
         }
 
@@ -222,10 +232,7 @@ impl PaperDownloader {
         doi: &str,
         output_dir: &Path,
     ) -> Result<DownloadResult, AdapterError> {
-        let url = format!(
-            "https://api.unpaywall.org/v2/{}?email={}",
-            doi, self.email
-        );
+        let url = format!("https://api.unpaywall.org/v2/{}?email={}", doi, self.email);
 
         let resp = self
             .client
@@ -279,9 +286,9 @@ impl PaperDownloader {
 
         let filename = format!("{}.pdf", doi_to_filename(doi));
         let path = output_dir.join(&filename);
-        tokio::fs::write(&path, &bytes).await.map_err(|e| {
-            AdapterError::Io(format!("failed to write {}: {e}", path.display()))
-        })?;
+        tokio::fs::write(&path, &bytes)
+            .await
+            .map_err(|e| AdapterError::Io(format!("failed to write {}: {e}", path.display())))?;
 
         Ok(DownloadResult {
             doi: doi.to_string(),
@@ -326,9 +333,9 @@ impl PaperDownloader {
 
         let filename = format!("{}.html", doi_to_filename(doi));
         let path = output_dir.join(&filename);
-        tokio::fs::write(&path, &bytes).await.map_err(|e| {
-            AdapterError::Io(format!("failed to write {}: {e}", path.display()))
-        })?;
+        tokio::fs::write(&path, &bytes)
+            .await
+            .map_err(|e| AdapterError::Io(format!("failed to write {}: {e}", path.display())))?;
 
         Ok(DownloadResult {
             doi: doi.to_string(),
@@ -368,9 +375,9 @@ impl PaperDownloader {
             .map_err(|e| AdapterError::Network(format!("failed to read arXiv PDF: {e}")))?;
 
         let path = output_dir.join(format!("{stem}.pdf"));
-        tokio::fs::write(&path, &bytes).await.map_err(|e| {
-            AdapterError::Io(format!("failed to write {}: {e}", path.display()))
-        })?;
+        tokio::fs::write(&path, &bytes)
+            .await
+            .map_err(|e| AdapterError::Io(format!("failed to write {}: {e}", path.display())))?;
 
         Ok(DownloadResult {
             doi: arxiv_id.to_string(),
@@ -420,9 +427,7 @@ impl PaperDownloader {
                     .and_then(|oa| oa.get("oa_url"))
                     .and_then(serde_json::Value::as_str)
             })
-            .ok_or_else(|| {
-                AdapterError::NotFound("OpenAlex reports no OA location".into())
-            })?
+            .ok_or_else(|| AdapterError::NotFound("OpenAlex reports no OA location".into()))?
             .to_string();
 
         let file_resp = self
@@ -461,9 +466,9 @@ impl PaperDownloader {
         };
 
         let path = output_dir.join(format!("{stem}.{ext}"));
-        tokio::fs::write(&path, &bytes).await.map_err(|e| {
-            AdapterError::Io(format!("failed to write {}: {e}", path.display()))
-        })?;
+        tokio::fs::write(&path, &bytes)
+            .await
+            .map_err(|e| AdapterError::Io(format!("failed to write {}: {e}", path.display())))?;
 
         Ok(DownloadResult {
             doi: openalex_id.to_string(),
@@ -506,9 +511,9 @@ impl PaperDownloader {
             .unwrap_or(AccessStatus::Unknown);
 
         let path = output_dir.join(format!("{stem}.html"));
-        tokio::fs::write(&path, &bytes).await.map_err(|e| {
-            AdapterError::Io(format!("failed to write {}: {e}", path.display()))
-        })?;
+        tokio::fs::write(&path, &bytes)
+            .await
+            .map_err(|e| AdapterError::Io(format!("failed to write {}: {e}", path.display())))?;
 
         Ok(DownloadResult {
             doi: url.to_string(),
@@ -561,7 +566,13 @@ pub fn file_stem_for(paper: &Paper) -> String {
 
 fn sanitize_filename(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_') { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 

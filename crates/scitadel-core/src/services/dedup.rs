@@ -2,14 +2,20 @@ use std::collections::HashMap;
 
 use tracing::warn;
 
-use crate::models::{CandidatePaper, Paper, SearchResult, SearchId, validate_doi, normalize_doi};
+use crate::models::{CandidatePaper, Paper, SearchId, SearchResult, normalize_doi, validate_doi};
 
 /// Normalize title for fuzzy matching: lowercase, strip punctuation/whitespace.
 fn normalize_title(title: &str) -> String {
     let lowered = title.to_lowercase();
     let stripped: String = lowered
         .chars()
-        .map(|c: char| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
+        .map(|c: char| {
+            if c.is_alphanumeric() || c.is_whitespace() {
+                c
+            } else {
+                ' '
+            }
+        })
         .collect();
     stripped.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -66,7 +72,9 @@ fn merge_candidate_into_paper(paper: &mut Paper, candidate: &CandidatePaper) {
         paper.authors.clone_from(&candidate.authors);
     }
     if let Some(url) = &candidate.url {
-        paper.source_urls.insert(candidate.source.clone(), url.clone());
+        paper
+            .source_urls
+            .insert(candidate.source.clone(), url.clone());
     }
 }
 
@@ -140,7 +148,9 @@ pub fn deduplicate(
             paper.journal.clone_from(&candidate.journal);
             paper.url.clone_from(&candidate.url);
             if let Some(url) = &candidate.url {
-                paper.source_urls.insert(candidate.source.clone(), url.clone());
+                paper
+                    .source_urls
+                    .insert(candidate.source.clone(), url.clone());
             }
 
             let idx = papers.len();
@@ -182,7 +192,10 @@ mod tests {
 
     #[test]
     fn test_title_similarity_identical() {
-        let sim = title_similarity("Machine Learning for Science", "Machine Learning for Science");
+        let sim = title_similarity(
+            "Machine Learning for Science",
+            "Machine Learning for Science",
+        );
         assert!((sim - 1.0).abs() < f64::EPSILON);
     }
 

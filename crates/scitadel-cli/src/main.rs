@@ -7,7 +7,11 @@ use tracing_subscriber::EnvFilter;
 mod commands;
 
 #[derive(Parser)]
-#[command(name = "scitadel", version, about = "Programmable, reproducible scientific literature retrieval")]
+#[command(
+    name = "scitadel",
+    version,
+    about = "Programmable, reproducible scientific literature retrieval"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -189,10 +193,7 @@ async fn main() -> Result<()> {
             format,
             output,
         } => commands::export(&search_id, &format, output),
-        Commands::Diff {
-            search_a,
-            search_b,
-        } => commands::diff(&search_a, &search_b),
+        Commands::Diff { search_a, search_b } => commands::diff(&search_a, &search_b),
         Commands::Question { command } => match command {
             QuestionCommands::Create { text, description } => {
                 commands::question_create(&text, &description)
@@ -226,8 +227,6 @@ async fn main() -> Result<()> {
             threshold,
             direction,
             model,
-        } => {
-            commands::snowball(&search_id, &question, depth, threshold, &direction, &model)
-        }
+        } => commands::snowball(&search_id, &question, depth, threshold, &direction, &model),
     }
 }

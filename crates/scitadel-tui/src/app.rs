@@ -3,20 +3,20 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
 use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Tabs;
-use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 use crate::data::DataStore;
-use crate::tasks::{spawn_download_paper, Task, TaskUpdate};
+use crate::tasks::{Task, TaskUpdate, spawn_download_paper};
 use crate::views::{detail, papers, questions, searches, tasks as tasks_view};
 use crate::widgets::status_bar;
 
@@ -210,16 +210,11 @@ impl App {
     fn handle_tab_key(&mut self, code: KeyCode) {
         match self.tab {
             Tab::Searches => {
-                let count = self
-                    .data
-                    .load_searches(100)
-                    .map(|s| s.len())
-                    .unwrap_or(0);
+                let count = self.data.load_searches(100).map(|s| s.len()).unwrap_or(0);
                 match code {
                     KeyCode::Char('j') | KeyCode::Down => {
                         if count > 0 {
-                            self.search_selected =
-                                (self.search_selected + 1).min(count - 1);
+                            self.search_selected = (self.search_selected + 1).min(count - 1);
                         }
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
@@ -239,16 +234,11 @@ impl App {
                 }
             }
             Tab::Papers => {
-                let count = self
-                    .data
-                    .load_papers(1000, 0)
-                    .map(|p| p.len())
-                    .unwrap_or(0);
+                let count = self.data.load_papers(1000, 0).map(|p| p.len()).unwrap_or(0);
                 match code {
                     KeyCode::Char('j') | KeyCode::Down => {
                         if count > 0 {
-                            self.paper_selected =
-                                (self.paper_selected + 1).min(count - 1);
+                            self.paper_selected = (self.paper_selected + 1).min(count - 1);
                         }
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
@@ -268,16 +258,11 @@ impl App {
                 }
             }
             Tab::Questions => {
-                let count = self
-                    .data
-                    .load_questions()
-                    .map(|q| q.len())
-                    .unwrap_or(0);
+                let count = self.data.load_questions().map(|q| q.len()).unwrap_or(0);
                 match code {
                     KeyCode::Char('j') | KeyCode::Down => {
                         if count > 0 {
-                            self.question_selected =
-                                (self.question_selected + 1).min(count - 1);
+                            self.question_selected = (self.question_selected + 1).min(count - 1);
                         }
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
@@ -329,10 +314,10 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),                // tabs
-            Constraint::Min(0),                   // content
-            Constraint::Length(task_panel_height),// task panel (0 when empty)
-            Constraint::Length(1),                // status bar
+            Constraint::Length(3),                 // tabs
+            Constraint::Min(0),                    // content
+            Constraint::Length(task_panel_height), // task panel (0 when empty)
+            Constraint::Length(1),                 // status bar
         ])
         .split(frame.area());
 
@@ -383,9 +368,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     }
 
     let help_text = match &app.overlay {
-        Some(Overlay::PaperDetail { .. }) => {
-            "Esc/q: back | j/k: scroll | d/u: page | D: download"
-        }
+        Some(Overlay::PaperDetail { .. }) => "Esc/q: back | j/k: scroll | d/u: page | D: download",
         Some(Overlay::SearchPapers { .. }) => "Esc/q: back | j/k: navigate | Enter: open paper",
         None => "Tab/Shift-Tab: switch tabs | j/k: navigate | Enter: select | q: quit",
     };

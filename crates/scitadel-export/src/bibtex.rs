@@ -48,7 +48,9 @@ fn generate_bibtex_key(paper: &Paper) -> String {
         .map(|a| {
             let name = a.split(',').next().unwrap_or(a);
             let last = name.split_whitespace().last().unwrap_or("").to_lowercase();
-            last.chars().filter(|c| c.is_alphanumeric()).collect::<String>()
+            last.chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect::<String>()
         })
         .unwrap_or_default();
 

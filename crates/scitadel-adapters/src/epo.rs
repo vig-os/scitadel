@@ -69,17 +69,22 @@ impl EpoOpsAdapter {
         let access_token = data
             .get("access_token")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| CoreError::Adapter("epo".into(), "no access_token in auth response".into()))?
+            .ok_or_else(|| {
+                CoreError::Adapter("epo".into(), "no access_token in auth response".into())
+            })?
             .to_string();
 
         let expires_in = data
             .get("expires_in")
-            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
             .unwrap_or(1200);
 
         // Cache with 60s safety margin
-        let expires_at =
-            std::time::Instant::now() + std::time::Duration::from_secs(expires_in.saturating_sub(60));
+        let expires_at = std::time::Instant::now()
+            + std::time::Duration::from_secs(expires_in.saturating_sub(60));
 
         let mut guard = self.token.write().await;
         *guard = Some(TokenData {
@@ -200,7 +205,11 @@ fn extract_documents(data: &serde_json::Value) -> Vec<serde_json::Value> {
 
     if let Some(arr) = docs.as_array() {
         arr.iter()
-            .filter_map(|d| d.get("exchange-document").cloned().or_else(|| Some(d.clone())))
+            .filter_map(|d| {
+                d.get("exchange-document")
+                    .cloned()
+                    .or_else(|| Some(d.clone()))
+            })
             .collect()
     } else if let Some(doc) = docs.get("exchange-document") {
         vec![doc.clone()]
@@ -211,7 +220,10 @@ fn extract_documents(data: &serde_json::Value) -> Vec<serde_json::Value> {
 
 fn document_to_candidate(doc: &serde_json::Value, rank: i32) -> CandidatePaper {
     let country = doc.get("@country").and_then(|v| v.as_str()).unwrap_or("");
-    let doc_number = doc.get("@doc-number").and_then(|v| v.as_str()).unwrap_or("");
+    let doc_number = doc
+        .get("@doc-number")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let kind = doc.get("@kind").and_then(|v| v.as_str()).unwrap_or("");
 
     let patent_id = format!("{country}{doc_number}.{kind}");
@@ -309,11 +321,7 @@ fn extract_abstract(doc: &serde_json::Value) -> String {
 
 fn extract_abstract_text(abs: &serde_json::Value) -> String {
     abs.get("p")
-        .and_then(|p| {
-            p.get("$")
-                .and_then(|v| v.as_str())
-                .or_else(|| p.as_str())
-        })
+        .and_then(|p| p.get("$").and_then(|v| v.as_str()).or_else(|| p.as_str()))
         .unwrap_or("")
         .to_string()
 }

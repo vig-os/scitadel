@@ -143,8 +143,7 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Self {
-        let workspace =
-            find_workspace_root().unwrap_or_else(|| std::env::current_dir().unwrap());
+        let workspace = find_workspace_root().unwrap_or_else(|| std::env::current_dir().unwrap());
         Self {
             db_path: default_db_path(&workspace),
             default_sources: default_sources(),
@@ -199,8 +198,7 @@ fn default_db_path(workspace: &Path) -> PathBuf {
 pub fn load_config() -> Config {
     use crate::credentials::resolve;
 
-    let workspace =
-        find_workspace_root().unwrap_or_else(|| std::env::current_dir().unwrap());
+    let workspace = find_workspace_root().unwrap_or_else(|| std::env::current_dir().unwrap());
     let db_path = default_db_path(&workspace);
 
     // Try loading TOML config file as base

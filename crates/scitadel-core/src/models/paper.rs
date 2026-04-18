@@ -85,7 +85,11 @@ pub struct CandidatePaper {
 
 impl CandidatePaper {
     #[must_use]
-    pub fn new(source: impl Into<String>, source_id: impl Into<String>, title: impl Into<String>) -> Self {
+    pub fn new(
+        source: impl Into<String>,
+        source_id: impl Into<String>,
+        title: impl Into<String>,
+    ) -> Self {
         Self {
             source: source.into(),
             source_id: source_id.into(),
