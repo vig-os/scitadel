@@ -718,6 +718,17 @@ pub fn prepare_batch_assessments_tool(
     Ok(out.join("\n"))
 }
 
+/// Return the scitadel assessment rubric (scoring criteria, score scale,
+/// response format) so an agent can fetch it once and cache, rather than
+/// re-fetching via `prepare_assessment` for every paper it evaluates.
+///
+/// Today the rubric is a static prompt shared across all questions;
+/// if per-question rubrics ever land, this function becomes the
+/// customization point.
+pub fn get_rubric_tool() -> Result<String, String> {
+    Ok(scitadel_scoring::SCORING_SYSTEM_PROMPT.to_string())
+}
+
 /// Summarize every paper in a search as JSON — title, abstract, access
 /// status, identifiers — in a single call. Saves round-trips vs. the
 /// agent iterating `get_paper` per result.
