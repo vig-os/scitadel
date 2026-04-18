@@ -106,7 +106,7 @@ pub async fn search_tool(
         .save_results(&search_results)
         .map_err(|e| e.to_string())?;
 
-    let outcomes: Vec<String> = search_record
+    let outcome_lines: Vec<String> = search_record
         .source_outcomes
         .iter()
         .map(|o| {
@@ -117,14 +117,28 @@ pub async fn search_tool(
         })
         .collect();
 
-    Ok(format!(
+    let summary = format!(
         "Search ID: {}\nQuery: {query}\nSources: {}\nTotal candidates: {}\nUnique papers after dedup: {}\n{}",
         search_record.id,
         source_list.join(", "),
         search_record.total_candidates,
         papers.len(),
-        outcomes.join("\n")
-    ))
+        outcome_lines.join("\n")
+    );
+
+    // Structured payload: agents introspect per-source status + counts
+    // without parsing the summary string. `summary` field kept so
+    // existing string-consuming clients keep working.
+    let payload = serde_json::json!({
+        "search_id": search_record.id.as_str(),
+        "query": search_record.query,
+        "sources": search_record.source_outcomes,
+        "total_candidates": search_record.total_candidates,
+        "total_unique_papers": papers.len(),
+        "summary": summary,
+    });
+
+    serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())
 }
 
 pub fn list_searches_tool(limit: i64) -> Result<String, String> {
