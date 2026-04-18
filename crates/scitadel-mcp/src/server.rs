@@ -72,6 +72,13 @@ impl ScitadelServer {
         tools::search_tool(req.query, req.sources, req.max_results, req.question_id).await
     }
 
+    #[tool(
+        description = "List every source scitadel knows about (pubmed, arxiv, openalex, inspire, patentsview, lens, epo) with per-source description, required credential fields, whether credentials are configured in this environment, and rate-limit hints. Read-only; call first to decide which sources to pass to `search`."
+    )]
+    fn list_sources(&self) -> Result<String, String> {
+        tools::list_sources_tool()
+    }
+
     #[tool(description = "List recent search runs")]
     fn list_searches(
         &self,

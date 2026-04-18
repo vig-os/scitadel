@@ -718,9 +718,106 @@ pub fn prepare_batch_assessments_tool(
     Ok(out.join("\n"))
 }
 
+/// Static descriptor for one source adapter — used by `list_sources_tool`.
+struct SourceInfo {
+    name: &'static str,
+    description: &'static str,
+    /// Which keychain / env fields need to be populated before this
+    /// adapter can actually make requests. Empty = no credentials needed.
+    credential_fields: &'static [&'static str],
+    rate_limit_hint: &'static str,
+}
+
+const SOURCE_REGISTRY: &[SourceInfo] = &[
+    SourceInfo {
+        name: "pubmed",
+        description: "US NLM biomedical/life-sciences literature via the NCBI E-utilities API.",
+        credential_fields: &["api_key"],
+        rate_limit_hint: "3 req/s without key, 10 req/s with key.",
+    },
+    SourceInfo {
+        name: "arxiv",
+        description: "Preprint server for physics, CS, math, and adjacent fields.",
+        credential_fields: &[],
+        rate_limit_hint: "1 req every 3s per the arXiv API terms.",
+    },
+    SourceInfo {
+        name: "openalex",
+        description: "Open scholarly-works graph covering most disciplines. Email polite-pool recommended.",
+        credential_fields: &["email"],
+        rate_limit_hint: "10 req/s in the polite pool (with email).",
+    },
+    SourceInfo {
+        name: "inspire",
+        description: "INSPIRE-HEP: high-energy physics literature and preprints.",
+        credential_fields: &[],
+        rate_limit_hint: "15 req/5s per their API guidelines.",
+    },
+    SourceInfo {
+        name: "patentsview",
+        description: "USPTO PatentsView API — US patent metadata.",
+        credential_fields: &["api_key"],
+        rate_limit_hint: "45 req/min (documented).",
+    },
+    SourceInfo {
+        name: "lens",
+        description: "Lens.org scholarly + patent metadata.",
+        credential_fields: &["api_token"],
+        rate_limit_hint: "Varies by plan; monthly quota enforced.",
+    },
+    SourceInfo {
+        name: "epo",
+        description: "European Patent Office OPS API (consumer_key + consumer_secret).",
+        credential_fields: &["consumer_key", "consumer_secret"],
+        rate_limit_hint: "10 req/min per OPS free tier.",
+    },
+];
+
+/// Return a JSON array describing every source scitadel knows about, with
+/// each one's credential requirements and whether they're configured in
+/// the current environment. Read-only; safe to call freely.
+pub fn list_sources_tool() -> Result<String, String> {
+    let config = load_config();
+
+    let entries: Vec<serde_json::Value> = SOURCE_REGISTRY
+        .iter()
+        .map(|src| {
+            let configured = is_source_configured(src, &config);
+            serde_json::json!({
+                "name": src.name,
+                "description": src.description,
+                "requires_credentials": !src.credential_fields.is_empty(),
+                "credential_fields": src.credential_fields,
+                "configured": configured,
+                "rate_limit_hint": src.rate_limit_hint,
+            })
+        })
+        .collect();
+
+    serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())
+}
+
+fn is_source_configured(src: &SourceInfo, config: &scitadel_core::config::Config) -> bool {
+    match src.name {
+        // Sources with no credentials are always considered configured.
+        "arxiv" | "inspire" => true,
+        "pubmed" => !config.pubmed.api_key.is_empty(),
+        // OpenAlex stores the polite-pool email under `openalex.api_key`
+        // (historical naming); an empty string means polite pool is off
+        // but the adapter still works, so we report configured only when
+        // the email is actually present.
+        "openalex" => !config.openalex.api_key.is_empty(),
+        "patentsview" => !config.patentsview.api_key.is_empty(),
+        "lens" => !config.lens.api_key.is_empty(),
+        "epo" => !config.epo.consumer_key.is_empty() && !config.epo.consumer_secret.is_empty(),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::html_to_text;
+    use super::{SOURCE_REGISTRY, html_to_text, is_source_configured};
+    use scitadel_core::config::Config;
 
     #[test]
     fn strips_tags_and_script() {
@@ -729,5 +826,51 @@ mod tests {
         assert!(out.contains("Hello"));
         assert!(out.contains("world"));
         assert!(!out.contains("var x"));
+    }
+
+    #[test]
+    fn source_registry_covers_every_adapter_name_used_by_build_adapters_full() {
+        // These are the names accepted by scitadel_adapters::build_adapters_full;
+        // the registry must stay in lockstep so the MCP tool stays honest.
+        let expected = [
+            "pubmed",
+            "arxiv",
+            "openalex",
+            "inspire",
+            "patentsview",
+            "lens",
+            "epo",
+        ];
+        for name in expected {
+            assert!(
+                SOURCE_REGISTRY.iter().any(|s| s.name == name),
+                "missing registry entry for adapter {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_flips_on_credential_presence() {
+        let mut config = Config::default();
+        config.openalex.api_key.clear();
+        let oa = SOURCE_REGISTRY
+            .iter()
+            .find(|s| s.name == "openalex")
+            .unwrap();
+        assert!(!is_source_configured(oa, &config));
+        config.openalex.api_key = "lars@example.org".into();
+        assert!(is_source_configured(oa, &config));
+    }
+
+    #[test]
+    fn sources_without_credentials_are_always_configured() {
+        let config = Config::default();
+        for name in ["arxiv", "inspire"] {
+            let src = SOURCE_REGISTRY.iter().find(|s| s.name == name).unwrap();
+            assert!(
+                is_source_configured(src, &config),
+                "{name} should always be configured"
+            );
+        }
     }
 }
