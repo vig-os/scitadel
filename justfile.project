@@ -19,39 +19,20 @@ info:
     @echo "Project: {{ project }}"
 
 # ===============================================================================
-# SECURITY
+# RUST
 # ===============================================================================
 
-# Run security scans (Bandit + Safety) — mirrors CI security job
-[group('quality')]
-security:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    echo "=== Bandit (Python security linting) ==="
-    uvx bandit -r src/ -ll
-    echo ""
-    echo "=== Safety (dependency vulnerability check) ==="
-    uvx safety==3.2.11 check || true
-
-# ===============================================================================
-# FULL VERIFICATION
-# ===============================================================================
-
-# Run the full CI suite locally: precommit + tests + security
+# Format check + clippy + tests
 [group('quality')]
 verify:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    echo "=== Pre-commit (lint, format, hooks) ==="
-    just precommit
-    echo ""
-    echo "=== Tests with coverage ==="
-    just test-cov
-    echo ""
-    echo "=== Security ==="
-    just security
-    echo ""
-    echo "=== All checks passed ==="
+    cargo fmt --check
+    cargo clippy --workspace -- -D warnings
+    cargo test --workspace
+
+# Dependency / license audit (requires cargo-deny)
+[group('quality')]
+security:
+    cargo deny check
 
 # ===============================================================================
 # CONDUCTOR (agent orchestrator)

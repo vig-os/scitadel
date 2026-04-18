@@ -1,1 +1,0 @@
-"""INSPIRE-HEP source adapter."""

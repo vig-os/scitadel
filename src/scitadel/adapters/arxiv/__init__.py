@@ -1,1 +1,0 @@
-"""arXiv source adapter."""

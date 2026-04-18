@@ -34,14 +34,6 @@ repos:
       - id: mixed-line-ending
       - id: trailing-whitespace
 
-  # Python Linting and Formatting (Ruff)
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: aad66557af3b56ba6d4d69cd1b6cba87cef50cbb  # v0.14.3
-    hooks:
-      - id: ruff
-        args: [--fix]
-      - id: ruff-format
-
   # YAML Linting
   - repo: https://github.com/adrienverge/yamllint
     rev: 81e9f98ffd059efe8aa9c1b1a42e5cce61b640c6  # v1.35.1
@@ -88,16 +80,6 @@ repos:
     hooks:
       - id: typos
 
-  # License Compliance Check (runs only when dependencies change)
-  - repo: local
-    hooks:
-      - id: pip-licenses
-        name: pip-licenses (check dependency licenses)
-        entry: uv run pip-licenses --fail-on="GPL-3.0-only;GPL-3.0-or-later;AGPL-3.0-only;AGPL-3.0-or-later"
-        language: system
-        files: ^(pyproject\.toml|uv\.lock|requirements.*\.txt)$
-        pass_filenames: false
-
   # GitHub Actions SHA pinning enforcement
   - repo: local
     hooks:
@@ -106,16 +88,6 @@ repos:
         entry: uv run check-action-pins
         language: system
         files: ^\.github/(workflows/.*\.ya?ml|actions/.*/action\.ya?ml)$
-        pass_filenames: false
-
-  # Python Security (Bandit)
-  - repo: local
-    hooks:
-      - id: bandit
-        name: bandit (Python security linting)
-        entry: uv run bandit -r src/ -ll
-        language: system
-        types: [python]
         pass_filenames: false
 
   # Skill directory naming convention
