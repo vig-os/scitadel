@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -8,9 +10,15 @@ use scitadel_core::models::Paper;
 use crate::data::DataStore;
 use crate::views::util::truncate;
 
-pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, selected: usize) {
+pub fn draw(
+    frame: &mut Frame,
+    area: Rect,
+    data: &DataStore,
+    selected: usize,
+    starred: &HashSet<String>,
+) {
     let papers = data.load_papers(1000, 0).unwrap_or_default();
-    render_paper_table(frame, area, &papers, selected, " Papers ");
+    render_paper_table(frame, area, &papers, selected, " Papers ", starred);
 }
 
 pub fn draw_for_search(
@@ -19,13 +27,14 @@ pub fn draw_for_search(
     data: &DataStore,
     search_id: &str,
     selected: usize,
+    starred: &HashSet<String>,
 ) {
     let papers = data.load_papers_for_search(search_id).unwrap_or_default();
     let title = format!(
         " Papers for search {} ",
         search_id.chars().take(8).collect::<String>()
     );
-    render_paper_table(frame, area, &papers, selected, &title);
+    render_paper_table(frame, area, &papers, selected, &title, starred);
 }
 
 fn render_paper_table(
@@ -34,6 +43,7 @@ fn render_paper_table(
     papers: &[Paper],
     selected: usize,
     title: &str,
+    starred: &HashSet<String>,
 ) {
     if papers.is_empty() {
         let block = Block::default()
@@ -46,6 +56,7 @@ fn render_paper_table(
 
     let header = Row::new(vec![
         Cell::from("#"),
+        Cell::from(""),
         Cell::from("Title"),
         Cell::from("Authors"),
         Cell::from("Year"),
@@ -62,9 +73,15 @@ fn render_paper_table(
         .map(|(i, p)| {
             let authors = format_authors(&p.authors);
             let year = p.year.map_or_else(|| "—".to_string(), |y| y.to_string());
+            let star = if starred.contains(p.id.as_str()) {
+                "★"
+            } else {
+                " "
+            };
 
             Row::new(vec![
                 Cell::from((i + 1).to_string()),
+                Cell::from(star).style(Style::default().fg(Color::Yellow)),
                 Cell::from(truncate(&p.title, 60)),
                 Cell::from(truncate(&authors, 30)),
                 Cell::from(year),
@@ -74,6 +91,7 @@ fn render_paper_table(
 
     let widths = [
         Constraint::Length(5),
+        Constraint::Length(2),
         Constraint::Min(30),
         Constraint::Length(32),
         Constraint::Length(6),
