@@ -54,6 +54,10 @@ pub struct DownloadResult {
     pub source: String,
     pub bytes: usize,
     pub access: AccessStatus,
+    /// Canonical publisher/landing URL. Populated for publisher HTML and
+    /// last-resort URL downloads so a paywall result can point the user at
+    /// the live page (institutional IPs may grant access).
+    pub publisher_url: Option<String>,
 }
 
 /// Heuristic: classify publisher HTML as full-text / abstract / paywall.
@@ -297,6 +301,7 @@ impl PaperDownloader {
             source: "unpaywall".into(),
             bytes: bytes.len(),
             access: AccessStatus::FullText,
+            publisher_url: None,
         })
     }
 
@@ -343,6 +348,7 @@ impl PaperDownloader {
             source: "publisher".into(),
             bytes: bytes.len(),
             access,
+            publisher_url: Some(doi_url),
         })
     }
 
@@ -385,6 +391,7 @@ impl PaperDownloader {
             source: "arxiv".into(),
             bytes: bytes.len(),
             access: AccessStatus::FullText,
+            publisher_url: None,
         })
     }
 
@@ -475,6 +482,11 @@ impl PaperDownloader {
             source: "openalex".into(),
             bytes: bytes.len(),
             access,
+            publisher_url: if matches!(format, DownloadFormat::Html) {
+                Some(pdf_url)
+            } else {
+                None
+            },
         })
     }
 
@@ -519,6 +531,7 @@ impl PaperDownloader {
             source: "url".into(),
             bytes: bytes.len(),
             access,
+            publisher_url: Some(url.to_string()),
         })
     }
 }
