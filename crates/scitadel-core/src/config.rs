@@ -257,15 +257,15 @@ pub fn load_config() -> Config {
     if let Ok(model) = std::env::var("SCITADEL_CHAT_MODEL") {
         config.chat.model = model;
     }
-    if let Ok(tokens) = std::env::var("SCITADEL_CHAT_MAX_TOKENS") {
-        if let Ok(v) = tokens.parse() {
-            config.chat.max_tokens = v;
-        }
+    if let Ok(tokens) = std::env::var("SCITADEL_CHAT_MAX_TOKENS")
+        && let Ok(v) = tokens.parse()
+    {
+        config.chat.max_tokens = v;
     }
-    if let Ok(conc) = std::env::var("SCITADEL_SCORING_CONCURRENCY") {
-        if let Ok(v) = conc.parse() {
-            config.chat.scoring_concurrency = v;
-        }
+    if let Ok(conc) = std::env::var("SCITADEL_SCORING_CONCURRENCY")
+        && let Ok(v) = conc.parse()
+    {
+        config.chat.scoring_concurrency = v;
     }
 
     config

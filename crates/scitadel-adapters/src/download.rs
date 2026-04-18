@@ -206,13 +206,13 @@ impl PaperDownloader {
             match self.try_unpaywall(&normalized, output_dir).await {
                 Ok(r) => return Ok(r),
                 Err(e) => {
-                    tracing::info!(doi = %normalized, error = %e, "unpaywall fallback failed")
+                    tracing::info!(doi = %normalized, error = %e, "unpaywall fallback failed");
                 }
             }
             match self.download_publisher_html(&normalized, output_dir).await {
                 Ok(r) => return Ok(r),
                 Err(e) => {
-                    tracing::info!(doi = %normalized, error = %e, "publisher html fallback failed")
+                    tracing::info!(doi = %normalized, error = %e, "publisher html fallback failed");
                 }
             }
         }
@@ -327,9 +327,8 @@ impl PaperDownloader {
             .await
             .map_err(|e| AdapterError::Network(format!("failed to read HTML: {e}")))?;
 
-        let access = std::str::from_utf8(&bytes)
-            .map(detect_access_status)
-            .unwrap_or(AccessStatus::Unknown);
+        let access =
+            std::str::from_utf8(&bytes).map_or(AccessStatus::Unknown, detect_access_status);
 
         let filename = format!("{}.html", doi_to_filename(doi));
         let path = output_dir.join(&filename);
@@ -459,9 +458,8 @@ impl PaperDownloader {
         let (ext, format, access) = if is_pdf {
             ("pdf", DownloadFormat::Pdf, AccessStatus::FullText)
         } else {
-            let access = std::str::from_utf8(&bytes)
-                .map(detect_access_status)
-                .unwrap_or(AccessStatus::Unknown);
+            let access =
+                std::str::from_utf8(&bytes).map_or(AccessStatus::Unknown, detect_access_status);
             ("html", DownloadFormat::Html, access)
         };
 
@@ -506,9 +504,8 @@ impl PaperDownloader {
             .await
             .map_err(|e| AdapterError::Network(format!("failed to read bytes: {e}")))?;
 
-        let access = std::str::from_utf8(&bytes)
-            .map(detect_access_status)
-            .unwrap_or(AccessStatus::Unknown);
+        let access =
+            std::str::from_utf8(&bytes).map_or(AccessStatus::Unknown, detect_access_status);
 
         let path = output_dir.join(format!("{stem}.html"));
         tokio::fs::write(&path, &bytes)
@@ -582,11 +579,11 @@ mod tests {
 
     #[test]
     fn classifies_obvious_paywall() {
-        let html = r#"<html><body>
+        let html = r"<html><body>
             <h1>Access options</h1>
             <button>Purchase access</button>
             <button>Institutional sign in</button>
-            </body></html>"#;
+            </body></html>";
         assert_eq!(detect_access_status(html), AccessStatus::Paywall);
     }
 

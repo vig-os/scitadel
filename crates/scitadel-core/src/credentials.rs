@@ -44,10 +44,10 @@ pub fn resolve(keychain_key: &str, env_var: &str, config_fallback: &str) -> Opti
     }
 
     // 2. Environment variable
-    if let Ok(val) = std::env::var(env_var) {
-        if !val.is_empty() {
-            return Some(val);
-        }
+    if let Ok(val) = std::env::var(env_var)
+        && !val.is_empty()
+    {
+        return Some(val);
     }
 
     // 3. Config fallback

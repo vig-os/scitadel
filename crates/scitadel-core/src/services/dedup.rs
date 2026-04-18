@@ -40,12 +40,11 @@ fn title_similarity(a: &str, b: &str) -> f64 {
 
 /// Merge a candidate's metadata into an existing paper (fill gaps).
 fn merge_candidate_into_paper(paper: &mut Paper, candidate: &CandidatePaper) {
-    if paper.doi.is_none() {
-        if let Some(doi) = candidate.doi.as_deref() {
-            if validate_doi(doi) {
-                paper.doi = Some(normalize_doi(doi));
-            }
-        }
+    if paper.doi.is_none()
+        && let Some(doi) = candidate.doi.as_deref()
+        && validate_doi(doi)
+    {
+        paper.doi = Some(normalize_doi(doi));
     }
     if paper.arxiv_id.is_none() && candidate.arxiv_id.is_some() {
         paper.arxiv_id.clone_from(&candidate.arxiv_id);
@@ -112,10 +111,10 @@ pub fn deduplicate(
         });
 
         // 1. DOI exact match
-        if let Some(ref doi) = valid_doi {
-            if let Some(&idx) = doi_index.get(doi) {
-                matched_idx = Some(idx);
-            }
+        if let Some(ref doi) = valid_doi
+            && let Some(&idx) = doi_index.get(doi)
+        {
+            matched_idx = Some(idx);
         }
 
         // 2. Fuzzy title match (only if no DOI match)
@@ -139,7 +138,7 @@ pub fn deduplicate(
             let mut paper = Paper::new(&candidate.title);
             paper.authors.clone_from(&candidate.authors);
             paper.r#abstract.clone_from(&candidate.r#abstract);
-            paper.doi = valid_doi.clone();
+            paper.doi.clone_from(&valid_doi);
             paper.arxiv_id.clone_from(&candidate.arxiv_id);
             paper.pubmed_id.clone_from(&candidate.pubmed_id);
             paper.inspire_id.clone_from(&candidate.inspire_id);

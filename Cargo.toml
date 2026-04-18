@@ -91,6 +91,10 @@ redundant_closure_for_method_calls = "allow"
 needless_lifetimes = "allow"
 unnecessary_literal_bound = "allow"
 uninlined_format_args = "allow"
+manual_let_else = "allow"
+needless_pass_by_value = "allow"
+unreadable_literal = "allow"
+unnecessary_wraps = "allow"
 
 [profile.release]
 lto = true

@@ -501,9 +501,7 @@ pub async fn download_paper_tool(
     output_dir: Option<&str>,
 ) -> Result<String, String> {
     let config = load_config();
-    let out_dir = output_dir
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| config.papers_dir());
+    let out_dir = output_dir.map_or_else(|| config.papers_dir(), std::path::PathBuf::from);
 
     let downloader =
         scitadel_adapters::download::PaperDownloader::new(config.openalex.api_key.clone(), 60.0);
@@ -616,20 +614,6 @@ fn html_to_text(html: &str) -> String {
     text
 }
 
-#[cfg(test)]
-mod tests {
-    use super::html_to_text;
-
-    #[test]
-    fn strips_tags_and_script() {
-        let html = "<html><body><p>Hello <b>world</b>.</p><script>var x=1;</script></body></html>";
-        let out = html_to_text(html);
-        assert!(out.contains("Hello"));
-        assert!(out.contains("world"));
-        assert!(!out.contains("var x"));
-    }
-}
-
 /// Prepare batch assessments for all papers in a search.
 ///
 /// Returns the rubric once, then a summary of each paper so the host LLM can
@@ -732,4 +716,18 @@ pub fn prepare_batch_assessments_tool(
     ));
 
     Ok(out.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::html_to_text;
+
+    #[test]
+    fn strips_tags_and_script() {
+        let html = "<html><body><p>Hello <b>world</b>.</p><script>var x=1;</script></body></html>";
+        let out = html_to_text(html);
+        assert!(out.contains("Hello"));
+        assert!(out.contains("world"));
+        assert!(!out.contains("var x"));
+    }
 }

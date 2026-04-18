@@ -36,10 +36,10 @@ impl EpoOpsAdapter {
         // Check cached token
         {
             let guard = self.token.read().await;
-            if let Some(ref td) = *guard {
-                if td.expires_at > std::time::Instant::now() {
-                    return Ok(td.access_token.clone());
-                }
+            if let Some(ref td) = *guard
+                && td.expires_at > std::time::Instant::now()
+            {
+                return Ok(td.access_token.clone());
             }
         }
 
@@ -279,10 +279,10 @@ fn extract_title(biblio: &serde_json::Value) -> String {
     if let Some(arr) = titles.as_array() {
         // Prefer English title
         for t in arr {
-            if t.get("@lang").and_then(|v| v.as_str()) == Some("en") {
-                if let Some(text) = t.get("$").and_then(|v| v.as_str()) {
-                    return text.to_string();
-                }
+            if t.get("@lang").and_then(|v| v.as_str()) == Some("en")
+                && let Some(text) = t.get("$").and_then(|v| v.as_str())
+            {
+                return text.to_string();
             }
         }
         // Fallback to first

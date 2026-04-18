@@ -35,7 +35,7 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, selected: usize) {
     let rows: Vec<Row<'_>> = questions
         .iter()
         .map(|q| {
-            let term_count = data.load_terms(q.id.as_str()).map(|t| t.len()).unwrap_or(0);
+            let term_count = data.load_terms(q.id.as_str()).map_or(0, |t| t.len());
 
             Row::new(vec![
                 Cell::from(q.id.short().to_string()),

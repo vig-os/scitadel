@@ -167,8 +167,7 @@ impl App {
                     let count = self
                         .data
                         .load_papers_for_search(search_id)
-                        .map(|p| p.len())
-                        .unwrap_or(0);
+                        .map_or(0, |p| p.len());
                     if count > 0 {
                         *selected = (*selected + 1).min(count - 1);
                     }
@@ -210,12 +209,10 @@ impl App {
     fn handle_tab_key(&mut self, code: KeyCode) {
         match self.tab {
             Tab::Searches => {
-                let count = self.data.load_searches(100).map(|s| s.len()).unwrap_or(0);
+                let count = self.data.load_searches(100).map_or(0, |s| s.len());
                 match code {
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        if count > 0 {
-                            self.search_selected = (self.search_selected + 1).min(count - 1);
-                        }
+                    KeyCode::Char('j') | KeyCode::Down if count > 0 => {
+                        self.search_selected = (self.search_selected + 1).min(count - 1);
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
                         self.search_selected = self.search_selected.saturating_sub(1);
@@ -234,12 +231,10 @@ impl App {
                 }
             }
             Tab::Papers => {
-                let count = self.data.load_papers(1000, 0).map(|p| p.len()).unwrap_or(0);
+                let count = self.data.load_papers(1000, 0).map_or(0, |p| p.len());
                 match code {
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        if count > 0 {
-                            self.paper_selected = (self.paper_selected + 1).min(count - 1);
-                        }
+                    KeyCode::Char('j') | KeyCode::Down if count > 0 => {
+                        self.paper_selected = (self.paper_selected + 1).min(count - 1);
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
                         self.paper_selected = self.paper_selected.saturating_sub(1);
@@ -258,12 +253,10 @@ impl App {
                 }
             }
             Tab::Questions => {
-                let count = self.data.load_questions().map(|q| q.len()).unwrap_or(0);
+                let count = self.data.load_questions().map_or(0, |q| q.len());
                 match code {
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        if count > 0 {
-                            self.question_selected = (self.question_selected + 1).min(count - 1);
-                        }
+                    KeyCode::Char('j') | KeyCode::Down if count > 0 => {
+                        self.question_selected = (self.question_selected + 1).min(count - 1);
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
                         self.question_selected = self.question_selected.saturating_sub(1);

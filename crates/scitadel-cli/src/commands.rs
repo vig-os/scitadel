@@ -555,8 +555,8 @@ pub fn auth_status() -> Result<()> {
                 "keychain"
             } else if std::env::var(key.env_var)
                 .ok()
-                .filter(|v| !v.is_empty())
-                .is_some()
+                .as_ref()
+                .is_some_and(|v| !v.is_empty())
             {
                 "env"
             } else {

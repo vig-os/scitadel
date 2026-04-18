@@ -251,15 +251,13 @@ pub fn parse_pubmed_xml(xml_text: &str) -> Vec<CandidatePaper> {
                     "ForeName" => {
                         in_fore_name = false;
                     }
-                    "Author" => {
-                        if !current_last_name.is_empty() {
-                            let name = if current_fore_name.is_empty() {
-                                current_last_name.clone()
-                            } else {
-                                format!("{}, {}", current_last_name, current_fore_name)
-                            };
-                            current_authors.push(name);
-                        }
+                    "Author" if !current_last_name.is_empty() => {
+                        let name = if current_fore_name.is_empty() {
+                            current_last_name.clone()
+                        } else {
+                            format!("{}, {}", current_last_name, current_fore_name)
+                        };
+                        current_authors.push(name);
                     }
                     "AbstractText" => in_abstract_text = false,
                     "ELocationID" => in_elocation_id = false,
