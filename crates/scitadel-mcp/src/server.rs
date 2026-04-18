@@ -80,6 +80,13 @@ impl ScitadelServer {
     }
 
     #[tool(
+        description = "Return the scoring rubric (criteria, 0.0-1.0 scale, response format) as a string. Fetch once at the start of a scoring session and cache; use with `save_assessment` or `assess_paper` for each paper. Avoids the per-paper rubric fetch that `prepare_assessment` does."
+    )]
+    fn get_rubric(&self) -> Result<String, String> {
+        tools::get_rubric_tool()
+    }
+
+    #[tool(
         description = "Summarize every paper in a search as JSON in one call: title, authors, year, abstract (truncated), DOI, identifiers. Preferred over iterating `get_paper` per result when scanning a corpus."
     )]
     fn summarize_search(
