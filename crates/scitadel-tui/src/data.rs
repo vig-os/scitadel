@@ -3,11 +3,11 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use scitadel_core::models::{Assessment, Paper, ResearchQuestion, Search, SearchTerm};
+use scitadel_core::models::{Annotation, Assessment, Paper, ResearchQuestion, Search, SearchTerm};
 use scitadel_core::ports::{
     AssessmentRepository, PaperRepository, QuestionRepository, SearchRepository,
 };
-use scitadel_db::sqlite::{Database, SqlitePaperStateRepository};
+use scitadel_db::sqlite::{Database, SqliteAnnotationRepository, SqlitePaperStateRepository};
 
 /// Wrapper around the database that loads data for each TUI view.
 pub struct DataStore {
@@ -70,6 +70,11 @@ impl DataStore {
     /// Load the set of paper IDs this reader has starred.
     pub fn load_starred_ids(&self, reader: &str) -> Result<HashSet<String>> {
         Ok(SqlitePaperStateRepository::new(self.db.clone()).starred_ids(reader)?)
+    }
+
+    /// Load live annotations for a paper (roots + replies), ordered oldest-first.
+    pub fn load_annotations_for_paper(&self, paper_id: &str) -> Result<Vec<Annotation>> {
+        Ok(SqliteAnnotationRepository::new(self.db.clone()).list_by_paper(paper_id)?)
     }
 
     /// Toggle the starred flag for a paper and return the new value.
