@@ -3,19 +3,26 @@ name = "scitadel-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Command-line interface for scitadel — programmable scientific literature retrieval."
+readme = "../../README.md"
 
 [[bin]]
 name = "scitadel"
 path = "src/main.rs"
 
 [dependencies]
-scitadel-core = { path = "../scitadel-core" }
-scitadel-db = { path = "../scitadel-db" }
-scitadel-adapters = { path = "../scitadel-adapters" }
-scitadel-scoring = { path = "../scitadel-scoring" }
-scitadel-export = { path = "../scitadel-export" }
-scitadel-mcp = { path = "../scitadel-mcp" }
-scitadel-tui = { path = "../scitadel-tui" }
+scitadel-core = { path = "../scitadel-core", version = "0.1.0" }
+scitadel-db = { path = "../scitadel-db", version = "0.1.0" }
+scitadel-adapters = { path = "../scitadel-adapters", version = "0.1.0" }
+scitadel-scoring = { path = "../scitadel-scoring", version = "0.1.0" }
+scitadel-export = { path = "../scitadel-export", version = "0.1.0" }
+scitadel-mcp = { path = "../scitadel-mcp", version = "0.1.0" }
+scitadel-tui = { path = "../scitadel-tui", version = "0.1.0" }
 rmcp = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }

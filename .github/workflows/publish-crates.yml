@@ -1,0 +1,88 @@
+# Publish scitadel workspace crates to crates.io in dependency order.
+#
+# Triggered on semver tag push (final or pre-release).
+# Each step is idempotent against crates.io — `cargo publish` errors
+# gracefully if the version is already published.
+#
+# SETUP (one-time, manual): create a crates.io API token at
+# https://crates.io/me and add it as repository secret CARGO_REGISTRY_TOKEN.
+# Until then, this workflow will fail the auth step and log a clear error.
+
+name: Publish crates
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-*'
+  pull_request:
+    branches: [dev, main]
+
+jobs:
+  # Always-on dry-run so breakage surfaces on PRs, not only at tag time.
+  dry-run:
+    name: cargo publish --dry-run
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Dry-run each crate
+        run: |
+          set -euo pipefail
+          for crate in scitadel-core scitadel-db scitadel-adapters \
+                       scitadel-scoring scitadel-export \
+                       scitadel-mcp scitadel-tui scitadel-cli; do
+            echo "::group::$crate"
+            cargo publish --dry-run --allow-dirty -p "$crate"
+            echo "::endgroup::"
+          done
+
+  # Live publish runs only on real tag pushes. Sequential and ordered; we
+  # sleep briefly between crates so the crates.io index has time to catch up.
+  publish:
+    name: Publish to crates.io
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: dry-run
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify CARGO_REGISTRY_TOKEN is set
+        env:
+          TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not set. Add a repo secret first."
+            exit 1
+          fi
+
+      - name: Publish in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          publish_one() {
+            local crate="$1"
+            echo "::group::Publishing $crate"
+            if cargo publish -p "$crate" 2>&1 | tee /tmp/publish.log; then
+              echo "$crate published"
+            elif grep -q "already exists" /tmp/publish.log; then
+              echo "$crate version already published — skipping"
+            else
+              echo "::error::$crate publish failed"
+              exit 1
+            fi
+            echo "::endgroup::"
+            sleep 20  # index propagation
+          }
+          for crate in scitadel-core scitadel-db scitadel-adapters \
+                       scitadel-scoring scitadel-export \
+                       scitadel-mcp scitadel-tui scitadel-cli; do
+            publish_one "$crate"
+          done
