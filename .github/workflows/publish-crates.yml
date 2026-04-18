@@ -29,13 +29,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Dry-run each crate
+        # --no-verify skips the build-from-packaged-source step, which would
+        # otherwise need upstream workspace crates to already exist on
+        # crates.io. Metadata packaging is still checked, so this still
+        # catches missing descriptions, bad categories, etc.
         run: |
           set -euo pipefail
           for crate in scitadel-core scitadel-db scitadel-adapters \
                        scitadel-scoring scitadel-export \
                        scitadel-mcp scitadel-tui scitadel-cli; do
             echo "::group::$crate"
-            cargo publish --dry-run --allow-dirty -p "$crate"
+            cargo publish --dry-run --allow-dirty --no-verify -p "$crate"
             echo "::endgroup::"
           done
 
