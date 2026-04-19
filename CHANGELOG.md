@@ -18,6 +18,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `crates/scitadel-tui/src/views/annotation_prompt.rs` (pure, fully
   tested). $EDITOR integration + visual-mode char-range selection
   remain out of scope — see #97 for the two-pane reader.
+- **Citation graph — iter 1** (#59). New OpenAlex helpers
+  (`fetch_work_by_id`, `fetch_works_by_ids`, `fetch_cited_by`,
+  `short_openalex_id`, `work_to_paper`) plus two MCP tools:
+  - `get_references(paper_id)` — fetches the works this paper cites
+    via OpenAlex's `referenced_works`, materialises each as a Paper
+    row, and persists the citation edges. Source paper must have an
+    `openalex_id`.
+  - `get_citations(paper_id, limit?)` — fetches the works that cite
+    this paper (`cites:` filter; default 25, capped at 200).
+  Idempotent: existing papers upsert on the OpenAlex id, and the
+  citation edge has a uniqueness constraint so re-runs are no-ops.
+  TUI graph view + snowball orchestration (`snowball(seed_paper_ids,
+  depth, stop_condition)`) ship in iter 2.
 - **`sentence_id` + `normalize_sentence` in `scitadel-core`** (#96):
   SHA1 of NFKC-composed, lowercased, whitespace-collapsed sentence
   text. Spec pinned in [ADR-004](docs/decisions/ADR-004-2026-04-19-sentence-id-normalization.md).
@@ -35,6 +48,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **MCP tool-signature + return-shape consistency pass** (#98):
+  - `add_search_terms.query_string` is now `Option<String>` to match
+    its description (was a required `String` clients couldn't omit).
+  - Every MCP tool description now telegraphs its return shape
+    (`Returns: JSON` / `Returns: text`); enforced by a new style test
+    in `crates/scitadel-mcp/src/server.rs`.
+  - `get_assessments` description now says "at least one of paper_id
+    or question_id is required" — the handler error is unchanged.
+  - `list_annotations` description now states paper_id is required and
+    cross-paper listing is not yet implemented (matches the schema +
+    handler).
+  - `prepare_assessment` and `get_rubric` cross-reference each other
+    so an LLM doesn't redundantly fetch the rubric twice.
 - **Annotation anchor resolver** (#96): completes the four-step
   W3C-style pipeline shipped half-done in 0.3.0. Adds
   prefix/suffix-based disambiguation for repeated quotes, sliding-
