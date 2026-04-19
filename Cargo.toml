@@ -62,8 +62,8 @@ ratatui = "0.29"
 crossterm = "0.28"
 
 # MCP
-rmcp = { version = "0.1", features = ["server", "transport-io"] }
-schemars = "0.8"
+rmcp = { version = "0.17", features = ["server", "transport-io", "macros"] }
+schemars = "1"
 
 # Content extraction (PDF / HTML → text)
 pdf-extract = "0.7"

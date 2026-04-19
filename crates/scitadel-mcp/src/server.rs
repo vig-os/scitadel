@@ -1,110 +1,284 @@
+//! MCP server using rmcp 0.17's `tool_router` macro.
+//!
+//! Each tool is a method on `ScitadelServer` annotated with `#[tool]`.
+//! Aggregate request structs implement `Deserialize + JsonSchema` and
+//! are extracted via `Parameters<T>`. The tool handler functions live
+//! in `crate::tools` so this file stays a thin façade.
+
 use rmcp::{
     ServerHandler,
-    model::{ServerCapabilities, ServerInfo},
-    schemars, tool,
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    schemars, tool, tool_handler, tool_router,
 };
+use schemars::JsonSchema;
+use serde::Deserialize;
 
 use crate::tools;
 
 // ---------- Aggregate request structs ----------
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchRequest {
-    #[schemars(description = "Search query string")]
+    /// Search query string
     pub query: String,
-    #[schemars(
-        description = "Comma-separated list of sources (e.g. pubmed,arxiv,openalex,inspire)"
-    )]
+    /// Comma-separated list of sources (e.g. pubmed,arxiv,openalex,inspire)
     pub sources: String,
-    #[schemars(description = "Maximum results per source")]
+    /// Maximum results per source
     pub max_results: usize,
-    #[schemars(description = "Optional research question ID to link the search")]
+    /// Optional research question ID to link the search
     pub question_id: Option<String>,
 }
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct AddSearchTermsRequest {
-    #[schemars(description = "Research question ID")]
+    /// Research question ID
     pub question_id: String,
-    #[schemars(description = "List of search terms")]
+    /// List of search terms
     pub terms: Vec<String>,
-    #[schemars(description = "Custom query string (optional, defaults to terms joined by space)")]
+    /// Custom query string (optional, defaults to terms joined by space)
     pub query_string: Option<String>,
 }
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct AssessPaperRequest {
-    #[schemars(description = "Paper ID")]
+    /// Paper ID
     pub paper_id: String,
-    #[schemars(description = "Research question ID")]
+    /// Research question ID
     pub question_id: String,
-    #[schemars(description = "Relevance score (0.0-1.0)")]
+    /// Relevance score (0.0-1.0)
     pub score: f64,
-    #[schemars(description = "Reasoning for the score")]
+    /// Reasoning for the score
     pub reasoning: String,
-    #[schemars(description = "Assessor identifier")]
+    /// Assessor identifier
     pub assessor: String,
-    #[schemars(description = "Model used for assessment (optional)")]
+    /// Model used for assessment (optional)
     pub model: Option<String>,
 }
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct CreateAnnotationRequest {
-    #[schemars(description = "Paper ID the annotation anchors to")]
+    /// Paper ID the annotation anchors to
     pub paper_id: String,
-    #[schemars(description = "Exact quoted passage (TextQuoteSelector body)")]
+    /// Exact quoted passage (TextQuoteSelector body)
     pub quote: String,
-    #[schemars(description = "Note body — markdown allowed")]
+    /// Note body — markdown allowed
     pub note: String,
-    #[schemars(description = "Identity of the author (e.g. lars, claude-opus-4-7)")]
+    /// Identity of the author (e.g. lars, claude-opus-4-7)
     pub author: String,
-    #[schemars(description = "Text immediately before the quote, for anchor disambiguation")]
+    /// Text immediately before the quote, for anchor disambiguation
     pub prefix: Option<String>,
-    #[schemars(description = "Text immediately after the quote")]
+    /// Text immediately after the quote
     pub suffix: Option<String>,
-    #[schemars(description = "Optional research-question ID to link the annotation")]
+    /// Optional research-question ID to link the annotation
     pub question_id: Option<String>,
-    #[schemars(description = "Optional color label (hex or name)")]
+    /// Optional color label (hex or name)
     pub color: Option<String>,
-    #[schemars(description = "Optional tag list")]
+    /// Optional tag list
     pub tags: Option<Vec<String>>,
 }
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct UpdateAnnotationRequest {
-    #[schemars(description = "Annotation ID")]
+    /// Annotation ID
     pub id: String,
-    #[schemars(description = "New note body")]
+    /// New note body
     pub note: Option<String>,
-    #[schemars(description = "New color")]
+    /// New color
     pub color: Option<String>,
-    #[schemars(description = "Replace tag list wholesale")]
+    /// Replace tag list wholesale
     pub tags: Option<Vec<String>>,
 }
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct SaveAssessmentRequest {
-    #[schemars(description = "Paper ID")]
+    /// Paper ID
     pub paper_id: String,
-    #[schemars(description = "Research question ID")]
+    /// Research question ID
     pub question_id: String,
-    #[schemars(description = "Relevance score (0.0-1.0)")]
+    /// Relevance score (0.0-1.0)
     pub score: f64,
-    #[schemars(description = "Reasoning for the score")]
+    /// Reasoning for the score
     pub reasoning: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReplyAnnotationRequest {
+    /// Parent annotation ID
+    pub parent_id: String,
+    /// Reply body
+    pub note: String,
+    /// Author identity
+    pub author: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeleteAnnotationRequest {
+    /// Annotation ID
+    pub id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListAnnotationsRequest {
+    /// Paper ID to list annotations for
+    pub paper_id: String,
+    /// Optional — only annotations by this author
+    pub author: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MarkSeenRequest {
+    /// Annotation IDs to mark seen
+    pub annotation_ids: Vec<String>,
+    /// Reader identity (e.g. agent slug)
+    pub reader: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MarkThreadSeenRequest {
+    /// Root annotation ID
+    pub root_id: String,
+    /// Reader identity
+    pub reader: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListUnreadRequest {
+    /// Reader identity
+    pub reader: String,
+    /// Optional paper ID filter
+    pub paper_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindSimilarSearchesRequest {
+    /// Free-text query — FTS5 operators are stripped automatically
+    pub query: String,
+    /// Max hits to return (default 10)
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SummarizeSearchRequest {
+    /// Search ID
+    pub search_id: String,
+    /// Max papers to return (default 50)
+    pub max_papers: Option<usize>,
+    /// Max chars per abstract before truncation (default 500)
+    pub abstract_char_limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListSearchesRequest {
+    /// Maximum number of searches to return
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PaperIdRequest {
+    /// Paper ID
+    pub paper_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetCitationsRequest {
+    /// Source paper ID (must have openalex_id)
+    pub paper_id: String,
+    /// Max citing works to return (default 25, max 200)
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ExportSearchRequest {
+    /// Search ID
+    pub search_id: String,
+    /// Export format: json, csv, or bibtex
+    pub format: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CreateQuestionRequest {
+    /// Question text
+    pub text: String,
+    /// Additional context or description
+    pub description: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetAssessmentsRequest {
+    /// Paper ID (optional)
+    pub paper_id: Option<String>,
+    /// Research question ID (optional)
+    pub question_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PaperQuestionRequest {
+    /// Paper ID
+    pub paper_id: String,
+    /// Research question ID
+    pub question_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DownloadPaperRequest {
+    /// Paper ID from the scitadel DB (preferred — unlocks arxiv/openalex/Unpaywall chain)
+    pub paper_id: Option<String>,
+    /// DOI (used only if paper_id is not provided)
+    pub doi: Option<String>,
+    /// Output directory (optional, defaults to .scitadel/papers/)
+    pub output_dir: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReadPaperRequest {
+    /// Paper ID
+    pub paper_id: String,
+    /// Max characters to return (default 20000)
+    pub max_chars: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchIdRequest {
+    /// Search ID
+    pub search_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchQuestionRequest {
+    /// Search ID
+    pub search_id: String,
+    /// Research question ID
+    pub question_id: String,
 }
 
 // ---------- Server ----------
 
-#[derive(Debug, Clone, Default)]
-pub struct ScitadelServer;
+#[derive(Debug, Clone)]
+pub struct ScitadelServer {
+    tool_router: ToolRouter<Self>,
+}
 
-#[tool(tool_box)]
+impl ScitadelServer {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            tool_router: Self::tool_router(),
+        }
+    }
+}
+
+impl Default for ScitadelServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[tool_router(router = tool_router)]
 impl ScitadelServer {
     #[tool(
         description = "Search scientific literature across multiple sources. Returns: JSON with search_id, query, per-source outcomes, total counts, and a `summary` text field for human readers."
     )]
-    async fn search(&self, #[tool(aggr)] req: SearchRequest) -> Result<String, String> {
+    async fn search(&self, Parameters(req): Parameters<SearchRequest>) -> Result<String, String> {
         tools::search_tool(req.query, req.sources, req.max_results, req.question_id).await
     }
 
@@ -127,7 +301,7 @@ impl ScitadelServer {
     )]
     fn create_annotation(
         &self,
-        #[tool(aggr)] req: CreateAnnotationRequest,
+        Parameters(req): Parameters<CreateAnnotationRequest>,
     ) -> Result<String, String> {
         tools::create_annotation_tool(
             &req.paper_id,
@@ -147,17 +321,9 @@ impl ScitadelServer {
     )]
     fn reply_annotation(
         &self,
-        #[tool(param)]
-        #[schemars(description = "Parent annotation ID")]
-        parent_id: String,
-        #[tool(param)]
-        #[schemars(description = "Reply body")]
-        note: String,
-        #[tool(param)]
-        #[schemars(description = "Author identity")]
-        author: String,
+        Parameters(req): Parameters<ReplyAnnotationRequest>,
     ) -> Result<String, String> {
-        tools::reply_annotation_tool(&parent_id, &note, &author)
+        tools::reply_annotation_tool(&req.parent_id, &req.note, &req.author)
     }
 
     #[tool(
@@ -165,7 +331,7 @@ impl ScitadelServer {
     )]
     fn update_annotation(
         &self,
-        #[tool(aggr)] req: UpdateAnnotationRequest,
+        Parameters(req): Parameters<UpdateAnnotationRequest>,
     ) -> Result<String, String> {
         tools::update_annotation_tool(&req.id, req.note.as_deref(), req.color.as_deref(), req.tags)
     }
@@ -175,11 +341,9 @@ impl ScitadelServer {
     )]
     fn delete_annotation(
         &self,
-        #[tool(param)]
-        #[schemars(description = "Annotation ID")]
-        id: String,
+        Parameters(req): Parameters<DeleteAnnotationRequest>,
     ) -> Result<String, String> {
-        tools::delete_annotation_tool(&id)
+        tools::delete_annotation_tool(&req.id)
     }
 
     #[tool(
@@ -187,29 +351,16 @@ impl ScitadelServer {
     )]
     fn list_annotations(
         &self,
-        #[tool(param)]
-        #[schemars(description = "Paper ID to list annotations for")]
-        paper_id: String,
-        #[tool(param)]
-        #[schemars(description = "Optional — only annotations by this author")]
-        author: Option<String>,
+        Parameters(req): Parameters<ListAnnotationsRequest>,
     ) -> Result<String, String> {
-        tools::list_annotations_tool(Some(&paper_id), author.as_deref())
+        tools::list_annotations_tool(Some(&req.paper_id), req.author.as_deref())
     }
 
     #[tool(
         description = "Mark one or more annotations as seen by `reader`. Repeat calls just update seen_at. Used so an agent can stop re-processing notes it already handled. Returns: text count."
     )]
-    fn mark_seen(
-        &self,
-        #[tool(param)]
-        #[schemars(description = "Annotation IDs to mark seen")]
-        annotation_ids: Vec<String>,
-        #[tool(param)]
-        #[schemars(description = "Reader identity (e.g. agent slug)")]
-        reader: String,
-    ) -> Result<String, String> {
-        tools::mark_seen_tool(annotation_ids, &reader)
+    fn mark_seen(&self, Parameters(req): Parameters<MarkSeenRequest>) -> Result<String, String> {
+        tools::mark_seen_tool(req.annotation_ids, &req.reader)
     }
 
     #[tool(
@@ -217,14 +368,9 @@ impl ScitadelServer {
     )]
     fn mark_thread_seen(
         &self,
-        #[tool(param)]
-        #[schemars(description = "Root annotation ID")]
-        root_id: String,
-        #[tool(param)]
-        #[schemars(description = "Reader identity")]
-        reader: String,
+        Parameters(req): Parameters<MarkThreadSeenRequest>,
     ) -> Result<String, String> {
-        tools::mark_thread_seen_tool(&root_id, &reader)
+        tools::mark_thread_seen_tool(&req.root_id, &req.reader)
     }
 
     #[tool(
@@ -232,14 +378,9 @@ impl ScitadelServer {
     )]
     fn list_unread(
         &self,
-        #[tool(param)]
-        #[schemars(description = "Reader identity")]
-        reader: String,
-        #[tool(param)]
-        #[schemars(description = "Optional paper ID filter")]
-        paper_id: Option<String>,
+        Parameters(req): Parameters<ListUnreadRequest>,
     ) -> Result<String, String> {
-        tools::list_unread_tool(&reader, paper_id.as_deref())
+        tools::list_unread_tool(&req.reader, req.paper_id.as_deref())
     }
 
     #[tool(
@@ -247,14 +388,9 @@ impl ScitadelServer {
     )]
     fn find_similar_searches(
         &self,
-        #[tool(param)]
-        #[schemars(description = "Free-text query — FTS5 operators are stripped automatically")]
-        query: String,
-        #[tool(param)]
-        #[schemars(description = "Max hits to return (default 10)")]
-        limit: Option<i64>,
+        Parameters(req): Parameters<FindSimilarSearchesRequest>,
     ) -> Result<String, String> {
-        tools::find_similar_searches_tool(&query, limit)
+        tools::find_similar_searches_tool(&req.query, req.limit)
     }
 
     #[tool(
@@ -262,49 +398,29 @@ impl ScitadelServer {
     )]
     fn summarize_search(
         &self,
-        #[tool(param)]
-        #[schemars(description = "Search ID")]
-        search_id: String,
-        #[tool(param)]
-        #[schemars(description = "Max papers to return (default 50)")]
-        max_papers: Option<usize>,
-        #[tool(param)]
-        #[schemars(description = "Max chars per abstract before truncation (default 500)")]
-        abstract_char_limit: Option<usize>,
+        Parameters(req): Parameters<SummarizeSearchRequest>,
     ) -> Result<String, String> {
-        tools::summarize_search_tool(&search_id, max_papers, abstract_char_limit)
+        tools::summarize_search_tool(&req.search_id, req.max_papers, req.abstract_char_limit)
     }
 
     #[tool(description = "List recent search runs. Returns: text table.")]
     fn list_searches(
         &self,
-        #[tool(param)]
-        #[schemars(description = "Maximum number of searches to return")]
-        limit: Option<i64>,
+        Parameters(req): Parameters<ListSearchesRequest>,
     ) -> Result<String, String> {
-        tools::list_searches_tool(limit.unwrap_or(20))
+        tools::list_searches_tool(req.limit.unwrap_or(20))
     }
 
     #[tool(
         description = "Get papers from a search result. Returns: text listing (title, authors, year, journal, IDs, abstract preview)."
     )]
-    fn get_papers(
-        &self,
-        #[tool(param)]
-        #[schemars(description = "Search ID")]
-        search_id: String,
-    ) -> Result<String, String> {
-        tools::get_papers_tool(&search_id)
+    fn get_papers(&self, Parameters(req): Parameters<SearchIdRequest>) -> Result<String, String> {
+        tools::get_papers_tool(&req.search_id)
     }
 
     #[tool(description = "Get full details of a single paper. Returns: JSON.")]
-    fn get_paper(
-        &self,
-        #[tool(param)]
-        #[schemars(description = "Paper ID")]
-        paper_id: String,
-    ) -> Result<String, String> {
-        tools::get_paper_tool(&paper_id)
+    fn get_paper(&self, Parameters(req): Parameters<PaperIdRequest>) -> Result<String, String> {
+        tools::get_paper_tool(&req.paper_id)
     }
 
     #[tool(
@@ -312,11 +428,9 @@ impl ScitadelServer {
     )]
     fn get_annotated_paper(
         &self,
-        #[tool(param)]
-        #[schemars(description = "Paper ID")]
-        paper_id: String,
+        Parameters(req): Parameters<PaperIdRequest>,
     ) -> Result<String, String> {
-        tools::get_annotated_paper_tool(&paper_id)
+        tools::get_annotated_paper_tool(&req.paper_id)
     }
 
     #[tool(
@@ -324,11 +438,9 @@ impl ScitadelServer {
     )]
     async fn get_references(
         &self,
-        #[tool(param)]
-        #[schemars(description = "Source paper ID (must have openalex_id)")]
-        paper_id: String,
+        Parameters(req): Parameters<PaperIdRequest>,
     ) -> Result<String, String> {
-        tools::get_references_tool(&paper_id).await
+        tools::get_references_tool(&req.paper_id).await
     }
 
     #[tool(
@@ -336,14 +448,9 @@ impl ScitadelServer {
     )]
     async fn get_citations(
         &self,
-        #[tool(param)]
-        #[schemars(description = "Source paper ID (must have openalex_id)")]
-        paper_id: String,
-        #[tool(param)]
-        #[schemars(description = "Max citing works to return (default 25, max 200)")]
-        limit: Option<usize>,
+        Parameters(req): Parameters<GetCitationsRequest>,
     ) -> Result<String, String> {
-        tools::get_citations_tool(&paper_id, limit).await
+        tools::get_citations_tool(&req.paper_id, req.limit).await
     }
 
     #[tool(
@@ -351,27 +458,17 @@ impl ScitadelServer {
     )]
     fn export_search(
         &self,
-        #[tool(param)]
-        #[schemars(description = "Search ID")]
-        search_id: String,
-        #[tool(param)]
-        #[schemars(description = "Export format: json, csv, or bibtex")]
-        format: String,
+        Parameters(req): Parameters<ExportSearchRequest>,
     ) -> Result<String, String> {
-        tools::export_search_tool(&search_id, &format)
+        tools::export_search_tool(&req.search_id, &req.format)
     }
 
     #[tool(description = "Create a new research question. Returns: text confirmation with ID.")]
     fn create_question(
         &self,
-        #[tool(param)]
-        #[schemars(description = "Question text")]
-        text: String,
-        #[tool(param)]
-        #[schemars(description = "Additional context or description")]
-        description: String,
+        Parameters(req): Parameters<CreateQuestionRequest>,
     ) -> Result<String, String> {
-        tools::create_question_tool(&text, &description)
+        tools::create_question_tool(&req.text, &req.description)
     }
 
     #[tool(description = "List all research questions. Returns: text table.")]
@@ -382,14 +479,20 @@ impl ScitadelServer {
     #[tool(
         description = "Add search terms linked to a research question. If `query_string` is omitted, the terms are joined by spaces. Returns: text confirmation."
     )]
-    fn add_search_terms(&self, #[tool(aggr)] req: AddSearchTermsRequest) -> Result<String, String> {
+    fn add_search_terms(
+        &self,
+        Parameters(req): Parameters<AddSearchTermsRequest>,
+    ) -> Result<String, String> {
         tools::add_search_terms_tool(&req.question_id, &req.terms, req.query_string.as_deref())
     }
 
     #[tool(
         description = "Record a paper assessment with score and reasoning. Returns: text summary."
     )]
-    fn assess_paper(&self, #[tool(aggr)] req: AssessPaperRequest) -> Result<String, String> {
+    fn assess_paper(
+        &self,
+        Parameters(req): Parameters<AssessPaperRequest>,
+    ) -> Result<String, String> {
         tools::assess_paper_tool(
             &req.paper_id,
             &req.question_id,
@@ -405,14 +508,9 @@ impl ScitadelServer {
     )]
     fn get_assessments(
         &self,
-        #[tool(param)]
-        #[schemars(description = "Paper ID (optional)")]
-        paper_id: Option<String>,
-        #[tool(param)]
-        #[schemars(description = "Research question ID (optional)")]
-        question_id: Option<String>,
+        Parameters(req): Parameters<GetAssessmentsRequest>,
     ) -> Result<String, String> {
-        tools::get_assessments_tool(paper_id.as_deref(), question_id.as_deref())
+        tools::get_assessments_tool(req.paper_id.as_deref(), req.question_id.as_deref())
     }
 
     #[tool(
@@ -420,20 +518,18 @@ impl ScitadelServer {
     )]
     fn prepare_assessment(
         &self,
-        #[tool(param)]
-        #[schemars(description = "Paper ID")]
-        paper_id: String,
-        #[tool(param)]
-        #[schemars(description = "Research question ID")]
-        question_id: String,
+        Parameters(req): Parameters<PaperQuestionRequest>,
     ) -> Result<String, String> {
-        tools::prepare_assessment_tool(&paper_id, &question_id)
+        tools::prepare_assessment_tool(&req.paper_id, &req.question_id)
     }
 
     #[tool(
         description = "Save an MCP-native assessment scored by the host LLM. Returns: text confirmation."
     )]
-    fn save_assessment(&self, #[tool(aggr)] req: SaveAssessmentRequest) -> Result<String, String> {
+    fn save_assessment(
+        &self,
+        Parameters(req): Parameters<SaveAssessmentRequest>,
+    ) -> Result<String, String> {
         tools::save_assessment_tool(&req.paper_id, &req.question_id, req.score, &req.reasoning)
     }
 
@@ -442,19 +538,14 @@ impl ScitadelServer {
     )]
     async fn download_paper(
         &self,
-        #[tool(param)]
-        #[schemars(
-            description = "Paper ID from the scitadel DB (preferred — unlocks arxiv/openalex/Unpaywall chain)"
-        )]
-        paper_id: Option<String>,
-        #[tool(param)]
-        #[schemars(description = "DOI (used only if paper_id is not provided)")]
-        doi: Option<String>,
-        #[tool(param)]
-        #[schemars(description = "Output directory (optional, defaults to .scitadel/papers/)")]
-        output_dir: Option<String>,
+        Parameters(req): Parameters<DownloadPaperRequest>,
     ) -> Result<String, String> {
-        tools::download_paper_tool(paper_id.as_deref(), doi.as_deref(), output_dir.as_deref()).await
+        tools::download_paper_tool(
+            req.paper_id.as_deref(),
+            req.doi.as_deref(),
+            req.output_dir.as_deref(),
+        )
+        .await
     }
 
     #[tool(
@@ -462,14 +553,9 @@ impl ScitadelServer {
     )]
     async fn read_paper(
         &self,
-        #[tool(param)]
-        #[schemars(description = "Paper ID")]
-        paper_id: String,
-        #[tool(param)]
-        #[schemars(description = "Max characters to return (default 20000)")]
-        max_chars: Option<usize>,
+        Parameters(req): Parameters<ReadPaperRequest>,
     ) -> Result<String, String> {
-        tools::read_paper_tool(&paper_id, max_chars).await
+        tools::read_paper_tool(&req.paper_id, req.max_chars).await
     }
 
     #[tool(
@@ -477,27 +563,14 @@ impl ScitadelServer {
     )]
     fn prepare_batch_assessments(
         &self,
-        #[tool(param)]
-        #[schemars(description = "Search ID")]
-        search_id: String,
-        #[tool(param)]
-        #[schemars(description = "Research question ID")]
-        question_id: String,
+        Parameters(req): Parameters<SearchQuestionRequest>,
     ) -> Result<String, String> {
-        tools::prepare_batch_assessments_tool(&search_id, &question_id)
+        tools::prepare_batch_assessments_tool(&req.search_id, &req.question_id)
     }
 }
 
-#[tool(tool_box)]
-impl ServerHandler for ScitadelServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some("Scitadel: scientific literature retrieval and assessment".into()),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
-    }
-}
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for ScitadelServer {}
 
 #[cfg(test)]
 mod tests {
@@ -519,7 +592,6 @@ mod tests {
         let mut tool_count = 0;
         while let Some(start) = src[offset..].find("#[tool(") {
             let abs_start = offset + start;
-            // Find matching close-paren by simple depth tracking.
             let mut depth = 0;
             let mut end = abs_start;
             for (i, c) in src[abs_start..].char_indices() {
@@ -538,7 +610,6 @@ mod tests {
             let attr = &src[abs_start..=end];
             offset = end + 1;
 
-            // Skip the macro-level `#[tool(tool_box)]` markers.
             if !attr.contains("description") {
                 continue;
             }
