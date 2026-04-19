@@ -799,8 +799,7 @@ mod tests {
         // case/whitespace). Quote string is wholly absent from the
         // new text so substring + fuzzy fail; sentence-id rescues.
         let original_sentence = "The Transformer Architecture relies on self-attention.";
-        let new_text =
-            "Intro. the   transformer architecture relies on self-attention. Outro.";
+        let new_text = "Intro. the   transformer architecture relies on self-attention. Outro.";
         let mut a = Anchor {
             char_range: None,
             // Bypasses substring + fuzzy.
