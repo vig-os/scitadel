@@ -836,6 +836,17 @@ pub fn create_annotation_tool(
     }
 
     repo.create(&ann).map_err(|e| e.to_string())?;
+    // Trust-on-first-use audit log: `author` is whatever string the
+    // MCP client supplied. rmcp 0.1.5 doesn't surface a peer identity
+    // to tool handlers, so this is the best we can do until auth lands
+    // (see ADR-003 "Phase-5 auth"). #100.
+    tracing::info!(
+        op = "create_annotation",
+        annotation_id = ann.id.as_str(),
+        paper_id = paper_id,
+        author = author,
+        "annotation write (trust-on-first-use)"
+    );
     Ok(ann.id.as_str().to_string())
 }
 
@@ -854,6 +865,13 @@ pub fn reply_annotation_tool(parent_id: &str, note: &str, author: &str) -> Resul
     let reply =
         scitadel_core::models::Annotation::new_reply(&parent, author.to_string(), note.to_string());
     repo.create(&reply).map_err(|e| e.to_string())?;
+    tracing::info!(
+        op = "reply_annotation",
+        annotation_id = reply.id.as_str(),
+        parent_id = parent_id,
+        author = author,
+        "annotation write (trust-on-first-use)"
+    );
     Ok(reply.id.as_str().to_string())
 }
 
@@ -870,11 +888,18 @@ pub fn update_annotation_tool(
         .get(id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Annotation '{id}' not found."))?;
+    let original_author = existing.author.clone();
     let new_note = note.unwrap_or(&existing.note);
     let new_color = color.or(existing.color.as_deref());
     let new_tags = tags.unwrap_or(existing.tags);
     repo.update_note(id, new_note, new_color, &new_tags)
         .map_err(|e| e.to_string())?;
+    tracing::info!(
+        op = "update_annotation",
+        annotation_id = id,
+        author = original_author.as_str(),
+        "annotation write (trust-on-first-use)"
+    );
     Ok(format!("Annotation {id} updated."))
 }
 
@@ -884,6 +909,11 @@ pub fn delete_annotation_tool(id: &str) -> Result<String, String> {
     let db = open_db()?;
     let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
     repo.soft_delete(id).map_err(|e| e.to_string())?;
+    tracing::info!(
+        op = "delete_annotation",
+        annotation_id = id,
+        "annotation write (trust-on-first-use)"
+    );
     Ok(format!("Annotation {id} deleted (soft)."))
 }
 
