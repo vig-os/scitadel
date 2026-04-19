@@ -10,7 +10,7 @@
 use scitadel_core::config::load_config;
 use scitadel_core::models::{Assessment, Paper, ResearchQuestion, SearchTerm};
 use scitadel_core::ports::{
-    AssessmentRepository, PaperRepository, QuestionRepository, SearchRepository,
+    AssessmentRepository, CitationRepository, PaperRepository, QuestionRepository, SearchRepository,
 };
 use scitadel_db::sqlite::Database;
 use scitadel_scoring::{SCORING_SYSTEM_PROMPT, build_user_prompt};
@@ -598,6 +598,213 @@ pub async fn read_paper_tool(paper_id: &str, max_chars: Option<usize>) -> Result
         path.display(),
         truncated
     ))
+}
+
+// ---------- Citation graph (#59 iter 1) ----------
+
+/// Fetch the OpenAlex `referenced_works` for a paper, materialise each
+/// cited work as a `Paper` row, and persist the citation edges. Returns
+/// JSON: `{ source_paper_id, count, references: [paper rows...] }`.
+///
+/// Iter 1 of #59. Forward-citation only (cited_by + snowball
+/// orchestration ship in later iters). Idempotent: existing papers
+/// upsert on the OpenAlex id, citation edges have a uniqueness
+/// constraint so re-runs are no-ops.
+pub async fn get_references_tool(paper_id: &str) -> Result<String, String> {
+    let stored = fetch_and_store_references(paper_id).await?;
+    let entries: Vec<serde_json::Value> = stored
+        .papers
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "id": p.id.as_str(),
+                "title": p.title,
+                "authors": p.authors,
+                "year": p.year,
+                "doi": p.doi,
+                "openalex_id": p.openalex_id,
+            })
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "source_paper_id": paper_id,
+        "count": stored.papers.len(),
+        "references": entries,
+    });
+    serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())
+}
+
+/// Fetch the works that cite a given paper (`cited_by` direction).
+/// Mirrors `get_references_tool`; bounded by `limit` (default 25, cap
+/// 200 per the OpenAlex API).
+pub async fn get_citations_tool(paper_id: &str, limit: Option<usize>) -> Result<String, String> {
+    let stored = fetch_and_store_citations(paper_id, limit.unwrap_or(25)).await?;
+    let entries: Vec<serde_json::Value> = stored
+        .papers
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "id": p.id.as_str(),
+                "title": p.title,
+                "authors": p.authors,
+                "year": p.year,
+                "doi": p.doi,
+                "openalex_id": p.openalex_id,
+            })
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "source_paper_id": paper_id,
+        "count": stored.papers.len(),
+        "citations": entries,
+    });
+    serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())
+}
+
+struct CitationFetchOutcome {
+    papers: Vec<scitadel_core::models::Paper>,
+}
+
+async fn fetch_and_store_references(paper_id: &str) -> Result<CitationFetchOutcome, String> {
+    let config = load_config();
+    let db = open_db()?;
+    let (paper_repo, _, _, _, citation_repo) = db.repositories();
+
+    let source_paper = paper_repo
+        .get(paper_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Paper '{paper_id}' not found."))?;
+    let source_openalex = source_paper.openalex_id.clone().ok_or_else(|| {
+        format!("Paper '{paper_id}' has no openalex_id; reference fetch needs it.")
+    })?;
+
+    let adapter =
+        scitadel_adapters::openalex::OpenAlexAdapter::new(config.openalex.api_key.clone(), 30.0);
+    let work = adapter
+        .fetch_work_by_id(&source_openalex)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let referenced_ids: Vec<String> = work
+        .get("referenced_works")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .filter_map(scitadel_adapters::openalex::short_openalex_id)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    materialise_and_link(
+        &paper_repo,
+        &citation_repo,
+        &adapter,
+        paper_id,
+        &referenced_ids,
+        scitadel_core::models::CitationDirection::References,
+    )
+    .await
+}
+
+async fn fetch_and_store_citations(
+    paper_id: &str,
+    limit: usize,
+) -> Result<CitationFetchOutcome, String> {
+    let config = load_config();
+    let db = open_db()?;
+    let (paper_repo, _, _, _, citation_repo) = db.repositories();
+
+    let source_paper = paper_repo
+        .get(paper_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Paper '{paper_id}' not found."))?;
+    let source_openalex = source_paper.openalex_id.clone().ok_or_else(|| {
+        format!("Paper '{paper_id}' has no openalex_id; citation fetch needs it.")
+    })?;
+
+    let adapter =
+        scitadel_adapters::openalex::OpenAlexAdapter::new(config.openalex.api_key.clone(), 30.0);
+
+    let citing_works = adapter
+        .fetch_cited_by(&source_openalex, limit)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut citing_ids: Vec<String> = Vec::with_capacity(citing_works.len());
+    for work in &citing_works {
+        if let Some(id) = work
+            .get("id")
+            .and_then(|v| v.as_str())
+            .and_then(scitadel_adapters::openalex::short_openalex_id)
+        {
+            citing_ids.push(id);
+        }
+    }
+
+    // Persist the works inline (we already have the metadata).
+    let papers: Vec<scitadel_core::models::Paper> = citing_works
+        .iter()
+        .map(scitadel_adapters::openalex::work_to_paper)
+        .collect();
+    paper_repo.save_many(&papers).map_err(|e| e.to_string())?;
+
+    let mut edges = Vec::with_capacity(citing_ids.len());
+    for cid in &citing_ids {
+        edges.push(scitadel_core::models::Citation {
+            source_paper_id: scitadel_core::models::PaperId::from(paper_id),
+            target_paper_id: scitadel_core::models::PaperId::from(cid.clone()),
+            direction: scitadel_core::models::CitationDirection::CitedBy,
+            discovered_by: "openalex".into(),
+            depth: 1,
+            snowball_run_id: None,
+        });
+    }
+    citation_repo.save_many(&edges).map_err(|e| e.to_string())?;
+    Ok(CitationFetchOutcome { papers })
+}
+
+async fn materialise_and_link(
+    paper_repo: &scitadel_db::sqlite::SqlitePaperRepository,
+    citation_repo: &scitadel_db::sqlite::SqliteCitationRepository,
+    adapter: &scitadel_adapters::openalex::OpenAlexAdapter,
+    source_paper_id: &str,
+    target_openalex_ids: &[String],
+    direction: scitadel_core::models::CitationDirection,
+) -> Result<CitationFetchOutcome, String> {
+    if target_openalex_ids.is_empty() {
+        return Ok(CitationFetchOutcome { papers: Vec::new() });
+    }
+    // Batch-fetch metadata in chunks of 50 (OpenAlex `openalex_id:`
+    // filter cap).
+    let mut all_papers: Vec<scitadel_core::models::Paper> = Vec::new();
+    for chunk in target_openalex_ids.chunks(50) {
+        let works = adapter
+            .fetch_works_by_ids(chunk)
+            .await
+            .map_err(|e| e.to_string())?;
+        for work in &works {
+            all_papers.push(scitadel_adapters::openalex::work_to_paper(work));
+        }
+    }
+    paper_repo
+        .save_many(&all_papers)
+        .map_err(|e| e.to_string())?;
+
+    let mut edges = Vec::with_capacity(all_papers.len());
+    for paper in &all_papers {
+        edges.push(scitadel_core::models::Citation {
+            source_paper_id: scitadel_core::models::PaperId::from(source_paper_id),
+            target_paper_id: paper.id.clone(),
+            direction: direction.clone(),
+            discovered_by: "openalex".into(),
+            depth: 1,
+            snowball_run_id: None,
+        });
+    }
+    citation_repo.save_many(&edges).map_err(|e| e.to_string())?;
+
+    Ok(CitationFetchOutcome { papers: all_papers })
 }
 
 fn html_to_text(html: &str) -> String {

@@ -301,6 +301,33 @@ impl ScitadelServer {
         tools::get_paper_tool(&paper_id)
     }
 
+    #[tool(
+        description = "Fetch the works this paper cites (forward references) via OpenAlex's `referenced_works`. Materialises each cited work as a Paper row + persists the citation edges so subsequent queries hit the local DB. Requires the source paper to have an openalex_id. Returns: JSON {source_paper_id, count, references[]}."
+    )]
+    async fn get_references(
+        &self,
+        #[tool(param)]
+        #[schemars(description = "Source paper ID (must have openalex_id)")]
+        paper_id: String,
+    ) -> Result<String, String> {
+        tools::get_references_tool(&paper_id).await
+    }
+
+    #[tool(
+        description = "Fetch the works that cite this paper (reverse direction) via OpenAlex's `cites:` filter. Materialises citing works + persists edges. `limit` defaults to 25, capped at 200 by the OpenAlex API. Returns: JSON {source_paper_id, count, citations[]}."
+    )]
+    async fn get_citations(
+        &self,
+        #[tool(param)]
+        #[schemars(description = "Source paper ID (must have openalex_id)")]
+        paper_id: String,
+        #[tool(param)]
+        #[schemars(description = "Max citing works to return (default 25, max 200)")]
+        limit: Option<usize>,
+    ) -> Result<String, String> {
+        tools::get_citations_tool(&paper_id, limit).await
+    }
+
     #[tool(description = "Export search results in a given format (json, csv, bibtex)")]
     fn export_search(
         &self,
