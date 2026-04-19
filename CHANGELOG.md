@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extracted text on first call so subsequent reads — including the
   new TUI reader — hit the DB instead of re-running pdf-extract.
   Failure to cache is non-fatal (extraction still returns).
+- **VHS coverage for CLI search + question subcommands** (#99): two
+  new tapes (`tests/vhs/cli-search.tape`,
+  `tests/vhs/cli-question-workflow.tape`) plus a `Shift+Tab`
+  (BackTab) + `d`/`u` page-scroll addition to `tui-launch.tape` to
+  close the gaps flagged in the 0.4.0 coverage audit.
 
 ### Changed
 
