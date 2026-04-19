@@ -11,6 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **MCP tool-signature + return-shape consistency pass** (#98):
+  - `add_search_terms.query_string` is now `Option<String>` to match
+    its description (was a required `String` clients couldn't omit).
+  - Every MCP tool description now telegraphs its return shape
+    (`Returns: JSON` / `Returns: text`); enforced by a new style test
+    in `crates/scitadel-mcp/src/server.rs`.
+  - `get_assessments` description now says "at least one of paper_id
+    or question_id is required" — the handler error is unchanged.
+  - `list_annotations` description now states paper_id is required and
+    cross-paper listing is not yet implemented (matches the schema +
+    handler).
+  - `prepare_assessment` and `get_rubric` cross-reference each other
+    so an LLM doesn't redundantly fetch the rubric twice.
+
 ### Removed
 
 ### Fixed
