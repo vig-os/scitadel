@@ -17,7 +17,8 @@ use tokio::sync::mpsc;
 
 use crate::data::DataStore;
 use crate::tasks::{Task, TaskUpdate, spawn_download_paper};
-use crate::views::{detail, papers, questions, searches, tasks as tasks_view};
+use crate::views::annotation_prompt::{AnnotationPrompt, PromptCommit, PromptSubmission};
+use crate::views::{annotation_prompt, detail, papers, questions, searches, tasks as tasks_view};
 use crate::widgets::status_bar;
 
 /// Active tab in the TUI.
@@ -59,8 +60,22 @@ impl Tab {
 /// Overlay view shown on top of the current tab.
 #[derive(Debug, Clone)]
 pub enum Overlay {
-    PaperDetail { paper_id: String, scroll: u16 },
-    SearchPapers { search_id: String, selected: usize },
+    PaperDetail {
+        paper_id: String,
+        scroll: u16,
+        /// `None` = scroll mode; `Some(i)` = focused on annotation `i`
+        /// in the paper's annotation list. Set by `J` (or `Tab` while
+        /// in PaperDetail) and cleared by `Esc`. Required so e/d/r
+        /// have a target.
+        annotation_focus: Option<usize>,
+        /// Active n/e/r/d prompt overlay. Drawn on top of the detail
+        /// view; eats keystrokes until submitted or cancelled.
+        prompt: Option<AnnotationPrompt>,
+    },
+    SearchPapers {
+        search_id: String,
+        selected: usize,
+    },
 }
 
 /// Main application state.
@@ -194,21 +209,7 @@ impl App {
 
     fn handle_overlay_key(&mut self, code: KeyCode) {
         match self.overlay {
-            Some(Overlay::PaperDetail {
-                ref paper_id,
-                ref mut scroll,
-            }) => match code {
-                KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
-                KeyCode::Char('j') | KeyCode::Down => *scroll = scroll.saturating_add(1),
-                KeyCode::Char('k') | KeyCode::Up => *scroll = scroll.saturating_sub(1),
-                KeyCode::Char('d') => *scroll = scroll.saturating_add(10),
-                KeyCode::Char('u') => *scroll = scroll.saturating_sub(10),
-                KeyCode::Char('D') => {
-                    let paper_id = paper_id.clone();
-                    self.queue_download(&paper_id);
-                }
-                _ => {}
-            },
+            Some(Overlay::PaperDetail { .. }) => self.handle_paper_detail_key(code),
             Some(Overlay::SearchPapers {
                 ref search_id,
                 ref mut selected,
@@ -235,6 +236,8 @@ impl App {
                         self.overlay = Some(Overlay::PaperDetail {
                             paper_id: paper.id.as_str().to_string(),
                             scroll: 0,
+                            annotation_focus: None,
+                            prompt: None,
                         });
                     }
                 }
@@ -255,6 +258,156 @@ impl App {
             self.unpaywall_email.clone(),
             self.papers_dir.clone(),
         );
+    }
+
+    /// Routes a key inside the PaperDetail overlay through three layers:
+    /// (1) an active prompt, (2) annotation-focus mode, (3) plain
+    /// scroll mode. Each layer eats its own keys and falls through
+    /// otherwise.
+    fn handle_paper_detail_key(&mut self, code: KeyCode) {
+        let Some(Overlay::PaperDetail {
+            paper_id,
+            scroll,
+            annotation_focus,
+            prompt,
+        }) = self.overlay.as_mut()
+        else {
+            return;
+        };
+
+        // Layer 1: an active prompt eats every keystroke.
+        if prompt.is_some() {
+            let submission = step_prompt(prompt, code);
+            if let Some(s) = submission {
+                self.dispatch_submission(s);
+            }
+            return;
+        }
+
+        // Layer 2: annotation focus mode (e/d/r operate on a focused row).
+        if let Some(focus) = annotation_focus {
+            let pid = paper_id.clone();
+            let annotations = self
+                .data
+                .load_annotations_for_paper(&pid)
+                .unwrap_or_default();
+            if annotations.is_empty() {
+                *annotation_focus = None;
+            } else {
+                let count = annotations.len();
+                match code {
+                    KeyCode::Esc => *annotation_focus = None,
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        *focus = (*focus + 1).min(count - 1);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        *focus = focus.saturating_sub(1);
+                    }
+                    KeyCode::Char('e') => {
+                        let target = &annotations[*focus];
+                        *prompt = Some(AnnotationPrompt::edit(
+                            target.id.as_str(),
+                            target.note.clone(),
+                        ));
+                    }
+                    KeyCode::Char('r') => {
+                        let target = &annotations[*focus];
+                        // Replies anchor to the root; if the focused row is
+                        // already a reply, attach the new reply to its root.
+                        let parent = target
+                            .parent_id
+                            .as_ref()
+                            .map_or(target.id.as_str(), |p| p.as_str());
+                        *prompt = Some(AnnotationPrompt::reply(parent));
+                    }
+                    KeyCode::Char('d') => {
+                        *prompt = Some(AnnotationPrompt::delete_confirm(
+                            annotations[*focus].id.as_str(),
+                        ));
+                    }
+                    KeyCode::Char('n') => {
+                        *prompt = Some(AnnotationPrompt::create());
+                    }
+                    _ => {}
+                }
+                return;
+            }
+        }
+
+        // Layer 3: scroll mode.
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
+            KeyCode::Char('j') | KeyCode::Down => *scroll = scroll.saturating_add(1),
+            KeyCode::Char('k') | KeyCode::Up => *scroll = scroll.saturating_sub(1),
+            KeyCode::Char('d') => *scroll = scroll.saturating_add(10),
+            KeyCode::Char('u') => *scroll = scroll.saturating_sub(10),
+            KeyCode::Char('D') => {
+                let pid = paper_id.clone();
+                self.queue_download(&pid);
+            }
+            KeyCode::Char('n') => {
+                *prompt = Some(AnnotationPrompt::create());
+            }
+            KeyCode::Char('J') => {
+                // Enter annotation focus mode if the paper has any.
+                let pid = paper_id.clone();
+                let count = self
+                    .data
+                    .load_annotations_for_paper(&pid)
+                    .map_or(0, |a| a.len());
+                if count > 0 {
+                    *annotation_focus = Some(0);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Translate a prompt submission into the matching repository call
+    /// and reconcile UI state afterwards (e.g. clamp annotation focus
+    /// when a delete shrinks the list).
+    fn dispatch_submission(&mut self, submission: PromptSubmission) {
+        let Some(Overlay::PaperDetail {
+            paper_id,
+            annotation_focus,
+            ..
+        }) = self.overlay.as_mut()
+        else {
+            return;
+        };
+        let pid = paper_id.clone();
+        let reader = self.reader.clone();
+        match submission {
+            PromptSubmission::Create { quote, note } => {
+                let _ = self
+                    .data
+                    .create_root_annotation(&pid, &quote, &note, &reader);
+            }
+            PromptSubmission::Edit {
+                annotation_id,
+                note,
+            } => {
+                let _ = self.data.update_annotation_note(&annotation_id, &note);
+            }
+            PromptSubmission::Reply { parent_id, note } => {
+                let _ = self.data.reply_annotation(&parent_id, &note, &reader);
+            }
+            PromptSubmission::Delete { annotation_id } => {
+                let _ = self.data.delete_annotation(&annotation_id);
+                // Keep focus inside the new (smaller) list.
+                if let Some(focus) = annotation_focus {
+                    let new_count = self
+                        .data
+                        .load_annotations_for_paper(&pid)
+                        .map_or(0, |a| a.len());
+                    if new_count == 0 {
+                        *annotation_focus = None;
+                    } else if *focus >= new_count {
+                        *focus = new_count - 1;
+                    }
+                }
+            }
+        }
     }
 
     fn handle_tab_key(&mut self, code: KeyCode) {
@@ -297,6 +450,8 @@ impl App {
                             self.overlay = Some(Overlay::PaperDetail {
                                 paper_id: paper.id.as_str().to_string(),
                                 scroll: 0,
+                                annotation_focus: None,
+                                prompt: None,
                             });
                         }
                     }
@@ -409,8 +564,23 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     frame.render_widget(tabs, chunks[0]);
 
     match &app.overlay {
-        Some(Overlay::PaperDetail { paper_id, scroll }) => {
-            detail::draw(frame, chunks[1], &app.data, paper_id, *scroll);
+        Some(Overlay::PaperDetail {
+            paper_id,
+            scroll,
+            annotation_focus,
+            prompt,
+        }) => {
+            detail::draw(
+                frame,
+                chunks[1],
+                &app.data,
+                paper_id,
+                *scroll,
+                *annotation_focus,
+            );
+            if let Some(active) = prompt {
+                annotation_prompt::draw_overlay(frame, chunks[1], active);
+            }
         }
         Some(Overlay::SearchPapers {
             search_id,
@@ -445,9 +615,28 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     }
 
     let help_text = match (&app.overlay, app.tab) {
-        (Some(Overlay::PaperDetail { .. }), _) => {
-            "Esc/q: back | j/k: scroll | d/u: page | D: download"
-        }
+        (
+            Some(Overlay::PaperDetail {
+                annotation_focus,
+                prompt,
+                ..
+            }),
+            _,
+        ) => match (prompt, annotation_focus) {
+            (Some(p), _) => match p {
+                AnnotationPrompt::DeleteConfirm { .. } => "y: confirm | n/Esc: cancel",
+                AnnotationPrompt::Create { .. } => {
+                    "Enter: next/submit | Backspace: delete char | Esc: cancel"
+                }
+                _ => "Enter: submit | Backspace: delete char | Esc: cancel",
+            },
+            (None, Some(_)) => {
+                "Esc: leave focus | j/k: navigate | n: new | e: edit | r: reply | d: delete"
+            }
+            (None, None) => {
+                "Esc/q: back | j/k: scroll | d/u: page | D: download | n: new annotation | J: focus annotations"
+            }
+        },
         (Some(Overlay::SearchPapers { .. }), _) => {
             "Esc/q: back | j/k: navigate | Enter: open paper"
         }
@@ -455,6 +644,52 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         (None, _) => "Tab/Shift-Tab: switch tabs | j/k: navigate | Enter: select | q: quit",
     };
     status_bar::draw(frame, chunks[3], help_text, app.offline);
+}
+
+/// Step the active annotation prompt by one keystroke. Mutates the
+/// `prompt` slot (clears it on cancel/submit, advances stage on Enter
+/// in a Create's Quote stage). Returns `Some(submission)` when the
+/// prompt resolved to a write the app should dispatch.
+fn step_prompt(prompt: &mut Option<AnnotationPrompt>, code: KeyCode) -> Option<PromptSubmission> {
+    let active = prompt.as_mut()?;
+    match code {
+        KeyCode::Esc => {
+            *prompt = None;
+            None
+        }
+        KeyCode::Enter => match active.submit() {
+            PromptCommit::AdvanceStage(next) => {
+                *prompt = Some(next);
+                None
+            }
+            PromptCommit::Submit(s) => {
+                *prompt = None;
+                Some(s)
+            }
+            PromptCommit::Cancel => {
+                *prompt = None;
+                None
+            }
+        },
+        KeyCode::Backspace => {
+            active.backspace();
+            None
+        }
+        KeyCode::Char(ch) => {
+            // Confirm prompts route y/n through their own handler.
+            if let Some(commit) = active.confirm(ch) {
+                let result = match commit {
+                    PromptCommit::Submit(s) => Some(s),
+                    PromptCommit::Cancel | PromptCommit::AdvanceStage(_) => None,
+                };
+                *prompt = None;
+                return result;
+            }
+            active.push_char(ch);
+            None
+        }
+        _ => None,
+    }
 }
 
 /// One-shot check: is the internet reachable? Uses a 3s HEAD to a stable
