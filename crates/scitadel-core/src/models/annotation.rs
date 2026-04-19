@@ -155,6 +155,56 @@ pub struct AnnotationRead {
     pub seen_at: DateTime<Utc>,
 }
 
+/// Normalize a sentence for sentence-id hashing.
+///
+/// Per ADR-004: NFKC compose (folds ligatures: ﬁ → fi, ﬂ → fl), Unicode
+/// lowercase, then collapse all Unicode whitespace runs to a single
+/// ASCII space and trim. Two sentences that differ only in case,
+/// whitespace, or ligature presentation hash to the same value.
+#[must_use]
+pub fn normalize_sentence(s: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    // NFKC: compatibility decomposition + canonical composition.
+    let composed: String = s.nfkc().collect();
+    let lowered: String = composed.chars().flat_map(char::to_lowercase).collect();
+    let mut out = String::with_capacity(lowered.len());
+    let mut prev_was_space = true; // collapses leading whitespace
+    for ch in lowered.chars() {
+        if ch.is_whitespace() {
+            if !prev_was_space {
+                out.push(' ');
+                prev_was_space = true;
+            }
+        } else {
+            out.push(ch);
+            prev_was_space = false;
+        }
+    }
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
+/// SHA1 hex of the normalized sentence — stable identifier the
+/// resolver can compare against sentences extracted from current
+/// paper text. See `normalize_sentence` and ADR-004 for the
+/// normalization spec.
+#[must_use]
+pub fn sentence_id(s: &str) -> String {
+    use sha1::{Digest, Sha1};
+    let normalized = normalize_sentence(s);
+    let mut hasher = Sha1::new();
+    hasher.update(normalized.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(40);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,5 +244,32 @@ mod tests {
         assert!(!a.is_orphan());
         a.status = AnchorStatus::Orphan;
         assert!(a.is_orphan());
+    }
+
+    #[test]
+    fn normalize_collapses_whitespace_and_lowercases() {
+        assert_eq!(normalize_sentence("  Hello   WORLD\n"), "hello world");
+    }
+
+    #[test]
+    fn normalize_folds_ligatures_via_nfkc() {
+        // U+FB01 (ﬁ) → "fi" under NFKC, so "ef + ﬁ + cient" → "efficient".
+        assert_eq!(normalize_sentence("ef\u{FB01}cient"), "efficient");
+    }
+
+    #[test]
+    fn sentence_id_is_stable_under_whitespace_and_case() {
+        let a = sentence_id("Hello   World");
+        let b = sentence_id("hello world");
+        let c = sentence_id("HELLO\tWORLD");
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+        // Length of SHA1 hex.
+        assert_eq!(a.len(), 40);
+    }
+
+    #[test]
+    fn sentence_id_changes_when_content_does() {
+        assert_ne!(sentence_id("hello world"), sentence_id("hello mars"));
     }
 }

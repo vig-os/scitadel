@@ -308,6 +308,18 @@ impl ScitadelServer {
     }
 
     #[tool(
+        description = "Returns: JSON {paper {id,title,abstract,full_text}, annotations[] (live only, with parent_id/root_id and full anchor incl. char_range/quote/prefix/suffix/sentence_id/source_version/status), source_version}. One call replaces get_paper + list_annotations when an agent needs to reason over offsets."
+    )]
+    fn get_annotated_paper(
+        &self,
+        #[tool(param)]
+        #[schemars(description = "Paper ID")]
+        paper_id: String,
+    ) -> Result<String, String> {
+        tools::get_annotated_paper_tool(&paper_id)
+    }
+
+    #[tool(
         description = "Export search results in a given format. Returns: text in the requested format (JSON / CSV / BibTeX)."
     )]
     fn export_search(

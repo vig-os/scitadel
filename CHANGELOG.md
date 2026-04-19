@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`sentence_id` + `normalize_sentence` in `scitadel-core`** (#96):
+  SHA1 of NFKC-composed, lowercased, whitespace-collapsed sentence
+  text. Spec pinned in [ADR-004](docs/decisions/ADR-004-2026-04-19-sentence-id-normalization.md).
+- **MCP `get_annotated_paper`** (#95): one-call JSON of a paper +
+  every live annotation anchored to it (with `parent_id` / `root_id`
+  for thread reconstruction and the full anchor incl.
+  char_range/quote/prefix/suffix/sentence_id/source_version/status).
+  Replaces `get_paper` + `list_annotations` for agents that reason
+  over offsets.
 - **VHS coverage for CLI search + question subcommands** (#99): two
   new tapes (`tests/vhs/cli-search.tape`,
   `tests/vhs/cli-question-workflow.tape`) plus a `Shift+Tab`
@@ -30,6 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     handler).
   - `prepare_assessment` and `get_rubric` cross-reference each other
     so an LLM doesn't redundantly fetch the rubric twice.
+- **Annotation anchor resolver** (#96): completes the four-step
+  W3C-style pipeline shipped half-done in 0.3.0. Adds
+  prefix/suffix-based disambiguation for repeated quotes, sliding-
+  window fuzzy match (Jaro-Winkler ≥ 0.9 default; tunable via
+  `resolve_anchor_with_threshold`), sentence-id fallback, and
+  bounds-checking on `char_range` so malformed rows return
+  `Orphan` instead of panicking.
 - **MCP annotation tool descriptions** (#100): `create_annotation`,
   `reply_annotation`, `update_annotation`, `delete_annotation`, and
   `list_unread` now flag trust-on-first-use author identity (real auth

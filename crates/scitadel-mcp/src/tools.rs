@@ -962,6 +962,95 @@ pub fn list_annotations_tool(
     serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())
 }
 
+/// Return the paper text + every live annotation anchored to it as a
+/// single structured JSON document, so an agent can reason over offsets
+/// without re-deriving the mapping from `get_paper` + `list_annotations`.
+///
+/// Soft-deleted annotations are excluded. Replies are flat with
+/// `parent_id` and `root_id` so threads can be reconstructed without
+/// extra round-trips.
+pub fn get_annotated_paper_tool(paper_id: &str) -> Result<String, String> {
+    let db = open_db()?;
+    build_annotated_paper(&db, paper_id)
+}
+
+fn build_annotated_paper(db: &Database, paper_id: &str) -> Result<String, String> {
+    use std::collections::HashMap;
+
+    let (paper_repo, _, _, _, _) = db.repositories();
+    let paper = paper_repo
+        .get(paper_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Paper '{paper_id}' not found."))?;
+
+    let ann_repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db.clone());
+    let annotations = ann_repo
+        .list_by_paper(paper_id)
+        .map_err(|e| e.to_string())?;
+
+    let by_id: HashMap<&str, &scitadel_core::models::Annotation> =
+        annotations.iter().map(|a| (a.id.as_str(), a)).collect();
+    let root_of = |start: &scitadel_core::models::Annotation| -> String {
+        let mut cur = start;
+        // Bounded chase to avoid pathological loops if data is malformed.
+        for _ in 0..64 {
+            match &cur.parent_id {
+                None => return cur.id.as_str().to_string(),
+                Some(pid) => match by_id.get(pid.as_str()) {
+                    Some(parent) => cur = parent,
+                    None => return cur.id.as_str().to_string(),
+                },
+            }
+        }
+        cur.id.as_str().to_string()
+    };
+
+    let source_version = annotations
+        .iter()
+        .find_map(|a| a.anchor.source_version.clone());
+
+    let entries: Vec<serde_json::Value> = annotations
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "id": a.id.as_str(),
+                "parent_id": a.parent_id.as_ref().map(|p| p.as_str()),
+                "root_id": root_of(a),
+                "paper_id": a.paper_id.as_str(),
+                "question_id": a.question_id.as_ref().map(|q| q.as_str()),
+                "anchor": {
+                    "char_range": a.anchor.char_range,
+                    "quote": a.anchor.quote,
+                    "prefix": a.anchor.prefix,
+                    "suffix": a.anchor.suffix,
+                    "sentence_id": a.anchor.sentence_id,
+                    "source_version": a.anchor.source_version,
+                    "status": a.anchor.status.as_str(),
+                },
+                "note": a.note,
+                "color": a.color,
+                "tags": a.tags,
+                "author": a.author,
+                "created_at": a.created_at.to_rfc3339(),
+                "updated_at": a.updated_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    let response = serde_json::json!({
+        "paper": {
+            "id": paper.id.as_str(),
+            "title": paper.title,
+            "abstract": paper.r#abstract,
+            "full_text": paper.full_text,
+        },
+        "annotations": entries,
+        "source_version": source_version,
+    });
+
+    serde_json::to_string_pretty(&response).map_err(|e| e.to_string())
+}
+
 /// Full-text search over stored search queries. Returns a JSON array of
 /// past searches matching `query` (lower `rank` = more relevant per
 /// BM25). Agents should call this before running a fresh search to
@@ -1184,8 +1273,148 @@ fn is_source_configured(src: &SourceInfo, config: &scitadel_core::config::Config
 
 #[cfg(test)]
 mod tests {
-    use super::{SOURCE_REGISTRY, html_to_text, is_source_configured, truncate_abstract};
+    use super::{
+        SOURCE_REGISTRY, build_annotated_paper, html_to_text, is_source_configured,
+        truncate_abstract,
+    };
     use scitadel_core::config::Config;
+    use scitadel_core::models::{Anchor, Annotation, Paper, PaperId};
+    use scitadel_core::ports::PaperRepository;
+    use scitadel_db::sqlite::{Database, SqliteAnnotationRepository};
+
+    fn fresh_db() -> Database {
+        let db = Database::open_in_memory().expect("open in-memory db");
+        db.migrate().expect("migrate");
+        db
+    }
+
+    fn save_paper(db: &Database, id: &str, title: &str, full_text: Option<&str>) -> PaperId {
+        let (paper_repo, _, _, _, _) = db.repositories();
+        let mut p = Paper::new(title);
+        p.id = PaperId::from(id);
+        p.r#abstract = "abs".into();
+        p.full_text = full_text.map(str::to_string);
+        paper_repo.save(&p).expect("save paper");
+        p.id
+    }
+
+    #[test]
+    fn get_annotated_paper_roundtrip_includes_offsets_and_quote() {
+        let db = fresh_db();
+        let pid = save_paper(
+            &db,
+            "p-1",
+            "Neutron stars",
+            Some("Neutron stars are dense."),
+        );
+        let repo = SqliteAnnotationRepository::new(db.clone());
+        let mut ann = Annotation::new_root(
+            pid.clone(),
+            "lars".into(),
+            "key claim".into(),
+            Anchor {
+                char_range: Some((0, 13)),
+                quote: Some("Neutron stars".into()),
+                prefix: None,
+                suffix: Some(" are dense.".into()),
+                ..Anchor::default()
+            },
+        );
+        ann.tags = vec!["physics".into()];
+        repo.create(&ann).expect("create ann");
+
+        let json = build_annotated_paper(&db, "p-1").expect("build");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(v["paper"]["id"], "p-1");
+        assert_eq!(v["paper"]["full_text"], "Neutron stars are dense.");
+        let arr = v["annotations"].as_array().expect("annotations array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["anchor"]["quote"], "Neutron stars");
+        assert_eq!(arr[0]["anchor"]["char_range"][0], 0);
+        assert_eq!(arr[0]["anchor"]["char_range"][1], 13);
+        assert_eq!(arr[0]["root_id"], arr[0]["id"]);
+        assert!(arr[0]["parent_id"].is_null());
+    }
+
+    #[test]
+    fn get_annotated_paper_excludes_soft_deleted() {
+        let db = fresh_db();
+        let pid = save_paper(&db, "p-2", "T", None);
+        let repo = SqliteAnnotationRepository::new(db.clone());
+        let live = Annotation::new_root(
+            pid.clone(),
+            "lars".into(),
+            "live".into(),
+            Anchor {
+                quote: Some("q1".into()),
+                ..Anchor::default()
+            },
+        );
+        let doomed = Annotation::new_root(
+            pid,
+            "lars".into(),
+            "gone".into(),
+            Anchor {
+                quote: Some("q2".into()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&live).unwrap();
+        repo.create(&doomed).unwrap();
+        repo.soft_delete(doomed.id.as_str()).unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-2").unwrap()).unwrap();
+        let arr = v["annotations"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["note"], "live");
+    }
+
+    #[test]
+    fn get_annotated_paper_zero_annotations_returns_empty_array() {
+        let db = fresh_db();
+        save_paper(&db, "p-3", "Empty", None);
+        let v: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-3").unwrap()).unwrap();
+        assert_eq!(v["annotations"].as_array().unwrap().len(), 0);
+        assert!(v["source_version"].is_null());
+    }
+
+    #[test]
+    fn get_annotated_paper_replies_carry_root_id() {
+        let db = fresh_db();
+        let pid = save_paper(&db, "p-4", "T", None);
+        let repo = SqliteAnnotationRepository::new(db.clone());
+        let root = Annotation::new_root(
+            pid,
+            "lars".into(),
+            "root note".into(),
+            Anchor {
+                quote: Some("q".into()),
+                ..Anchor::default()
+            },
+        );
+        let reply = Annotation::new_reply(&root, "claude".into(), "agreed".into());
+        repo.create(&root).unwrap();
+        repo.create(&reply).unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-4").unwrap()).unwrap();
+        let arr = v["annotations"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        let reply_entry = arr
+            .iter()
+            .find(|a| a["parent_id"].is_string())
+            .expect("has reply");
+        assert_eq!(reply_entry["root_id"], root.id.as_str());
+    }
+
+    #[test]
+    fn get_annotated_paper_unknown_paper_errors() {
+        let db = fresh_db();
+        let err = build_annotated_paper(&db, "nope").unwrap_err();
+        assert!(err.contains("not found"));
+    }
 
     #[test]
     fn truncate_abstract_shorter_than_limit_untouched() {
