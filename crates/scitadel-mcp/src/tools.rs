@@ -560,24 +560,43 @@ pub async fn read_paper_tool(paper_id: &str, max_chars: Option<usize>) -> Result
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("paper not found: {paper_id}"))?;
 
-    let path = scitadel_adapters::download::find_cached_file(&paper, &config.papers_dir())
-        .ok_or_else(|| "paper not downloaded yet. Call download_paper first.".to_string())?;
+    // Cache hit: skip the (slow) PDF extract if the text was already
+    // persisted on a previous call. Same envelope as the cold path.
+    let mut text: Option<String> = paper.full_text.clone();
+    let mut path: Option<std::path::PathBuf> = None;
 
-    let text = match path.extension().and_then(|e| e.to_str()) {
-        Some("pdf") => {
-            let path_clone = path.clone();
-            tokio::task::spawn_blocking(move || pdf_extract::extract_text(&path_clone))
-                .await
-                .map_err(|e| format!("pdf extract task failed: {e}"))?
-                .map_err(|e| format!("pdf extract failed: {e}"))?
+    if text.is_none() {
+        let p = scitadel_adapters::download::find_cached_file(&paper, &config.papers_dir())
+            .ok_or_else(|| "paper not downloaded yet. Call download_paper first.".to_string())?;
+        let extracted = match p.extension().and_then(|e| e.to_str()) {
+            Some("pdf") => {
+                let path_clone = p.clone();
+                tokio::task::spawn_blocking(move || pdf_extract::extract_text(&path_clone))
+                    .await
+                    .map_err(|e| format!("pdf extract task failed: {e}"))?
+                    .map_err(|e| format!("pdf extract failed: {e}"))?
+            }
+            Some("html") => {
+                let bytes = tokio::fs::read(&p).await.map_err(|e| e.to_string())?;
+                let html = String::from_utf8_lossy(&bytes);
+                html_to_text(&html)
+            }
+            other => return Err(format!("unsupported file type: {other:?}")),
+        };
+        // Persist so future reads hit the cache (and the TUI two-pane
+        // reader has something to render). Failure is non-fatal; we
+        // still return what we just extracted.
+        if let Err(e) = paper_repo.update_full_text(paper_id, &extracted) {
+            tracing::warn!(paper_id, error = %e, "failed to cache full_text");
         }
-        Some("html") => {
-            let bytes = tokio::fs::read(&path).await.map_err(|e| e.to_string())?;
-            let html = String::from_utf8_lossy(&bytes);
-            html_to_text(&html)
-        }
-        other => return Err(format!("unsupported file type: {other:?}")),
-    };
+        path = Some(p);
+        text = Some(extracted);
+    }
+
+    let path_display = path
+        .as_ref()
+        .map_or_else(|| "(cached in db)".to_string(), |p| p.display().to_string());
+    let text = text.expect("text populated above");
 
     let limit = max_chars.unwrap_or(20_000);
     let truncated = if text.chars().count() > limit {
@@ -593,9 +612,7 @@ pub async fn read_paper_tool(paper_id: &str, max_chars: Option<usize>) -> Result
 
     Ok(format!(
         "Paper: {}\nPath: {}\n\n{}",
-        paper.title,
-        path.display(),
-        truncated
+        paper.title, path_display, truncated
     ))
 }
 

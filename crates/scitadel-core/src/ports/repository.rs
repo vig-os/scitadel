@@ -18,6 +18,12 @@ pub trait PaperRepository: Send + Sync {
     fn find_by_doi(&self, doi: &str) -> Result<Option<Paper>, CoreError>;
     fn find_by_title(&self, title: &str) -> Result<Option<Paper>, CoreError>;
     fn list_all(&self, limit: i64, offset: i64) -> Result<Vec<Paper>, CoreError>;
+    /// Persist extracted full text for a paper. Used by `read_paper_tool`
+    /// after the first PDF/HTML extraction so subsequent reads (TUI
+    /// reader, MCP `get_annotated_paper`) hit the DB instead of
+    /// re-running pdf-extract. Idempotent — overwrites the existing
+    /// `full_text` column.
+    fn update_full_text(&self, paper_id: &str, text: &str) -> Result<(), CoreError>;
 }
 
 /// Port for search run persistence.

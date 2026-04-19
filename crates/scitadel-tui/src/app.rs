@@ -64,13 +64,19 @@ pub enum Overlay {
         paper_id: String,
         scroll: u16,
         /// `None` = scroll mode; `Some(i)` = focused on annotation `i`
-        /// in the paper's annotation list. Set by `J` (or `Tab` while
-        /// in PaperDetail) and cleared by `Esc`. Required so e/d/r
-        /// have a target.
+        /// in the paper's annotation list. Set by `Shift+J` and
+        /// cleared by `Esc`. Required so e/d/r (#92) have a target.
         annotation_focus: Option<usize>,
-        /// Active n/e/r/d prompt overlay. Drawn on top of the detail
-        /// view; eats keystrokes until submitted or cancelled.
+        /// Active n/e/r/d prompt overlay (#92). Drawn on top of the
+        /// detail view; eats keystrokes until submitted or cancelled.
         prompt: Option<AnnotationPrompt>,
+        /// True = two-pane reader mode (#97); false = the existing
+        /// single-pane metadata + annotation list. Toggled with `R`.
+        /// Mutually exclusive with `annotation_focus`/`prompt`.
+        reader: bool,
+        /// Index into the paper's root annotations while the reader
+        /// is open; cycles via `J` / `K` to hop between highlights.
+        highlight_focus: Option<usize>,
     },
     SearchPapers {
         search_id: String,
@@ -238,6 +244,8 @@ impl App {
                             scroll: 0,
                             annotation_focus: None,
                             prompt: None,
+                            reader: false,
+                            highlight_focus: None,
                         });
                     }
                 }
@@ -260,20 +268,47 @@ impl App {
         );
     }
 
-    /// Routes a key inside the PaperDetail overlay through three layers:
-    /// (1) an active prompt, (2) annotation-focus mode, (3) plain
-    /// scroll mode. Each layer eats its own keys and falls through
-    /// otherwise.
+    /// Routes a key inside the PaperDetail overlay through four layers:
+    /// (0) reader mode (#97) — its own R/Esc/J/K loop;
+    /// (1) an active prompt (#92);
+    /// (2) annotation-focus mode (#92);
+    /// (3) plain scroll mode.
+    /// Each layer eats its own keys and falls through otherwise.
     fn handle_paper_detail_key(&mut self, code: KeyCode) {
         let Some(Overlay::PaperDetail {
             paper_id,
             scroll,
             annotation_focus,
             prompt,
+            reader,
+            highlight_focus,
         }) = self.overlay.as_mut()
         else {
             return;
         };
+
+        // Layer 0: reader mode owns the keystroke loop while it's open.
+        if *reader {
+            let count = crate::views::reader::highlight_count(&self.data, paper_id);
+            match code {
+                KeyCode::Esc | KeyCode::Char('q' | 'R') => {
+                    *reader = false;
+                    *highlight_focus = None;
+                }
+                KeyCode::Char('J') | KeyCode::Down if count > 0 => {
+                    *highlight_focus = Some(highlight_focus.map_or(0, |f| (f + 1).min(count - 1)));
+                }
+                KeyCode::Char('K') | KeyCode::Up if count > 0 => {
+                    *highlight_focus = Some(highlight_focus.map_or(0, |f| f.saturating_sub(1)));
+                }
+                KeyCode::Char('D') => {
+                    let pid = paper_id.clone();
+                    self.queue_download(&pid);
+                }
+                _ => {}
+            }
+            return;
+        }
 
         // Layer 1: an active prompt eats every keystroke.
         if prompt.is_some() {
@@ -358,6 +393,14 @@ impl App {
                 if count > 0 {
                     *annotation_focus = Some(0);
                 }
+            }
+            KeyCode::Char('R') => {
+                // Enter reader mode (#97). Highlight cursor starts at
+                // 0 if the paper has any root annotations.
+                let pid = paper_id.clone();
+                let count = crate::views::reader::highlight_count(&self.data, &pid);
+                *reader = true;
+                *highlight_focus = if count > 0 { Some(0) } else { None };
             }
             _ => {}
         }
@@ -452,6 +495,8 @@ impl App {
                                 scroll: 0,
                                 annotation_focus: None,
                                 prompt: None,
+                                reader: false,
+                                highlight_focus: None,
                             });
                         }
                     }
@@ -569,17 +614,23 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             scroll,
             annotation_focus,
             prompt,
+            reader,
+            highlight_focus,
         }) => {
-            detail::draw(
-                frame,
-                chunks[1],
-                &app.data,
-                paper_id,
-                *scroll,
-                *annotation_focus,
-            );
-            if let Some(active) = prompt {
-                annotation_prompt::draw_overlay(frame, chunks[1], active);
+            if *reader {
+                crate::views::reader::draw(frame, chunks[1], &app.data, paper_id, *highlight_focus);
+            } else {
+                detail::draw(
+                    frame,
+                    chunks[1],
+                    &app.data,
+                    paper_id,
+                    *scroll,
+                    *annotation_focus,
+                );
+                if let Some(active) = prompt {
+                    annotation_prompt::draw_overlay(frame, chunks[1], active);
+                }
             }
         }
         Some(Overlay::SearchPapers {
@@ -619,24 +670,31 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             Some(Overlay::PaperDetail {
                 annotation_focus,
                 prompt,
+                reader,
                 ..
             }),
             _,
-        ) => match (prompt, annotation_focus) {
-            (Some(p), _) => match p {
-                AnnotationPrompt::DeleteConfirm { .. } => "y: confirm | n/Esc: cancel",
-                AnnotationPrompt::Create { .. } => {
-                    "Enter: next/submit | Backspace: delete char | Esc: cancel"
+        ) => {
+            if *reader {
+                "Esc/R: leave reader | J/K: hop highlight | D: download"
+            } else {
+                match (prompt, annotation_focus) {
+                    (Some(p), _) => match p {
+                        AnnotationPrompt::DeleteConfirm { .. } => "y: confirm | n/Esc: cancel",
+                        AnnotationPrompt::Create { .. } => {
+                            "Enter: next/submit | Backspace: delete char | Esc: cancel"
+                        }
+                        _ => "Enter: submit | Backspace: delete char | Esc: cancel",
+                    },
+                    (None, Some(_)) => {
+                        "Esc: leave focus | j/k: navigate | n: new | e: edit | r: reply | d: delete"
+                    }
+                    (None, None) => {
+                        "Esc/q: back | j/k: scroll | d/u: page | D: download | n: new | J: focus | R: reader"
+                    }
                 }
-                _ => "Enter: submit | Backspace: delete char | Esc: cancel",
-            },
-            (None, Some(_)) => {
-                "Esc: leave focus | j/k: navigate | n: new | e: edit | r: reply | d: delete"
             }
-            (None, None) => {
-                "Esc/q: back | j/k: scroll | d/u: page | D: download | n: new annotation | J: focus annotations"
-            }
-        },
+        }
         (Some(Overlay::SearchPapers { .. }), _) => {
             "Esc/q: back | j/k: navigate | Enter: open paper"
         }
