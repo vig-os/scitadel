@@ -6,14 +6,41 @@
 //! in `crate::tools` so this file stays a thin façade.
 
 use rmcp::{
-    ServerHandler,
+    Peer, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    schemars, tool, tool_handler, tool_router,
+    model::{ProgressNotificationParam, ProgressToken},
+    schemars,
+    service::RequestContext,
+    tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::tools;
+
+/// Helper: emit a progress notification if the caller opted in by
+/// supplying a `progressToken` in the request `_meta`. Failures are
+/// logged but never propagated — progress is best-effort.
+async fn notify(
+    peer: &Peer<RoleServer>,
+    token: Option<&ProgressToken>,
+    progress: f64,
+    total: Option<f64>,
+    message: impl Into<String>,
+) {
+    let Some(token) = token else { return };
+    let result = peer
+        .notify_progress(ProgressNotificationParam {
+            progress_token: token.clone(),
+            progress,
+            total,
+            message: Some(message.into()),
+        })
+        .await;
+    if let Err(e) = result {
+        tracing::warn!(error = %e, "failed to send progress notification");
+    }
+}
 
 // ---------- Aggregate request structs ----------
 
@@ -276,10 +303,46 @@ impl Default for ScitadelServer {
 #[tool_router(router = tool_router)]
 impl ScitadelServer {
     #[tool(
-        description = "Search scientific literature across multiple sources. Returns: JSON with search_id, query, per-source outcomes, total counts, and a `summary` text field for human readers."
+        description = "Search scientific literature across multiple sources. Returns: JSON with search_id, query, per-source outcomes, total counts, and a `summary` text field for human readers. Emits MCP progress notifications (start + done) when the caller supplies a `progressToken` in `_meta` (#58)."
     )]
-    async fn search(&self, Parameters(req): Parameters<SearchRequest>) -> Result<String, String> {
-        tools::search_tool(req.query, req.sources, req.max_results, req.question_id).await
+    async fn search(
+        &self,
+        Parameters(req): Parameters<SearchRequest>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<String, String> {
+        let token = ctx.meta.get_progress_token();
+        let source_count = req
+            .sources
+            .split(',')
+            .filter(|s| !s.trim().is_empty())
+            .count() as f64;
+        notify(
+            &ctx.peer,
+            token.as_ref(),
+            0.0,
+            Some(source_count.max(1.0)),
+            format!(
+                "searching {} source(s) for \"{}\"",
+                source_count.max(1.0),
+                req.query
+            ),
+        )
+        .await;
+        let result =
+            tools::search_tool(req.query, req.sources, req.max_results, req.question_id).await;
+        let done_msg = match &result {
+            Ok(_) => "search complete".to_string(),
+            Err(e) => format!("search failed: {e}"),
+        };
+        notify(
+            &ctx.peer,
+            token.as_ref(),
+            source_count.max(1.0),
+            Some(source_count.max(1.0)),
+            done_msg,
+        )
+        .await;
+        result
     }
 
     #[tool(
@@ -534,18 +597,39 @@ impl ScitadelServer {
     }
 
     #[tool(
-        description = "Download a paper (PDF or HTML). Prefer passing paper_id to leverage all stored identifiers (arxiv/openalex/doi); doi is a fallback for ad-hoc lookups. Returns: text (path + access status)."
+        description = "Download a paper (PDF or HTML). Prefer passing paper_id to leverage all stored identifiers (arxiv/openalex/doi); doi is a fallback for ad-hoc lookups. Returns: text (path + access status). Emits MCP progress notifications (start + done) when the caller supplies a `progressToken` in `_meta` (#58)."
     )]
     async fn download_paper(
         &self,
         Parameters(req): Parameters<DownloadPaperRequest>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<String, String> {
-        tools::download_paper_tool(
+        let token = ctx.meta.get_progress_token();
+        let target = req
+            .paper_id
+            .as_deref()
+            .or(req.doi.as_deref())
+            .unwrap_or("(no paper_id or doi)");
+        notify(
+            &ctx.peer,
+            token.as_ref(),
+            0.0,
+            Some(1.0),
+            format!("downloading {target}"),
+        )
+        .await;
+        let result = tools::download_paper_tool(
             req.paper_id.as_deref(),
             req.doi.as_deref(),
             req.output_dir.as_deref(),
         )
-        .await
+        .await;
+        let done_msg = match &result {
+            Ok(_) => "download complete".to_string(),
+            Err(e) => format!("download failed: {e}"),
+        };
+        notify(&ctx.peer, token.as_ref(), 1.0, Some(1.0), done_msg).await;
+        result
     }
 
     #[tool(
@@ -559,13 +643,29 @@ impl ScitadelServer {
     }
 
     #[tool(
-        description = "Prepare batch assessments for all papers in a search. Returns: text (rubric + per-paper context + instructions)."
+        description = "Prepare batch assessments for all papers in a search. Returns: text (rubric + per-paper context + instructions). Emits MCP progress notifications (start + done) when the caller supplies a `progressToken` in `_meta` (#58)."
     )]
-    fn prepare_batch_assessments(
+    async fn prepare_batch_assessments(
         &self,
         Parameters(req): Parameters<SearchQuestionRequest>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<String, String> {
-        tools::prepare_batch_assessments_tool(&req.search_id, &req.question_id)
+        let token = ctx.meta.get_progress_token();
+        notify(
+            &ctx.peer,
+            token.as_ref(),
+            0.0,
+            Some(1.0),
+            format!("preparing assessments for search {}", req.search_id),
+        )
+        .await;
+        let result = tools::prepare_batch_assessments_tool(&req.search_id, &req.question_id);
+        let done_msg = match &result {
+            Ok(_) => "batch prep complete".to_string(),
+            Err(e) => format!("batch prep failed: {e}"),
+        };
+        notify(&ctx.peer, token.as_ref(), 1.0, Some(1.0), done_msg).await;
+        result
     }
 }
 

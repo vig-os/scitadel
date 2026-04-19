@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MCP progress notifications** (#58). The `search`,
+  `download_paper`, and `prepare_batch_assessments` tools now emit
+  `notifications/progress` frames when the caller supplies a
+  `progressToken` in the request `_meta`. Bracketing pattern: a
+  start frame at progress=0 (with a human-readable message naming
+  the operation), then a done frame at progress=total on success or
+  with the error string on failure. Per-source / per-paper
+  granularity is a follow-up that needs the orchestrator to thread a
+  callback through each adapter loop. Built on the rmcp 0.17 upgrade
+  that landed earlier in 0.4.0.
 - **TUI two-pane annotation reader** (#97, iter 1). Toggled with `R`
   on the paper detail overlay: left pane renders the paper body
   (`full_text` if cached, else the abstract) with background-color
