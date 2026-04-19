@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `crates/scitadel-tui/src/views/annotation_prompt.rs` (pure, fully
   tested). $EDITOR integration + visual-mode char-range selection
   remain out of scope — see #97 for the two-pane reader.
+- **VHS coverage for CLI search + question subcommands** (#99): two
+  new tapes (`tests/vhs/cli-search.tape`,
+  `tests/vhs/cli-question-workflow.tape`) plus a `Shift+Tab`
+  (BackTab) + `d`/`u` page-scroll addition to `tui-launch.tape` to
+  close the gaps flagged in the 0.4.0 coverage audit.
 
 ### Changed
 
