@@ -314,7 +314,7 @@ pub fn list_questions_tool() -> Result<String, String> {
 pub fn add_search_terms_tool(
     question_id: &str,
     terms: &[String],
-    query_string: &str,
+    query_string: Option<&str>,
 ) -> Result<String, String> {
     let db = open_db()?;
     let (_, _, q_repo, _, _) = db.repositories();
@@ -324,10 +324,9 @@ pub fn add_search_terms_tool(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Question '{question_id}' not found."))?;
 
-    let query_str = if query_string.is_empty() {
-        terms.join(" ")
-    } else {
-        query_string.to_string()
+    let query_str = match query_string {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => terms.join(" "),
     };
 
     let mut term = SearchTerm::new(question.id.clone());

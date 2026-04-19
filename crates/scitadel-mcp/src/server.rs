@@ -29,7 +29,7 @@ pub struct AddSearchTermsRequest {
     #[schemars(description = "List of search terms")]
     pub terms: Vec<String>,
     #[schemars(description = "Custom query string (optional, defaults to terms joined by space)")]
-    pub query_string: String,
+    pub query_string: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -101,27 +101,29 @@ pub struct ScitadelServer;
 
 #[tool(tool_box)]
 impl ScitadelServer {
-    #[tool(description = "Search scientific literature across multiple sources")]
+    #[tool(
+        description = "Search scientific literature across multiple sources. Returns: JSON with search_id, query, per-source outcomes, total counts, and a `summary` text field for human readers."
+    )]
     async fn search(&self, #[tool(aggr)] req: SearchRequest) -> Result<String, String> {
         tools::search_tool(req.query, req.sources, req.max_results, req.question_id).await
     }
 
     #[tool(
-        description = "List every source scitadel knows about (pubmed, arxiv, openalex, inspire, patentsview, lens, epo) with per-source description, required credential fields, whether credentials are configured in this environment, and rate-limit hints. Read-only; call first to decide which sources to pass to `search`."
+        description = "List every source scitadel knows about (pubmed, arxiv, openalex, inspire, patentsview, lens, epo) with per-source description, required credential fields, whether credentials are configured in this environment, and rate-limit hints. Read-only; call first to decide which sources to pass to `search`. Returns: JSON array."
     )]
     fn list_sources(&self) -> Result<String, String> {
         tools::list_sources_tool()
     }
 
     #[tool(
-        description = "Return the scoring rubric (criteria, 0.0-1.0 scale, response format) as a string. Fetch once at the start of a scoring session and cache; use with `save_assessment` or `assess_paper` for each paper. Avoids the per-paper rubric fetch that `prepare_assessment` does."
+        description = "Return the scoring rubric (criteria, 0.0-1.0 scale, response format). Fetch once at the start of a scoring session and cache; use with `save_assessment` or `assess_paper` for each paper. Avoids the per-paper rubric fetch that `prepare_assessment` does — if you only need the rubric (no paper context), prefer this. Returns: text."
     )]
     fn get_rubric(&self) -> Result<String, String> {
         tools::get_rubric_tool()
     }
 
     #[tool(
-        description = "Create an annotation anchored to a passage in a paper. Root-level; use `reply_annotation` for replies. `author` is required — pass your identity string (e.g. agent slug). NOTE: author identity is trust-on-first-use until the Dolt sync / auth layer lands (Phase 5); any client may impersonate any author. Every write is logged via tracing for audit. Returns plain text (the new annotation ID)."
+        description = "Create an annotation anchored to a passage in a paper. Root-level; use `reply_annotation` for replies. `author` is required — pass your identity string (e.g. agent slug). NOTE: author identity is trust-on-first-use until the Dolt sync / auth layer lands (Phase 5); any client may impersonate any author. Every write is logged via tracing for audit. Returns: text (the new annotation ID)."
     )]
     fn create_annotation(
         &self,
@@ -141,7 +143,7 @@ impl ScitadelServer {
     }
 
     #[tool(
-        description = "Reply to an existing annotation. Inherits paper_id + question_id from the parent; the reply has no anchor of its own. NOTE: author identity is trust-on-first-use (see create_annotation); writes are tracing-logged."
+        description = "Reply to an existing annotation. Inherits paper_id + question_id from the parent; the reply has no anchor of its own. NOTE: author identity is trust-on-first-use (see create_annotation); writes are tracing-logged. Returns: text (the new reply ID)."
     )]
     fn reply_annotation(
         &self,
@@ -159,7 +161,7 @@ impl ScitadelServer {
     }
 
     #[tool(
-        description = "Update note / color / tags on an existing annotation. NOTE: no author check — trust-on-first-use (see create_annotation). Writes are tracing-logged."
+        description = "Update note / color / tags on an existing annotation. NOTE: no author check — trust-on-first-use (see create_annotation). Writes are tracing-logged. Returns: text confirmation."
     )]
     fn update_annotation(
         &self,
@@ -169,7 +171,7 @@ impl ScitadelServer {
     }
 
     #[tool(
-        description = "Soft-delete an annotation (tombstone). Threads stay intact; list_annotations hides the row. NOTE: no author check — trust-on-first-use (see create_annotation). Writes are tracing-logged."
+        description = "Soft-delete an annotation (tombstone). Threads stay intact; list_annotations hides the row. NOTE: no author check — trust-on-first-use (see create_annotation). Writes are tracing-logged. Returns: text confirmation."
     )]
     fn delete_annotation(
         &self,
@@ -181,7 +183,7 @@ impl ScitadelServer {
     }
 
     #[tool(
-        description = "List annotations for a paper (required). Optional author filter. Returns JSON array with id, parent_id, anchor, note, tags, author, timestamps, and anchor_status."
+        description = "List annotations for a paper. `paper_id` is required (cross-paper listing is not yet implemented). Optional `author` filter. Returns: JSON array of {id, parent_id, anchor, note, tags, author, timestamps, anchor_status}."
     )]
     fn list_annotations(
         &self,
@@ -196,7 +198,7 @@ impl ScitadelServer {
     }
 
     #[tool(
-        description = "Mark one or more annotations as seen by `reader`. Repeat calls just update seen_at. Used so an agent can stop re-processing notes it already handled."
+        description = "Mark one or more annotations as seen by `reader`. Repeat calls just update seen_at. Used so an agent can stop re-processing notes it already handled. Returns: text count."
     )]
     fn mark_seen(
         &self,
@@ -211,7 +213,7 @@ impl ScitadelServer {
     }
 
     #[tool(
-        description = "Mark a whole annotation thread (root + replies) as seen by `reader` in one call."
+        description = "Mark a whole annotation thread (root + replies) as seen by `reader` in one call. Returns: text confirmation."
     )]
     fn mark_thread_seen(
         &self,
@@ -226,7 +228,7 @@ impl ScitadelServer {
     }
 
     #[tool(
-        description = "List annotations `reader` has not yet seen (or that were edited since last seen). Optional paper_id scopes the query. Use at session start to pick up human replies from the previous turn. NOTE: comparison is wall-clock-based (`seen_at < updated_at`), so a concurrent edit between mark_seen and list_unread can race on microsecond ordering and a non-monotonic clock rewind breaks the comparison entirely. Single-reader use is unaffected; multi-reader clients should treat unread as a hint, not a guarantee. (#100)"
+        description = "List annotations `reader` has not yet seen (or that were edited since last seen). Optional paper_id scopes the query. Use at session start to pick up human replies from the previous turn. NOTE: comparison is wall-clock-based (`seen_at < updated_at`), so a concurrent edit between mark_seen and list_unread can race on microsecond ordering and a non-monotonic clock rewind breaks the comparison entirely. Single-reader use is unaffected; multi-reader clients should treat unread as a hint, not a guarantee. (#100) Returns: JSON array."
     )]
     fn list_unread(
         &self,
@@ -241,7 +243,7 @@ impl ScitadelServer {
     }
 
     #[tool(
-        description = "Full-text search over stored past searches (FTS5 + Porter stemming). Returns JSON array of matching prior searches sorted by relevance (lower rank = more relevant). Call before running a fresh `search` to detect redundant work."
+        description = "Full-text search over stored past searches (FTS5 + Porter stemming). Sorted by relevance (lower rank = more relevant). Call before running a fresh `search` to detect redundant work. Returns: JSON array."
     )]
     fn find_similar_searches(
         &self,
@@ -256,7 +258,7 @@ impl ScitadelServer {
     }
 
     #[tool(
-        description = "Summarize every paper in a search as JSON in one call: title, authors, year, abstract (truncated), DOI, identifiers. Preferred over iterating `get_paper` per result when scanning a corpus."
+        description = "Summarize every paper in a search in one call: title, authors, year, abstract (truncated), DOI, identifiers. Preferred over iterating `get_paper` per result when scanning a corpus. Returns: JSON array."
     )]
     fn summarize_search(
         &self,
@@ -273,7 +275,7 @@ impl ScitadelServer {
         tools::summarize_search_tool(&search_id, max_papers, abstract_char_limit)
     }
 
-    #[tool(description = "List recent search runs")]
+    #[tool(description = "List recent search runs. Returns: text table.")]
     fn list_searches(
         &self,
         #[tool(param)]
@@ -283,7 +285,9 @@ impl ScitadelServer {
         tools::list_searches_tool(limit.unwrap_or(20))
     }
 
-    #[tool(description = "Get papers from a search result")]
+    #[tool(
+        description = "Get papers from a search result. Returns: text listing (title, authors, year, journal, IDs, abstract preview)."
+    )]
     fn get_papers(
         &self,
         #[tool(param)]
@@ -293,7 +297,7 @@ impl ScitadelServer {
         tools::get_papers_tool(&search_id)
     }
 
-    #[tool(description = "Get full details of a single paper")]
+    #[tool(description = "Get full details of a single paper. Returns: JSON.")]
     fn get_paper(
         &self,
         #[tool(param)]
@@ -304,7 +308,7 @@ impl ScitadelServer {
     }
 
     #[tool(
-        description = "Return JSON: paper {id,title,abstract,full_text}, annotations[] (live only, with parent_id/root_id and full anchor incl. char_range/quote/prefix/suffix/sentence_id/source_version/status), and source_version. One call replaces get_paper + list_annotations when an agent needs to reason over offsets."
+        description = "Returns: JSON {paper {id,title,abstract,full_text}, annotations[] (live only, with parent_id/root_id and full anchor incl. char_range/quote/prefix/suffix/sentence_id/source_version/status), source_version}. One call replaces get_paper + list_annotations when an agent needs to reason over offsets."
     )]
     fn get_annotated_paper(
         &self,
@@ -315,7 +319,9 @@ impl ScitadelServer {
         tools::get_annotated_paper_tool(&paper_id)
     }
 
-    #[tool(description = "Export search results in a given format (json, csv, bibtex)")]
+    #[tool(
+        description = "Export search results in a given format. Returns: text in the requested format (JSON / CSV / BibTeX)."
+    )]
     fn export_search(
         &self,
         #[tool(param)]
@@ -328,7 +334,7 @@ impl ScitadelServer {
         tools::export_search_tool(&search_id, &format)
     }
 
-    #[tool(description = "Create a new research question")]
+    #[tool(description = "Create a new research question. Returns: text confirmation with ID.")]
     fn create_question(
         &self,
         #[tool(param)]
@@ -341,17 +347,21 @@ impl ScitadelServer {
         tools::create_question_tool(&text, &description)
     }
 
-    #[tool(description = "List all research questions")]
+    #[tool(description = "List all research questions. Returns: text table.")]
     fn list_questions(&self) -> Result<String, String> {
         tools::list_questions_tool()
     }
 
-    #[tool(description = "Add search terms linked to a research question")]
+    #[tool(
+        description = "Add search terms linked to a research question. If `query_string` is omitted, the terms are joined by spaces. Returns: text confirmation."
+    )]
     fn add_search_terms(&self, #[tool(aggr)] req: AddSearchTermsRequest) -> Result<String, String> {
-        tools::add_search_terms_tool(&req.question_id, &req.terms, &req.query_string)
+        tools::add_search_terms_tool(&req.question_id, &req.terms, req.query_string.as_deref())
     }
 
-    #[tool(description = "Record a paper assessment with score and reasoning")]
+    #[tool(
+        description = "Record a paper assessment with score and reasoning. Returns: text summary."
+    )]
     fn assess_paper(&self, #[tool(aggr)] req: AssessPaperRequest) -> Result<String, String> {
         tools::assess_paper_tool(
             &req.paper_id,
@@ -363,7 +373,9 @@ impl ScitadelServer {
         )
     }
 
-    #[tool(description = "Get assessments for a paper and/or question")]
+    #[tool(
+        description = "Get assessments for a paper and/or question. At least one of `paper_id` or `question_id` is required (the call errors if both are omitted). Returns: text listing."
+    )]
     fn get_assessments(
         &self,
         #[tool(param)]
@@ -376,7 +388,9 @@ impl ScitadelServer {
         tools::get_assessments_tool(paper_id.as_deref(), question_id.as_deref())
     }
 
-    #[tool(description = "Prepare assessment rubric and paper data for LLM evaluation")]
+    #[tool(
+        description = "Prepare assessment rubric and paper data for LLM evaluation. Bundles `get_rubric` + the paper context for a single-call setup; if you only need the static rubric (no paper) prefer `get_rubric` to skip the paper fetch. Returns: text (rubric + paper block + instructions)."
+    )]
     fn prepare_assessment(
         &self,
         #[tool(param)]
@@ -389,13 +403,15 @@ impl ScitadelServer {
         tools::prepare_assessment_tool(&paper_id, &question_id)
     }
 
-    #[tool(description = "Save an MCP-native assessment scored by the host LLM")]
+    #[tool(
+        description = "Save an MCP-native assessment scored by the host LLM. Returns: text confirmation."
+    )]
     fn save_assessment(&self, #[tool(aggr)] req: SaveAssessmentRequest) -> Result<String, String> {
         tools::save_assessment_tool(&req.paper_id, &req.question_id, req.score, &req.reasoning)
     }
 
     #[tool(
-        description = "Download a paper (PDF or HTML). Prefer passing paper_id to leverage all stored identifiers (arxiv/openalex/doi); doi is a fallback for ad-hoc lookups."
+        description = "Download a paper (PDF or HTML). Prefer passing paper_id to leverage all stored identifiers (arxiv/openalex/doi); doi is a fallback for ad-hoc lookups. Returns: text (path + access status)."
     )]
     async fn download_paper(
         &self,
@@ -415,7 +431,7 @@ impl ScitadelServer {
     }
 
     #[tool(
-        description = "Extract the text from an already-downloaded paper's PDF or HTML. Call download_paper first."
+        description = "Extract the text from an already-downloaded paper's PDF or HTML. Call download_paper first. Returns: text (paper title, path, extracted body, possibly truncated)."
     )]
     async fn read_paper(
         &self,
@@ -429,7 +445,9 @@ impl ScitadelServer {
         tools::read_paper_tool(&paper_id, max_chars).await
     }
 
-    #[tool(description = "Prepare batch assessments for all papers in a search")]
+    #[tool(
+        description = "Prepare batch assessments for all papers in a search. Returns: text (rubric + per-paper context + instructions)."
+    )]
     fn prepare_batch_assessments(
         &self,
         #[tool(param)]
@@ -451,5 +469,69 @@ impl ServerHandler for ScitadelServer {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Style gate (#98): every `#[tool(description = "...")]` must
+    /// telegraph its return shape so an LLM client can parse the
+    /// response without trial and error. Accepts any of:
+    /// `Returns: JSON`, `Returns: text`, `Returns JSON`, `Returns text`.
+    #[test]
+    fn every_tool_description_states_return_shape() {
+        let full = include_str!("server.rs");
+        // Stop at the test module so the assertion's example string
+        // (which itself contains `#[tool(...)]`) doesn't trigger the
+        // gate on itself.
+        let cutoff = full
+            .find("#[cfg(test)]")
+            .expect("test module marker present");
+        let src = &full[..cutoff];
+        let mut offset = 0;
+        let mut tool_count = 0;
+        while let Some(start) = src[offset..].find("#[tool(") {
+            let abs_start = offset + start;
+            // Find matching close-paren by simple depth tracking.
+            let mut depth = 0;
+            let mut end = abs_start;
+            for (i, c) in src[abs_start..].char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = abs_start + i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let attr = &src[abs_start..=end];
+            offset = end + 1;
+
+            // Skip the macro-level `#[tool(tool_box)]` markers.
+            if !attr.contains("description") {
+                continue;
+            }
+            tool_count += 1;
+            let ok = [
+                "Returns: JSON",
+                "Returns: text",
+                "Returns JSON",
+                "Returns text",
+            ]
+            .iter()
+            .any(|needle| attr.contains(needle));
+            assert!(
+                ok,
+                "tool description missing return-shape marker (one of `Returns: JSON` / `Returns: text` / `Returns JSON` / `Returns text`):\n{attr}"
+            );
+        }
+        assert!(
+            tool_count >= 25,
+            "expected to scan all MCP tools (~26+); only saw {tool_count} — has the macro shape changed?"
+        );
     }
 }
