@@ -59,8 +59,20 @@ impl Tab {
 /// Overlay view shown on top of the current tab.
 #[derive(Debug, Clone)]
 pub enum Overlay {
-    PaperDetail { paper_id: String, scroll: u16 },
-    SearchPapers { search_id: String, selected: usize },
+    PaperDetail {
+        paper_id: String,
+        scroll: u16,
+        /// True = two-pane reader (#97); false = the existing single-
+        /// pane metadata + annotation list. Toggled with `R`.
+        reader: bool,
+        /// Index into the paper's root annotations while the reader is
+        /// open; cycles via `J` / `K` to hop between highlights.
+        highlight_focus: Option<usize>,
+    },
+    SearchPapers {
+        search_id: String,
+        selected: usize,
+    },
 }
 
 /// Main application state.
@@ -194,21 +206,7 @@ impl App {
 
     fn handle_overlay_key(&mut self, code: KeyCode) {
         match self.overlay {
-            Some(Overlay::PaperDetail {
-                ref paper_id,
-                ref mut scroll,
-            }) => match code {
-                KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
-                KeyCode::Char('j') | KeyCode::Down => *scroll = scroll.saturating_add(1),
-                KeyCode::Char('k') | KeyCode::Up => *scroll = scroll.saturating_sub(1),
-                KeyCode::Char('d') => *scroll = scroll.saturating_add(10),
-                KeyCode::Char('u') => *scroll = scroll.saturating_sub(10),
-                KeyCode::Char('D') => {
-                    let paper_id = paper_id.clone();
-                    self.queue_download(&paper_id);
-                }
-                _ => {}
-            },
+            Some(Overlay::PaperDetail { .. }) => self.handle_paper_detail_key(code),
             Some(Overlay::SearchPapers {
                 ref search_id,
                 ref mut selected,
@@ -235,6 +233,8 @@ impl App {
                         self.overlay = Some(Overlay::PaperDetail {
                             paper_id: paper.id.as_str().to_string(),
                             scroll: 0,
+                            reader: false,
+                            highlight_focus: None,
                         });
                     }
                 }
@@ -255,6 +255,59 @@ impl App {
             self.unpaywall_email.clone(),
             self.papers_dir.clone(),
         );
+    }
+
+    /// Handles keys when the active overlay is `PaperDetail`. Splits
+    /// into reader-mode and metadata-mode; the reader cycles
+    /// highlights with J/K and exits with R or Esc.
+    fn handle_paper_detail_key(&mut self, code: KeyCode) {
+        let Some(Overlay::PaperDetail {
+            paper_id,
+            scroll,
+            reader,
+            highlight_focus,
+        }) = self.overlay.as_mut()
+        else {
+            return;
+        };
+        if *reader {
+            let count = crate::views::reader::highlight_count(&self.data, paper_id);
+            match code {
+                KeyCode::Esc | KeyCode::Char('q' | 'R') => {
+                    *reader = false;
+                    *highlight_focus = None;
+                }
+                KeyCode::Char('J') | KeyCode::Down if count > 0 => {
+                    *highlight_focus = Some(highlight_focus.map_or(0, |f| (f + 1).min(count - 1)));
+                }
+                KeyCode::Char('K') | KeyCode::Up if count > 0 => {
+                    *highlight_focus = Some(highlight_focus.map_or(0, |f| f.saturating_sub(1)));
+                }
+                KeyCode::Char('D') => {
+                    let pid = paper_id.clone();
+                    self.queue_download(&pid);
+                }
+                _ => {}
+            }
+            return;
+        }
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
+            KeyCode::Char('j') | KeyCode::Down => *scroll = scroll.saturating_add(1),
+            KeyCode::Char('k') | KeyCode::Up => *scroll = scroll.saturating_sub(1),
+            KeyCode::Char('d') => *scroll = scroll.saturating_add(10),
+            KeyCode::Char('u') => *scroll = scroll.saturating_sub(10),
+            KeyCode::Char('D') => {
+                let pid = paper_id.clone();
+                self.queue_download(&pid);
+            }
+            KeyCode::Char('R') => {
+                *reader = true;
+                let count = crate::views::reader::highlight_count(&self.data, paper_id);
+                *highlight_focus = if count > 0 { Some(0) } else { None };
+            }
+            _ => {}
+        }
     }
 
     fn handle_tab_key(&mut self, code: KeyCode) {
@@ -297,6 +350,8 @@ impl App {
                             self.overlay = Some(Overlay::PaperDetail {
                                 paper_id: paper.id.as_str().to_string(),
                                 scroll: 0,
+                                reader: false,
+                                highlight_focus: None,
                             });
                         }
                     }
@@ -409,8 +464,17 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     frame.render_widget(tabs, chunks[0]);
 
     match &app.overlay {
-        Some(Overlay::PaperDetail { paper_id, scroll }) => {
-            detail::draw(frame, chunks[1], &app.data, paper_id, *scroll);
+        Some(Overlay::PaperDetail {
+            paper_id,
+            scroll,
+            reader,
+            highlight_focus,
+        }) => {
+            if *reader {
+                crate::views::reader::draw(frame, chunks[1], &app.data, paper_id, *highlight_focus);
+            } else {
+                detail::draw(frame, chunks[1], &app.data, paper_id, *scroll);
+            }
         }
         Some(Overlay::SearchPapers {
             search_id,
@@ -445,8 +509,11 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     }
 
     let help_text = match (&app.overlay, app.tab) {
-        (Some(Overlay::PaperDetail { .. }), _) => {
-            "Esc/q: back | j/k: scroll | d/u: page | D: download"
+        (Some(Overlay::PaperDetail { reader: true, .. }), _) => {
+            "Esc/R: leave reader | J/K: hop highlight | D: download"
+        }
+        (Some(Overlay::PaperDetail { reader: false, .. }), _) => {
+            "Esc/q: back | j/k: scroll | d/u: page | D: download | R: reader"
         }
         (Some(Overlay::SearchPapers { .. }), _) => {
             "Esc/q: back | j/k: navigate | Enter: open paper"

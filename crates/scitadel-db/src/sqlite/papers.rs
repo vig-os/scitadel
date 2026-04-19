@@ -272,6 +272,16 @@ impl PaperRepository for SqlitePaperRepository {
             .collect();
         Ok(papers)
     }
+
+    fn update_full_text(&self, paper_id: &str, text: &str) -> Result<(), CoreError> {
+        let conn = self.db.conn()?;
+        conn.execute(
+            "UPDATE papers SET full_text = ?1, updated_at = ?2 WHERE id = ?3",
+            params![text, chrono::Utc::now().to_rfc3339(), paper_id],
+        )
+        .map_err(DbError::Sqlite)?;
+        Ok(())
+    }
 }
 
 // Need this import for .optional()

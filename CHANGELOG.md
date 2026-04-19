@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **TUI two-pane annotation reader** (#97, iter 1). Toggled with `R`
+  on the paper detail overlay: left pane renders the paper body
+  (`full_text` if cached, else the abstract) with background-color
+  highlights over annotated ranges, palette hashed by thread root_id
+  so a thread keeps the same color on every render. Right pane
+  threads root annotations + replies, focused row syncs with the
+  highlight underline. `J` / `K` hop between highlights. Single-
+  pane fallback message when no body text is available yet.
+  Multi-line gutter bars and PDF overlay are deferred.
+- **`PaperRepository::update_full_text`** + caching in
+  `read_paper_tool` (#97 prep). The MCP read tool now persists the
+  extracted text on first call so subsequent reads — including the
+  new TUI reader — hit the DB instead of re-running pdf-extract.
+  Failure to cache is non-fatal (extraction still returns).
+
 ### Changed
 
 ### Removed
