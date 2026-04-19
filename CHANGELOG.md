@@ -62,6 +62,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **rmcp upgrade 0.1.5 → 0.17** (#58 prep). Mechanical rewrite of
+  `crates/scitadel-mcp/src/server.rs` against the new `tool_router`
+  macro: each tool is a method with a `Parameters<T>` extractor;
+  `ToolRouter<Self>` field on the server; `ServerHandler` delegates
+  via `#[tool_handler]`. Per-param structs added for tools that
+  used `#[tool(param)]` in 0.1.5. Behaviour unchanged — every
+  existing tool still works the same — but the new API unlocks the
+  `Peer<RoleServer>` extractor that #58 (MCP progress notifications)
+  will use as a follow-up. Workspace `schemars` bumped 0.8 → 1 to
+  match rmcp 0.17's transitive dep.
 - **MCP tool-signature + return-shape consistency pass** (#98):
   - `add_search_terms.query_string` is now `Option<String>` to match
     its description (was a required `String` clients couldn't omit).

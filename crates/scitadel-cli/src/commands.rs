@@ -37,7 +37,7 @@ where
 pub async fn mcp() -> Result<()> {
     use rmcp::ServiceExt;
     let transport = rmcp::transport::io::stdio();
-    let server = scitadel_mcp::server::ScitadelServer;
+    let server = scitadel_mcp::server::ScitadelServer::new();
     let service = server.serve(transport).await?;
     service.waiting().await?;
     Ok(())
