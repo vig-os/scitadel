@@ -22,6 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   citation edge has a uniqueness constraint so re-runs are no-ops.
   TUI graph view + snowball orchestration (`snowball(seed_paper_ids,
   depth, stop_condition)`) ship in iter 2.
+- **VHS coverage for CLI search + question subcommands** (#99): two
+  new tapes (`tests/vhs/cli-search.tape`,
+  `tests/vhs/cli-question-workflow.tape`) plus a `Shift+Tab`
+  (BackTab) + `d`/`u` page-scroll addition to `tui-launch.tape` to
+  close the gaps flagged in the 0.4.0 coverage audit.
 
 ### Changed
 
