@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`sentence_id` + `normalize_sentence` in `scitadel-core`** (#96):
   SHA1 of NFKC-composed, lowercased, whitespace-collapsed sentence
   text. Spec pinned in [ADR-004](docs/decisions/ADR-004-2026-04-19-sentence-id-normalization.md).
+- **VHS coverage for CLI search + question subcommands** (#99): two
+  new tapes (`tests/vhs/cli-search.tape`,
+  `tests/vhs/cli-question-workflow.tape`) plus a `Shift+Tab`
+  (BackTab) + `d`/`u` page-scroll addition to `tui-launch.tape` to
+  close the gaps flagged in the 0.4.0 coverage audit.
 
 ### Changed
 
