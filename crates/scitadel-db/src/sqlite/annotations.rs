@@ -1,10 +1,14 @@
-//! SQLite-backed repository for annotations (#49 iter 2).
+//! SQLite-backed repository for annotations (#49 iter 2, #96 resolver).
 //!
-//! Covers CRUD, threaded reply loading, and a minimal anchoring resolver.
-//! The resolver currently tries two selectors — exact char range and
-//! quote-substring match — and marks orphans for anything else. Fuzzy
-//! quote matching and sentence-id lookup are deferred to iter 3 once we
-//! have a TUI surfacing orphans to trigger re-anchoring.
+//! Covers CRUD, threaded reply loading, and the four-step W3C-style
+//! anchor resolver:
+//!
+//! 1. position (`char_range` + bounds-check)
+//! 2. quote with prefix/suffix context disambiguation
+//! 3. fuzzy quote match (Jaro-Winkler over a sliding window)
+//! 4. sentence-id (SHA1 of normalized sentence; see ADR-004)
+//!
+//! Failure of all four selectors yields `AnchorStatus::Orphan`.
 
 use chrono::{DateTime, Utc};
 use rusqlite::{OptionalExtension, params};
@@ -279,39 +283,239 @@ fn parse_dt(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc))
 }
 
+/// Default fuzzy-match threshold (Jaro-Winkler similarity in [0,1]).
+/// Anchors at or above this score are accepted as `Drifted`. See
+/// `resolve_anchor_with_threshold` for tuning.
+pub const FUZZY_THRESHOLD: f64 = 0.9;
+
 /// Resolve an anchor against current paper text, updating `status` and
-/// (if the quote shifted) `char_range` in place. The resolver tries two
-/// selectors today:
+/// (if the quote shifted) `char_range` in place. Four-step W3C-style
+/// pipeline (#96):
 ///
 /// 1. **Position**: `char_range` still hits the same `quote` → `Ok`.
-/// 2. **Quote substring**: `text.find(quote)` succeeds → `Drifted`,
-///    offsets auto-updated.
+///    Bounds-checked; out-of-range offsets fall through, never panic.
+/// 2. **Quote + prefix/suffix context**: every occurrence of `quote`
+///    in `text` is scored by how well its surroundings match the
+///    stored `prefix` / `suffix`; the best-scoring occurrence wins.
+///    With a single occurrence and no context, behaves like a plain
+///    substring search → `Drifted`.
+/// 3. **Fuzzy quote match**: sliding window the size of `quote` over
+///    `text`; Jaro-Winkler ≥ `FUZZY_THRESHOLD` → `Drifted`. Catches
+///    one-word publisher edits that would otherwise orphan.
+/// 4. **Sentence-id**: split text into sentences, hash each via
+///    `sentence_id()`, and re-anchor on a match. Survives quote
+///    rewrites that preserve the surrounding sentence.
 ///
-/// Fuzzy match + sentence-id lookup are deferred to iter 3 (introduces
-/// normalization + SHA1 hashing pipeline).
+/// Returns `Orphan` only when all four selectors fail.
 pub fn resolve_anchor(anchor: &mut Anchor, text: &str) -> AnchorStatus {
-    // Attempt 1: current offsets still match the quote exactly.
-    if let (Some((start, end)), Some(quote)) = (anchor.char_range, anchor.quote.as_ref()) {
-        let candidate: String = text.chars().skip(start).take(end - start).collect();
-        if &candidate == quote {
-            anchor.status = AnchorStatus::Ok;
-            return AnchorStatus::Ok;
-        }
+    resolve_anchor_with_threshold(anchor, text, FUZZY_THRESHOLD)
+}
+
+pub fn resolve_anchor_with_threshold(
+    anchor: &mut Anchor,
+    text: &str,
+    fuzzy_threshold: f64,
+) -> AnchorStatus {
+    // Step 1: position selector — bounds-checked.
+    if let (Some((start, end)), Some(quote)) = (anchor.char_range, anchor.quote.as_ref())
+        && let Some(slice) = char_slice(text, start, end)
+        && &slice == quote
+    {
+        anchor.status = AnchorStatus::Ok;
+        return AnchorStatus::Ok;
     }
 
-    // Attempt 2: find the quote anywhere in the text.
+    // Step 2: quote with prefix/suffix disambiguation.
     if let Some(quote) = anchor.quote.as_ref()
-        && let Some(byte_pos) = text.find(quote.as_str())
+        && let Some((sc, ec)) = find_with_context(
+            text,
+            quote,
+            anchor.prefix.as_deref(),
+            anchor.suffix.as_deref(),
+        )
     {
-        let start_char = text[..byte_pos].chars().count();
-        let end_char = start_char + quote.chars().count();
-        anchor.char_range = Some((start_char, end_char));
+        anchor.char_range = Some((sc, ec));
+        anchor.status = AnchorStatus::Drifted;
+        return AnchorStatus::Drifted;
+    }
+
+    // Step 3: fuzzy quote match (sliding window).
+    if let Some(quote) = anchor.quote.as_ref()
+        && let Some((sc, ec)) = fuzzy_find(text, quote, fuzzy_threshold)
+    {
+        anchor.char_range = Some((sc, ec));
+        anchor.status = AnchorStatus::Drifted;
+        return AnchorStatus::Drifted;
+    }
+
+    // Step 4: sentence-id fallback.
+    if let Some(sid) = anchor.sentence_id.as_ref()
+        && let Some((sc, ec)) = find_sentence_by_id(text, sid)
+    {
+        anchor.char_range = Some((sc, ec));
         anchor.status = AnchorStatus::Drifted;
         return AnchorStatus::Drifted;
     }
 
     anchor.status = AnchorStatus::Orphan;
     AnchorStatus::Orphan
+}
+
+/// Slice `text` by char positions, returning `None` if the requested
+/// range is malformed (start > end) or beyond the text. Avoids the
+/// panic the old resolver hit on out-of-bounds rows (#96 gap 4).
+fn char_slice(text: &str, start: usize, end: usize) -> Option<String> {
+    if end < start {
+        return None;
+    }
+    let want = end - start;
+    let collected: String = text.chars().skip(start).take(want).collect();
+    if collected.chars().count() == want {
+        Some(collected)
+    } else {
+        None
+    }
+}
+
+/// Find every (start_char, end_char) where `quote` occurs in `text`.
+/// Char-position aware — matches step over multibyte boundaries cleanly.
+fn find_all(text: &str, quote: &str) -> Vec<(usize, usize)> {
+    if quote.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let qlen_chars = quote.chars().count();
+    let mut search_byte = 0;
+    while let Some(rel) = text[search_byte..].find(quote) {
+        let abs = search_byte + rel;
+        let start_char = text[..abs].chars().count();
+        out.push((start_char, start_char + qlen_chars));
+        search_byte = abs + quote.len(); // non-overlapping; quote is non-empty
+    }
+    out
+}
+
+/// Pick the occurrence whose surrounding context best matches the
+/// stored `prefix` / `suffix`. With a single hit and no context, it's
+/// a plain substring lookup; with multiple hits, the prefix-suffix
+/// score breaks the tie.
+fn find_with_context(
+    text: &str,
+    quote: &str,
+    prefix: Option<&str>,
+    suffix: Option<&str>,
+) -> Option<(usize, usize)> {
+    let occurrences = find_all(text, quote);
+    if occurrences.is_empty() {
+        return None;
+    }
+    if occurrences.len() == 1 || (prefix.is_none() && suffix.is_none()) {
+        return Some(occurrences[0]);
+    }
+
+    let chars: Vec<char> = text.chars().collect();
+    occurrences
+        .into_iter()
+        .max_by_key(|&(sc, ec)| context_score(&chars, sc, ec, prefix, suffix))
+}
+
+/// Score a candidate's surroundings against the stored prefix/suffix.
+/// Counts characters that match starting from the inside out (the
+/// chars adjacent to the match are most load-bearing).
+fn context_score(
+    chars: &[char],
+    start: usize,
+    end: usize,
+    prefix: Option<&str>,
+    suffix: Option<&str>,
+) -> i64 {
+    let mut score = 0i64;
+    if let Some(p) = prefix {
+        let want: Vec<char> = p.chars().collect();
+        let max = want.len().min(start);
+        for i in 0..max {
+            // chars[start - 1 - i] vs want[want.len() - 1 - i]
+            if chars[start - 1 - i] == want[want.len() - 1 - i] {
+                score += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    if let Some(s) = suffix {
+        let want: Vec<char> = s.chars().collect();
+        let max = want.len().min(chars.len().saturating_sub(end));
+        for i in 0..max {
+            if chars[end + i] == want[i] {
+                score += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    score
+}
+
+/// Sliding-window fuzzy match. Walks character-aligned windows the
+/// size of `quote` and returns the highest-scoring window that meets
+/// `threshold` (Jaro-Winkler in [0,1]).
+fn fuzzy_find(text: &str, quote: &str, threshold: f64) -> Option<(usize, usize)> {
+    if quote.is_empty() {
+        return None;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let qlen = quote.chars().count();
+    if chars.len() < qlen {
+        return None;
+    }
+
+    let mut best: Option<(usize, f64)> = None;
+    for start in 0..=chars.len() - qlen {
+        let window: String = chars[start..start + qlen].iter().collect();
+        let score = strsim::jaro_winkler(&window, quote);
+        if score >= threshold && best.is_none_or(|(_, b)| score > b) {
+            best = Some((start, score));
+        }
+    }
+    best.map(|(start, _)| (start, start + qlen))
+}
+
+/// Find the sentence in `text` whose `sentence_id` matches `sid`.
+/// Sentence boundaries are simple terminator-based (`. ! ?`) — good
+/// enough for paper bodies and abstracts; ADR-004 calls out that
+/// proper ICU sentence segmentation is a follow-up.
+fn find_sentence_by_id(text: &str, sid: &str) -> Option<(usize, usize)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut sentence_start_char = 0;
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        let is_terminator = matches!(ch, '.' | '!' | '?');
+        let is_end = i + 1 == chars.len();
+        if is_terminator || is_end {
+            let end = if is_end { chars.len() } else { i + 1 };
+            let sentence: String = chars[sentence_start_char..end].iter().collect();
+            let trimmed = sentence.trim();
+            if !trimmed.is_empty() && scitadel_core::models::sentence_id(trimmed) == sid {
+                // Map back to the trimmed sentence's char range inside `text`.
+                let leading_ws = sentence.chars().take_while(|c| c.is_whitespace()).count();
+                let trailing_ws = sentence
+                    .chars()
+                    .rev()
+                    .take_while(|c| c.is_whitespace())
+                    .count();
+                let trimmed_start = sentence_start_char + leading_ws;
+                let trimmed_end = end - trailing_ws;
+                if trimmed_end > trimmed_start {
+                    return Some((trimmed_start, trimmed_end));
+                }
+            }
+            // Advance past the terminator into the next sentence.
+            sentence_start_char = end;
+        }
+        i += 1;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -531,5 +735,90 @@ mod tests {
             ..Anchor::default()
         };
         assert_eq!(resolve_anchor(&mut a, text), AnchorStatus::Ok);
+    }
+
+    // ---- #96 multi-selector resolver tests ----
+
+    #[test]
+    fn resolver_uses_prefix_to_disambiguate_collision() {
+        // "the model" appears twice; suffix " was trained" picks the second.
+        let text = "Initially the model failed. Then the model was trained on more data.";
+        let mut a = Anchor {
+            char_range: None,
+            quote: Some("the model".into()),
+            prefix: None,
+            suffix: Some(" was trained".into()),
+            ..Anchor::default()
+        };
+        assert_eq!(resolve_anchor(&mut a, text), AnchorStatus::Drifted);
+        let (s, e) = a.char_range.unwrap();
+        assert_eq!(&text[s..e], "the model");
+        // Specifically the *second* occurrence.
+        assert!(s > 20, "expected the second occurrence at s>20, got s={s}");
+    }
+
+    #[test]
+    fn resolver_falls_back_to_fuzzy_on_minor_edit() {
+        // Quote was "the network was deep"; publisher edited to "the
+        // network was very deep" — substring fails, fuzzy still hits.
+        let text = "We argued the network was very deep enough to overfit.";
+        let mut a = Anchor {
+            char_range: None,
+            quote: Some("the network was deep".into()),
+            ..Anchor::default()
+        };
+        // Use a permissive threshold so the test isn't sensitive to
+        // strsim version drift.
+        let s = resolve_anchor_with_threshold(&mut a, text, 0.85);
+        assert_eq!(
+            s,
+            AnchorStatus::Drifted,
+            "fuzzy match should drift, got {s:?}"
+        );
+    }
+
+    #[test]
+    fn resolver_returns_orphan_when_offsets_oob_and_quote_absent() {
+        // char_range out of bounds, quote not present in text — must
+        // return Orphan instead of panicking. (#96 gap 4)
+        let mut a = Anchor {
+            char_range: Some((9000, 9100)),
+            quote: Some("vanished".into()),
+            ..Anchor::default()
+        };
+        assert_eq!(
+            resolve_anchor(&mut a, "the small text"),
+            AnchorStatus::Orphan
+        );
+    }
+
+    #[test]
+    fn resolver_uses_sentence_id_when_quote_unfindable() {
+        use scitadel_core::models::sentence_id;
+        // Sentence content preserved (same words, different
+        // case/whitespace). Quote string is wholly absent from the
+        // new text so substring + fuzzy fail; sentence-id rescues.
+        let original_sentence = "The Transformer Architecture relies on self-attention.";
+        let new_text =
+            "Intro. the   transformer architecture relies on self-attention. Outro.";
+        let mut a = Anchor {
+            char_range: None,
+            // Bypasses substring + fuzzy.
+            quote: Some("ZZZ-not-in-new-text-ZZZ".into()),
+            sentence_id: Some(sentence_id(original_sentence)),
+            ..Anchor::default()
+        };
+        let s = resolve_anchor(&mut a, new_text);
+        assert_eq!(
+            s,
+            AnchorStatus::Drifted,
+            "sentence-id rescue should mark Drifted, got {s:?}"
+        );
+        let (start, end) = a.char_range.unwrap();
+        let resolved: String = new_text.chars().skip(start).take(end - start).collect();
+        assert!(
+            resolved.contains("transformer architecture"),
+            "expected re-anchor to the matching sentence; got {resolved:?}"
+        );
     }
 }

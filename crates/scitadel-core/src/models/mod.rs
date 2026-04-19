@@ -6,7 +6,9 @@ mod paper;
 mod question;
 mod search;
 
-pub use annotation::{Anchor, AnchorStatus, Annotation, AnnotationRead};
+pub use annotation::{
+    Anchor, AnchorStatus, Annotation, AnnotationRead, normalize_sentence, sentence_id,
+};
 pub use assessment::Assessment;
 pub use citation::{Citation, CitationDirection, SnowballRun};
 pub use doi::{doi_to_filename, normalize_doi, validate_doi};

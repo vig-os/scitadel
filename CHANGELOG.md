@@ -9,7 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`sentence_id` + `normalize_sentence` in `scitadel-core`** (#96):
+  SHA1 of NFKC-composed, lowercased, whitespace-collapsed sentence
+  text. Spec pinned in [ADR-004](docs/decisions/ADR-004-2026-04-19-sentence-id-normalization.md).
+
 ### Changed
+
+- **Annotation anchor resolver** (#96): completes the four-step
+  W3C-style pipeline shipped half-done in 0.3.0. Adds
+  prefix/suffix-based disambiguation for repeated quotes, sliding-
+  window fuzzy match (Jaro-Winkler ≥ 0.9 default; tunable via
+  `resolve_anchor_with_threshold`), sentence-id fallback, and
+  bounds-checking on `char_range` so malformed rows return
+  `Orphan` instead of panicking.
 
 ### Removed
 
