@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MCP `get_annotated_paper`** (#95): one-call JSON of a paper +
+  every live annotation anchored to it (with `parent_id` / `root_id`
+  for thread reconstruction and the full anchor incl.
+  char_range/quote/prefix/suffix/sentence_id/source_version/status).
+  Replaces `get_paper` + `list_annotations` for agents that reason
+  over offsets.
+
 ### Changed
 
 ### Removed
