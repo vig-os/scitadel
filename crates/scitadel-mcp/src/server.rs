@@ -123,7 +123,7 @@ impl ScitadelServer {
     }
 
     #[tool(
-        description = "Create an annotation anchored to a passage in a paper. Root-level; use `reply_annotation` for replies. `author` is required — pass your identity string (e.g. agent slug). Returns: text (the new annotation ID)."
+        description = "Create an annotation anchored to a passage in a paper. Root-level; use `reply_annotation` for replies. `author` is required — pass your identity string (e.g. agent slug). NOTE: author identity is trust-on-first-use until the Dolt sync / auth layer lands (Phase 5); any client may impersonate any author. Every write is logged via tracing for audit. Returns: text (the new annotation ID)."
     )]
     fn create_annotation(
         &self,
@@ -143,7 +143,7 @@ impl ScitadelServer {
     }
 
     #[tool(
-        description = "Reply to an existing annotation. Inherits paper_id + question_id from the parent; the reply has no anchor of its own. Returns: text (the new reply ID)."
+        description = "Reply to an existing annotation. Inherits paper_id + question_id from the parent; the reply has no anchor of its own. NOTE: author identity is trust-on-first-use (see create_annotation); writes are tracing-logged. Returns: text (the new reply ID)."
     )]
     fn reply_annotation(
         &self,
@@ -161,7 +161,7 @@ impl ScitadelServer {
     }
 
     #[tool(
-        description = "Update note / color / tags on an existing annotation. Returns: text confirmation."
+        description = "Update note / color / tags on an existing annotation. NOTE: no author check — trust-on-first-use (see create_annotation). Writes are tracing-logged. Returns: text confirmation."
     )]
     fn update_annotation(
         &self,
@@ -171,7 +171,7 @@ impl ScitadelServer {
     }
 
     #[tool(
-        description = "Soft-delete an annotation (tombstone). Threads stay intact; list_annotations hides the row. Returns: text confirmation."
+        description = "Soft-delete an annotation (tombstone). Threads stay intact; list_annotations hides the row. NOTE: no author check — trust-on-first-use (see create_annotation). Writes are tracing-logged. Returns: text confirmation."
     )]
     fn delete_annotation(
         &self,
@@ -228,7 +228,7 @@ impl ScitadelServer {
     }
 
     #[tool(
-        description = "List annotations `reader` has not yet seen (or that were edited since last seen). Optional paper_id scopes the query. Use at session start to pick up human replies from the previous turn. Returns: JSON array."
+        description = "List annotations `reader` has not yet seen (or that were edited since last seen). Optional paper_id scopes the query. Use at session start to pick up human replies from the previous turn. NOTE: comparison is wall-clock-based (`seen_at < updated_at`), so a concurrent edit between mark_seen and list_unread can race on microsecond ordering and a non-monotonic clock rewind breaks the comparison entirely. Single-reader use is unaffected; multi-reader clients should treat unread as a hint, not a guarantee. (#100) Returns: JSON array."
     )]
     fn list_unread(
         &self,
