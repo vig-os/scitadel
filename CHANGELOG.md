@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Citation graph — iter 1** (#59). New OpenAlex helpers
+  (`fetch_work_by_id`, `fetch_works_by_ids`, `fetch_cited_by`,
+  `short_openalex_id`, `work_to_paper`) plus two MCP tools:
+  - `get_references(paper_id)` — fetches the works this paper cites
+    via OpenAlex's `referenced_works`, materialises each as a Paper
+    row, and persists the citation edges. Source paper must have an
+    `openalex_id`.
+  - `get_citations(paper_id, limit?)` — fetches the works that cite
+    this paper (`cites:` filter; default 25, capped at 200).
+  Idempotent: existing papers upsert on the OpenAlex id, and the
+  citation edge has a uniqueness constraint so re-runs are no-ops.
+  TUI graph view + snowball orchestration (`snowball(seed_paper_ids,
+  depth, stop_condition)`) ship in iter 2.
 - **`sentence_id` + `normalize_sentence` in `scitadel-core`** (#96):
   SHA1 of NFKC-composed, lowercased, whitespace-collapsed sentence
   text. Spec pinned in [ADR-004](docs/decisions/ADR-004-2026-04-19-sentence-id-normalization.md).
