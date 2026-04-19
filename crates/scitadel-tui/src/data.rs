@@ -3,7 +3,10 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use scitadel_core::models::{Annotation, Assessment, Paper, ResearchQuestion, Search, SearchTerm};
+use scitadel_core::models::{
+    Anchor, AnchorStatus, Annotation, Assessment, Paper, PaperId, ResearchQuestion, Search,
+    SearchTerm,
+};
 use scitadel_core::ports::{
     AssessmentRepository, PaperRepository, QuestionRepository, SearchRepository,
 };
@@ -80,5 +83,63 @@ impl DataStore {
     /// Toggle the starred flag for a paper and return the new value.
     pub fn toggle_starred(&self, paper_id: &str, reader: &str) -> Result<bool> {
         Ok(SqlitePaperStateRepository::new(self.db.clone()).toggle_starred(paper_id, reader)?)
+    }
+
+    /// Create a root annotation anchored to a quoted passage. Anchors
+    /// from the TUI carry only the quote (no offsets), so the resolver
+    /// will substring-match on next paper-open.
+    pub fn create_root_annotation(
+        &self,
+        paper_id: &str,
+        quote: &str,
+        note: &str,
+        author: &str,
+    ) -> Result<String> {
+        let anchor = Anchor {
+            quote: Some(quote.to_string()),
+            status: AnchorStatus::Ok,
+            ..Anchor::default()
+        };
+        let ann = Annotation::new_root(
+            PaperId::from(paper_id),
+            author.to_string(),
+            note.to_string(),
+            anchor,
+        );
+        SqliteAnnotationRepository::new(self.db.clone()).create(&ann)?;
+        Ok(ann.id.as_str().to_string())
+    }
+
+    /// Reply to an existing annotation; inherits paper_id + question_id
+    /// from the parent.
+    pub fn reply_annotation(&self, parent_id: &str, note: &str, author: &str) -> Result<String> {
+        let repo = SqliteAnnotationRepository::new(self.db.clone());
+        let parent = repo
+            .get(parent_id)?
+            .with_context(|| format!("annotation {parent_id} not found"))?;
+        let reply = Annotation::new_reply(&parent, author.to_string(), note.to_string());
+        repo.create(&reply)?;
+        Ok(reply.id.as_str().to_string())
+    }
+
+    /// Update the note body of an existing annotation; preserves color +
+    /// tags as-is.
+    pub fn update_annotation_note(&self, annotation_id: &str, note: &str) -> Result<()> {
+        let repo = SqliteAnnotationRepository::new(self.db.clone());
+        let existing = repo
+            .get(annotation_id)?
+            .with_context(|| format!("annotation {annotation_id} not found"))?;
+        repo.update_note(
+            annotation_id,
+            note,
+            existing.color.as_deref(),
+            &existing.tags,
+        )?;
+        Ok(())
+    }
+
+    /// Soft-delete an annotation (tombstone — replies stay readable).
+    pub fn delete_annotation(&self, annotation_id: &str) -> Result<()> {
+        Ok(SqliteAnnotationRepository::new(self.db.clone()).soft_delete(annotation_id)?)
     }
 }

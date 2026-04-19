@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **TUI-native annotation create / edit / reply / delete** (#92,
+  iter 3b of #49). New keybindings on the paper detail overlay:
+  `n` opens a two-stage Create prompt (quote → note); `Shift+J`
+  enters annotation focus mode; `e` edits the focused note inline;
+  `r` opens a reply prompt; `d` opens a y/n delete confirmation.
+  The state machine lives in
+  `crates/scitadel-tui/src/views/annotation_prompt.rs` (pure, fully
+  tested). $EDITOR integration + visual-mode char-range selection
+  remain out of scope — see #97 for the two-pane reader.
 - **Citation graph — iter 1** (#59). New OpenAlex helpers
   (`fetch_work_by_id`, `fetch_works_by_ids`, `fetch_cited_by`,
   `short_openalex_id`, `work_to_paper`) plus two MCP tools:

@@ -6,7 +6,14 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::data::DataStore;
 
-pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, paper_id: &str, scroll: u16) {
+pub fn draw(
+    frame: &mut Frame,
+    area: Rect,
+    data: &DataStore,
+    paper_id: &str,
+    scroll: u16,
+    annotation_focus: Option<usize>,
+) {
     let Ok(Some(paper)) = data.load_paper(paper_id) else {
         let block = Block::default()
             .title(" Paper Detail ")
@@ -107,8 +114,9 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, paper_id: &str, scr
         }
     }
 
-    // Annotations panel — view-only in iter 3. Create/edit happen via MCP
-    // (`create_annotation` etc.) until iter 3b wires in-TUI writes.
+    // Annotations panel. Iter 3b (#92): focused annotation is
+    // highlighted via a leading marker so the user can see what e/d/r
+    // would target.
     let annotations = data
         .load_annotations_for_paper(paper_id)
         .unwrap_or_default();
@@ -118,11 +126,24 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, paper_id: &str, scr
             format!("Annotations ({}):", annotations.len()),
             label_style,
         )));
-        for ann in &annotations {
-            let prefix = if ann.is_reply() { "  └ " } else { "  • " };
+        for (idx, ann) in annotations.iter().enumerate() {
+            let is_focused = annotation_focus == Some(idx);
+            let marker = match (ann.is_reply(), is_focused) {
+                (false, true) => "▶ • ",
+                (false, false) => "  • ",
+                (true, true) => "▶ └ ",
+                (true, false) => "  └ ",
+            };
+            let marker_style = if is_focused {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
             if let Some(quote) = ann.anchor.quote.as_deref() {
                 lines.push(Line::from(vec![
-                    Span::raw(prefix),
+                    Span::styled(marker, marker_style),
                     Span::styled(format!("\"{quote}\" "), Style::default().fg(Color::Cyan)),
                     Span::styled(
                         format!("— {}", ann.anchor.status.as_str()),
@@ -138,7 +159,7 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, paper_id: &str, scr
             } else {
                 // Reply — no anchor, just author + note, indented.
                 lines.push(Line::from(vec![
-                    Span::raw(prefix),
+                    Span::styled(marker, marker_style),
                     Span::styled(
                         format!("{}: ", ann.author),
                         Style::default().fg(Color::Yellow),
