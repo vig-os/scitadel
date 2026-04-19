@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **MCP annotation tool descriptions** (#100): `create_annotation`,
+  `reply_annotation`, `update_annotation`, `delete_annotation`, and
+  `list_unread` now flag trust-on-first-use author identity (real auth
+  ships with the Phase-5 Dolt sync layer) and the wall-clock-based
+  read-receipt race window (`seen_at < updated_at`). Every annotation
+  write now emits a `tracing::info!` audit record (op + ids + author).
+
 ### Removed
 
 ### Fixed
