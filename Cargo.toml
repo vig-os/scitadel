@@ -69,6 +69,11 @@ schemars = "0.8"
 pdf-extract = "0.7"
 scraper = "0.20"
 
+# Annotation anchor resolver (#96)
+strsim = "0.11"
+sha1 = "0.10"
+unicode-normalization = "0.1"
+
 # Testing
 insta = { version = "1", features = ["json"] }
 wiremock = "0.6"
