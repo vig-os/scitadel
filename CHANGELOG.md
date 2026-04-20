@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **TUI task panel flush policy** (#113). Done downloads auto-flush
+  after 5 s, Failed after 30 s — long enough for the user to see the
+  result, short enough that they don't crowd the panel. The 10-task
+  cap now only evicts terminal tasks; an in-flight Queued or Running
+  download is never dropped to make room. New `c` keybind clears all
+  completed/failed tasks immediately (visible in the tab-mode status
+  bar).
 - **CI vhs gate now asserts distinct snapshots** (#116). After
   rendering each tape, the workflow checks that every tape declaring
   `N` `Screenshot` calls produced at least `N` PNGs and that they're
