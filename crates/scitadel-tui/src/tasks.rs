@@ -27,7 +27,13 @@ pub struct Task {
 #[derive(Debug, Clone)]
 pub enum TaskKind {
     /// `ref_id` is the best identifier we have to show the user (DOI, arxiv id, or paper UUID prefix).
-    Download { ref_id: String, title: String },
+    /// `paper_id` lets the drain loop persist the outcome back to the
+    /// `papers.download_status` column (#112).
+    Download {
+        paper_id: String,
+        ref_id: String,
+        title: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +92,7 @@ pub fn spawn_download_paper(
     let task = Task {
         id,
         kind: TaskKind::Download {
+            paper_id: paper.id.as_str().to_string(),
             ref_id,
             title: paper.title.clone(),
         },
@@ -125,6 +132,7 @@ mod tests {
         Task {
             id: Uuid::new_v4(),
             kind: TaskKind::Download {
+                paper_id: "p".into(),
                 ref_id: "ref".into(),
                 title: "title".into(),
             },

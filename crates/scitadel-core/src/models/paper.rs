@@ -29,6 +29,19 @@ pub struct Paper {
     pub source_urls: HashMap<String, String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Absolute path to the locally downloaded file (PDF/HTML), if any.
+    /// Populated by the download pipeline; `None` until first successful
+    /// download attempt. See #112.
+    #[serde(default)]
+    pub local_path: Option<String>,
+    /// Outcome of the most recent download attempt. `None` = never tried.
+    #[serde(default)]
+    pub download_status: Option<DownloadStatus>,
+    /// Wall-clock time of the most recent download attempt. Together with
+    /// `download_status` lets the UI distinguish "fresh failure" from
+    /// "tried weeks ago, retry might work".
+    #[serde(default)]
+    pub last_attempt_at: Option<DateTime<Utc>>,
 }
 
 impl Paper {
@@ -53,6 +66,47 @@ impl Paper {
             source_urls: HashMap::new(),
             created_at: now,
             updated_at: now,
+            local_path: None,
+            download_status: None,
+            last_attempt_at: None,
+        }
+    }
+}
+
+/// Outcome of a paper download attempt. Persisted on `papers.download_status`.
+///
+/// `Downloaded` means the adapter classified the fetched bytes as full
+/// content. `Paywall` means we got bytes but they're an HTML stub /
+/// abstract / paywall page — file exists but doesn't contain the paper.
+/// `Failed` means the download itself errored (network, 404, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadStatus {
+    Downloaded,
+    Paywall,
+    Failed,
+}
+
+impl DownloadStatus {
+    /// SQL-friendly string used in the `download_status` text column.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Downloaded => "downloaded",
+            Self::Paywall => "paywall",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Inverse of `as_str`. Returns `None` for unknown values so a
+    /// stale row from a future schema doesn't crash the loader.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "downloaded" => Some(Self::Downloaded),
+            "paywall" => Some(Self::Paywall),
+            "failed" => Some(Self::Failed),
+            _ => None,
         }
     }
 }

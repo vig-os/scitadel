@@ -35,6 +35,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Papers-table download-state column** (#112). Migration 007 adds
+  `local_path`, `download_status`, and `last_attempt_at` columns to
+  `papers`. The TUI Papers table renders a one-char symbol next to
+  each row: blank (never tried), `↻` (in flight), `✓` (downloaded),
+  `⊘` (paywalled / abstract-only), `✗` (failed). Both the TUI's
+  `D` keybind and the `scitadel download` CLI persist the outcome
+  back to the row so the symbol survives restarts. The in-flight
+  symbol is derived from the live task list — no DB write while
+  running.
 - **MCP progress notifications** (#58). The `search`,
   `download_paper`, and `prepare_batch_assessments` tools now emit
   `notifications/progress` frames when the caller supplies a
