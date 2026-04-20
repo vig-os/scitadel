@@ -695,7 +695,10 @@ impl ScitadelServer {
     #[tool(
         description = "Toggle the starred flag for a paper under `reader`. Creates the per-reader state row if missing. NOTE: author/reader identity is trust-on-first-use — real auth ships with the Phase-5 Dolt sync layer. Returns: JSON `{paper_id, starred}` with the new value."
     )]
-    fn toggle_star(&self, Parameters(req): Parameters<ToggleStarRequest>) -> Result<String, String> {
+    fn toggle_star(
+        &self,
+        Parameters(req): Parameters<ToggleStarRequest>,
+    ) -> Result<String, String> {
         tools::toggle_star_tool(&req.paper_id, &req.reader)
     }
 
