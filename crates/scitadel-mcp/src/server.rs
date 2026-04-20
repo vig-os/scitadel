@@ -693,6 +693,13 @@ impl ScitadelServer {
     }
 
     #[tool(
+        description = "Read the open scitadel TUI's current selection. Use to answer 'what is the user looking at right now?' so you can score the open paper / draft from current context without the user pasting IDs. Returns JSON `{tab, paper_id?, search_id?, question_id?, annotation_id?, updated_at, stale}`. `stale: true` means the singleton row is >60s old — TUI may have been closed. (#122)"
+    )]
+    fn get_current_selection(&self) -> Result<String, String> {
+        tools::get_current_selection_tool()
+    }
+
+    #[tool(
         description = "Toggle the starred flag for a paper under `reader`. Creates the per-reader state row if missing. NOTE: author/reader identity is trust-on-first-use — real auth ships with the Phase-5 Dolt sync layer. Returns: JSON `{paper_id, starred}` with the new value."
     )]
     fn toggle_star(

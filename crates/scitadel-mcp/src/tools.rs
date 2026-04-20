@@ -1495,6 +1495,41 @@ fn is_source_configured(src: &SourceInfo, config: &scitadel_core::config::Config
     }
 }
 
+// ===== TUI selection tool (#122) =====
+
+/// Read the singleton `tui_state` row written by the open scitadel TUI.
+/// Returns JSON: `{ tab, paper_id?, search_id?, question_id?,
+/// annotation_id?, updated_at, stale }`. `stale` is true when the
+/// row is older than 60s (TUI may have been closed).
+pub fn get_current_selection_tool() -> Result<String, String> {
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqliteTuiStateRepository::new(db);
+    match repo.get().map_err(|e| e.to_string())? {
+        Some(row) => {
+            let stale = chrono::DateTime::parse_from_rfc3339(&row.updated_at).map_or(true, |t| {
+                chrono::Utc::now().signed_duration_since(t.with_timezone(&chrono::Utc))
+                    > chrono::Duration::seconds(60)
+            });
+            Ok(serde_json::json!({
+                "tab": row.tab,
+                "paper_id": row.paper_id,
+                "search_id": row.search_id,
+                "question_id": row.question_id,
+                "annotation_id": row.annotation_id,
+                "updated_at": row.updated_at,
+                "stale": stale,
+            })
+            .to_string())
+        }
+        None => Ok(serde_json::json!({
+            "tab": null,
+            "stale": true,
+            "note": "no TUI has written state yet — start `scitadel tui` to populate"
+        })
+        .to_string()),
+    }
+}
+
 // ===== Star / paper-state tools (#120) =====
 
 /// Toggle the starred flag for `paper_id` under `reader`. Returns the

@@ -155,4 +155,10 @@ impl DataStore {
         let (paper_repo, _, _, _, _) = self.db.repositories();
         Ok(paper_repo.update_download_state(paper_id, local_path, status)?)
     }
+
+    /// Persist the TUI's current selection so an MCP-side agent can
+    /// query it (#122).
+    pub fn publish_tui_state(&self, state: &scitadel_db::sqlite::TuiState) -> Result<()> {
+        Ok(scitadel_db::sqlite::SqliteTuiStateRepository::new(self.db.clone()).set(state)?)
+    }
 }

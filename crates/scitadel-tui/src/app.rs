@@ -96,6 +96,9 @@ pub struct App {
     pub question_selected: usize,
 
     pub tasks: Vec<Task>,
+    /// Last `TuiState` written to the DB, used by `publish_tui_state`
+    /// to skip redundant UPDATEs when the user hasn't moved (#122).
+    pub last_published_state: Option<scitadel_db::sqlite::TuiState>,
     pub unpaywall_email: String,
     pub papers_dir: PathBuf,
     pub show_institutional_hint: bool,
@@ -139,6 +142,7 @@ impl App {
             paper_selected: 0,
             question_selected: 0,
             tasks: Vec::new(),
+            last_published_state: None,
             unpaywall_email,
             papers_dir,
             show_institutional_hint,
@@ -172,6 +176,72 @@ impl App {
         self.drain_task_updates();
         self.drain_offline();
         self.flush_completed_tasks();
+        self.publish_tui_state();
+    }
+
+    /// Write the TUI's current selection to the singleton `tui_state`
+    /// row so an MCP-side agent can ask "what's the user looking at?"
+    /// (#122). Runs every drain pass; only writes if the *selection*
+    /// (not the timestamp) changed since last publish — otherwise the
+    /// TUI would emit ~10 UPDATEs/sec on a static screen.
+    fn publish_tui_state(&mut self) {
+        let snapshot = self.current_tui_state();
+        if let Some(prev) = &self.last_published_state
+            && tui_state_key(prev) == tui_state_key(&snapshot)
+        {
+            return;
+        }
+        if let Err(e) = self.data.publish_tui_state(&snapshot) {
+            tracing::warn!(error = %e, "failed to publish TUI state");
+            return;
+        }
+        self.last_published_state = Some(snapshot);
+    }
+
+    fn current_tui_state(&self) -> scitadel_db::sqlite::TuiState {
+        let tab = match self.tab {
+            Tab::Searches => "Searches",
+            Tab::Papers => "Papers",
+            Tab::Questions => "Questions",
+        };
+        let (paper_id, search_id, annotation_id) = match &self.overlay {
+            Some(Overlay::PaperDetail {
+                paper_id,
+                annotation_focus,
+                ..
+            }) => {
+                // Resolve the focused annotation's id only when the
+                // user is actively in focus mode — otherwise leave None
+                // so agents don't think the user is "on" an annotation
+                // they happen to be scrolling past.
+                let ann_id = annotation_focus.and_then(|i| {
+                    self.data
+                        .load_annotations_for_paper(paper_id)
+                        .ok()
+                        .and_then(|anns| anns.get(i).map(|a| a.id.as_str().to_string()))
+                });
+                (Some(paper_id.clone()), None, ann_id)
+            }
+            Some(Overlay::SearchPapers { search_id, .. }) => (None, Some(search_id.clone()), None),
+            None => (None, None, None),
+        };
+        // Question id only when the user is actually on the Questions tab.
+        let question_id = if matches!(self.tab, Tab::Questions) {
+            self.data.load_questions().ok().and_then(|qs| {
+                qs.get(self.question_selected)
+                    .map(|q| q.id.as_str().to_string())
+            })
+        } else {
+            None
+        };
+        scitadel_db::sqlite::TuiState {
+            tab: tab.to_string(),
+            paper_id,
+            search_id,
+            question_id,
+            annotation_id,
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        }
     }
 
     fn drain_task_updates(&mut self) {
@@ -607,6 +677,21 @@ impl App {
             }
         }
     }
+}
+
+/// Identity of a `TuiState` for dedup purposes — everything except
+/// `updated_at`. Two snapshots with the same key represent the same
+/// user-visible selection so we skip the redundant DB write (#122).
+fn tui_state_key(
+    s: &scitadel_db::sqlite::TuiState,
+) -> (&str, Option<&str>, Option<&str>, Option<&str>, Option<&str>) {
+    (
+        s.tab.as_str(),
+        s.paper_id.as_deref(),
+        s.search_id.as_deref(),
+        s.question_id.as_deref(),
+        s.annotation_id.as_deref(),
+    )
 }
 
 pub fn run(

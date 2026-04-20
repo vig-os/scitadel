@@ -2485,6 +2485,7 @@ name = "scitadel-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "pdf-extract",
  "rmcp",
  "schemars",
@@ -2523,6 +2524,7 @@ name = "scitadel-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "crossterm",
  "ratatui",
  "reqwest",

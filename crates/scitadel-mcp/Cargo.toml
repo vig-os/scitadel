@@ -25,6 +25,7 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+chrono = { workspace = true }
 pdf-extract = { workspace = true }
 scraper = { workspace = true }
 

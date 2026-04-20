@@ -43,6 +43,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MCP `get_current_selection`** (#122). The TUI publishes its
+  current selection (active tab, open paper/search/question, focused
+  annotation) to a singleton `tui_state` row on every focus change.
+  Agents in the adjacent pane can now ask "what is the user looking
+  at right now?" without the user pasting IDs. Result includes a
+  `stale: bool` flag (true when the row is >60s old) so an agent can
+  tell the TUI was closed. Migration 008. Dedup by selection key —
+  no UPDATE traffic when the user isn't moving.
 - **MCP star tools — `toggle_star`, `set_star`, `list_starred`** (#120).
   Closes the only TUI-only affordance gap so an agent in an adjacent
   pane (the recommended 2-pane workflow) can drive every state change
