@@ -16,7 +16,7 @@ use ratatui::widgets::Tabs;
 use tokio::sync::mpsc;
 
 use crate::data::DataStore;
-use crate::tasks::{Task, TaskUpdate, spawn_download_paper};
+use crate::tasks::{Task, TaskStatus, TaskUpdate, spawn_download_paper};
 use crate::views::annotation_prompt::{AnnotationPrompt, PromptCommit, PromptSubmission};
 use crate::views::{annotation_prompt, detail, papers, questions, searches, tasks as tasks_view};
 use crate::widgets::status_bar;
@@ -171,6 +171,7 @@ impl App {
     fn drain_all_channels(&mut self) {
         self.drain_task_updates();
         self.drain_offline();
+        self.flush_completed_tasks();
     }
 
     fn drain_task_updates(&mut self) {
@@ -178,17 +179,37 @@ impl App {
             match update {
                 TaskUpdate::New(task) => {
                     self.tasks.push(task);
-                    if self.tasks.len() > 10 {
-                        self.tasks.remove(0);
+                    // Evict the oldest *terminal* task only — never drop
+                    // a Queued or Running download just because the panel
+                    // is full. If everything in the panel is still active,
+                    // grow past the cap rather than lose work.
+                    if self.tasks.len() > 10
+                        && let Some(idx) = self.tasks.iter().position(|t| t.terminal_at.is_some())
+                    {
+                        self.tasks.remove(idx);
                     }
                 }
                 TaskUpdate::Status { id, status } => {
                     if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
                         t.status = status;
+                        if matches!(t.status, TaskStatus::Done { .. } | TaskStatus::Failed(_)) {
+                            t.terminal_at = Some(std::time::Instant::now());
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// Drop terminal tasks once their linger window has elapsed (5s for
+    /// Done, 30s for Failed). Runs every drain pass — cheap.
+    fn flush_completed_tasks(&mut self) {
+        crate::tasks::retain_recent_terminal(&mut self.tasks, std::time::Instant::now());
+    }
+
+    /// Drop every terminal task immediately. Bound to `c` in tab mode (#113).
+    fn clear_completed_tasks(&mut self) {
+        crate::tasks::clear_terminal(&mut self.tasks);
     }
 
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
@@ -209,6 +230,9 @@ impl App {
         match code {
             KeyCode::Tab => self.tab = self.tab.next(),
             KeyCode::BackTab => self.tab = self.tab.prev(),
+            // `c` clears all terminal tasks (#113). Available globally
+            // in tab mode; no-op when the panel is already empty.
+            KeyCode::Char('c') => self.clear_completed_tasks(),
             _ => self.handle_tab_key(code),
         }
     }
@@ -698,8 +722,12 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         (Some(Overlay::SearchPapers { .. }), _) => {
             "Esc/q: back | j/k: navigate | Enter: open paper"
         }
-        (None, Tab::Papers) => "Tab: switch tabs | j/k: navigate | Enter: open | s: star | q: quit",
-        (None, _) => "Tab/Shift-Tab: switch tabs | j/k: navigate | Enter: select | q: quit",
+        (None, Tab::Papers) => {
+            "Tab: switch tabs | j/k: navigate | Enter: open | s: star | c: clear tasks | q: quit"
+        }
+        (None, _) => {
+            "Tab/Shift-Tab: switch tabs | j/k: navigate | Enter: select | c: clear tasks | q: quit"
+        }
     };
     status_bar::draw(frame, chunks[3], help_text, app.offline);
 }
