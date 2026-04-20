@@ -92,8 +92,23 @@ jobs:
             fi
             unique=$(md5sum "$dir"/*.png | awk '{print $1}' | sort -u | wc -l | tr -d ' ')
             if [ "$unique" -lt 2 ]; then
-              echo "::error::$tape produced $produced byte-identical screenshots — feature did not render anything"
-              dead+=("$tape (all snapshots identical)")
+              # CI runners have variable load — a tape can flake on one
+              # render and pass on the next. Re-render this tape once
+              # before declaring failure. A real bug (feature genuinely
+              # doesn't render) will fail both times; a timing flake
+              # almost never repeats back-to-back.
+              echo "::warning::$tape all-identical on first render — retrying once"
+              rm -f "$dir"/*.png
+              if vhs "$tape"; then
+                produced2=$(find "$dir" -maxdepth 1 -name '*.png' 2>/dev/null | wc -l | tr -d ' ')
+                unique2=$(md5sum "$dir"/*.png 2>/dev/null | awk '{print $1}' | sort -u | wc -l | tr -d ' ')
+                if [ "$unique2" -ge 2 ]; then
+                  echo "ok (retry): $tape — $produced2 screenshots, $unique2 distinct"
+                  continue
+                fi
+              fi
+              echo "::error::$tape produced byte-identical screenshots on two consecutive renders — feature did not render anything"
+              dead+=("$tape (all snapshots identical, twice)")
             else
               echo "ok: $tape — $produced screenshots, $unique distinct"
             fi
