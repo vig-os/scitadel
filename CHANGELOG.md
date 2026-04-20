@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SQLite cross-process write visibility** (#121). Added `synchronous=NORMAL`
+  to the WAL pairing (already had `journal_mode=WAL` and `busy_timeout=5000`)
+  and a `cross_process_write_visible_within_one_redraw` integration test
+  that opens two `Database` handles on the same file and verifies a write
+  through one is visible through the other on the very next read. This is
+  the property the 2-pane workflow (TUI in one pane, `scitadel mcp` in
+  another) depends on — without it the TUI shows stale state after every
+  agent-driven edit.
 - **VHS tape PATH ordering** (#116). All 9 tapes now put
   `$PWD/target/release` before `$HOME/.cargo/bin` so a stale installed
   `scitadel` can no longer shadow the project build. This was the
