@@ -142,4 +142,17 @@ impl DataStore {
     pub fn delete_annotation(&self, annotation_id: &str) -> Result<()> {
         Ok(SqliteAnnotationRepository::new(self.db.clone()).soft_delete(annotation_id)?)
     }
+
+    /// Persist the outcome of a download attempt for the Papers-table
+    /// state column (#112). `local_path` is the absolute path to the
+    /// saved file on success, `None` on failure.
+    pub fn record_download_outcome(
+        &self,
+        paper_id: &str,
+        local_path: Option<&str>,
+        status: scitadel_core::models::DownloadStatus,
+    ) -> Result<()> {
+        let (paper_repo, _, _, _, _) = self.db.repositories();
+        Ok(paper_repo.update_download_state(paper_id, local_path, status)?)
+    }
 }
