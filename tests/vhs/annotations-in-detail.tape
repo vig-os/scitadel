@@ -39,14 +39,14 @@ Show
 
 Type "scitadel tui"
 Enter
-Sleep 1500ms
+Sleep 2500ms
 
 Tab
-Sleep 500ms
+Sleep 1500ms
 Screenshot "tests/vhs/snapshots/annotations-in-detail/01-papers-tab.png"
 
 Enter
-Sleep 1500ms
+Sleep 2500ms
 Screenshot "tests/vhs/snapshots/annotations-in-detail/02-paper-detail-with-annotations.png"
 
 Type "q"
