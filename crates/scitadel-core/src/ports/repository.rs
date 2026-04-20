@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use crate::error::CoreError;
 use crate::models::{
-    Assessment, Citation, Paper, PaperId, ResearchQuestion, Search, SearchResult, SearchTerm,
-    SnowballRun,
+    Assessment, Citation, DownloadStatus, Paper, PaperId, ResearchQuestion, Search, SearchResult,
+    SearchTerm, SnowballRun,
 };
 
 /// Port for paper persistence.
@@ -24,6 +24,16 @@ pub trait PaperRepository: Send + Sync {
     /// re-running pdf-extract. Idempotent — overwrites the existing
     /// `full_text` column.
     fn update_full_text(&self, paper_id: &str, text: &str) -> Result<(), CoreError>;
+    /// Persist the outcome of a download attempt. `local_path` is the
+    /// absolute path to the saved file on success (any non-`Failed`
+    /// status); pass `None` for `Failed`. `last_attempt_at` is set to
+    /// `now()` automatically. See #112.
+    fn update_download_state(
+        &self,
+        paper_id: &str,
+        local_path: Option<&str>,
+        status: DownloadStatus,
+    ) -> Result<(), CoreError>;
 }
 
 /// Port for search run persistence.

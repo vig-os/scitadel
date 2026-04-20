@@ -16,7 +16,7 @@ use ratatui::widgets::Tabs;
 use tokio::sync::mpsc;
 
 use crate::data::DataStore;
-use crate::tasks::{Task, TaskUpdate, spawn_download_paper};
+use crate::tasks::{Task, TaskKind, TaskStatus, TaskUpdate, spawn_download_paper};
 use crate::views::annotation_prompt::{AnnotationPrompt, PromptCommit, PromptSubmission};
 use crate::views::{annotation_prompt, detail, papers, questions, searches, tasks as tasks_view};
 use crate::widgets::status_bar;
@@ -183,10 +183,68 @@ impl App {
                     }
                 }
                 TaskUpdate::Status { id, status } => {
+                    // Persist Done/Failed back to papers.download_status
+                    // (#112) before mutating the in-memory task — borrow
+                    // the matching task once to read the paper_id.
+                    let paper_id = self
+                        .tasks
+                        .iter()
+                        .find(|t| t.id == id)
+                        .map(|t| match &t.kind {
+                            TaskKind::Download { paper_id, .. } => paper_id.clone(),
+                        });
+                    if let Some(pid) = paper_id {
+                        self.persist_download_outcome(&pid, &status);
+                    }
                     if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
                         t.status = status;
                     }
                 }
+            }
+        }
+    }
+
+    /// Set of paper IDs that have a Queued or Running download task.
+    /// Used by the Papers table to render the `↻` in-flight symbol.
+    fn downloading_paper_ids(&self) -> std::collections::HashSet<String> {
+        self.tasks
+            .iter()
+            .filter(|t| matches!(t.status, TaskStatus::Queued | TaskStatus::Running))
+            .map(|t| {
+                let TaskKind::Download { paper_id, .. } = &t.kind;
+                paper_id.clone()
+            })
+            .collect()
+    }
+
+    fn persist_download_outcome(&self, paper_id: &str, status: &TaskStatus) {
+        use scitadel_adapters::download::AccessStatus;
+        use scitadel_core::models::DownloadStatus;
+        let outcome = match status {
+            TaskStatus::Done { path, access, .. } => {
+                let download_status = match access {
+                    AccessStatus::FullText => DownloadStatus::Downloaded,
+                    AccessStatus::Abstract | AccessStatus::Paywall | AccessStatus::Unknown => {
+                        DownloadStatus::Paywall
+                    }
+                };
+                Some((path.to_string_lossy().into_owned(), download_status))
+            }
+            TaskStatus::Failed(_) => Some((String::new(), DownloadStatus::Failed)),
+            TaskStatus::Queued | TaskStatus::Running => None,
+        };
+        if let Some((path, ds)) = outcome {
+            let path_arg = if matches!(ds, DownloadStatus::Failed) {
+                None
+            } else {
+                Some(path.as_str())
+            };
+            if let Err(e) = self.data.record_download_outcome(paper_id, path_arg, ds) {
+                tracing::warn!(
+                    paper_id,
+                    error = %e,
+                    "failed to persist download outcome"
+                );
             }
         }
     }
@@ -644,6 +702,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 search_id,
                 *selected,
                 &app.starred,
+                &app.downloading_paper_ids(),
             );
         }
         None => match app.tab {
@@ -654,6 +713,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 &app.data,
                 app.paper_selected,
                 &app.starred,
+                &app.downloading_paper_ids(),
             ),
             Tab::Questions => {
                 questions::draw(frame, chunks[1], &app.data, app.question_selected);

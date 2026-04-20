@@ -36,7 +36,7 @@ fn render_row(task: &Task, show_institutional_hint: bool) -> ListItem<'_> {
     };
 
     let (title, ref_id) = match &task.kind {
-        TaskKind::Download { title, ref_id } => (truncate(title, 55), ref_id.as_str()),
+        TaskKind::Download { title, ref_id, .. } => (truncate(title, 55), ref_id.as_str()),
     };
 
     let status_tail = status_tail_text(&task.status, show_institutional_hint);
