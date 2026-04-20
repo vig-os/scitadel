@@ -1530,6 +1530,71 @@ pub fn get_current_selection_tool() -> Result<String, String> {
     }
 }
 
+// ===== Star / paper-state tools (#120) =====
+
+/// Toggle the starred flag for `paper_id` under `reader`. Returns the
+/// new value as JSON: `{"paper_id": "...", "starred": true|false}`.
+pub fn toggle_star_tool(paper_id: &str, reader: &str) -> Result<String, String> {
+    if reader.trim().is_empty() {
+        return Err("reader is required (pass an identity string)".into());
+    }
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqlitePaperStateRepository::new(db);
+    let starred = repo
+        .toggle_starred(paper_id, reader)
+        .map_err(|e| e.to_string())?;
+    tracing::info!(
+        op = "toggle_star",
+        paper_id,
+        reader,
+        starred,
+        "star write (trust-on-first-use)"
+    );
+    Ok(serde_json::json!({ "paper_id": paper_id, "starred": starred }).to_string())
+}
+
+/// Idempotent "ensure starred state" — sets `starred` to the requested
+/// value regardless of current. Returns the same JSON shape as toggle.
+pub fn set_star_tool(paper_id: &str, starred: bool, reader: &str) -> Result<String, String> {
+    if reader.trim().is_empty() {
+        return Err("reader is required".into());
+    }
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqlitePaperStateRepository::new(db);
+    let existing = repo.get(paper_id, reader).map_err(|e| e.to_string())?;
+    let new_state = scitadel_db::sqlite::PaperState {
+        paper_id: paper_id.into(),
+        reader: reader.into(),
+        starred,
+        to_read: existing.as_ref().is_some_and(|s| s.to_read),
+        read_at: existing.and_then(|s| s.read_at),
+    };
+    repo.set(&new_state).map_err(|e| e.to_string())?;
+    tracing::info!(
+        op = "set_star",
+        paper_id,
+        reader,
+        starred,
+        "star write (trust-on-first-use)"
+    );
+    Ok(serde_json::json!({ "paper_id": paper_id, "starred": starred }).to_string())
+}
+
+/// List all paper IDs `reader` has starred. Returns a JSON array of
+/// strings (paper IDs only — call `get_paper` for each if you need
+/// metadata).
+pub fn list_starred_tool(reader: &str) -> Result<String, String> {
+    if reader.trim().is_empty() {
+        return Err("reader is required".into());
+    }
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqlitePaperStateRepository::new(db);
+    let ids = repo.starred_ids(reader).map_err(|e| e.to_string())?;
+    let mut sorted: Vec<String> = ids.into_iter().collect();
+    sorted.sort();
+    serde_json::to_string(&sorted).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
