@@ -35,6 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MCP star tools — `toggle_star`, `set_star`, `list_starred`** (#120).
+  Closes the only TUI-only affordance gap so an agent in an adjacent
+  pane (the recommended 2-pane workflow) can drive every state change
+  the user can drive in the TUI. Trust-on-first-use `reader` identity,
+  matching the existing annotation tools (#100). Audit logged.
 - **Papers-table download-state column** (#112). Migration 007 adds
   `local_path`, `download_status`, and `last_attempt_at` columns to
   `papers`. The TUI Papers table renders a one-char symbol next to

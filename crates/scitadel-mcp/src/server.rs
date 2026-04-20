@@ -247,6 +247,30 @@ pub struct PaperQuestionRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct ToggleStarRequest {
+    /// Paper ID to toggle the star on
+    pub paper_id: String,
+    /// Reader identity (e.g. agent slug, user name)
+    pub reader: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetStarRequest {
+    /// Paper ID
+    pub paper_id: String,
+    /// Desired starred state (true = star, false = unstar)
+    pub starred: bool,
+    /// Reader identity
+    pub reader: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReaderRequest {
+    /// Reader identity to scope the query to
+    pub reader: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct DownloadPaperRequest {
     /// Paper ID from the scitadel DB (preferred — unlocks arxiv/openalex/Unpaywall chain)
     pub paper_id: Option<String>,
@@ -666,6 +690,27 @@ impl ScitadelServer {
         };
         notify(&ctx.peer, token.as_ref(), 1.0, Some(1.0), done_msg).await;
         result
+    }
+
+    #[tool(
+        description = "Toggle the starred flag for a paper under `reader`. Creates the per-reader state row if missing. NOTE: author/reader identity is trust-on-first-use — real auth ships with the Phase-5 Dolt sync layer. Returns: JSON `{paper_id, starred}` with the new value."
+    )]
+    fn toggle_star(&self, Parameters(req): Parameters<ToggleStarRequest>) -> Result<String, String> {
+        tools::toggle_star_tool(&req.paper_id, &req.reader)
+    }
+
+    #[tool(
+        description = "Set the starred flag for a paper under `reader` to an explicit value. Idempotent — call this when you want \"ensure starred\" semantics rather than a toggle. NOTE: trust-on-first-use identity (#100). Returns: JSON `{paper_id, starred}`."
+    )]
+    fn set_star(&self, Parameters(req): Parameters<SetStarRequest>) -> Result<String, String> {
+        tools::set_star_tool(&req.paper_id, req.starred, &req.reader)
+    }
+
+    #[tool(
+        description = "List all paper IDs `reader` has starred. Returns: JSON array of paper ID strings (no metadata — call `get_paper` for each if you need title/authors)."
+    )]
+    fn list_starred(&self, Parameters(req): Parameters<ReaderRequest>) -> Result<String, String> {
+        tools::list_starred_tool(&req.reader)
     }
 }
 
