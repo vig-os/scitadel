@@ -6,6 +6,7 @@ mod paper_state;
 mod papers;
 mod questions;
 mod searches;
+mod tui_state;
 
 pub use annotations::{SqliteAnnotationRepository, resolve_anchor};
 pub use assessments::SqliteAssessmentRepository;
@@ -15,6 +16,7 @@ pub use paper_state::{PaperState, SqlitePaperStateRepository};
 pub use papers::SqlitePaperRepository;
 pub use questions::SqliteQuestionRepository;
 pub use searches::SqliteSearchRepository;
+pub use tui_state::{SqliteTuiStateRepository, TuiState};
 
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;

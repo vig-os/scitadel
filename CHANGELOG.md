@@ -35,6 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MCP `get_current_selection`** (#122). The TUI publishes its
+  current selection (active tab, open paper/search/question, focused
+  annotation) to a singleton `tui_state` row on every focus change.
+  Agents in the adjacent pane can now ask "what is the user looking
+  at right now?" without the user pasting IDs. Result includes a
+  `stale: bool` flag (true when the row is >60s old) so an agent can
+  tell the TUI was closed. Migration 008. Dedup by selection key —
+  no UPDATE traffic when the user isn't moving.
 - **Papers-table download-state column** (#112). Migration 007 adds
   `local_path`, `download_status`, and `last_attempt_at` columns to
   `papers`. The TUI Papers table renders a one-char symbol next to

@@ -667,6 +667,13 @@ impl ScitadelServer {
         notify(&ctx.peer, token.as_ref(), 1.0, Some(1.0), done_msg).await;
         result
     }
+
+    #[tool(
+        description = "Read the open scitadel TUI's current selection. Use to answer 'what is the user looking at right now?' so you can score the open paper / draft from current context without the user pasting IDs. Returns JSON `{tab, paper_id?, search_id?, question_id?, annotation_id?, updated_at, stale}`. `stale: true` means the singleton row is >60s old — TUI may have been closed. (#122)"
+    )]
+    fn get_current_selection(&self) -> Result<String, String> {
+        tools::get_current_selection_tool()
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
