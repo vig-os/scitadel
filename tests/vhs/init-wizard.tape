@@ -13,7 +13,7 @@ Set Padding 10
 Set TypingSpeed 40ms
 
 Hide
-Type `export PATH="$HOME/.cargo/bin:$PWD/target/release:$PATH"`
+Type `export PATH="$PWD/target/release:$HOME/.cargo/bin:$PATH"`
 Enter
 Type `export PS1="$ "`
 Enter

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+
+- **VHS tape PATH ordering** (#116). All 9 tapes now put
+  `$PWD/target/release` before `$HOME/.cargo/bin` so a stale installed
+  `scitadel` can no longer shadow the project build. This was the
+  root cause of false-positive bug reports #114 and #115 — both
+  symptoms (R reader not opening, status bar truncated) disappeared
+  once the tape used the freshly built binary.
+
+### Changed
+
+- **CI vhs gate now asserts distinct snapshots** (#116). After
+  rendering each tape, the workflow checks that every tape declaring
+  `N` `Screenshot` calls produced at least `N` PNGs and that they're
+  not all byte-identical. This catches the dead-tape class of bugs
+  where a tape was committed but never actually exercised the feature
+  (the failure mode that hid #97's reader being unverified for two
+  PRs).
+
 ### Added
 
 - **MCP progress notifications** (#58). The `search`,
