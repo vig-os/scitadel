@@ -10,6 +10,30 @@ Scientific literature retrieval is fragmented, manual, and non-reproducible. Res
 
 Scitadel fixes this: one query, all sources, deterministic results, full audit trail.
 
+## Recommended workflow: TUI + agent in adjacent pane
+
+Scitadel's primary workflow is **`scitadel tui` in one terminal pane, an MCP-aware agent (Claude Code, Cursor, Cline, …) in an adjacent pane**. The agent talks to scitadel through the MCP server (40+ tools); the TUI redraws live as the agent writes.
+
+```
+┌─────────────────────────────┬──────────────────────────────┐
+│ $ scitadel tui              │ $ claude                     │
+│ ┌── Papers ───────────────┐ │                              │
+│ │ ✓ Attention Is All You  │ │ > score the open paper       │
+│ │ ⊘ Recurrent Neural...   │ │   against my CRISPR question │
+│ │ ★ ✓ Transformer Survey  │ │                              │
+│ └─────────────────────────┘ │   [agent calls                │
+│   Annotations (3)           │    get_current_selection,    │
+│   • "self-attention..." ─ok │    prepare_assessment,       │
+│   • "the Transformer" ─ ok  │    save_assessment]           │
+│                             │                              │
+│   Esc: back · n: new · …    │ Done. Score: 0.87, reasoning │
+└─────────────────────────────┴──────────────────────────────┘
+```
+
+The agent owns conversational reasoning (drafting questions, summarizing papers, suggesting related terms). The TUI owns reading and quick navigation (browse, star, annotate, scroll). They share the SQLite database via WAL mode — every MCP write surfaces in the open TUI within ~100 ms.
+
+You don't need any LLM CLI installed to use scitadel — every TUI/CLI feature works standalone. But once you set up the MCP server (one line, see below), the agent + TUI combo is what scitadel was designed for.
+
 ## Install
 
 Scitadel is a Rust workspace. You need a Rust toolchain (`rustup`, stable channel).
@@ -155,72 +179,57 @@ New papers discovered via snowballing are deduplicated against the existing data
 
 ### 4. Interactive TUI
 
-Browse searches, papers, assessments, and citation trees in an interactive terminal dashboard.
+Browse searches, papers, annotations, and citation trees in an interactive terminal dashboard. Best experienced with an MCP-aware agent in an adjacent terminal pane (see [Recommended workflow](#recommended-workflow-tui--agent-in-adjacent-pane)).
 
 ```bash
-# Launch the TUI (requires textual: pip install scitadel[tui])
 scitadel tui
-
-# Or use the standalone entry point
-scitadel-tui
 ```
 
 The TUI has three tabs:
 
 - **Searches** — browse past search runs, drill into papers, view full metadata and assessments
-- **Questions** — see research questions with their linked terms and assessment statistics
-- **New Search** — run a search and watch results stream in
+- **Papers** — every paper across every search, with a state column (`✓` downloaded, `⊘` paywalled, `✗` failed, `↻` in flight) and a star toggle (`s`)
+- **Questions** — research questions with their linked search terms
 
-From any paper, press `c` to view its citation tree (references and citing papers from snowball runs).
+**Per-paper overlay** (Enter on a paper): full metadata, annotation list, and:
+- `R` — two-pane reader (left: full text with colored highlights, right: annotation threads)
+- `n / e / r / d` — create / edit / reply / delete annotation
+- `J / K` — hop between highlights in reader mode
+- `D` — download via Unpaywall / publisher
+
+The TUI re-queries the DB every redraw, so any write through the MCP server (in an adjacent pane) shows up live with no refresh keypress.
 
 ### 5. Agent-driven workflow via MCP
 
-Connect scitadel as an MCP server and let an LLM agent drive the pipeline — from question formulation through search, scoring, and snowballing.
+The MCP server is the seam between scitadel and any agent that speaks MCP. See [Recommended workflow](#recommended-workflow-tui--agent-in-adjacent-pane) above for the 2-pane setup that's the primary use case.
 
 ```bash
 # Run the server manually (stdio transport)
 scitadel mcp
 ```
 
-For Claude Code, register once (see [Install](#install) above):
+**Setup snippets:**
 
-```bash
-claude mcp add --scope user scitadel -- scitadel mcp
-```
+| Agent | Setup |
+|---|---|
+| **Claude Code** | `claude mcp add --scope user scitadel -- scitadel mcp` |
+| **Claude Desktop** | Add to `claude_desktop_config.json`: `{"mcpServers": {"scitadel": {"command": "scitadel", "args": ["mcp"]}}}` |
+| **Cursor / Cline / Continue** | Same JSON shape — point at the `scitadel mcp` subcommand |
 
-For Claude Desktop, add to `claude_desktop_config.json`:
+**40+ MCP tools** spanning the full pipeline:
 
-```json
-{
-  "mcpServers": {
-    "scitadel": {
-      "command": "scitadel",
-      "args": ["mcp"]
-    }
-  }
-}
-```
+- **Search & retrieval**: `search`, `list_searches`, `get_papers`, `get_paper`, `get_annotated_paper`, `find_similar_searches`, `summarize_search`, `download_paper`, `read_paper`, `list_sources`
+- **Research questions**: `create_question`, `list_questions`, `add_search_terms`, `get_rubric`
+- **Scoring**: `prepare_assessment`, `prepare_batch_assessments`, `assess_paper`, `save_assessment`, `get_assessments`
+- **Annotations** (#49): `create_annotation`, `reply_annotation`, `update_annotation`, `delete_annotation`, `list_annotations`, `mark_seen`, `mark_thread_seen`, `list_unread`
+- **Citation graph** (#59): `get_references`, `get_citations`
+- **Stars** (#120): `toggle_star`, `set_star`, `list_starred`
+- **TUI awareness** (#122): `get_current_selection` — "what is the user looking at right now?"
+- **Export**: `export_search`
 
-The MCP server exposes 14 tools:
+Every long-running tool (search / batch scoring / download) emits MCP `notifications/progress` frames if the caller supplies a `progressToken` (#58). Annotation writes are audit-logged. Identity is trust-on-first-use (real auth ships with the Phase-5 Dolt sync layer).
 
-| Tool | What it does |
-|------|-------------|
-| `search` | Federated search (supports `question_id` for auto-query) |
-| `list_searches` | Browse past search runs |
-| `get_papers` | List papers from a search |
-| `get_paper` | Full details of a single paper |
-| `export_search` | Export as BibTeX / JSON / CSV |
-| `create_question` | Define a research question |
-| `list_questions` | Browse research questions |
-| `add_search_terms` | Link keywords to a question |
-| `assess_paper` | Record a relevance score with reasoning |
-| `get_assessments` | Retrieve scores for a paper or question |
-| `prepare_assessment` | Build a rubric + paper payload for host-LLM scoring |
-| `prepare_batch_assessments` | Same, for every paper in a search |
-| `save_assessment` | Persist a host-LLM-scored assessment |
-| `download_paper` | Fetch PDF (Unpaywall) or publisher HTML by DOI |
-
-This enables a workflow where the agent formulates a question, generates search terms, runs a search, scores each paper, snowballs relevant citations, and writes structured assessments — all through tool calls with no manual intervention.
+The full pipeline — agent formulates a question, generates search terms, runs a search, scores each paper, snowballs relevant citations, writes structured assessments — runs through tool calls with no manual intervention. With #122, the agent can also act on whatever the user is looking at in the TUI without the user pasting IDs.
 
 ## Workflow coverage
 
