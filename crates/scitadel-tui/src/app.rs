@@ -684,13 +684,7 @@ impl App {
 /// user-visible selection so we skip the redundant DB write (#122).
 fn tui_state_key(
     s: &scitadel_db::sqlite::TuiState,
-) -> (
-    &str,
-    Option<&str>,
-    Option<&str>,
-    Option<&str>,
-    Option<&str>,
-) {
+) -> (&str, Option<&str>, Option<&str>, Option<&str>, Option<&str>) {
     (
         s.tab.as_str(),
         s.paper_id.as_deref(),
