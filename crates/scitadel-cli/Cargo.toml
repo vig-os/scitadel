@@ -16,13 +16,13 @@ name = "scitadel"
 path = "src/main.rs"
 
 [dependencies]
-scitadel-core = { path = "../scitadel-core", version = "0.1.0" }
-scitadel-db = { path = "../scitadel-db", version = "0.1.0" }
-scitadel-adapters = { path = "../scitadel-adapters", version = "0.1.0" }
-scitadel-scoring = { path = "../scitadel-scoring", version = "0.1.0" }
-scitadel-export = { path = "../scitadel-export", version = "0.1.0" }
-scitadel-mcp = { path = "../scitadel-mcp", version = "0.1.0" }
-scitadel-tui = { path = "../scitadel-tui", version = "0.1.0" }
+scitadel-core = { path = "../scitadel-core", version = "0.5.0" }
+scitadel-db = { path = "../scitadel-db", version = "0.5.0" }
+scitadel-adapters = { path = "../scitadel-adapters", version = "0.5.0" }
+scitadel-scoring = { path = "../scitadel-scoring", version = "0.5.0" }
+scitadel-export = { path = "../scitadel-export", version = "0.5.0" }
+scitadel-mcp = { path = "../scitadel-mcp", version = "0.5.0" }
+scitadel-tui = { path = "../scitadel-tui", version = "0.5.0" }
 rmcp = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }

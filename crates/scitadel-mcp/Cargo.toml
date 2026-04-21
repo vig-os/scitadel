@@ -12,11 +12,11 @@ description = "MCP server exposing scitadel tools to host LLMs."
 readme = "../../README.md"
 
 [dependencies]
-scitadel-core = { path = "../scitadel-core", version = "0.1.0" }
-scitadel-db = { path = "../scitadel-db", version = "0.1.0" }
-scitadel-adapters = { path = "../scitadel-adapters", version = "0.1.0" }
-scitadel-scoring = { path = "../scitadel-scoring", version = "0.1.0" }
-scitadel-export = { path = "../scitadel-export", version = "0.1.0" }
+scitadel-core = { path = "../scitadel-core", version = "0.5.0" }
+scitadel-db = { path = "../scitadel-db", version = "0.5.0" }
+scitadel-adapters = { path = "../scitadel-adapters", version = "0.5.0" }
+scitadel-scoring = { path = "../scitadel-scoring", version = "0.5.0" }
+scitadel-export = { path = "../scitadel-export", version = "0.5.0" }
 rmcp = { workspace = true }
 schemars = { workspace = true }
 tokio = { workspace = true }
@@ -25,6 +25,7 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+chrono = { workspace = true }
 pdf-extract = { workspace = true }
 scraper = { workspace = true }
 

@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.5.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/vig-os/scitadel"
@@ -62,12 +62,17 @@ ratatui = "0.29"
 crossterm = "0.28"
 
 # MCP
-rmcp = { version = "0.1", features = ["server", "transport-io"] }
-schemars = "0.8"
+rmcp = { version = "0.17", features = ["server", "transport-io", "macros"] }
+schemars = "1"
 
 # Content extraction (PDF / HTML → text)
 pdf-extract = "0.7"
 scraper = "0.20"
+
+# Annotation anchor resolver (#96)
+strsim = "0.11"
+sha1 = "0.10"
+unicode-normalization = "0.1"
 
 # Testing
 insta = { version = "1", features = ["json"] }

@@ -13,7 +13,7 @@ Set Padding 10
 Set TypingSpeed 40ms
 
 Hide
-Type `export PATH="$HOME/.cargo/bin:$PWD/target/release:$PATH"`
+Type `export PATH="$PWD/target/release:$HOME/.cargo/bin:$PATH"`
 Enter
 Type `export PS1="$ "`
 Enter
@@ -31,18 +31,18 @@ Show
 
 Type "scitadel tui"
 Enter
-Sleep 1500ms
+Sleep 2500ms
 
 Tab
-Sleep 600ms
+Sleep 1500ms
 Screenshot "tests/vhs/snapshots/reading-queue-star/01-papers-unstarred.png"
 
 Type "s"
-Sleep 600ms
+Sleep 1500ms
 Screenshot "tests/vhs/snapshots/reading-queue-star/02-papers-starred.png"
 
 Type "s"
-Sleep 600ms
+Sleep 1500ms
 Screenshot "tests/vhs/snapshots/reading-queue-star/03-papers-unstarred-again.png"
 
 Type "q"

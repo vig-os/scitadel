@@ -16,8 +16,9 @@ use ratatui::widgets::Tabs;
 use tokio::sync::mpsc;
 
 use crate::data::DataStore;
-use crate::tasks::{Task, TaskUpdate, spawn_download_paper};
-use crate::views::{detail, papers, questions, searches, tasks as tasks_view};
+use crate::tasks::{Task, TaskKind, TaskStatus, TaskUpdate, spawn_download_paper};
+use crate::views::annotation_prompt::{AnnotationPrompt, PromptCommit, PromptSubmission};
+use crate::views::{annotation_prompt, detail, papers, questions, searches, tasks as tasks_view};
 use crate::widgets::status_bar;
 
 /// Active tab in the TUI.
@@ -59,8 +60,28 @@ impl Tab {
 /// Overlay view shown on top of the current tab.
 #[derive(Debug, Clone)]
 pub enum Overlay {
-    PaperDetail { paper_id: String, scroll: u16 },
-    SearchPapers { search_id: String, selected: usize },
+    PaperDetail {
+        paper_id: String,
+        scroll: u16,
+        /// `None` = scroll mode; `Some(i)` = focused on annotation `i`
+        /// in the paper's annotation list. Set by `Shift+J` and
+        /// cleared by `Esc`. Required so e/d/r (#92) have a target.
+        annotation_focus: Option<usize>,
+        /// Active n/e/r/d prompt overlay (#92). Drawn on top of the
+        /// detail view; eats keystrokes until submitted or cancelled.
+        prompt: Option<AnnotationPrompt>,
+        /// True = two-pane reader mode (#97); false = the existing
+        /// single-pane metadata + annotation list. Toggled with `R`.
+        /// Mutually exclusive with `annotation_focus`/`prompt`.
+        reader: bool,
+        /// Index into the paper's root annotations while the reader
+        /// is open; cycles via `J` / `K` to hop between highlights.
+        highlight_focus: Option<usize>,
+    },
+    SearchPapers {
+        search_id: String,
+        selected: usize,
+    },
 }
 
 /// Main application state.
@@ -75,6 +96,9 @@ pub struct App {
     pub question_selected: usize,
 
     pub tasks: Vec<Task>,
+    /// Last `TuiState` written to the DB, used by `publish_tui_state`
+    /// to skip redundant UPDATEs when the user hasn't moved (#122).
+    pub last_published_state: Option<scitadel_db::sqlite::TuiState>,
     pub unpaywall_email: String,
     pub papers_dir: PathBuf,
     pub show_institutional_hint: bool,
@@ -118,6 +142,7 @@ impl App {
             paper_selected: 0,
             question_selected: 0,
             tasks: Vec::new(),
+            last_published_state: None,
             unpaywall_email,
             papers_dir,
             show_institutional_hint,
@@ -150,6 +175,73 @@ impl App {
     fn drain_all_channels(&mut self) {
         self.drain_task_updates();
         self.drain_offline();
+        self.flush_completed_tasks();
+        self.publish_tui_state();
+    }
+
+    /// Write the TUI's current selection to the singleton `tui_state`
+    /// row so an MCP-side agent can ask "what's the user looking at?"
+    /// (#122). Runs every drain pass; only writes if the *selection*
+    /// (not the timestamp) changed since last publish — otherwise the
+    /// TUI would emit ~10 UPDATEs/sec on a static screen.
+    fn publish_tui_state(&mut self) {
+        let snapshot = self.current_tui_state();
+        if let Some(prev) = &self.last_published_state
+            && tui_state_key(prev) == tui_state_key(&snapshot)
+        {
+            return;
+        }
+        if let Err(e) = self.data.publish_tui_state(&snapshot) {
+            tracing::warn!(error = %e, "failed to publish TUI state");
+            return;
+        }
+        self.last_published_state = Some(snapshot);
+    }
+
+    fn current_tui_state(&self) -> scitadel_db::sqlite::TuiState {
+        let tab = match self.tab {
+            Tab::Searches => "Searches",
+            Tab::Papers => "Papers",
+            Tab::Questions => "Questions",
+        };
+        let (paper_id, search_id, annotation_id) = match &self.overlay {
+            Some(Overlay::PaperDetail {
+                paper_id,
+                annotation_focus,
+                ..
+            }) => {
+                // Resolve the focused annotation's id only when the
+                // user is actively in focus mode — otherwise leave None
+                // so agents don't think the user is "on" an annotation
+                // they happen to be scrolling past.
+                let ann_id = annotation_focus.and_then(|i| {
+                    self.data
+                        .load_annotations_for_paper(paper_id)
+                        .ok()
+                        .and_then(|anns| anns.get(i).map(|a| a.id.as_str().to_string()))
+                });
+                (Some(paper_id.clone()), None, ann_id)
+            }
+            Some(Overlay::SearchPapers { search_id, .. }) => (None, Some(search_id.clone()), None),
+            None => (None, None, None),
+        };
+        // Question id only when the user is actually on the Questions tab.
+        let question_id = if matches!(self.tab, Tab::Questions) {
+            self.data.load_questions().ok().and_then(|qs| {
+                qs.get(self.question_selected)
+                    .map(|q| q.id.as_str().to_string())
+            })
+        } else {
+            None
+        };
+        scitadel_db::sqlite::TuiState {
+            tab: tab.to_string(),
+            paper_id,
+            search_id,
+            question_id,
+            annotation_id,
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        }
     }
 
     fn drain_task_updates(&mut self) {
@@ -157,15 +249,93 @@ impl App {
             match update {
                 TaskUpdate::New(task) => {
                     self.tasks.push(task);
-                    if self.tasks.len() > 10 {
-                        self.tasks.remove(0);
+                    // Evict the oldest *terminal* task only — never drop
+                    // a Queued or Running download just because the panel
+                    // is full. If everything in the panel is still active,
+                    // grow past the cap rather than lose work.
+                    if self.tasks.len() > 10
+                        && let Some(idx) = self.tasks.iter().position(|t| t.terminal_at.is_some())
+                    {
+                        self.tasks.remove(idx);
                     }
                 }
                 TaskUpdate::Status { id, status } => {
+                    // Persist Done/Failed back to papers.download_status
+                    // (#112) before mutating the in-memory task — borrow
+                    // the matching task once to read the paper_id.
+                    let paper_id = self
+                        .tasks
+                        .iter()
+                        .find(|t| t.id == id)
+                        .map(|t| match &t.kind {
+                            TaskKind::Download { paper_id, .. } => paper_id.clone(),
+                        });
+                    if let Some(pid) = paper_id {
+                        self.persist_download_outcome(&pid, &status);
+                    }
                     if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
                         t.status = status;
+                        if matches!(t.status, TaskStatus::Done { .. } | TaskStatus::Failed(_)) {
+                            t.terminal_at = Some(std::time::Instant::now());
+                        }
                     }
                 }
+            }
+        }
+    }
+
+    /// Drop terminal tasks once their linger window has elapsed (5s for
+    /// Done, 30s for Failed). Runs every drain pass — cheap.
+    fn flush_completed_tasks(&mut self) {
+        crate::tasks::retain_recent_terminal(&mut self.tasks, std::time::Instant::now());
+    }
+
+    /// Drop every terminal task immediately. Bound to `c` in tab mode (#113).
+    fn clear_completed_tasks(&mut self) {
+        crate::tasks::clear_terminal(&mut self.tasks);
+    }
+
+    /// Set of paper IDs that have a Queued or Running download task.
+    /// Used by the Papers table to render the `↻` in-flight symbol.
+    fn downloading_paper_ids(&self) -> std::collections::HashSet<String> {
+        self.tasks
+            .iter()
+            .filter(|t| matches!(t.status, TaskStatus::Queued | TaskStatus::Running))
+            .map(|t| {
+                let TaskKind::Download { paper_id, .. } = &t.kind;
+                paper_id.clone()
+            })
+            .collect()
+    }
+
+    fn persist_download_outcome(&self, paper_id: &str, status: &TaskStatus) {
+        use scitadel_adapters::download::AccessStatus;
+        use scitadel_core::models::DownloadStatus;
+        let outcome = match status {
+            TaskStatus::Done { path, access, .. } => {
+                let download_status = match access {
+                    AccessStatus::FullText => DownloadStatus::Downloaded,
+                    AccessStatus::Abstract | AccessStatus::Paywall | AccessStatus::Unknown => {
+                        DownloadStatus::Paywall
+                    }
+                };
+                Some((path.to_string_lossy().into_owned(), download_status))
+            }
+            TaskStatus::Failed(_) => Some((String::new(), DownloadStatus::Failed)),
+            TaskStatus::Queued | TaskStatus::Running => None,
+        };
+        if let Some((path, ds)) = outcome {
+            let path_arg = if matches!(ds, DownloadStatus::Failed) {
+                None
+            } else {
+                Some(path.as_str())
+            };
+            if let Err(e) = self.data.record_download_outcome(paper_id, path_arg, ds) {
+                tracing::warn!(
+                    paper_id,
+                    error = %e,
+                    "failed to persist download outcome"
+                );
             }
         }
     }
@@ -188,27 +358,16 @@ impl App {
         match code {
             KeyCode::Tab => self.tab = self.tab.next(),
             KeyCode::BackTab => self.tab = self.tab.prev(),
+            // `c` clears all terminal tasks (#113). Available globally
+            // in tab mode; no-op when the panel is already empty.
+            KeyCode::Char('c') => self.clear_completed_tasks(),
             _ => self.handle_tab_key(code),
         }
     }
 
     fn handle_overlay_key(&mut self, code: KeyCode) {
         match self.overlay {
-            Some(Overlay::PaperDetail {
-                ref paper_id,
-                ref mut scroll,
-            }) => match code {
-                KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
-                KeyCode::Char('j') | KeyCode::Down => *scroll = scroll.saturating_add(1),
-                KeyCode::Char('k') | KeyCode::Up => *scroll = scroll.saturating_sub(1),
-                KeyCode::Char('d') => *scroll = scroll.saturating_add(10),
-                KeyCode::Char('u') => *scroll = scroll.saturating_sub(10),
-                KeyCode::Char('D') => {
-                    let paper_id = paper_id.clone();
-                    self.queue_download(&paper_id);
-                }
-                _ => {}
-            },
+            Some(Overlay::PaperDetail { .. }) => self.handle_paper_detail_key(code),
             Some(Overlay::SearchPapers {
                 ref search_id,
                 ref mut selected,
@@ -235,6 +394,10 @@ impl App {
                         self.overlay = Some(Overlay::PaperDetail {
                             paper_id: paper.id.as_str().to_string(),
                             scroll: 0,
+                            annotation_focus: None,
+                            prompt: None,
+                            reader: false,
+                            highlight_focus: None,
                         });
                     }
                 }
@@ -255,6 +418,191 @@ impl App {
             self.unpaywall_email.clone(),
             self.papers_dir.clone(),
         );
+    }
+
+    /// Routes a key inside the PaperDetail overlay through four layers:
+    /// (0) reader mode (#97) — its own R/Esc/J/K loop;
+    /// (1) an active prompt (#92);
+    /// (2) annotation-focus mode (#92);
+    /// (3) plain scroll mode.
+    /// Each layer eats its own keys and falls through otherwise.
+    fn handle_paper_detail_key(&mut self, code: KeyCode) {
+        let Some(Overlay::PaperDetail {
+            paper_id,
+            scroll,
+            annotation_focus,
+            prompt,
+            reader,
+            highlight_focus,
+        }) = self.overlay.as_mut()
+        else {
+            return;
+        };
+
+        // Layer 0: reader mode owns the keystroke loop while it's open.
+        if *reader {
+            let count = crate::views::reader::highlight_count(&self.data, paper_id);
+            match code {
+                KeyCode::Esc | KeyCode::Char('q' | 'R') => {
+                    *reader = false;
+                    *highlight_focus = None;
+                }
+                KeyCode::Char('J') | KeyCode::Down if count > 0 => {
+                    *highlight_focus = Some(highlight_focus.map_or(0, |f| (f + 1).min(count - 1)));
+                }
+                KeyCode::Char('K') | KeyCode::Up if count > 0 => {
+                    *highlight_focus = Some(highlight_focus.map_or(0, |f| f.saturating_sub(1)));
+                }
+                KeyCode::Char('D') => {
+                    let pid = paper_id.clone();
+                    self.queue_download(&pid);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Layer 1: an active prompt eats every keystroke.
+        if prompt.is_some() {
+            let submission = step_prompt(prompt, code);
+            if let Some(s) = submission {
+                self.dispatch_submission(s);
+            }
+            return;
+        }
+
+        // Layer 2: annotation focus mode (e/d/r operate on a focused row).
+        if let Some(focus) = annotation_focus {
+            let pid = paper_id.clone();
+            let annotations = self
+                .data
+                .load_annotations_for_paper(&pid)
+                .unwrap_or_default();
+            if annotations.is_empty() {
+                *annotation_focus = None;
+            } else {
+                let count = annotations.len();
+                match code {
+                    KeyCode::Esc => *annotation_focus = None,
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        *focus = (*focus + 1).min(count - 1);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        *focus = focus.saturating_sub(1);
+                    }
+                    KeyCode::Char('e') => {
+                        let target = &annotations[*focus];
+                        *prompt = Some(AnnotationPrompt::edit(
+                            target.id.as_str(),
+                            target.note.clone(),
+                        ));
+                    }
+                    KeyCode::Char('r') => {
+                        let target = &annotations[*focus];
+                        // Replies anchor to the root; if the focused row is
+                        // already a reply, attach the new reply to its root.
+                        let parent = target
+                            .parent_id
+                            .as_ref()
+                            .map_or(target.id.as_str(), |p| p.as_str());
+                        *prompt = Some(AnnotationPrompt::reply(parent));
+                    }
+                    KeyCode::Char('d') => {
+                        *prompt = Some(AnnotationPrompt::delete_confirm(
+                            annotations[*focus].id.as_str(),
+                        ));
+                    }
+                    KeyCode::Char('n') => {
+                        *prompt = Some(AnnotationPrompt::create());
+                    }
+                    _ => {}
+                }
+                return;
+            }
+        }
+
+        // Layer 3: scroll mode.
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
+            KeyCode::Char('j') | KeyCode::Down => *scroll = scroll.saturating_add(1),
+            KeyCode::Char('k') | KeyCode::Up => *scroll = scroll.saturating_sub(1),
+            KeyCode::Char('d') => *scroll = scroll.saturating_add(10),
+            KeyCode::Char('u') => *scroll = scroll.saturating_sub(10),
+            KeyCode::Char('D') => {
+                let pid = paper_id.clone();
+                self.queue_download(&pid);
+            }
+            KeyCode::Char('n') => {
+                *prompt = Some(AnnotationPrompt::create());
+            }
+            KeyCode::Char('J') => {
+                // Enter annotation focus mode if the paper has any.
+                let pid = paper_id.clone();
+                let count = self
+                    .data
+                    .load_annotations_for_paper(&pid)
+                    .map_or(0, |a| a.len());
+                if count > 0 {
+                    *annotation_focus = Some(0);
+                }
+            }
+            KeyCode::Char('R') => {
+                // Enter reader mode (#97). Highlight cursor starts at
+                // 0 if the paper has any root annotations.
+                let pid = paper_id.clone();
+                let count = crate::views::reader::highlight_count(&self.data, &pid);
+                *reader = true;
+                *highlight_focus = if count > 0 { Some(0) } else { None };
+            }
+            _ => {}
+        }
+    }
+
+    /// Translate a prompt submission into the matching repository call
+    /// and reconcile UI state afterwards (e.g. clamp annotation focus
+    /// when a delete shrinks the list).
+    fn dispatch_submission(&mut self, submission: PromptSubmission) {
+        let Some(Overlay::PaperDetail {
+            paper_id,
+            annotation_focus,
+            ..
+        }) = self.overlay.as_mut()
+        else {
+            return;
+        };
+        let pid = paper_id.clone();
+        let reader = self.reader.clone();
+        match submission {
+            PromptSubmission::Create { quote, note } => {
+                let _ = self
+                    .data
+                    .create_root_annotation(&pid, &quote, &note, &reader);
+            }
+            PromptSubmission::Edit {
+                annotation_id,
+                note,
+            } => {
+                let _ = self.data.update_annotation_note(&annotation_id, &note);
+            }
+            PromptSubmission::Reply { parent_id, note } => {
+                let _ = self.data.reply_annotation(&parent_id, &note, &reader);
+            }
+            PromptSubmission::Delete { annotation_id } => {
+                let _ = self.data.delete_annotation(&annotation_id);
+                // Keep focus inside the new (smaller) list.
+                if let Some(focus) = annotation_focus {
+                    let new_count = self
+                        .data
+                        .load_annotations_for_paper(&pid)
+                        .map_or(0, |a| a.len());
+                    if new_count == 0 {
+                        *annotation_focus = None;
+                    } else if *focus >= new_count {
+                        *focus = new_count - 1;
+                    }
+                }
+            }
+        }
     }
 
     fn handle_tab_key(&mut self, code: KeyCode) {
@@ -297,6 +645,10 @@ impl App {
                             self.overlay = Some(Overlay::PaperDetail {
                                 paper_id: paper.id.as_str().to_string(),
                                 scroll: 0,
+                                annotation_focus: None,
+                                prompt: None,
+                                reader: false,
+                                highlight_focus: None,
                             });
                         }
                     }
@@ -325,6 +677,21 @@ impl App {
             }
         }
     }
+}
+
+/// Identity of a `TuiState` for dedup purposes — everything except
+/// `updated_at`. Two snapshots with the same key represent the same
+/// user-visible selection so we skip the redundant DB write (#122).
+fn tui_state_key(
+    s: &scitadel_db::sqlite::TuiState,
+) -> (&str, Option<&str>, Option<&str>, Option<&str>, Option<&str>) {
+    (
+        s.tab.as_str(),
+        s.paper_id.as_deref(),
+        s.search_id.as_deref(),
+        s.question_id.as_deref(),
+        s.annotation_id.as_deref(),
+    )
 }
 
 pub fn run(
@@ -409,8 +776,29 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     frame.render_widget(tabs, chunks[0]);
 
     match &app.overlay {
-        Some(Overlay::PaperDetail { paper_id, scroll }) => {
-            detail::draw(frame, chunks[1], &app.data, paper_id, *scroll);
+        Some(Overlay::PaperDetail {
+            paper_id,
+            scroll,
+            annotation_focus,
+            prompt,
+            reader,
+            highlight_focus,
+        }) => {
+            if *reader {
+                crate::views::reader::draw(frame, chunks[1], &app.data, paper_id, *highlight_focus);
+            } else {
+                detail::draw(
+                    frame,
+                    chunks[1],
+                    &app.data,
+                    paper_id,
+                    *scroll,
+                    *annotation_focus,
+                );
+                if let Some(active) = prompt {
+                    annotation_prompt::draw_overlay(frame, chunks[1], active);
+                }
+            }
         }
         Some(Overlay::SearchPapers {
             search_id,
@@ -423,6 +811,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 search_id,
                 *selected,
                 &app.starred,
+                &app.downloading_paper_ids(),
             );
         }
         None => match app.tab {
@@ -433,6 +822,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 &app.data,
                 app.paper_selected,
                 &app.starred,
+                &app.downloading_paper_ids(),
             ),
             Tab::Questions => {
                 questions::draw(frame, chunks[1], &app.data, app.question_selected);
@@ -445,16 +835,92 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     }
 
     let help_text = match (&app.overlay, app.tab) {
-        (Some(Overlay::PaperDetail { .. }), _) => {
-            "Esc/q: back | j/k: scroll | d/u: page | D: download"
+        (
+            Some(Overlay::PaperDetail {
+                annotation_focus,
+                prompt,
+                reader,
+                ..
+            }),
+            _,
+        ) => {
+            if *reader {
+                "Esc/R: leave reader | J/K: hop highlight | D: download"
+            } else {
+                match (prompt, annotation_focus) {
+                    (Some(p), _) => match p {
+                        AnnotationPrompt::DeleteConfirm { .. } => "y: confirm | n/Esc: cancel",
+                        AnnotationPrompt::Create { .. } => {
+                            "Enter: next/submit | Backspace: delete char | Esc: cancel"
+                        }
+                        _ => "Enter: submit | Backspace: delete char | Esc: cancel",
+                    },
+                    (None, Some(_)) => {
+                        "Esc: leave focus | j/k: navigate | n: new | e: edit | r: reply | d: delete"
+                    }
+                    (None, None) => {
+                        "Esc/q: back | j/k: scroll | d/u: page | D: download | n: new | J: focus | R: reader"
+                    }
+                }
+            }
         }
         (Some(Overlay::SearchPapers { .. }), _) => {
             "Esc/q: back | j/k: navigate | Enter: open paper"
         }
-        (None, Tab::Papers) => "Tab: switch tabs | j/k: navigate | Enter: open | s: star | q: quit",
-        (None, _) => "Tab/Shift-Tab: switch tabs | j/k: navigate | Enter: select | q: quit",
+        (None, Tab::Papers) => {
+            "Tab: switch tabs | j/k: navigate | Enter: open | s: star | c: clear tasks | q: quit"
+        }
+        (None, _) => {
+            "Tab/Shift-Tab: switch tabs | j/k: navigate | Enter: select | c: clear tasks | q: quit"
+        }
     };
     status_bar::draw(frame, chunks[3], help_text, app.offline);
+}
+
+/// Step the active annotation prompt by one keystroke. Mutates the
+/// `prompt` slot (clears it on cancel/submit, advances stage on Enter
+/// in a Create's Quote stage). Returns `Some(submission)` when the
+/// prompt resolved to a write the app should dispatch.
+fn step_prompt(prompt: &mut Option<AnnotationPrompt>, code: KeyCode) -> Option<PromptSubmission> {
+    let active = prompt.as_mut()?;
+    match code {
+        KeyCode::Esc => {
+            *prompt = None;
+            None
+        }
+        KeyCode::Enter => match active.submit() {
+            PromptCommit::AdvanceStage(next) => {
+                *prompt = Some(next);
+                None
+            }
+            PromptCommit::Submit(s) => {
+                *prompt = None;
+                Some(s)
+            }
+            PromptCommit::Cancel => {
+                *prompt = None;
+                None
+            }
+        },
+        KeyCode::Backspace => {
+            active.backspace();
+            None
+        }
+        KeyCode::Char(ch) => {
+            // Confirm prompts route y/n through their own handler.
+            if let Some(commit) = active.confirm(ch) {
+                let result = match commit {
+                    PromptCommit::Submit(s) => Some(s),
+                    PromptCommit::Cancel | PromptCommit::AdvanceStage(_) => None,
+                };
+                *prompt = None;
+                return result;
+            }
+            active.push_char(ch);
+            None
+        }
+        _ => None,
+    }
 }
 
 /// One-shot check: is the internet reachable? Uses a 3s HEAD to a stable

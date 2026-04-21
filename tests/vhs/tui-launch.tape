@@ -13,7 +13,7 @@ Set Padding 10
 Set TypingSpeed 40ms
 
 Hide
-Type `export PATH="$HOME/.cargo/bin:$PWD/target/release:$PATH"`
+Type `export PATH="$PWD/target/release:$HOME/.cargo/bin:$PATH"`
 Enter
 Type `export PS1="$ "`
 Enter
@@ -39,6 +39,18 @@ Tab
 Sleep 500ms
 Screenshot "tests/vhs/snapshots/tui-launch/03-questions-tab.png"
 
+# BackTab cycles tabs in reverse — back to Papers (#99 audit gap).
+Shift+Tab
+Sleep 500ms
+Screenshot "tests/vhs/snapshots/tui-launch/04-backtab-papers.png"
+
+# `d` / `u` page-scroll bindings.
+Type "d"
+Sleep 200ms
+Type "u"
+Sleep 200ms
+Screenshot "tests/vhs/snapshots/tui-launch/05-page-scroll.png"
+
 Type "q"
 Sleep 500ms
-Screenshot "tests/vhs/snapshots/tui-launch/04-quit.png"
+Screenshot "tests/vhs/snapshots/tui-launch/06-quit.png"

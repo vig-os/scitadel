@@ -7,9 +7,181 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-### Added
+## [0.5.0] - 2026-04-21
+
+The 2-pane workflow release. Combines the agent-side affordances
+shipped under the 0.4.0 milestone (citation graph, MCP progress
+notifications, rmcp 0.17 upgrade, annotations CRUD via TUI + MCP,
+two-pane reader, get_annotated_paper, multi-selector resolver) with
+the 0.5.0 milestone's affordance-gap closures (download-state column,
+task-panel flush, star MCP tools, get_current_selection, SQLite
+cross-process visibility) and the meta-pivot away from a bundled LLM
+abstraction (#60/#61 closed as superseded) toward MCP-driven
+2-pane workflow as the primary recommendation.
+
+`Cargo.toml` workspace version is bumped 0.1.0 → 0.5.0 to align with
+the changelog narrative; this is the first release where the on-disk
+crate version actually matches the documented release. Earlier 0.2.x
+and 0.3.x sections in this file are CHANGELOG-only milestones — no
+git tags exist for them.
+
+### Fixed
+
+- **SQLite cross-process write visibility** (#121). Added `synchronous=NORMAL`
+  to the WAL pairing (already had `journal_mode=WAL` and `busy_timeout=5000`)
+  and a `cross_process_write_visible_within_one_redraw` integration test
+  that opens two `Database` handles on the same file and verifies a write
+  through one is visible through the other on the very next read. This is
+  the property the 2-pane workflow (TUI in one pane, `scitadel mcp` in
+  another) depends on — without it the TUI shows stale state after every
+  agent-driven edit.
+- **VHS tape PATH ordering** (#116). All 9 tapes now put
+  `$PWD/target/release` before `$HOME/.cargo/bin` so a stale installed
+  `scitadel` can no longer shadow the project build. This was the
+  root cause of false-positive bug reports #114 and #115 — both
+  symptoms (R reader not opening, status bar truncated) disappeared
+  once the tape used the freshly built binary.
 
 ### Changed
+
+- **TUI task panel flush policy** (#113). Done downloads auto-flush
+  after 5 s, Failed after 30 s — long enough for the user to see the
+  result, short enough that they don't crowd the panel. The 10-task
+  cap now only evicts terminal tasks; an in-flight Queued or Running
+  download is never dropped to make room. New `c` keybind clears all
+  completed/failed tasks immediately (visible in the tab-mode status
+  bar).
+- **CI vhs gate now asserts distinct snapshots** (#116). After
+  rendering each tape, the workflow checks that every tape declaring
+  `N` `Screenshot` calls produced at least `N` PNGs and that they're
+  not all byte-identical. This catches the dead-tape class of bugs
+  where a tape was committed but never actually exercised the feature
+  (the failure mode that hid #97's reader being unverified for two
+  PRs).
+
+### Added
+
+- **MCP `get_current_selection`** (#122). The TUI publishes its
+  current selection (active tab, open paper/search/question, focused
+  annotation) to a singleton `tui_state` row on every focus change.
+  Agents in the adjacent pane can now ask "what is the user looking
+  at right now?" without the user pasting IDs. Result includes a
+  `stale: bool` flag (true when the row is >60s old) so an agent can
+  tell the TUI was closed. Migration 008. Dedup by selection key —
+  no UPDATE traffic when the user isn't moving.
+- **MCP star tools — `toggle_star`, `set_star`, `list_starred`** (#120).
+  Closes the only TUI-only affordance gap so an agent in an adjacent
+  pane (the recommended 2-pane workflow) can drive every state change
+  the user can drive in the TUI. Trust-on-first-use `reader` identity,
+  matching the existing annotation tools (#100). Audit logged.
+- **Papers-table download-state column** (#112). Migration 007 adds
+  `local_path`, `download_status`, and `last_attempt_at` columns to
+  `papers`. The TUI Papers table renders a one-char symbol next to
+  each row: blank (never tried), `↻` (in flight), `✓` (downloaded),
+  `⊘` (paywalled / abstract-only), `✗` (failed). Both the TUI's
+  `D` keybind and the `scitadel download` CLI persist the outcome
+  back to the row so the symbol survives restarts. The in-flight
+  symbol is derived from the live task list — no DB write while
+  running.
+- **MCP progress notifications** (#58). The `search`,
+  `download_paper`, and `prepare_batch_assessments` tools now emit
+  `notifications/progress` frames when the caller supplies a
+  `progressToken` in the request `_meta`. Bracketing pattern: a
+  start frame at progress=0 (with a human-readable message naming
+  the operation), then a done frame at progress=total on success or
+  with the error string on failure. Per-source / per-paper
+  granularity is a follow-up that needs the orchestrator to thread a
+  callback through each adapter loop. Built on the rmcp 0.17 upgrade
+  that landed earlier in 0.4.0.
+- **TUI two-pane annotation reader** (#97, iter 1). Toggled with `R`
+  on the paper detail overlay: left pane renders the paper body
+  (`full_text` if cached, else the abstract) with background-color
+  highlights over annotated ranges, palette hashed by thread root_id
+  so a thread keeps the same color on every render. Right pane
+  threads root annotations + replies, focused row syncs with the
+  highlight underline. `J` / `K` hop between highlights. Single-
+  pane fallback message when no body text is available yet.
+  Multi-line gutter bars and PDF overlay are deferred.
+- **`PaperRepository::update_full_text`** + caching in
+  `read_paper_tool` (#97 prep). The MCP read tool now persists the
+  extracted text on first call so subsequent reads — including the
+  new TUI reader — hit the DB instead of re-running pdf-extract.
+  Failure to cache is non-fatal (extraction still returns).
+- **TUI-native annotation create / edit / reply / delete** (#92,
+  iter 3b of #49). New keybindings on the paper detail overlay:
+  `n` opens a two-stage Create prompt (quote → note); `Shift+J`
+  enters annotation focus mode; `e` edits the focused note inline;
+  `r` opens a reply prompt; `d` opens a y/n delete confirmation.
+  The state machine lives in
+  `crates/scitadel-tui/src/views/annotation_prompt.rs` (pure, fully
+  tested). $EDITOR integration + visual-mode char-range selection
+  remain out of scope — see #97 for the two-pane reader.
+- **Citation graph — iter 1** (#59). New OpenAlex helpers
+  (`fetch_work_by_id`, `fetch_works_by_ids`, `fetch_cited_by`,
+  `short_openalex_id`, `work_to_paper`) plus two MCP tools:
+  - `get_references(paper_id)` — fetches the works this paper cites
+    via OpenAlex's `referenced_works`, materialises each as a Paper
+    row, and persists the citation edges. Source paper must have an
+    `openalex_id`.
+  - `get_citations(paper_id, limit?)` — fetches the works that cite
+    this paper (`cites:` filter; default 25, capped at 200).
+  Idempotent: existing papers upsert on the OpenAlex id, and the
+  citation edge has a uniqueness constraint so re-runs are no-ops.
+  TUI graph view + snowball orchestration (`snowball(seed_paper_ids,
+  depth, stop_condition)`) ship in iter 2.
+- **`sentence_id` + `normalize_sentence` in `scitadel-core`** (#96):
+  SHA1 of NFKC-composed, lowercased, whitespace-collapsed sentence
+  text. Spec pinned in [ADR-004](docs/decisions/ADR-004-2026-04-19-sentence-id-normalization.md).
+- **MCP `get_annotated_paper`** (#95): one-call JSON of a paper +
+  every live annotation anchored to it (with `parent_id` / `root_id`
+  for thread reconstruction and the full anchor incl.
+  char_range/quote/prefix/suffix/sentence_id/source_version/status).
+  Replaces `get_paper` + `list_annotations` for agents that reason
+  over offsets.
+- **VHS coverage for CLI search + question subcommands** (#99): two
+  new tapes (`tests/vhs/cli-search.tape`,
+  `tests/vhs/cli-question-workflow.tape`) plus a `Shift+Tab`
+  (BackTab) + `d`/`u` page-scroll addition to `tui-launch.tape` to
+  close the gaps flagged in the 0.4.0 coverage audit.
+
+### Changed
+
+- **rmcp upgrade 0.1.5 → 0.17** (#58 prep). Mechanical rewrite of
+  `crates/scitadel-mcp/src/server.rs` against the new `tool_router`
+  macro: each tool is a method with a `Parameters<T>` extractor;
+  `ToolRouter<Self>` field on the server; `ServerHandler` delegates
+  via `#[tool_handler]`. Per-param structs added for tools that
+  used `#[tool(param)]` in 0.1.5. Behaviour unchanged — every
+  existing tool still works the same — but the new API unlocks the
+  `Peer<RoleServer>` extractor that #58 (MCP progress notifications)
+  will use as a follow-up. Workspace `schemars` bumped 0.8 → 1 to
+  match rmcp 0.17's transitive dep.
+- **MCP tool-signature + return-shape consistency pass** (#98):
+  - `add_search_terms.query_string` is now `Option<String>` to match
+    its description (was a required `String` clients couldn't omit).
+  - Every MCP tool description now telegraphs its return shape
+    (`Returns: JSON` / `Returns: text`); enforced by a new style test
+    in `crates/scitadel-mcp/src/server.rs`.
+  - `get_assessments` description now says "at least one of paper_id
+    or question_id is required" — the handler error is unchanged.
+  - `list_annotations` description now states paper_id is required and
+    cross-paper listing is not yet implemented (matches the schema +
+    handler).
+  - `prepare_assessment` and `get_rubric` cross-reference each other
+    so an LLM doesn't redundantly fetch the rubric twice.
+- **Annotation anchor resolver** (#96): completes the four-step
+  W3C-style pipeline shipped half-done in 0.3.0. Adds
+  prefix/suffix-based disambiguation for repeated quotes, sliding-
+  window fuzzy match (Jaro-Winkler ≥ 0.9 default; tunable via
+  `resolve_anchor_with_threshold`), sentence-id fallback, and
+  bounds-checking on `char_range` so malformed rows return
+  `Orphan` instead of panicking.
+- **MCP annotation tool descriptions** (#100): `create_annotation`,
+  `reply_annotation`, `update_annotation`, `delete_annotation`, and
+  `list_unread` now flag trust-on-first-use author identity (real auth
+  ships with the Phase-5 Dolt sync layer) and the wall-clock-based
+  read-receipt race window (`seen_at < updated_at`). Every annotation
+  write now emits a `tracing::info!` audit record (op + ids + author).
 
 ### Removed
 

@@ -37,7 +37,7 @@ where
 pub async fn mcp() -> Result<()> {
     use rmcp::ServiceExt;
     let transport = rmcp::transport::io::stdio();
-    let server = scitadel_mcp::server::ScitadelServer;
+    let server = scitadel_mcp::server::ScitadelServer::new();
     let service = server.serve(transport).await?;
     service.waiting().await?;
     Ok(())
@@ -641,10 +641,13 @@ pub async fn download(doi: &str, output_dir: Option<PathBuf>) -> Result<()> {
     println!("Downloading paper: {doi}");
     println!("  Output dir: {}", out_dir.display());
 
-    let result = downloader
-        .download(doi, &out_dir)
-        .await
-        .context("download failed")?;
+    let result = downloader.download(doi, &out_dir).await;
+
+    // Persist outcome on the matching paper row (#112) before reporting
+    // so the Papers table reflects the attempt regardless of outcome.
+    persist_cli_download_outcome(&config, doi, result.as_ref().ok());
+
+    let result = result.context("download failed")?;
 
     println!("  Format: {}", result.format);
     println!("  Source: {}", result.source);
@@ -653,6 +656,56 @@ pub async fn download(doi: &str, output_dir: Option<PathBuf>) -> Result<()> {
     println!("  Saved:  {}", result.path.display());
 
     Ok(())
+}
+
+fn persist_cli_download_outcome(
+    config: &scitadel_core::config::Config,
+    doi: &str,
+    success: Option<&scitadel_adapters::download::DownloadResult>,
+) {
+    use scitadel_adapters::download::AccessStatus;
+    use scitadel_core::models::DownloadStatus;
+    use scitadel_core::ports::PaperRepository as _;
+
+    let db = match scitadel_db::sqlite::Database::open(&config.db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not open DB to persist download outcome");
+            return;
+        }
+    };
+    if let Err(e) = db.migrate() {
+        tracing::warn!(error = %e, "DB migration failed while persisting download outcome");
+        return;
+    }
+    let (paper_repo, _, _, _, _) = db.repositories();
+    let paper = match paper_repo.find_by_doi(doi) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            tracing::debug!(doi, "no paper row for DOI; skipping download-state write");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(doi, error = %e, "DOI lookup failed");
+            return;
+        }
+    };
+
+    let (path, status) = match success {
+        Some(r) => {
+            let ds = match r.access {
+                AccessStatus::FullText => DownloadStatus::Downloaded,
+                AccessStatus::Abstract | AccessStatus::Paywall | AccessStatus::Unknown => {
+                    DownloadStatus::Paywall
+                }
+            };
+            (Some(r.path.to_string_lossy().into_owned()), ds)
+        }
+        None => (None, DownloadStatus::Failed),
+    };
+    if let Err(e) = paper_repo.update_download_state(paper.id.as_str(), path.as_deref(), status) {
+        tracing::warn!(error = %e, "failed to persist download outcome");
+    }
 }
 
 #[allow(clippy::unnecessary_wraps)]
