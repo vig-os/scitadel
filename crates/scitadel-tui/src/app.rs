@@ -18,7 +18,9 @@ use tokio::sync::mpsc;
 use crate::data::DataStore;
 use crate::tasks::{Task, TaskKind, TaskStatus, TaskUpdate, spawn_download_paper};
 use crate::views::annotation_prompt::{AnnotationPrompt, PromptCommit, PromptSubmission};
-use crate::views::{annotation_prompt, detail, papers, questions, searches, tasks as tasks_view};
+use crate::views::{
+    annotation_prompt, detail, papers, queue, questions, searches, tasks as tasks_view,
+};
 use crate::widgets::status_bar;
 
 /// Active tab in the TUI.
@@ -27,16 +29,27 @@ pub enum Tab {
     Searches,
     Papers,
     Questions,
+    /// Cross-search aggregator showing all starred papers (#48).
+    /// Reuses the Papers-tab rendering + Enter-to-open-detail flow
+    /// but backs the data by `paper_state.starred = 1` instead of
+    /// a single search.
+    Queue,
 }
 
 impl Tab {
-    const ALL: [Self; 3] = [Self::Searches, Self::Papers, Self::Questions];
+    const ALL: [Self; 4] = [
+        Self::Searches,
+        Self::Papers,
+        Self::Questions,
+        Self::Queue,
+    ];
 
     fn index(self) -> usize {
         match self {
             Self::Searches => 0,
             Self::Papers => 1,
             Self::Questions => 2,
+            Self::Queue => 3,
         }
     }
 
@@ -44,15 +57,17 @@ impl Tab {
         match self {
             Self::Searches => Self::Papers,
             Self::Papers => Self::Questions,
-            Self::Questions => Self::Searches,
+            Self::Questions => Self::Queue,
+            Self::Queue => Self::Searches,
         }
     }
 
     fn prev(self) -> Self {
         match self {
-            Self::Searches => Self::Questions,
+            Self::Searches => Self::Queue,
             Self::Papers => Self::Searches,
             Self::Questions => Self::Papers,
+            Self::Queue => Self::Questions,
         }
     }
 }
@@ -94,6 +109,7 @@ pub struct App {
     pub search_selected: usize,
     pub paper_selected: usize,
     pub question_selected: usize,
+    pub queue_selected: usize,
 
     pub tasks: Vec<Task>,
     /// Last `TuiState` written to the DB, used by `publish_tui_state`
@@ -141,6 +157,7 @@ impl App {
             search_selected: 0,
             paper_selected: 0,
             question_selected: 0,
+            queue_selected: 0,
             tasks: Vec::new(),
             last_published_state: None,
             unpaywall_email,
@@ -203,6 +220,7 @@ impl App {
             Tab::Searches => "Searches",
             Tab::Papers => "Papers",
             Tab::Questions => "Questions",
+            Tab::Queue => "Queue",
         };
         let (paper_id, search_id, annotation_id) = match &self.overlay {
             Some(Overlay::PaperDetail {
@@ -675,6 +693,54 @@ impl App {
                     _ => {}
                 }
             }
+            Tab::Queue => {
+                let count = self
+                    .data
+                    .load_starred_papers(&self.reader)
+                    .map_or(0, |p| p.len());
+                match code {
+                    KeyCode::Char('j') | KeyCode::Down if count > 0 => {
+                        self.queue_selected = (self.queue_selected + 1).min(count - 1);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.queue_selected = self.queue_selected.saturating_sub(1);
+                    }
+                    KeyCode::Enter => {
+                        if let Ok(papers) = self.data.load_starred_papers(&self.reader)
+                            && let Some(paper) = papers.get(self.queue_selected)
+                        {
+                            self.overlay = Some(Overlay::PaperDetail {
+                                paper_id: paper.id.as_str().to_string(),
+                                scroll: 0,
+                                annotation_focus: None,
+                                prompt: None,
+                                reader: false,
+                                highlight_focus: None,
+                            });
+                        }
+                    }
+                    KeyCode::Char('s') => {
+                        // Unstar: consistent with Papers tab behaviour.
+                        if let Ok(papers) = self.data.load_starred_papers(&self.reader)
+                            && let Some(paper) = papers.get(self.queue_selected)
+                        {
+                            let pid = paper.id.as_str().to_string();
+                            self.toggle_star(&pid);
+                            // Clamp cursor — list just shrank by one.
+                            let new_count = self
+                                .data
+                                .load_starred_papers(&self.reader)
+                                .map_or(0, |p| p.len());
+                            if new_count > 0 {
+                                self.queue_selected = self.queue_selected.min(new_count - 1);
+                            } else {
+                                self.queue_selected = 0;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 }
@@ -759,6 +825,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 Tab::Searches => "Searches",
                 Tab::Papers => "Papers",
                 Tab::Questions => "Questions",
+                Tab::Queue => "Queue",
             };
             Line::from(Span::raw(label))
         })
@@ -827,6 +894,14 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             Tab::Questions => {
                 questions::draw(frame, chunks[1], &app.data, app.question_selected);
             }
+            Tab::Queue => queue::draw(
+                frame,
+                chunks[1],
+                &app.data,
+                &app.reader,
+                app.queue_selected,
+                &app.downloading_paper_ids(),
+            ),
         },
     }
 
@@ -867,8 +942,8 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         (Some(Overlay::SearchPapers { .. }), _) => {
             "Esc/q: back | j/k: navigate | Enter: open paper"
         }
-        (None, Tab::Papers) => {
-            "Tab: switch tabs | j/k: navigate | Enter: open | s: star | c: clear tasks | q: quit"
+        (None, Tab::Papers | Tab::Queue) => {
+            "Tab: switch tabs | j/k: navigate | Enter: open | s: (un)star | c: clear tasks | q: quit"
         }
         (None, _) => {
             "Tab/Shift-Tab: switch tabs | j/k: navigate | Enter: select | c: clear tasks | q: quit"
