@@ -19,7 +19,7 @@ use crate::data::DataStore;
 use crate::tasks::{Task, TaskKind, TaskStatus, TaskUpdate, spawn_download_paper};
 use crate::views::annotation_prompt::{AnnotationPrompt, PromptCommit, PromptSubmission};
 use crate::views::{
-    annotation_prompt, detail, papers, queue, questions, searches, tasks as tasks_view,
+    annotation_prompt, detail, papers, questions, queue, searches, tasks as tasks_view,
 };
 use crate::widgets::status_bar;
 
@@ -37,12 +37,7 @@ pub enum Tab {
 }
 
 impl Tab {
-    const ALL: [Self; 4] = [
-        Self::Searches,
-        Self::Papers,
-        Self::Questions,
-        Self::Queue,
-    ];
+    const ALL: [Self; 4] = [Self::Searches, Self::Papers, Self::Questions, Self::Queue];
 
     fn index(self) -> usize {
         match self {
