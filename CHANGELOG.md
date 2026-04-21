@@ -24,6 +24,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and forces an explicit migration. See [ADR-006](docs/decisions/ADR-006-2026-04-21-bibtex-key-algorithm.md).
   CLI surface (`scitadel bib export` / `snapshot` / `verify`), `.scitadel-bib.lock`
   sidecar, import and watch ship in 0.6.1 (#134) and 0.6.2 (#135).
+- **Question Dashboard** (#133). New TUI overlay accessed via `Enter`
+  on the Questions tab. Split pane: left 40% shows papers scored
+  against the question, ranked by score DESC; right 60% shows the
+  focused paper's rationale + abstract + metadata. `c` toggles a
+  citation shortlist (persisted per `(question_id, reader)`) marked
+  with `●`. `Enter` opens the focused paper in the existing detail
+  overlay; `Esc`/`q` returns to Questions. Shortlist membership feeds
+  `bib snapshot <question_id>` in 0.6.1 (#134). Migration 010 adds
+  the `shortlist_members` table. MCP `get_question_dashboard` /
+  `toggle_shortlist` / `list_shortlist` tools ship in a follow-up.
 - **Dalton Dark theme + central `theme.rs` abstraction** (#136). TUI now
   pulls colours through semantic roles (`emphasis`, `muted`,
   `selection_bg`, `quote`, `info`, `success`, `warning`, `danger`, plus
