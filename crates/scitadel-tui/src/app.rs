@@ -418,10 +418,7 @@ impl App {
         // offline badge is already showing; the user can retry after
         // reconnecting.
         if self.offline {
-            let _ = crate::tasks::synthesize_offline_failure(
-                self.task_tx.clone(),
-                &paper,
-            );
+            let _ = crate::tasks::synthesize_offline_failure(self.task_tx.clone(), &paper);
             return;
         }
         spawn_download_paper(
