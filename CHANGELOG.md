@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [0.5.0] - 2026-04-21
+
+The 2-pane workflow release. Combines the agent-side affordances
+shipped under the 0.4.0 milestone (citation graph, MCP progress
+notifications, rmcp 0.17 upgrade, annotations CRUD via TUI + MCP,
+two-pane reader, get_annotated_paper, multi-selector resolver) with
+the 0.5.0 milestone's affordance-gap closures (download-state column,
+task-panel flush, star MCP tools, get_current_selection, SQLite
+cross-process visibility) and the meta-pivot away from a bundled LLM
+abstraction (#60/#61 closed as superseded) toward MCP-driven
+2-pane workflow as the primary recommendation.
+
+`Cargo.toml` workspace version is bumped 0.1.0 → 0.5.0 to align with
+the changelog narrative; this is the first release where the on-disk
+crate version actually matches the documented release. Earlier 0.2.x
+and 0.3.x sections in this file are CHANGELOG-only milestones — no
+git tags exist for them.
+
 ### Fixed
 
 - **SQLite cross-process write visibility** (#121). Added `synchronous=NORMAL`
