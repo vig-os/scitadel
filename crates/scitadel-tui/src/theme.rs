@@ -45,13 +45,13 @@ impl Theme {
     /// impairing readability.
     pub const DALTON_DARK: Theme = Theme {
         emphasis: Color::Rgb(0xc4, 0xc4, 0x0c),     // dalton yellow
-        muted: Color::Rgb(0x56, 0x71, 0x7f),        // dalton cyan (desaturated; works as secondary text on dark)
+        muted: Color::Rgb(0x56, 0x71, 0x7f), // dalton cyan (desaturated; works as secondary text on dark)
         selection_bg: Color::Rgb(0x33, 0x33, 0x33), // dalton selection
-        quote: Color::Rgb(0x66, 0x91, 0xa7),        // dalton bright-cyan
-        info: Color::Rgb(0x7a, 0xa2, 0xf7),         // dalton blue
-        success: Color::Rgb(0x5b, 0x91, 0x4e),      // dalton green
-        warning: Color::Rgb(0xc4, 0xc4, 0x0c),      // dalton yellow (same as emphasis — attention-worthy)
-        danger: Color::Rgb(0xd8, 0x50, 0x50),       // dalton red
+        quote: Color::Rgb(0x66, 0x91, 0xa7), // dalton bright-cyan
+        info: Color::Rgb(0x7a, 0xa2, 0xf7),  // dalton blue
+        success: Color::Rgb(0x5b, 0x91, 0x4e), // dalton green
+        warning: Color::Rgb(0xc4, 0xc4, 0x0c), // dalton yellow (same as emphasis — attention-worthy)
+        danger: Color::Rgb(0xd8, 0x50, 0x50),  // dalton red
         highlights: [
             Color::Rgb(0x56, 0x1f, 0x1f), // muted red
             Color::Rgb(0x24, 0x3a, 0x1f), // muted green

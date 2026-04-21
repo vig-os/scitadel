@@ -144,7 +144,10 @@ pub fn draw(
             if let Some(quote) = ann.anchor.quote.as_deref() {
                 lines.push(Line::from(vec![
                     Span::styled(marker, marker_style),
-                    Span::styled(format!("\"{quote}\" "), Style::default().fg(crate::theme::theme().quote)),
+                    Span::styled(
+                        format!("\"{quote}\" "),
+                        Style::default().fg(crate::theme::theme().quote),
+                    ),
                     Span::styled(
                         format!("— {}", ann.anchor.status.as_str()),
                         Style::default().fg(crate::theme::theme().muted),

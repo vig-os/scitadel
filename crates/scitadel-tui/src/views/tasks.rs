@@ -49,8 +49,14 @@ fn render_row(task: &Task, show_institutional_hint: bool) -> ListItem<'_> {
         ),
         Span::raw(title),
         Span::raw("  "),
-        Span::styled(format!("[{ref_id}] "), Style::default().fg(crate::theme::theme().info)),
-        Span::styled(status_tail, Style::default().fg(crate::theme::theme().muted)),
+        Span::styled(
+            format!("[{ref_id}] "),
+            Style::default().fg(crate::theme::theme().info),
+        ),
+        Span::styled(
+            status_tail,
+            Style::default().fg(crate::theme::theme().muted),
+        ),
     ]))
 }
 

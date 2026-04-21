@@ -123,7 +123,10 @@ fn draw_notes_pane(
         } else {
             lines.push(Line::from(vec![
                 Span::styled(marker, marker_style),
-                Span::styled("(no quote)", Style::default().fg(crate::theme::theme().muted)),
+                Span::styled(
+                    "(no quote)",
+                    Style::default().fg(crate::theme::theme().muted),
+                ),
             ]));
         }
         lines.push(Line::from(format!(

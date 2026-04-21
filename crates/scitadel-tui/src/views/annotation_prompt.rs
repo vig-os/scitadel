@@ -267,7 +267,10 @@ pub fn draw_overlay(frame: &mut Frame, area: Rect, prompt: &AnnotationPrompt) {
     {
         lines.push(Line::from(vec![
             Span::styled("quote: ", Style::default().fg(crate::theme::theme().muted)),
-            Span::styled(format!("\"{quote_buf}\""), Style::default().fg(crate::theme::theme().quote)),
+            Span::styled(
+                format!("\"{quote_buf}\""),
+                Style::default().fg(crate::theme::theme().quote),
+            ),
         ]));
         lines.push(Line::from(""));
     }
@@ -277,7 +280,9 @@ pub fn draw_overlay(frame: &mut Frame, area: Rect, prompt: &AnnotationPrompt) {
             Span::raw("Delete annotation "),
             Span::styled(
                 annotation_id.clone(),
-                Style::default().fg(crate::theme::theme().danger).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(crate::theme::theme().danger)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw("?"),
         ]));
