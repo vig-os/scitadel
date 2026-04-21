@@ -73,6 +73,40 @@ pub fn clear_terminal(tasks: &mut Vec<Task>) {
     tasks.retain(|t| matches!(t.status, TaskStatus::Queued | TaskStatus::Running));
 }
 
+/// Fail-fast variant for when the TUI knows the network is down (#51).
+/// Instead of spawning a download that will time out on reqwest after
+/// ~60s, synthesize a task that transitions immediately to `Failed`
+/// with a clear offline message. Returns the task id so callers can
+/// reference it.
+pub fn synthesize_offline_failure(tx: UnboundedSender<TaskUpdate>, paper: &Paper) -> Uuid {
+    let id = Uuid::new_v4();
+    let ref_id = paper
+        .doi
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or_else(|| paper.arxiv_id.clone().filter(|s| !s.is_empty()))
+        .or_else(|| paper.openalex_id.clone().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| paper.id.as_str().chars().take(8).collect());
+    let task = Task {
+        id,
+        kind: TaskKind::Download {
+            paper_id: paper.id.as_str().to_string(),
+            ref_id,
+            title: paper.title.clone(),
+        },
+        status: TaskStatus::Queued,
+        terminal_at: None,
+    };
+    let _ = tx.send(TaskUpdate::New(task));
+    let _ = tx.send(TaskUpdate::Status {
+        id,
+        status: TaskStatus::Failed(
+            "offline: download requires network — retry after reconnecting".to_string(),
+        ),
+    });
+    id
+}
+
 /// Spawn a download for a full `Paper` (uses all available identifiers).
 pub fn spawn_download_paper(
     tx: UnboundedSender<TaskUpdate>,

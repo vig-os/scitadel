@@ -549,6 +549,42 @@ mod tests {
         )
     }
 
+    /// Offline-safe invariant (#51). Every annotation write path
+    /// (`create`, replies, `update_note`, `soft_delete`) must be purely
+    /// local — no network, no auth probe, no reqwest. The 2-pane
+    /// workflow makes this trust-critical: a user on a plane still
+    /// captures their reading notes; the TUI's offline badge only
+    /// gates network-requiring operations (search / download), not
+    /// annotations.
+    ///
+    /// This test locks that invariant in: the entire annotation
+    /// lifecycle round-trips through a fresh in-memory SQLite DB with
+    /// no `reqwest::Client`, no environment, no adapters instantiated.
+    /// If a future refactor introduces a network dep on this path,
+    /// the construction of that dep will either force this test to
+    /// change or will be catchable by review.
+    #[test]
+    fn annotation_writes_are_offline_safe() {
+        let db = fresh_db_with_paper();
+        let repo = SqliteAnnotationRepository::new(db);
+
+        // Create root → reply → update root note → soft-delete reply.
+        // If any of these silently required network access, the call
+        // chain wouldn't compile (no reqwest in this crate's deps).
+        let root = sample_root();
+        repo.create(&root).unwrap();
+        let reply = Annotation::new_reply(&root, "claude".into(), "seconded".into());
+        repo.create(&reply).unwrap();
+        repo.update_note(root.id.as_str(), "edited offline", None, &[])
+            .unwrap();
+        repo.soft_delete(reply.id.as_str()).unwrap();
+
+        // Survivors visible on next read.
+        let all = repo.list_by_paper("p1").unwrap();
+        assert_eq!(all.len(), 1, "root survives; reply tombstoned out");
+        assert_eq!(all[0].note, "edited offline");
+    }
+
     #[test]
     fn create_and_get_roundtrip() {
         let db = fresh_db_with_paper();
