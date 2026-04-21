@@ -412,6 +412,15 @@ impl App {
             Ok(Some(p)) => p,
             _ => return,
         };
+        // Fail fast when we know the network is down — spawning the
+        // download task anyway would waste ~60s on a reqwest timeout
+        // before surfacing the failure in the task panel (#51). The
+        // offline badge is already showing; the user can retry after
+        // reconnecting.
+        if self.offline {
+            let _ = crate::tasks::synthesize_offline_failure(self.task_tx.clone(), &paper);
+            return;
+        }
         spawn_download_paper(
             self.task_tx.clone(),
             paper,
