@@ -1,6 +1,6 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders, Cell, Row, Table, TableState};
 
 use scitadel_core::models::SourceStatus;
@@ -30,7 +30,7 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, selected: usize) {
     ])
     .style(
         Style::default()
-            .fg(Color::Yellow)
+            .fg(crate::theme::theme().emphasis)
             .add_modifier(Modifier::BOLD),
     );
 
@@ -67,7 +67,7 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, selected: usize) {
         .block(Block::default().title(" Searches ").borders(Borders::ALL))
         .row_highlight_style(
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(crate::theme::theme().selection_bg)
                 .add_modifier(Modifier::BOLD),
         );
 

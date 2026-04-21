@@ -1,6 +1,6 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem};
 use scitadel_adapters::download::AccessStatus;
@@ -28,11 +28,12 @@ pub fn draw(frame: &mut Frame, area: Rect, tasks: &[Task], show_institutional_hi
 }
 
 fn render_row(task: &Task, show_institutional_hint: bool) -> ListItem<'_> {
+    let t = crate::theme::theme();
     let (icon, color) = match &task.status {
-        TaskStatus::Queued => ("…", Color::DarkGray),
-        TaskStatus::Running => ("◐", Color::Yellow),
-        TaskStatus::Done { .. } => ("✓", Color::Green),
-        TaskStatus::Failed(_) => ("✗", Color::Red),
+        TaskStatus::Queued => ("…", t.muted),
+        TaskStatus::Running => ("◐", t.warning),
+        TaskStatus::Done { .. } => ("✓", t.success),
+        TaskStatus::Failed(_) => ("✗", t.danger),
     };
 
     let (title, ref_id) = match &task.kind {
@@ -48,8 +49,8 @@ fn render_row(task: &Task, show_institutional_hint: bool) -> ListItem<'_> {
         ),
         Span::raw(title),
         Span::raw("  "),
-        Span::styled(format!("[{ref_id}] "), Style::default().fg(Color::Blue)),
-        Span::styled(status_tail, Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("[{ref_id}] "), Style::default().fg(crate::theme::theme().info)),
+        Span::styled(status_tail, Style::default().fg(crate::theme::theme().muted)),
     ]))
 }
 

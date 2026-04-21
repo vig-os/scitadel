@@ -1,6 +1,6 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
@@ -28,7 +28,7 @@ pub fn draw(
         .unwrap_or_default();
 
     let label_style = Style::default()
-        .fg(Color::Yellow)
+        .fg(crate::theme::theme().emphasis)
         .add_modifier(Modifier::BOLD);
 
     let mut lines: Vec<Line<'_>> = Vec::new();
@@ -136,7 +136,7 @@ pub fn draw(
             };
             let marker_style = if is_focused {
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(crate::theme::theme().emphasis)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
@@ -144,10 +144,10 @@ pub fn draw(
             if let Some(quote) = ann.anchor.quote.as_deref() {
                 lines.push(Line::from(vec![
                     Span::styled(marker, marker_style),
-                    Span::styled(format!("\"{quote}\" "), Style::default().fg(Color::Cyan)),
+                    Span::styled(format!("\"{quote}\" "), Style::default().fg(crate::theme::theme().quote)),
                     Span::styled(
                         format!("— {}", ann.anchor.status.as_str()),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(crate::theme::theme().muted),
                     ),
                 ]));
                 lines.push(Line::from(format!(
@@ -162,7 +162,7 @@ pub fn draw(
                     Span::styled(marker, marker_style),
                     Span::styled(
                         format!("{}: ", ann.author),
-                        Style::default().fg(Color::Yellow),
+                        Style::default().fg(crate::theme::theme().emphasis),
                     ),
                     Span::raw(ann.note.clone()),
                 ]));

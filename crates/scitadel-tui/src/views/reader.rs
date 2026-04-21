@@ -22,20 +22,9 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use crate::data::DataStore;
 use scitadel_core::models::Annotation;
 
-/// Palette of muted background tints for highlighting annotation
-/// spans. Hashed by the annotation's root_id so a thread keeps the
-/// same color on every render. 8 entries — enough for a typical
-/// paper without every passage looking identical.
-const HIGHLIGHT_COLORS: [Color; 8] = [
-    Color::Rgb(80, 60, 30), // dim amber
-    Color::Rgb(30, 60, 80), // dim teal
-    Color::Rgb(60, 30, 80), // dim purple
-    Color::Rgb(30, 80, 50), // dim green
-    Color::Rgb(80, 30, 60), // dim magenta
-    Color::Rgb(60, 70, 30), // dim olive
-    Color::Rgb(30, 70, 80), // dim cyan
-    Color::Rgb(80, 50, 30), // dim rust
-];
+// Highlight palette lives in `crate::theme` (#136). This keeps the 8
+// annotation-background tints swappable alongside the rest of the UI
+// when light-mode / auto-detect ships in #137.
 
 pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, paper_id: &str, focus: Option<usize>) {
     let Ok(Some(paper)) = data.load_paper(paper_id) else {
@@ -114,7 +103,7 @@ fn draw_notes_pane(
         let marker = if is_focused { "▶ " } else { "  " };
         let marker_style = if is_focused {
             Style::default()
-                .fg(Color::Yellow)
+                .fg(crate::theme::theme().emphasis)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
@@ -128,13 +117,13 @@ fn draw_notes_pane(
                 ),
                 Span::styled(
                     format!(" — {}", root.anchor.status.as_str()),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(crate::theme::theme().muted),
                 ),
             ]));
         } else {
             lines.push(Line::from(vec![
                 Span::styled(marker, marker_style),
-                Span::styled("(no quote)", Style::default().fg(Color::DarkGray)),
+                Span::styled("(no quote)", Style::default().fg(crate::theme::theme().muted)),
             ]));
         }
         lines.push(Line::from(format!(
@@ -153,7 +142,7 @@ fn draw_notes_pane(
                 Span::raw("    └ "),
                 Span::styled(
                     format!("{}: ", ann.author),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(crate::theme::theme().emphasis),
                 ),
                 Span::raw(ann.note.clone()),
             ]));
@@ -283,13 +272,10 @@ fn slice_chars(chars: &[char], start: usize, end: usize) -> String {
     chars[start..end].iter().collect()
 }
 
-/// Stable-per-thread color: hash the root_id and pick from the palette.
+/// Stable-per-thread color: delegates to `Theme::highlight_for` on the
+/// active theme so this module stays palette-agnostic (#136).
 fn color_for(root_id: &str) -> Color {
-    let mut hash: u32 = 0;
-    for b in root_id.bytes() {
-        hash = hash.wrapping_mul(31).wrapping_add(u32::from(b));
-    }
-    HIGHLIGHT_COLORS[(hash as usize) % HIGHLIGHT_COLORS.len()]
+    crate::theme::theme().highlight_for(root_id)
 }
 
 /// How many root annotations does this paper have? Used by the app

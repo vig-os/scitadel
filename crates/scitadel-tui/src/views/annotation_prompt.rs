@@ -11,7 +11,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
@@ -246,7 +246,7 @@ pub fn draw_overlay(frame: &mut Frame, area: Rect, prompt: &AnnotationPrompt) {
     let inner = Block::default()
         .title(prompt.title())
         .borders(Borders::ALL)
-        .style(Style::default().fg(Color::Yellow));
+        .style(Style::default().fg(crate::theme::theme().emphasis));
     let inner_area = modal;
     frame.render_widget(inner, inner_area);
 
@@ -266,8 +266,8 @@ pub fn draw_overlay(frame: &mut Frame, area: Rect, prompt: &AnnotationPrompt) {
     } = prompt
     {
         lines.push(Line::from(vec![
-            Span::styled("quote: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("\"{quote_buf}\""), Style::default().fg(Color::Cyan)),
+            Span::styled("quote: ", Style::default().fg(crate::theme::theme().muted)),
+            Span::styled(format!("\"{quote_buf}\""), Style::default().fg(crate::theme::theme().quote)),
         ]));
         lines.push(Line::from(""));
     }
@@ -277,7 +277,7 @@ pub fn draw_overlay(frame: &mut Frame, area: Rect, prompt: &AnnotationPrompt) {
             Span::raw("Delete annotation "),
             Span::styled(
                 annotation_id.clone(),
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default().fg(crate::theme::theme().danger).add_modifier(Modifier::BOLD),
             ),
             Span::raw("?"),
         ]));
@@ -300,11 +300,11 @@ pub fn draw_overlay(frame: &mut Frame, area: Rect, prompt: &AnnotationPrompt) {
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{prompt_label}: "),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(crate::theme::theme().muted),
             ),
             Span::raw(prompt.body().to_string()),
             // Trailing block-cursor hint so the user can see the caret.
-            Span::styled("█", Style::default().fg(Color::Yellow)),
+            Span::styled("█", Style::default().fg(crate::theme::theme().emphasis)),
         ]));
     }
 
