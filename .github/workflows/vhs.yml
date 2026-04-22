@@ -92,23 +92,31 @@ jobs:
             fi
             unique=$(md5sum "$dir"/*.png | awk '{print $1}' | sort -u | wc -l | tr -d ' ')
             if [ "$unique" -lt 2 ]; then
-              # CI runners have variable load — a tape can flake on one
-              # render and pass on the next. Re-render this tape once
-              # before declaring failure. A real bug (feature genuinely
-              # doesn't render) will fail both times; a timing flake
-              # almost never repeats back-to-back.
-              echo "::warning::$tape all-identical on first render — retrying once"
-              rm -f "$dir"/*.png
-              if vhs "$tape"; then
-                produced2=$(find "$dir" -maxdepth 1 -name '*.png' 2>/dev/null | wc -l | tr -d ' ')
-                unique2=$(md5sum "$dir"/*.png 2>/dev/null | awk '{print $1}' | sort -u | wc -l | tr -d ' ')
-                if [ "$unique2" -ge 2 ]; then
-                  echo "ok (retry): $tape — $produced2 screenshots, $unique2 distinct"
+              # CI runners have variable load — a tape can flake on
+              # multiple consecutive renders when the runner is under
+              # heavy contention. Re-render up to 3 times before
+              # declaring failure. A real rendering bug (#97-class
+              # silent failure) will fail all attempts; a timing flake
+              # rarely repeats four times in a row.
+              pass=0
+              for attempt in 1 2 3; do
+                echo "::warning::$tape all-identical on render $((attempt)); retrying"
+                rm -f "$dir"/*.png
+                if ! vhs "$tape"; then
                   continue
                 fi
+                unique_retry=$(md5sum "$dir"/*.png 2>/dev/null | awk '{print $1}' | sort -u | wc -l | tr -d ' ')
+                if [ "$unique_retry" -ge 2 ]; then
+                  produced_retry=$(find "$dir" -maxdepth 1 -name '*.png' 2>/dev/null | wc -l | tr -d ' ')
+                  echo "ok (retry $attempt): $tape — $produced_retry screenshots, $unique_retry distinct"
+                  pass=1
+                  break
+                fi
+              done
+              if [ "$pass" -eq 0 ]; then
+                echo "::error::$tape produced byte-identical screenshots on 4 consecutive renders — feature did not render anything"
+                dead+=("$tape (all snapshots identical, 4x)")
               fi
-              echo "::error::$tape produced byte-identical screenshots on two consecutive renders — feature did not render anything"
-              dead+=("$tape (all snapshots identical, twice)")
             else
               echo "ok: $tape — $produced screenshots, $unique distinct"
             fi

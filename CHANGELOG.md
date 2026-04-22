@@ -24,6 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and forces an explicit migration. See [ADR-006](docs/decisions/ADR-006-2026-04-21-bibtex-key-algorithm.md).
   CLI surface (`scitadel bib export` / `snapshot` / `verify`), `.scitadel-bib.lock`
   sidecar, import and watch ship in 0.6.1 (#134) and 0.6.2 (#135).
+- **Dalton Dark theme + central `theme.rs` abstraction** (#136). TUI now
+  pulls colours through semantic roles (`emphasis`, `muted`,
+  `selection_bg`, `quote`, `info`, `success`, `warning`, `danger`, plus
+  an 8-slot highlight palette) rather than hardcoding `Color::Yellow` /
+  `Color::Rgb(...)`. Default palette is [Dalton
+  Dark](https://github.com/gerchowl/dalton-colorscheme), a
+  colourblind-friendly scheme tuned for deuteranopia and protanopia.
+  Light mode and auto-detection ship in #137.
 
 ## [0.5.0] - 2026-04-21
 

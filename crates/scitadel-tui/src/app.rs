@@ -10,7 +10,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Tabs;
 use tokio::sync::mpsc;
@@ -777,7 +777,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         .select(app.tab.index())
         .highlight_style(
             Style::default()
-                .fg(Color::Yellow)
+                .fg(crate::theme::theme().emphasis)
                 .add_modifier(Modifier::BOLD),
         )
         .divider(Span::raw(" | "));
