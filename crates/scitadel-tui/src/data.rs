@@ -56,6 +56,13 @@ impl DataStore {
         Ok(q_repo.list_questions()?)
     }
 
+    /// Fetch a single research question by id. Used by the dashboard
+    /// title bar (#133).
+    pub fn load_question(&self, question_id: &str) -> Result<Option<ResearchQuestion>> {
+        let (_, _, q_repo, _, _) = self.db.repositories();
+        Ok(q_repo.get_question(question_id)?)
+    }
+
     pub fn load_terms(&self, question_id: &str) -> Result<Vec<SearchTerm>> {
         let (_, _, q_repo, _, _) = self.db.repositories();
         Ok(q_repo.get_terms(question_id)?)
@@ -156,6 +163,70 @@ impl DataStore {
     /// Soft-delete an annotation (tombstone — replies stay readable).
     pub fn delete_annotation(&self, annotation_id: &str) -> Result<()> {
         Ok(SqliteAnnotationRepository::new(self.db.clone()).soft_delete(annotation_id)?)
+    }
+
+    /// Load a question's papers ranked by assessment score (DESC) for
+    /// the Question Dashboard (#133). Returns `(Paper, Option<Assessment>)`
+    /// so the dashboard can show both metadata and the LLM score +
+    /// rationale in one render pass. Papers without an assessment
+    /// sort to the end.
+    pub fn load_question_dashboard(
+        &self,
+        question_id: &str,
+    ) -> Result<Vec<(Paper, Option<Assessment>)>> {
+        let (paper_repo, _, _, a_repo, _) = self.db.repositories();
+        let assessments = a_repo.get_for_question(question_id)?;
+        let mut out: Vec<(Paper, Option<Assessment>)> = Vec::with_capacity(assessments.len());
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for a in assessments {
+            let pid = a.paper_id.as_str().to_string();
+            if seen.contains(&pid) {
+                continue;
+            }
+            if let Ok(Some(paper)) = paper_repo.get(&pid) {
+                seen.insert(pid);
+                out.push((paper, Some(a)));
+            }
+        }
+        // Sort by score DESC, then by paper_id for tie stability.
+        out.sort_by(|a, b| {
+            let sa = a.1.as_ref().map_or(0.0, |x| x.score);
+            let sb = b.1.as_ref().map_or(0.0, |x| x.score);
+            sb.partial_cmp(&sa)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.id.as_str().cmp(b.0.id.as_str()))
+        });
+        Ok(out)
+    }
+
+    /// Toggle a paper's shortlist membership for the current reader.
+    /// Returns the post-toggle state (true = on shortlist). (#133)
+    pub fn toggle_shortlist(
+        &self,
+        question_id: &str,
+        paper_id: &str,
+        reader: &str,
+    ) -> Result<bool> {
+        Ok(
+            scitadel_db::sqlite::SqliteShortlistRepository::new(self.db.clone()).toggle(
+                question_id,
+                paper_id,
+                reader,
+            )?,
+        )
+    }
+
+    /// Members of `reader`'s shortlist for `question_id` as a set.
+    /// Used by the dashboard render to mark shortlisted rows. (#133)
+    pub fn load_shortlist_set(
+        &self,
+        question_id: &str,
+        reader: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        Ok(
+            scitadel_db::sqlite::SqliteShortlistRepository::new(self.db.clone())
+                .members_set(question_id, reader)?,
+        )
     }
 
     /// Persist the outcome of a download attempt for the Papers-table
