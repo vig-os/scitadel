@@ -281,9 +281,12 @@ impl App {
                         .iter()
                         .find(|t| t.id == id)
                         .map(|t| match &t.kind {
-                            TaskKind::Download { paper_id, .. } => paper_id.clone(),
+                            TaskKind::Download { paper_id, .. } => (paper_id.clone(), true),
+                            TaskKind::OpenExternal { paper_id, .. } => (paper_id.clone(), false),
                         });
-                    if let Some(pid) = paper_id {
+                    if let Some((pid, persist)) = paper_id
+                        && persist
+                    {
                         self.persist_download_outcome(&pid, &status);
                     }
                     if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
@@ -314,9 +317,9 @@ impl App {
         self.tasks
             .iter()
             .filter(|t| matches!(t.status, TaskStatus::Queued | TaskStatus::Running))
-            .map(|t| {
-                let TaskKind::Download { paper_id, .. } = &t.kind;
-                paper_id.clone()
+            .filter_map(|t| match &t.kind {
+                TaskKind::Download { paper_id, .. } => Some(paper_id.clone()),
+                TaskKind::OpenExternal { .. } => None,
             })
             .collect()
     }
@@ -576,7 +579,53 @@ impl App {
                 *reader = true;
                 *highlight_focus = if count > 0 { Some(0) } else { None };
             }
+            KeyCode::Char('O') => {
+                // #144: open the locally downloaded file in the OS
+                // default viewer. PDFs that are unreadable as plain
+                // text (figures, math, tables) are the main motivator —
+                // R is for the in-TUI reader, O escapes to the real one.
+                let pid = paper_id.clone();
+                self.open_paper_externally(&pid);
+            }
             _ => {}
+        }
+    }
+
+    /// Spawn the OS default viewer for the paper's local file. Surfaces
+    /// errors (no local file, exec failure) via a transient task panel
+    /// row — success is implicit because the user sees the viewer pop up.
+    fn open_paper_externally(&self, paper_id: &str) {
+        let Ok(Some(paper)) = self.data.load_paper(paper_id) else {
+            return;
+        };
+        let path = paper.local_path.as_ref().map(std::path::PathBuf::from);
+        if let Some(p) = path {
+            crate::tasks::spawn_open_external(self.task_tx.clone(), &paper, p);
+        } else {
+            // Synthesize a Failed task so the user sees feedback rather
+            // than a silent no-op when they haven't downloaded yet.
+            let id = uuid::Uuid::new_v4();
+            let ref_id = paper
+                .doi
+                .clone()
+                .filter(|s| !s.is_empty())
+                .or_else(|| paper.arxiv_id.clone().filter(|s| !s.is_empty()))
+                .unwrap_or_else(|| paper.id.as_str().chars().take(8).collect());
+            let task = crate::tasks::Task {
+                id,
+                kind: TaskKind::OpenExternal {
+                    paper_id: paper.id.as_str().to_string(),
+                    ref_id,
+                    title: paper.title.clone(),
+                },
+                status: TaskStatus::Queued,
+                terminal_at: None,
+            };
+            let _ = self.task_tx.send(crate::tasks::TaskUpdate::New(task));
+            let _ = self.task_tx.send(crate::tasks::TaskUpdate::Status {
+                id,
+                status: TaskStatus::Failed("no local file — press D to download first".to_string()),
+            });
         }
     }
 
@@ -938,7 +987,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                         "Esc: leave focus | j/k: navigate | n: new | e: edit | r: reply | d: delete"
                     }
                     (None, None) => {
-                        "Esc/q: back | j/k: scroll | d/u: page | D: download | n: new | J: focus | R: reader"
+                        "Esc/q: back | j/k: scroll | d/u: page | D: download | O: open externally | R: reader | n: new | J: focus"
                     }
                 }
             }
