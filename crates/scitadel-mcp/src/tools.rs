@@ -565,20 +565,22 @@ pub async fn read_paper_tool(paper_id: &str, max_chars: Option<usize>) -> Result
     let mut text: Option<String> = paper.full_text.clone();
     let mut path: Option<std::path::PathBuf> = None;
 
+    let mut extractor: Option<&'static str> = None;
     if text.is_none() {
         let p = scitadel_adapters::download::find_cached_file(&paper, &config.papers_dir())
             .ok_or_else(|| "paper not downloaded yet. Call download_paper first.".to_string())?;
         let extracted = match p.extension().and_then(|e| e.to_str()) {
             Some("pdf") => {
-                let path_clone = p.clone();
-                tokio::task::spawn_blocking(move || pdf_extract::extract_text(&path_clone))
-                    .await
-                    .map_err(|e| format!("pdf extract task failed: {e}"))?
-                    .map_err(|e| format!("pdf extract failed: {e}"))?
+                // Layout-aware pdftotext when available, else
+                // pdf-extract — see crate::extract for rationale (#145).
+                let (body, used) = crate::extract::extract_pdf_text(&p).await?;
+                extractor = Some(used.as_str());
+                body
             }
             Some("html") => {
                 let bytes = tokio::fs::read(&p).await.map_err(|e| e.to_string())?;
                 let html = String::from_utf8_lossy(&bytes);
+                extractor = Some("html2text");
                 html_to_text(&html)
             }
             other => return Err(format!("unsupported file type: {other:?}")),
@@ -610,8 +612,9 @@ pub async fn read_paper_tool(paper_id: &str, max_chars: Option<usize>) -> Result
         text
     };
 
+    let extractor_line = extractor.map_or_else(String::new, |e| format!("Extractor: {e}\n"));
     Ok(format!(
-        "Paper: {}\nPath: {}\n\n{}",
+        "Paper: {}\nPath: {}\n{extractor_line}\n{}",
         paper.title, path_display, truncated
     ))
 }
