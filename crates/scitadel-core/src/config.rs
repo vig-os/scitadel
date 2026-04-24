@@ -106,12 +106,24 @@ pub struct UiConfig {
     /// grant access. Disable for headless / CI runs.
     #[serde(default = "default_true")]
     pub show_institutional_hint: bool,
+    /// Active TUI theme (#137). Accepts: `auto`, `dark`, `light`,
+    /// `dalton-dark`, `dalton-bright`. `auto` = read terminal
+    /// background via COLORFGBG → OSC 11 → fall back to dark.
+    /// Resolution order: CLI flag > `SCITADEL_THEME` env > this
+    /// config key > `auto`.
+    #[serde(default = "default_theme")]
+    pub theme: String,
+}
+
+fn default_theme() -> String {
+    "auto".into()
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
             show_institutional_hint: true,
+            theme: default_theme(),
         }
     }
 }
