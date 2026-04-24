@@ -1,21 +1,22 @@
-use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, Cell, Row, Table, TableState};
 use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
+use ratatui::widgets::{Block, Borders, Cell, Row, Table, TableState};
 
 use scitadel_core::models::SourceStatus;
 
 use crate::data::DataStore;
+use crate::views::util::truncate;
 
 pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, selected: usize) {
     let searches = data.load_searches(100).unwrap_or_default();
 
     if searches.is_empty() {
-        let block = Block::default()
-            .title(" Searches ")
-            .borders(Borders::ALL);
-        let empty = ratatui::widgets::Paragraph::new("No searches yet. Run `scitadel search` to get started.")
-            .block(block);
+        let block = Block::default().title(" Searches ").borders(Borders::ALL);
+        let empty = ratatui::widgets::Paragraph::new(
+            "No searches yet. Run `scitadel search` to get started.",
+        )
+        .block(block);
         frame.render_widget(empty, area);
         return;
     }
@@ -29,7 +30,7 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, selected: usize) {
     ])
     .style(
         Style::default()
-            .fg(Color::Yellow)
+            .fg(crate::theme::theme().emphasis)
             .add_modifier(Modifier::BOLD),
     );
 
@@ -66,19 +67,11 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, selected: usize) {
         .block(Block::default().title(" Searches ").borders(Borders::ALL))
         .row_highlight_style(
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(crate::theme::theme().selection_bg)
                 .add_modifier(Modifier::BOLD),
         );
 
     let mut state = TableState::default();
     state.select(Some(selected));
     frame.render_stateful_widget(table, area, &mut state);
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max.saturating_sub(3)])
-    }
 }

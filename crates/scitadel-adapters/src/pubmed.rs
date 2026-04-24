@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use quick_xml::events::Event;
 use quick_xml::Reader;
+use quick_xml::events::Event;
 use reqwest::Client;
 
 use scitadel_core::error::CoreError;
@@ -35,8 +35,7 @@ impl SourceAdapter for PubMedAdapter {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs_f64(self.timeout))
             .build()
-            .map_err(|e| CoreError::Adapter("pubmed".into(), e.to_string(),
-            ))?;
+            .map_err(|e| CoreError::Adapter("pubmed".into(), e.to_string()))?;
 
         let pmids = esearch(&client, query, max_results, &self.api_key).await?;
         if pmids.is_empty() {
@@ -68,11 +67,12 @@ async fn esearch(
         .query(&params)
         .send()
         .await
-        .map_err(|e| CoreError::Adapter("pubmed".into(), e.to_string(),
-        ))?;
+        .map_err(|e| CoreError::Adapter("pubmed".into(), e.to_string()))?;
 
-    let data: serde_json::Value = resp.json().await.map_err(|e| CoreError::Adapter("pubmed".into(), e.to_string(),
-    ))?;
+    let data: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| CoreError::Adapter("pubmed".into(), e.to_string()))?;
 
     let ids = data
         .get("esearchresult")
@@ -107,11 +107,12 @@ async fn efetch(
         .query(&params)
         .send()
         .await
-        .map_err(|e| CoreError::Adapter("pubmed".into(), e.to_string(),
-        ))?;
+        .map_err(|e| CoreError::Adapter("pubmed".into(), e.to_string()))?;
 
-    let xml_text = resp.text().await.map_err(|e| CoreError::Adapter("pubmed".into(), e.to_string(),
-    ))?;
+    let xml_text = resp
+        .text()
+        .await
+        .map_err(|e| CoreError::Adapter("pubmed".into(), e.to_string()))?;
 
     Ok(parse_pubmed_xml(&xml_text))
 }
@@ -230,7 +231,9 @@ pub fn parse_pubmed_xml(xml_text: &str) -> Vec<CandidatePaper> {
                         format!("{}: {text}", current_abstract_label)
                     };
                     current_abstract_parts.push(part);
-                } else if in_elocation_id && current_elocation_type == "doi" && current_doi.is_none()
+                } else if in_elocation_id
+                    && current_elocation_type == "doi"
+                    && current_doi.is_none()
                 {
                     current_doi = Some(text);
                 } else if in_journal_title {
@@ -248,15 +251,13 @@ pub fn parse_pubmed_xml(xml_text: &str) -> Vec<CandidatePaper> {
                     "ForeName" => {
                         in_fore_name = false;
                     }
-                    "Author" => {
-                        if !current_last_name.is_empty() {
-                            let name = if current_fore_name.is_empty() {
-                                current_last_name.clone()
-                            } else {
-                                format!("{}, {}", current_last_name, current_fore_name)
-                            };
-                            current_authors.push(name);
-                        }
+                    "Author" if !current_last_name.is_empty() => {
+                        let name = if current_fore_name.is_empty() {
+                            current_last_name.clone()
+                        } else {
+                            format!("{}, {}", current_last_name, current_fore_name)
+                        };
+                        current_authors.push(name);
                     }
                     "AbstractText" => in_abstract_text = false,
                     "ELocationID" => in_elocation_id = false,
@@ -344,9 +345,6 @@ mod tests {
         assert_eq!(c.r#abstract, "This paper reviews ML methods.");
         assert_eq!(c.doi, Some("10.1234/test.2024".to_string()));
         assert_eq!(c.year, Some(2024));
-        assert_eq!(
-            c.journal,
-            Some("Nature Reviews Drug Discovery".to_string())
-        );
+        assert_eq!(c.journal, Some("Nature Reviews Drug Discovery".to_string()));
     }
 }

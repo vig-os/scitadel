@@ -1,8 +1,6 @@
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use scitadel_core::error::CoreError;
-use scitadel_core::models::{
-    PaperId, Search, SearchId, SearchResult, SourceOutcome,
-};
+use scitadel_core::models::{PaperId, Search, SearchId, SearchResult, SourceOutcome};
 use scitadel_core::ports::SearchRepository;
 
 use super::Database;
@@ -16,6 +14,54 @@ impl SqliteSearchRepository {
     pub fn new(db: Database) -> Self {
         Self { db }
     }
+
+    /// Full-text search over past search queries using the `searches_fts`
+    /// FTS5 index (migration 006). Returns `(Search, rank)` tuples where
+    /// lower rank = more relevant (bm25 convention). Input is sanitized of
+    /// FTS5 operators so arbitrary user strings don't raise syntax errors.
+    pub fn find_similar(&self, query: &str, limit: i64) -> Result<Vec<(Search, f64)>, DbError> {
+        let sanitized = sanitize_fts5_query(query);
+        if sanitized.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.db.conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.*, bm25(searches_fts) AS rank
+                 FROM searches_fts f
+                 JOIN searches s ON s.id = f.search_id
+                 WHERE searches_fts MATCH ?1
+                 ORDER BY rank ASC
+                 LIMIT ?2",
+            )
+            .map_err(DbError::Sqlite)?;
+        let rows = stmt
+            .query_map(params![sanitized, limit], |row| {
+                let search = row_to_search(row)?;
+                let rank: f64 = row.get("rank")?;
+                Ok((search, rank))
+            })
+            .map_err(DbError::Sqlite)?;
+        let out: Vec<(Search, f64)> = rows.filter_map(Result::ok).collect();
+        Ok(out)
+    }
+}
+
+/// Strip FTS5 query-syntax characters so arbitrary user input doesn't
+/// trigger `fts5: syntax error near …`. We lose operator support but
+/// gain robustness; callers who want advanced syntax can submit
+/// pre-sanitized queries with the operators they know to be valid.
+fn sanitize_fts5_query(q: &str) -> String {
+    q.chars()
+        .map(|c| match c {
+            // These are FTS5 operators / quote chars.
+            '"' | '\'' | '(' | ')' | ':' | '*' | '-' => ' ',
+            other => other,
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn row_to_search(row: &rusqlite::Row) -> rusqlite::Result<Search> {
@@ -154,17 +200,18 @@ impl SearchRepository for SqliteSearchRepository {
     ) -> Result<(Vec<String>, Vec<String>), CoreError> {
         let conn = self.db.conn()?;
 
-        let get_paper_ids = |search_id: &str| -> Result<std::collections::HashSet<String>, DbError> {
-            let mut stmt = conn
-                .prepare("SELECT DISTINCT paper_id FROM search_results WHERE search_id = ?1")
-                .map_err(DbError::Sqlite)?;
-            let ids: std::collections::HashSet<String> = stmt
-                .query_map(params![search_id], |row| row.get(0))
-                .map_err(DbError::Sqlite)?
-                .filter_map(Result::ok)
-                .collect();
-            Ok(ids)
-        };
+        let get_paper_ids =
+            |search_id: &str| -> Result<std::collections::HashSet<String>, DbError> {
+                let mut stmt = conn
+                    .prepare("SELECT DISTINCT paper_id FROM search_results WHERE search_id = ?1")
+                    .map_err(DbError::Sqlite)?;
+                let ids: std::collections::HashSet<String> = stmt
+                    .query_map(params![search_id], |row| row.get(0))
+                    .map_err(DbError::Sqlite)?
+                    .filter_map(Result::ok)
+                    .collect();
+                Ok(ids)
+            };
 
         let papers_a = get_paper_ids(search_id_a).map_err(Into::<CoreError>::into)?;
         let papers_b = get_paper_ids(search_id_b).map_err(Into::<CoreError>::into)?;
@@ -201,6 +248,52 @@ mod tests {
 
         let loaded = repo.get(search.id.as_str()).unwrap().unwrap();
         assert_eq!(loaded.query, "test query");
+    }
+
+    #[test]
+    fn fts_sanitizer_strips_operators() {
+        assert_eq!(sanitize_fts5_query(r#"GAN "stability""#), "GAN stability");
+        assert_eq!(sanitize_fts5_query("foo (bar) - baz"), "foo bar baz");
+        assert_eq!(sanitize_fts5_query("   "), "");
+        assert_eq!(sanitize_fts5_query("scope:field"), "scope field");
+    }
+
+    #[test]
+    fn fts_find_similar_roundtrip() {
+        let (_, repo, _) = setup();
+        let a = {
+            let mut s = Search::new("generative adversarial networks stability");
+            s.id = SearchId::from("s-a");
+            s
+        };
+        let b = {
+            let mut s = Search::new("attention is all you need transformers");
+            s.id = SearchId::from("s-b");
+            s
+        };
+        let c = {
+            let mut s = Search::new("retrieval augmented generation");
+            s.id = SearchId::from("s-c");
+            s
+        };
+        repo.save(&a).unwrap();
+        repo.save(&b).unwrap();
+        repo.save(&c).unwrap();
+
+        // Porter stemming should match "generative" against "generating".
+        let hits = repo.find_similar("generative networks", 10).unwrap();
+        assert!(
+            hits.iter().any(|(s, _)| s.id.as_str() == "s-a"),
+            "expected GAN search to be found; got {:?}",
+            hits.iter().map(|(s, _)| s.id.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn fts_find_similar_empty_query() {
+        let (_, repo, _) = setup();
+        repo.save(&Search::new("something")).unwrap();
+        assert!(repo.find_similar("()(", 10).unwrap().is_empty());
     }
 
     #[test]

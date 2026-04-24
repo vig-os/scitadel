@@ -178,7 +178,13 @@ pub fn build_user_prompt(paper: &Paper, question: &ResearchQuestion) -> String {
         format!("Context: {}", question.description)
     };
 
-    let authors = paper.authors.iter().take(5).cloned().collect::<Vec<_>>().join("; ");
+    let authors = paper
+        .authors
+        .iter()
+        .take(5)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
     let abstract_text = if paper.r#abstract.len() > 2000 {
         &paper.r#abstract[..2000]
     } else if paper.r#abstract.is_empty() {
@@ -192,7 +198,10 @@ pub fn build_user_prompt(paper: &Paper, question: &ResearchQuestion) -> String {
         .replace("{question_description}", &description)
         .replace("{title}", &paper.title)
         .replace("{authors}", &authors)
-        .replace("{year}", &paper.year.map_or_else(|| "N/A".into(), |y| y.to_string()))
+        .replace(
+            "{year}",
+            &paper.year.map_or_else(|| "N/A".into(), |y| y.to_string()),
+        )
         .replace("{journal}", paper.journal.as_deref().unwrap_or("N/A"))
         .replace("{abstract}", abstract_text)
 }
@@ -225,8 +234,17 @@ pub fn parse_scoring_response(text: &str) -> (f64, String) {
             .to_string();
         (score, reasoning)
     } else {
-        warn!("Failed to parse scoring response: {}", &text[..text.len().min(200)]);
-        (0.0, format!("Parse error. Raw response: {}", &text[..text.len().min(500)]))
+        warn!(
+            "Failed to parse scoring response: {}",
+            &text[..text.len().min(200)]
+        );
+        (
+            0.0,
+            format!(
+                "Parse error. Raw response: {}",
+                &text[..text.len().min(500)]
+            ),
+        )
     }
 }
 

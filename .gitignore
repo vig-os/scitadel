@@ -149,7 +149,6 @@ activemq-data/
 
 # Environments
 .env
-.envrc
 .venv
 env/
 venv/
@@ -215,6 +214,9 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# Personal justfile recipes
+justfile.local
+
 # Pre-commit cache
 .pre-commit-cache/
 
@@ -222,8 +224,10 @@ __marimo__/
 .scitadel/
 results.bib
 
-# Claude Code (keep CLAUDE.md, ignore local settings)
+# Claude Code (keep CLAUDE.md, ignore local settings + loop state)
 .claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/scheduled_tasks.json
 
 # Conductor orchestration state
 .conductor/
@@ -234,3 +238,12 @@ results.bib
 
 # VS Code extension (separate project, has its own build artifacts)
 vscode-scitadel/
+
+# Nix / direnv
+.direnv/
+result
+result-*
+
+# VHS tape outputs (v1 has no golden-file comparison; tapes are run locally).
+# Re-enable when structural-similarity snapshotting lands.
+tests/vhs/snapshots/

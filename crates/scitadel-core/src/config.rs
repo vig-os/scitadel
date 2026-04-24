@@ -38,6 +38,33 @@ fn default_max_retries() -> u32 {
     3
 }
 
+/// EPO OPS adapter configuration (requires consumer key + secret pair).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpoConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_timeout")]
+    pub timeout: f64,
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+    #[serde(default)]
+    pub consumer_key: String,
+    #[serde(default)]
+    pub consumer_secret: String,
+}
+
+impl Default for EpoConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            timeout: 30.0,
+            max_retries: 3,
+            consumer_key: String::new(),
+            consumer_secret: String::new(),
+        }
+    }
+}
+
 /// Configuration for Claude-based scoring.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatConfig {
@@ -71,6 +98,24 @@ fn default_scoring_concurrency() -> u32 {
     5
 }
 
+/// UI/UX preferences (TUI-only today; extensible for future surfaces).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiConfig {
+    /// When a download lands on a paywalled publisher page, show the live URL
+    /// plus a note that an institutional IP range (e.g. university VPN) may
+    /// grant access. Disable for headless / CI runs.
+    #[serde(default = "default_true")]
+    pub show_institutional_hint: bool,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            show_institutional_hint: true,
+        }
+    }
+}
+
 /// Top-level application configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -86,7 +131,15 @@ pub struct Config {
     #[serde(default)]
     pub inspire: SourceConfig,
     #[serde(default)]
+    pub patentsview: SourceConfig,
+    #[serde(default)]
+    pub lens: SourceConfig,
+    #[serde(default)]
+    pub epo: EpoConfig,
+    #[serde(default)]
     pub chat: ChatConfig,
+    #[serde(default)]
+    pub ui: UiConfig,
 }
 
 fn default_sources() -> Vec<String> {
@@ -98,10 +151,19 @@ fn default_sources() -> Vec<String> {
     ]
 }
 
+impl Config {
+    /// Directory for downloaded paper files, relative to the database location.
+    pub fn papers_dir(&self) -> PathBuf {
+        self.db_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("papers")
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
-        let workspace =
-            find_workspace_root().unwrap_or_else(|| std::env::current_dir().unwrap());
+        let workspace = find_workspace_root().unwrap_or_else(|| std::env::current_dir().unwrap());
         Self {
             db_path: default_db_path(&workspace),
             default_sources: default_sources(),
@@ -109,7 +171,11 @@ impl Default for Config {
             arxiv: SourceConfig::default(),
             openalex: SourceConfig::default(),
             inspire: SourceConfig::default(),
+            patentsview: SourceConfig::default(),
+            lens: SourceConfig::default(),
+            epo: EpoConfig::default(),
             chat: ChatConfig::default(),
+            ui: UiConfig::default(),
         }
     }
 }
@@ -147,61 +213,83 @@ fn default_db_path(workspace: &Path) -> PathBuf {
     workspace.join(".scitadel").join("scitadel.db")
 }
 
-/// Load configuration from environment variables and optional TOML file.
+/// Load configuration from keychain, environment variables, and optional TOML file.
+///
+/// Resolution priority per credential: keychain → env var → config.toml → empty default.
 pub fn load_config() -> Config {
-    let workspace =
-        find_workspace_root().unwrap_or_else(|| std::env::current_dir().unwrap());
+    use crate::credentials::resolve;
+
+    let workspace = find_workspace_root().unwrap_or_else(|| std::env::current_dir().unwrap());
     let db_path = default_db_path(&workspace);
 
-    let pubmed = SourceConfig {
-        api_key: std::env::var("SCITADEL_PUBMED_API_KEY").unwrap_or_default(),
-        ..Default::default()
-    };
-
-    let openalex = SourceConfig {
-        api_key: std::env::var("SCITADEL_OPENALEX_EMAIL").unwrap_or_default(),
-        ..Default::default()
-    };
-
-    let chat = ChatConfig {
-        model: std::env::var("SCITADEL_CHAT_MODEL")
-            .unwrap_or_else(|_| "claude-sonnet-4-6".to_string()),
-        max_tokens: std::env::var("SCITADEL_CHAT_MAX_TOKENS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(4096),
-        scoring_concurrency: std::env::var("SCITADEL_SCORING_CONCURRENCY")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(5),
-    };
-
-    // Try loading TOML config file
+    // Try loading TOML config file as base
     let config_path = workspace.join(".scitadel").join("config.toml");
-
-    if let Some(mut config) = std::fs::read_to_string(&config_path)
+    let mut config: Config = std::fs::read_to_string(&config_path)
         .ok()
-        .and_then(|contents| toml::from_str::<Config>(&contents).ok())
+        .and_then(|contents| toml::from_str(&contents).ok())
+        .unwrap_or_default();
+
+    config.db_path = db_path;
+
+    // Resolve credentials: keychain → env → config.toml value
+    config.pubmed.api_key = resolve(
+        "pubmed.api_key",
+        "SCITADEL_PUBMED_API_KEY",
+        &config.pubmed.api_key,
+    )
+    .unwrap_or_default();
+
+    config.openalex.api_key = resolve(
+        "openalex.email",
+        "SCITADEL_OPENALEX_EMAIL",
+        &config.openalex.api_key,
+    )
+    .unwrap_or_default();
+
+    config.patentsview.api_key = resolve(
+        "patentsview.api_key",
+        "SCITADEL_PATENTSVIEW_KEY",
+        &config.patentsview.api_key,
+    )
+    .unwrap_or_default();
+
+    config.lens.api_key = resolve(
+        "lens.api_token",
+        "SCITADEL_LENS_TOKEN",
+        &config.lens.api_key,
+    )
+    .unwrap_or_default();
+
+    config.epo.consumer_key = resolve(
+        "epo.consumer_key",
+        "SCITADEL_EPO_KEY",
+        &config.epo.consumer_key,
+    )
+    .unwrap_or_default();
+
+    config.epo.consumer_secret = resolve(
+        "epo.consumer_secret",
+        "SCITADEL_EPO_SECRET",
+        &config.epo.consumer_secret,
+    )
+    .unwrap_or_default();
+
+    // Chat config from env (no keychain needed)
+    if let Ok(model) = std::env::var("SCITADEL_CHAT_MODEL") {
+        config.chat.model = model;
+    }
+    if let Ok(tokens) = std::env::var("SCITADEL_CHAT_MAX_TOKENS")
+        && let Ok(v) = tokens.parse()
     {
-        // Env vars override TOML
-        config.db_path = db_path;
-        if !pubmed.api_key.is_empty() {
-            config.pubmed.api_key = pubmed.api_key;
-        }
-        if !openalex.api_key.is_empty() {
-            config.openalex.api_key = openalex.api_key;
-        }
-        config.chat = chat;
-        return config;
+        config.chat.max_tokens = v;
+    }
+    if let Ok(conc) = std::env::var("SCITADEL_SCORING_CONCURRENCY")
+        && let Ok(v) = conc.parse()
+    {
+        config.chat.scoring_concurrency = v;
     }
 
-    Config {
-        db_path,
-        pubmed,
-        openalex,
-        chat,
-        ..Default::default()
-    }
+    config
 }
 
 /// Load config from a specific TOML file path.

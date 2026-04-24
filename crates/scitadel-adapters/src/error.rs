@@ -14,6 +14,21 @@ pub enum AdapterError {
     #[error("unknown source: {0}")]
     UnknownSource(String),
 
+    #[error("validation error: {0}")]
+    Validation(String),
+
+    #[error("network error: {0}")]
+    Network(String),
+
+    #[error("parse error: {0}")]
+    Parse(String),
+
+    #[error("not found: {0}")]
+    NotFound(String),
+
+    #[error("I/O error: {0}")]
+    Io(String),
+
     #[error("{0}")]
     Other(String),
 }

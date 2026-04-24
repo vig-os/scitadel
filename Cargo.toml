@@ -12,10 +12,14 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.5.0"
 edition = "2024"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/vig-os/scitadel"
+homepage = "https://github.com/vig-os/scitadel"
+authors = ["scitadel contributors"]
+keywords = ["literature", "science", "research", "bibtex", "cli"]
+categories = ["command-line-utilities", "science"]
 
 [workspace.dependencies]
 # Core
@@ -46,6 +50,10 @@ r2d2_sqlite = "0.25"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Credentials
+keyring = { version = "3", features = ["apple-native", "sync-secret-service"] }
+rpassword = "7"
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 
@@ -54,7 +62,17 @@ ratatui = "0.29"
 crossterm = "0.28"
 
 # MCP
-rmcp = { version = "0.1", features = ["server", "transport-io"] }
+rmcp = { version = "0.17", features = ["server", "transport-io", "macros"] }
+schemars = "1"
+
+# Content extraction (PDF / HTML → text)
+pdf-extract = "0.7"
+scraper = "0.20"
+
+# Annotation anchor resolver (#96)
+strsim = "0.11"
+sha1 = "0.10"
+unicode-normalization = "0.1"
 
 # Testing
 insta = { version = "1", features = ["json"] }
@@ -82,6 +100,10 @@ redundant_closure_for_method_calls = "allow"
 needless_lifetimes = "allow"
 unnecessary_literal_bound = "allow"
 uninlined_format_args = "allow"
+manual_let_else = "allow"
+needless_pass_by_value = "allow"
+unreadable_literal = "allow"
+unnecessary_wraps = "allow"
 
 [profile.release]
 lto = true

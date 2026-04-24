@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use quick_xml::events::Event;
 use quick_xml::Reader;
+use quick_xml::events::Event;
 use reqwest::Client;
 
 use scitadel_core::error::CoreError;
@@ -33,8 +33,7 @@ impl SourceAdapter for ArxivAdapter {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs_f64(self.timeout))
             .build()
-            .map_err(|e| CoreError::Adapter("arxiv".into(), e.to_string(),
-            ))?;
+            .map_err(|e| CoreError::Adapter("arxiv".into(), e.to_string()))?;
 
         let params = [
             ("search_query", format!("all:{query}")),
@@ -49,11 +48,12 @@ impl SourceAdapter for ArxivAdapter {
             .query(&params)
             .send()
             .await
-            .map_err(|e| CoreError::Adapter("arxiv".into(), e.to_string(),
-            ))?;
+            .map_err(|e| CoreError::Adapter("arxiv".into(), e.to_string()))?;
 
-        let xml_text = resp.text().await.map_err(|e| CoreError::Adapter("arxiv".into(), e.to_string(),
-        ))?;
+        let xml_text = resp
+            .text()
+            .await
+            .map_err(|e| CoreError::Adapter("arxiv".into(), e.to_string()))?;
 
         Ok(parse_arxiv_atom(&xml_text))
     }
@@ -149,8 +149,7 @@ pub fn parse_arxiv_atom(xml_text: &str) -> Vec<CandidatePaper> {
                     current_summary.push_str(&text);
                 } else if in_author_name {
                     current_authors.push(text);
-                } else if in_published && current_year.is_none()
-                    && text.len() >= 4 {
+                } else if in_published && current_year.is_none() && text.len() >= 4 {
                     current_year = text[..4].parse().ok();
                 }
             }
@@ -168,10 +167,14 @@ pub fn parse_arxiv_atom(xml_text: &str) -> Vec<CandidatePaper> {
                             rank += 1;
                             let arxiv_id = extract_arxiv_id(&current_id);
                             // Collapse whitespace
-                            let title: String =
-                                current_title.split_whitespace().collect::<Vec<_>>().join(" ");
-                            let abstract_text: String =
-                                current_summary.split_whitespace().collect::<Vec<_>>().join(" ");
+                            let title: String = current_title
+                                .split_whitespace()
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            let abstract_text: String = current_summary
+                                .split_whitespace()
+                                .collect::<Vec<_>>()
+                                .join(" ");
 
                             candidates.push(CandidatePaper {
                                 source: "arxiv".into(),

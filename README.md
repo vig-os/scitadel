@@ -10,26 +10,85 @@ Scientific literature retrieval is fragmented, manual, and non-reproducible. Res
 
 Scitadel fixes this: one query, all sources, deterministic results, full audit trail.
 
+## Recommended workflow: TUI + agent in adjacent pane
+
+Scitadel's primary workflow is **`scitadel tui` in one terminal pane, an MCP-aware agent (Claude Code, Cursor, Cline, …) in an adjacent pane**. The agent talks to scitadel through the MCP server (40+ tools); the TUI redraws live as the agent writes.
+
+```
+┌─────────────────────────────┬──────────────────────────────┐
+│ $ scitadel tui              │ $ claude                     │
+│ ┌── Papers ───────────────┐ │                              │
+│ │ ✓ Attention Is All You  │ │ > score the open paper       │
+│ │ ⊘ Recurrent Neural...   │ │   against my CRISPR question │
+│ │ ★ ✓ Transformer Survey  │ │                              │
+│ └─────────────────────────┘ │   [agent calls                │
+│   Annotations (3)           │    get_current_selection,    │
+│   • "self-attention..." ─ok │    prepare_assessment,       │
+│   • "the Transformer" ─ ok  │    save_assessment]           │
+│                             │                              │
+│   Esc: back · n: new · …    │ Done. Score: 0.87, reasoning │
+└─────────────────────────────┴──────────────────────────────┘
+```
+
+The agent owns conversational reasoning (drafting questions, summarizing papers, suggesting related terms). The TUI owns reading and quick navigation (browse, star, annotate, scroll). They share the SQLite database via WAL mode — every MCP write surfaces in the open TUI within ~100 ms.
+
+You don't need any LLM CLI installed to use scitadel — every TUI/CLI feature works standalone. But once you set up the MCP server (one line, see below), the agent + TUI combo is what scitadel was designed for.
+
+## Install
+
+Scitadel is a Rust workspace. You need a Rust toolchain (`rustup`, stable channel).
+
+### From source (recommended today)
+
+```bash
+git clone https://github.com/vig-os/scitadel.git
+cd scitadel
+cargo install --path crates/scitadel-cli --locked
+```
+
+This drops a single `scitadel` binary into `~/.cargo/bin` (make sure that's on your `PATH`). CLI, TUI, and MCP server are all subcommands of the same binary.
+
+### As a Claude MCP server
+
+**User scope (available in every session, everywhere):**
+
+```bash
+claude mcp add --scope user scitadel -- scitadel mcp
+```
+
+**Project scope (committed to the repo, available when cwd is this project):**
+
+The repo ships a `.mcp.json` that registers the `scitadel` binary from `PATH`. Just run `cargo install --path crates/scitadel-cli` once and Claude Code will pick it up automatically.
+
+**Local/session scope (no commit, just this machine):**
+
+```bash
+claude mcp add --scope local scitadel -- scitadel mcp
+```
+
+Verify with `claude mcp list`.
+
 ## Quick start
 
 ```bash
-# Install (core)
-pip install -e .
-
-# Install with TUI
-pip install -e ".[tui]"
-
-# Initialize the database
+# Initialize the database (creates ./.scitadel/scitadel.db)
 scitadel init
 
+# Store credentials in your OS keychain (one-time, per source)
+scitadel auth login pubmed
+scitadel auth login openalex
+scitadel auth status
+
 # Run a federated search
-scitadel search "PET tracer development" --sources pubmed,arxiv,openalex,inspire --max-results 20
+scitadel search "PET tracer development" -s pubmed,arxiv,openalex,inspire -n 20
 
-# View past searches
+# View past searches / show a paper / export
 scitadel history
-
-# Export results
+scitadel show <paper-or-search-id>
 scitadel export <search-id> --format bibtex --output results.bib
+
+# Download a paper by DOI (OA PDF via Unpaywall, else publisher HTML)
+scitadel download 10.1038/s41586-020-2649-2
 
 # Launch the interactive TUI
 scitadel tui
@@ -120,62 +179,57 @@ New papers discovered via snowballing are deduplicated against the existing data
 
 ### 4. Interactive TUI
 
-Browse searches, papers, assessments, and citation trees in an interactive terminal dashboard.
+Browse searches, papers, annotations, and citation trees in an interactive terminal dashboard. Best experienced with an MCP-aware agent in an adjacent terminal pane (see [Recommended workflow](#recommended-workflow-tui--agent-in-adjacent-pane)).
 
 ```bash
-# Launch the TUI (requires textual: pip install scitadel[tui])
 scitadel tui
-
-# Or use the standalone entry point
-scitadel-tui
 ```
 
 The TUI has three tabs:
 
 - **Searches** — browse past search runs, drill into papers, view full metadata and assessments
-- **Questions** — see research questions with their linked terms and assessment statistics
-- **New Search** — run a search and watch results stream in
+- **Papers** — every paper across every search, with a state column (`✓` downloaded, `⊘` paywalled, `✗` failed, `↻` in flight) and a star toggle (`s`)
+- **Questions** — research questions with their linked search terms
 
-From any paper, press `c` to view its citation tree (references and citing papers from snowball runs).
+**Per-paper overlay** (Enter on a paper): full metadata, annotation list, and:
+- `R` — two-pane reader (left: full text with colored highlights, right: annotation threads)
+- `n / e / r / d` — create / edit / reply / delete annotation
+- `J / K` — hop between highlights in reader mode
+- `D` — download via Unpaywall / publisher
+
+The TUI re-queries the DB every redraw, so any write through the MCP server (in an adjacent pane) shows up live with no refresh keypress.
 
 ### 5. Agent-driven workflow via MCP
 
-Connect scitadel as an MCP server and let an LLM agent drive the entire pipeline — from question formulation through search, scoring, and snowballing.
+The MCP server is the seam between scitadel and any agent that speaks MCP. See [Recommended workflow](#recommended-workflow-tui--agent-in-adjacent-pane) above for the 2-pane setup that's the primary use case.
 
 ```bash
-# Start the MCP server
-scitadel-mcp
+# Run the server manually (stdio transport)
+scitadel mcp
 ```
 
-Configure in Claude Desktop (`claude_desktop_config.json`):
+**Setup snippets:**
 
-```json
-{
-  "mcpServers": {
-    "scitadel": {
-      "command": "scitadel-mcp"
-    }
-  }
-}
-```
+| Agent | Setup |
+|---|---|
+| **Claude Code** | `claude mcp add --scope user scitadel -- scitadel mcp` |
+| **Claude Desktop** | Add to `claude_desktop_config.json`: `{"mcpServers": {"scitadel": {"command": "scitadel", "args": ["mcp"]}}}` |
+| **Cursor / Cline / Continue** | Same JSON shape — point at the `scitadel mcp` subcommand |
 
-The MCP server exposes 12 tools:
+**40+ MCP tools** spanning the full pipeline:
 
-| Tool | What it does |
-|------|-------------|
-| `search` | Federated search (supports `question_id` for auto-query) |
-| `list_searches` | Browse past search runs |
-| `get_papers` | List papers from a search |
-| `get_paper` | Full details of a single paper |
-| `export_search` | Export as BibTeX / JSON / CSV |
-| `create_question` | Define a research question |
-| `list_questions` | Browse research questions |
-| `add_search_terms` | Link keywords to a question |
-| `assess_paper` | Record a relevance score with reasoning |
-| `get_assessments` | Retrieve scores for a paper or question |
-| `snowball_search` | Run citation chaining from a search |
+- **Search & retrieval**: `search`, `list_searches`, `get_papers`, `get_paper`, `get_annotated_paper`, `find_similar_searches`, `summarize_search`, `download_paper`, `read_paper`, `list_sources`
+- **Research questions**: `create_question`, `list_questions`, `add_search_terms`, `get_rubric`
+- **Scoring**: `prepare_assessment`, `prepare_batch_assessments`, `assess_paper`, `save_assessment`, `get_assessments`
+- **Annotations** (#49): `create_annotation`, `reply_annotation`, `update_annotation`, `delete_annotation`, `list_annotations`, `mark_seen`, `mark_thread_seen`, `list_unread`
+- **Citation graph** (#59): `get_references`, `get_citations`
+- **Stars** (#120): `toggle_star`, `set_star`, `list_starred`
+- **TUI awareness** (#122): `get_current_selection` — "what is the user looking at right now?"
+- **Export**: `export_search`
 
-This enables a workflow where the agent formulates a question, generates search terms, runs a search, scores each paper, snowballs relevant citations, and writes structured assessments — all through tool calls with no manual intervention.
+Every long-running tool (search / batch scoring / download) emits MCP `notifications/progress` frames if the caller supplies a `progressToken` (#58). Annotation writes are audit-logged. Identity is trust-on-first-use (real auth ships with the Phase-5 Dolt sync layer).
+
+The full pipeline — agent formulates a question, generates search terms, runs a search, scores each paper, snowballs relevant citations, writes structured assessments — runs through tool calls with no manual intervention. With #122, the agent can also act on whatever the user is looking at in the TUI without the user pasting IDs.
 
 ## Workflow coverage
 
@@ -217,9 +271,11 @@ scitadel question add-terms <qid> ...  Link search terms to a question
 scitadel assess <search-id>            Score papers against a question with Claude
 scitadel snowball <search-id>          Run citation chaining from a search
 scitadel tui                           Launch the interactive TUI
+scitadel mcp                           Start the MCP server (stdio)
+scitadel download <doi>                Fetch PDF (Unpaywall) or publisher HTML
+scitadel auth login <source>           Store credentials in OS keychain
+scitadel auth status                   List configured credentials
 scitadel init                          Initialize the database
-scitadel-mcp                           Start the MCP server
-scitadel-tui                           Launch TUI (standalone entry point)
 ```
 
 ### Search options
@@ -263,35 +319,44 @@ scitadel-tui                           Launch TUI (standalone entry point)
 
 ## Configuration
 
-All configuration is via environment variables:
+Credentials resolve in this order: **OS keychain → environment variable → `.scitadel/config.toml` → empty**. For most users the keychain path is best — `scitadel auth login <source>` prompts you and stores the secret securely.
+
+| Source | Keychain key | Env var | Notes |
+|--------|-------------|---------|-------|
+| PubMed | `pubmed.api_key` | `SCITADEL_PUBMED_API_KEY` | Optional, higher rate limits |
+| OpenAlex | `openalex.email` | `SCITADEL_OPENALEX_EMAIL` | Polite pool |
+| PatentsView | `patentsview.api_key` | `SCITADEL_PATENTSVIEW_KEY` | Free registration |
+| Lens | `lens.api_token` | `SCITADEL_LENS_TOKEN` | Free tier |
+| EPO OPS | `epo.consumer_key` + `epo.consumer_secret` | `SCITADEL_EPO_KEY`, `SCITADEL_EPO_SECRET` | Registered app |
+| Anthropic | _(not stored)_ | `ANTHROPIC_API_KEY` | Required for `assess`, `snowball`, MCP scoring |
+
+Other knobs:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SCITADEL_DB` | `~/.scitadel/scitadel.db` | Database path |
-| `SCITADEL_PUBMED_API_KEY` | _(none)_ | NCBI API key for PubMed |
-| `SCITADEL_OPENALEX_EMAIL` | _(none)_ | Email for OpenAlex polite pool |
-| `ANTHROPIC_API_KEY` | _(none)_ | Required for `assess`, `snowball`, and MCP scoring |
+| `SCITADEL_DB` | `./.scitadel/scitadel.db` | Database path |
+| `SCITADEL_CHAT_MODEL` | `claude-sonnet-4-6` | Model used for scoring |
+| `SCITADEL_CHAT_MAX_TOKENS` | `4096` | Max completion tokens |
+| `SCITADEL_SCORING_CONCURRENCY` | `5` | Parallel scoring requests |
 
 ## Architecture
 
-Hexagonal (ports and adapters):
+Hexagonal (ports and adapters), implemented as a Rust workspace:
 
 ```
-CLI (Click) / MCP server (FastMCP) / TUI (Textual)
-  -> Services (orchestrator, dedup, export, scoring, snowball)
-    -> Domain models (Pydantic)
-    -> Repository ports (Protocol interfaces)
-      -> SQLite adapters
-    -> Source adapters (async httpx)
-      -> PubMed, arXiv, OpenAlex, INSPIRE-HEP
-    -> Citation fetcher (OpenAlex via PyAlex)
-    -> Anthropic SDK (relevance scoring)
+scitadel-cli (clap) / scitadel-mcp (rmcp) / scitadel-tui (ratatui)
+  -> scitadel-core (services, domain, ports)
+    -> scitadel-db        (rusqlite adapters)
+    -> scitadel-adapters  (PubMed, arXiv, OpenAlex, INSPIRE-HEP,
+                           PatentsView, Lens, EPO OPS, Unpaywall)
+    -> scitadel-scoring   (Anthropic SDK)
+    -> scitadel-export    (BibTeX, JSON, CSV)
 ```
 
-- **Domain models** define Paper, Search, ResearchQuestion, Assessment, Citation, SnowballRun as Pydantic models
-- **Repository ports** are Python Protocol classes — swap SQLite for Postgres without touching services
+- **Domain models** define `Paper`, `Search`, `ResearchQuestion`, `Assessment`, `Citation`, `SnowballRun`
+- **Repository ports** are traits — SQLite today, swap for Postgres without touching services
 - **Source adapters** run in parallel with retry/backoff; partial failures don't abort the search
-- **Dedup engine** merges candidates by DOI (exact) then title similarity (Jaccard), filling metadata gaps across sources
+- **Dedup engine** validates and normalizes DOIs, merges by DOI (exact) then title similarity (Jaccard), filling metadata gaps across sources
 - **Snowball service** chains citations with relevance-gated traversal, depth limiting, and deduplication
 
 ## Data model
@@ -309,21 +374,52 @@ Paper -< Citation >- Paper
 
 ## Development
 
-Requires Python >= 3.12.
+Requires a stable Rust toolchain.
 
 ```bash
-# Set up
-pip install -e ".[dev,tui]"
+# Build
+cargo build
 
-# Run tests
-pytest
+# Run the binary without installing
+cargo run -- search "PET tracer"
 
-# Run tests with coverage
-pytest --cov=scitadel
+# Run tests (workspace-wide)
+cargo test --workspace
+
+# Lint
+cargo clippy --workspace --all-targets
+cargo fmt --all --check
 ```
 
-140 tests across domain models, config, repositories, adapters, services, scoring, snowball, TUI, MCP tools, and CLI integration. 13 additional contract tests hit real APIs (run with `pytest -m contract`).
+## Prebuilt binaries
+
+Every tagged release attaches tarballs for Linux x86_64, macOS x86_64, and
+macOS arm64 to the [Releases page](https://github.com/vig-os/scitadel/releases).
+Download the one for your platform, extract, and put the `scitadel` binary on
+your `$PATH`:
+
+```sh
+# Example for macOS arm64 (Apple Silicon)
+curl -L https://github.com/vig-os/scitadel/releases/latest/download/scitadel-X.Y.Z-aarch64-apple-darwin.tar.gz \
+  | tar xz
+sudo mv scitadel-X.Y.Z-aarch64-apple-darwin/scitadel /usr/local/bin/
+scitadel --version
+```
+
+Each release also ships a `.sha256` file next to each tarball — verify with
+`shasum -a 256 -c <file>.sha256`.
 
 ## License
 
-See [LICENSE](LICENSE).
+Dual-licensed under either of
+
+- [Apache License 2.0](LICENSE-APACHE)
+- [MIT License](LICENSE-MIT)
+
+at your option.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.

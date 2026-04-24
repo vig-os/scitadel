@@ -1,15 +1,33 @@
+use std::collections::HashSet;
+
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
-use ratatui::Frame;
 
-use scitadel_core::models::Paper;
+use scitadel_core::models::{DownloadStatus, Paper};
 
 use crate::data::DataStore;
+use crate::views::util::truncate;
 
-pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, selected: usize) {
+pub fn draw(
+    frame: &mut Frame,
+    area: Rect,
+    data: &DataStore,
+    selected: usize,
+    starred: &HashSet<String>,
+    downloading: &HashSet<String>,
+) {
     let papers = data.load_papers(1000, 0).unwrap_or_default();
-    render_paper_table(frame, area, &papers, selected, " Papers ");
+    render_paper_table(
+        frame,
+        area,
+        &papers,
+        selected,
+        " Papers ",
+        starred,
+        downloading,
+    );
 }
 
 pub fn draw_for_search(
@@ -18,10 +36,31 @@ pub fn draw_for_search(
     data: &DataStore,
     search_id: &str,
     selected: usize,
+    starred: &HashSet<String>,
+    downloading: &HashSet<String>,
 ) {
     let papers = data.load_papers_for_search(search_id).unwrap_or_default();
-    let title = format!(" Papers for search {} ", &search_id[..search_id.len().min(8)]);
-    render_paper_table(frame, area, &papers, selected, &title);
+    let title = format!(
+        " Papers for search {} ",
+        search_id.chars().take(8).collect::<String>()
+    );
+    render_paper_table(frame, area, &papers, selected, &title, starred, downloading);
+}
+
+/// Returns (symbol, color) for the Papers-table state column.
+/// `↻` if a download is currently running for this paper, otherwise
+/// derived from the persisted `download_status` (#112).
+fn download_cell(paper: &Paper, downloading: &HashSet<String>) -> (&'static str, Color) {
+    let t = crate::theme::theme();
+    if downloading.contains(paper.id.as_str()) {
+        return ("↻", t.warning);
+    }
+    match paper.download_status {
+        Some(DownloadStatus::Downloaded) => ("✓", t.success),
+        Some(DownloadStatus::Paywall) => ("⊘", t.warning),
+        Some(DownloadStatus::Failed) => ("✗", t.danger),
+        None => (" ", t.muted),
+    }
 }
 
 fn render_paper_table(
@@ -30,9 +69,13 @@ fn render_paper_table(
     papers: &[Paper],
     selected: usize,
     title: &str,
+    starred: &HashSet<String>,
+    downloading: &HashSet<String>,
 ) {
     if papers.is_empty() {
-        let block = Block::default().title(title.to_string()).borders(Borders::ALL);
+        let block = Block::default()
+            .title(title.to_string())
+            .borders(Borders::ALL);
         let empty = Paragraph::new("No papers found.").block(block);
         frame.render_widget(empty, area);
         return;
@@ -40,13 +83,15 @@ fn render_paper_table(
 
     let header = Row::new(vec![
         Cell::from("#"),
+        Cell::from(""),
+        Cell::from(""),
         Cell::from("Title"),
         Cell::from("Authors"),
         Cell::from("Year"),
     ])
     .style(
         Style::default()
-            .fg(Color::Yellow)
+            .fg(crate::theme::theme().emphasis)
             .add_modifier(Modifier::BOLD),
     );
 
@@ -55,12 +100,18 @@ fn render_paper_table(
         .enumerate()
         .map(|(i, p)| {
             let authors = format_authors(&p.authors);
-            let year = p
-                .year
-                .map_or_else(|| "—".to_string(), |y| y.to_string());
+            let year = p.year.map_or_else(|| "—".to_string(), |y| y.to_string());
+            let star = if starred.contains(p.id.as_str()) {
+                "★"
+            } else {
+                " "
+            };
+            let (dl_symbol, dl_color) = download_cell(p, downloading);
 
             Row::new(vec![
                 Cell::from((i + 1).to_string()),
+                Cell::from(star).style(Style::default().fg(crate::theme::theme().emphasis)),
+                Cell::from(dl_symbol).style(Style::default().fg(dl_color)),
                 Cell::from(truncate(&p.title, 60)),
                 Cell::from(truncate(&authors, 30)),
                 Cell::from(year),
@@ -70,6 +121,8 @@ fn render_paper_table(
 
     let widths = [
         Constraint::Length(5),
+        Constraint::Length(2),
+        Constraint::Length(2),
         Constraint::Min(30),
         Constraint::Length(32),
         Constraint::Length(6),
@@ -77,10 +130,14 @@ fn render_paper_table(
 
     let table = Table::new(rows, widths)
         .header(header)
-        .block(Block::default().title(title.to_string()).borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(title.to_string())
+                .borders(Borders::ALL),
+        )
         .row_highlight_style(
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(crate::theme::theme().selection_bg)
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -95,13 +152,5 @@ fn format_authors(authors: &[String]) -> String {
         1 => authors[0].clone(),
         2 => format!("{}, {}", authors[0], authors[1]),
         _ => format!("{}, {} et al.", authors[0], authors[1]),
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max.saturating_sub(3)])
     }
 }

@@ -1,3 +1,6 @@
+pub mod extract;
+#[allow(clippy::unused_self, clippy::needless_pass_by_value)]
+pub mod server;
 pub mod tools;
 
 use scitadel_core::config::load_config;

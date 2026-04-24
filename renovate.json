@@ -1,0 +1,7 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "github>vig-os/scitadel//.github/renovate-default"
+  ],
+  "enabledManagers": ["github-actions", "pep621", "uv", "npm"]
+}

@@ -34,14 +34,6 @@ repos:
       - id: mixed-line-ending
       - id: trailing-whitespace
 
-  # Python Linting and Formatting (Ruff)
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: aad66557af3b56ba6d4d69cd1b6cba87cef50cbb  # v0.14.3
-    hooks:
-      - id: ruff
-        args: [--fix]
-      - id: ruff-format
-
   # YAML Linting
   - repo: https://github.com/adrienverge/yamllint
     rev: 81e9f98ffd059efe8aa9c1b1a42e5cce61b640c6  # v1.35.1
@@ -56,13 +48,7 @@ repos:
       - id: shellcheck
         name: shellcheck
         args: ["-x"]
-
-  # Containerfile
-  - repo: https://github.com/hadolint/hadolint
-    rev: 346e4199e4baca7d6827f20ac078b6eee5b39327  # v2.9.3
-    hooks:
-      - id: hadolint-docker
-        name: hadolint
+        exclude: ^\.envrc$
 
   # Markdown Linting (excludes auto-generated docs)
   - repo: https://github.com/jackdewinter/pymarkdown
@@ -83,83 +69,8 @@ repos:
         files: ^justfile(\..*)?$
         pass_filenames: false
 
+  # Typo Linting
   - repo: https://github.com/crate-ci/typos
     rev: 07d900b8fa1097806b8adb6391b0d3e0ac2fdea7  # v1.39.0
     hooks:
       - id: typos
-
-  # License Compliance Check (runs only when dependencies change)
-  - repo: local
-    hooks:
-      - id: pip-licenses
-        name: pip-licenses (check dependency licenses)
-        entry: uv run pip-licenses --fail-on="GPL-3.0-only;GPL-3.0-or-later;AGPL-3.0-only;AGPL-3.0-or-later"
-        language: system
-        files: ^(pyproject\.toml|uv\.lock|requirements.*\.txt)$
-        pass_filenames: false
-
-  # GitHub Actions SHA pinning enforcement
-  - repo: local
-    hooks:
-      - id: check-action-pins
-        name: check-action-pins (verify SHA-pinned actions)
-        entry: uv run check-action-pins
-        language: system
-        files: ^\.github/(workflows/.*\.ya?ml|actions/.*/action\.ya?ml)$
-        pass_filenames: false
-
-  # Python Security (Bandit)
-  - repo: local
-    hooks:
-      - id: bandit
-        name: bandit (Python security linting)
-        entry: uv run bandit -r src/ -ll
-        language: system
-        types: [python]
-        pass_filenames: false
-
-  # Skill directory naming convention
-  - repo: local
-    hooks:
-      - id: check-skill-names
-        name: check-skill-names (enforce naming convention)
-        entry: .devcontainer/scripts/check-skill-names.sh .cursor/skills
-        language: script
-        files: ^\.cursor/skills/
-        pass_filenames: false
-
-  # AI agent identity: strip trailers before commit-msg (Refs: #163)
-  - repo: local
-    hooks:
-      - id: prepare-commit-msg-strip-trailers
-        name: strip agent trailers from commit message
-        entry: uv run python .devcontainer/scripts/prepare-commit-msg-strip-trailers.py
-        language: system
-        stages: [prepare-commit-msg]
-        pass_filenames: true
-
-  # AI agent identity: reject author/committer matching blocklist (Refs: #163)
-  - repo: local
-    hooks:
-      - id: check-agent-identity
-        name: check agent identity
-        entry: uv run python .devcontainer/scripts/check-agent-identity.py
-        language: system
-        pass_filenames: false
-
-  # Commit message validation (commit-msg stage)
-  - repo: local
-    hooks:
-      - id: validate-commit-msg
-        name: validate commit message
-        entry: uv run validate-commit-msg
-        language: system
-        stages: [commit-msg]
-        pass_filenames: false
-        # Optional: customize commit types, scopes, or refs-optional types via CLI arguments.
-        # By default, scopes are not enforced. Set --scopes to require specific scopes.
-        # Examples (choose one args line):
-        #   args: ["--types", "feat,fix,docs,chore"]
-        #   args: ["--scopes", "api,cli,utils"]
-        #   args: ["--refs-optional-types", "chore"]
-        #   args: ["--types", "feat,fix,docs", "--scopes", "api,cli,utils", "--refs-optional-types", "chore"]

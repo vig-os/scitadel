@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "scitadel": {
+      "type": "stdio",
+      "command": "scitadel",
+      "args": ["mcp"]
+    }
+  }
+}

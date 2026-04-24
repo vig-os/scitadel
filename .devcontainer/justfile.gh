@@ -8,9 +8,96 @@
 
 alias gh-i := gh-issues
 
-_gh_scripts := source_directory() / "scripts"
-
 # List open issues and PRs grouped by milestone
 [group('github')]
 gh-issues:
-    uv run python {{ _gh_scripts }}/gh_issues.py
+    #!/usr/bin/env bash
+    gh-issues
+
+# -------------------------------------------------------------------------------
+# GIT HELPERS
+# -------------------------------------------------------------------------------
+
+# Pretty one-line git log (last 20 commits)
+[group('git')]
+log:
+    git log --oneline -20
+
+# Show current branch + list recent branches
+[group('git')]
+branch:
+    #!/usr/bin/env bash
+    echo "Current: $(git branch --show-current)"
+    echo ""
+    echo "Recent branches:"
+    git branch -a | head -15
+
+# -------------------------------------------------------------------------------
+# RELEASE WORKFLOW DISPATCH HELPERS
+# -------------------------------------------------------------------------------
+
+# Prepare release branch for testing (step 1)
+[group('release')]
+prepare-release version ref="" *flags:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Trigger the prepare-release workflow via GitHub Actions
+    # The workflow handles: validate inputs, create release branch, prepare CHANGELOG, create draft PR
+    REF="{{ ref }}"
+    if [ -z "$REF" ]; then
+        REF="dev"
+    fi
+    gh workflow run prepare-release.yml --ref "$REF" -f "version={{ version }}" {{ flags }}
+    echo ""
+    echo "✓ Release preparation workflow triggered for version {{ version }}"
+    echo "Monitor progress: gh run list --workflow prepare-release.yml"
+
+# Finalize and publish release via GitHub Actions workflow (step 3, after testing)
+[group('release')]
+finalize-release version ref="" *flags:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Trigger the release workflow via GitHub Actions
+    # The workflow handles: finalize CHANGELOG, create final tag, publish
+    REF="{{ ref }}"
+    if [ -z "$REF" ]; then
+        REF="release/{{ version }}"
+    fi
+    gh workflow run release.yml --ref "$REF" -f "version={{ version }}" -f "release-kind=final" {{ flags }}
+    echo ""
+    echo "✓ Release workflow triggered for version {{ version }}"
+    echo "Monitor progress: gh run list --workflow release.yml"
+
+# Promote final release: publish draft GitHub Release, merge release PR
+[group('release')]
+promote-release version ref="" *flags:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    REF="{{ ref }}"
+    if [ -z "$REF" ]; then
+        REF="release/{{ version }}"
+    fi
+    gh workflow run promote-release.yml --ref "$REF" -f "version={{ version }}" {{ flags }}
+    echo ""
+    echo "✓ Promote-release workflow triggered for version {{ version }}"
+    echo "Monitor progress: gh run list --workflow promote-release.yml"
+
+# Publish release candidate via GitHub Actions workflow
+[group('release')]
+publish-candidate version ref="" create-release="false" *flags:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Trigger release workflow in candidate mode (default mode in workflow)
+    REF="{{ ref }}"
+    if [ -z "$REF" ]; then
+        REF="release/{{ version }}"
+    fi
+    gh workflow run release.yml --ref "$REF" -f "version={{ version }}" -f "release-kind=candidate" -f "create-release={{ create-release }}" {{ flags }}
+    echo ""
+    echo "✓ Candidate release workflow triggered for version {{ version }}"
+    echo "Monitor progress: gh run list --workflow release.yml"
+
+# Reset CHANGELOG Unreleased section (after merging release to dev)
+[group('release')]
+reset-changelog:
+    prepare-changelog reset CHANGELOG.md

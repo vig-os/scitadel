@@ -18,11 +18,7 @@ pub trait Scorer: Send + Sync {
     /// Score multiple papers with optional progress callback.
     ///
     /// Default implementation calls `score_paper` in a loop.
-    async fn score_papers(
-        &self,
-        papers: &[Paper],
-        question: &ResearchQuestion,
-    ) -> Vec<Assessment> {
+    async fn score_papers(&self, papers: &[Paper], question: &ResearchQuestion) -> Vec<Assessment> {
         let mut assessments = Vec::new();
         let total = papers.len();
 

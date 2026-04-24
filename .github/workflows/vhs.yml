@@ -1,0 +1,185 @@
+name: VHS
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev, main]
+
+env:
+  CARGO_TERM_COLOR: always
+  VHS_VERSION: "0.11.0"
+
+jobs:
+  tapes:
+    name: Run tapes
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install ffmpeg + ttyd
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg ttyd
+
+      - name: Install vhs
+        run: |
+          curl -fsSL \
+            "https://github.com/charmbracelet/vhs/releases/download/v${VHS_VERSION}/vhs_${VHS_VERSION}_amd64.deb" \
+            -o vhs.deb
+          sudo dpkg -i vhs.deb
+          vhs --version
+
+      - name: Build scitadel
+        run: cargo build --release -p scitadel-cli
+
+      - name: Run all tapes
+        run: |
+          set -euo pipefail
+          export PATH="$PWD/target/release:$PATH"
+          shopt -s nullglob
+          tapes=(tests/vhs/*.tape)
+          if [ ${#tapes[@]} -eq 0 ]; then
+            echo "No tapes under tests/vhs/. Nothing to run."
+            exit 0
+          fi
+          mkdir -p tests/vhs/snapshots
+          failed=()
+          for tape in "${tapes[@]}"; do
+            echo "::group::$tape"
+            if vhs "$tape"; then
+              echo "::endgroup::"
+            else
+              echo "::endgroup::"
+              failed+=("$tape")
+            fi
+          done
+          if [ ${#failed[@]} -gt 0 ]; then
+            echo "::error::${#failed[@]} tape(s) failed: ${failed[*]}"
+            exit 1
+          fi
+          echo "All ${#tapes[@]} tape(s) ran cleanly."
+
+      - name: Assert tapes produced distinct snapshots
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          # The hard failure case is "all snapshots identical" — that's the
+          # bug class (#97 silent reader failure) this gate exists to catch.
+          # "Fewer PNGs than declared" is a warning: it can be genuine vhs /
+          # runner-timing flakiness rather than a real bug, and we don't
+          # want to wedge merges on it.
+          dead=()
+          for tape in tests/vhs/*.tape; do
+            base=$(basename "$tape" .tape)
+            dir="tests/vhs/snapshots/$base"
+            declared=$(grep -c '^Screenshot ' "$tape" || true)
+            # Tapes that take 0 or 1 screenshots can't be checked for diversity.
+            if [ "$declared" -le 1 ]; then
+              continue
+            fi
+            produced=$(find "$dir" -maxdepth 1 -name '*.png' 2>/dev/null | wc -l | tr -d ' ')
+            if [ "$produced" -lt 2 ]; then
+              echo "::warning::$tape declared $declared screenshots but only $produced produced"
+              continue
+            fi
+            if [ "$produced" -lt "$declared" ]; then
+              echo "::warning::$tape declared $declared screenshots but only $produced produced (will still check distinctness)"
+            fi
+            unique=$(md5sum "$dir"/*.png | awk '{print $1}' | sort -u | wc -l | tr -d ' ')
+            if [ "$unique" -lt 2 ]; then
+              # CI runners have variable load — a tape can flake on
+              # multiple consecutive renders when the runner is under
+              # heavy contention. Re-render up to 3 times before
+              # declaring failure. A real rendering bug (#97-class
+              # silent failure) will fail all attempts; a timing flake
+              # rarely repeats four times in a row.
+              pass=0
+              for attempt in 1 2 3; do
+                echo "::warning::$tape all-identical on render $((attempt)); retrying"
+                rm -f "$dir"/*.png
+                if ! vhs "$tape"; then
+                  continue
+                fi
+                unique_retry=$(md5sum "$dir"/*.png 2>/dev/null | awk '{print $1}' | sort -u | wc -l | tr -d ' ')
+                if [ "$unique_retry" -ge 2 ]; then
+                  produced_retry=$(find "$dir" -maxdepth 1 -name '*.png' 2>/dev/null | wc -l | tr -d ' ')
+                  echo "ok (retry $attempt): $tape — $produced_retry screenshots, $unique_retry distinct"
+                  pass=1
+                  break
+                fi
+              done
+              if [ "$pass" -eq 0 ]; then
+                echo "::error::$tape produced byte-identical screenshots on 4 consecutive renders — feature did not render anything"
+                dead+=("$tape (all snapshots identical, 4x)")
+              fi
+            else
+              echo "ok: $tape — $produced screenshots, $unique distinct"
+            fi
+          done
+          if [ ${#dead[@]} -gt 0 ]; then
+            echo "::error::${#dead[@]} tape(s) failed the distinct-snapshot check:"
+            printf '  - %s\n' "${dead[@]}"
+            exit 1
+          fi
+
+      - name: Upload tape artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vhs-snapshots
+          path: tests/vhs/snapshots/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  coverage:
+    name: Tape coverage
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch base ref
+        run: git fetch origin "${{ github.base_ref }}"
+
+      - name: Check that TUI/CLI changes include a VHS tape
+        run: |
+          set -euo pipefail
+          BASE="origin/${{ github.base_ref }}"
+          CHANGED=$(git diff --name-only "$BASE"...HEAD)
+          echo "Changed files:"
+          echo "$CHANGED" | sed 's/^/  /'
+
+          TUI_CHANGED=$(echo "$CHANGED" | grep -E '^crates/scitadel-(tui|cli)/src/' || true)
+          TAPE_CHANGED=$(echo "$CHANGED" | grep -E '^tests/vhs/.*\.tape$' || true)
+
+          if [ -z "$TUI_CHANGED" ]; then
+            echo "No TUI/CLI source touched — tape coverage gate skipped."
+            exit 0
+          fi
+
+          if [ -n "$TAPE_CHANGED" ]; then
+            echo "TUI/CLI changed and at least one tape was added/updated:"
+            echo "$TAPE_CHANGED" | sed 's/^/  /'
+            exit 0
+          fi
+
+          # Escape hatch for infra-only PRs that legitimately don't need a tape.
+          if git log --format=%B "$BASE"..HEAD | grep -qE '\[tape-exempt:'; then
+            echo "Tape exemption found in commit message — allowing:"
+            git log --format=%B "$BASE"..HEAD | grep -E '\[tape-exempt:' | sed 's/^/  /'
+            exit 0
+          fi
+
+          echo "::error::TUI or CLI source changed but no VHS tape was added or updated."
+          echo "Add a tape under tests/vhs/ that exercises the change, or include"
+          echo '[tape-exempt: <reason>] in a commit message if the change is'
+          echo "genuinely not user-visible (refactor, internal helper, etc.)."
+          exit 1

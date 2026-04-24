@@ -10,10 +10,10 @@
 use scitadel_core::config::load_config;
 use scitadel_core::models::{Assessment, Paper, ResearchQuestion, SearchTerm};
 use scitadel_core::ports::{
-    AssessmentRepository, PaperRepository, QuestionRepository, SearchRepository,
+    AssessmentRepository, CitationRepository, PaperRepository, QuestionRepository, SearchRepository,
 };
 use scitadel_db::sqlite::Database;
-use scitadel_scoring::{build_user_prompt, SCORING_SYSTEM_PROMPT};
+use scitadel_scoring::{SCORING_SYSTEM_PROMPT, build_user_prompt};
 
 fn open_db() -> Result<Database, String> {
     let config = load_config();
@@ -48,7 +48,9 @@ pub async fn search_tool(
         );
 
         if query.is_none() {
-            let terms = q_repo.get_terms(question.id.as_str()).map_err(|e| e.to_string())?;
+            let terms = q_repo
+                .get_terms(question.id.as_str())
+                .map_err(|e| e.to_string())?;
             if terms.is_empty() {
                 return Err(format!(
                     "No search terms linked to question '{}'.",
@@ -68,10 +70,14 @@ pub async fn search_tool(
 
     let query = query.ok_or("Provide a query or question_id with linked search terms.")?;
 
-    let adapters = scitadel_adapters::build_adapters(
+    let adapters = scitadel_adapters::build_adapters_full(
         &source_list,
         &config.pubmed.api_key,
         &config.openalex.api_key,
+        &config.patentsview.api_key,
+        &config.lens.api_key,
+        &config.epo.consumer_key,
+        &config.epo.consumer_secret,
     )
     .map_err(|e| e.to_string())?;
 
@@ -85,17 +91,22 @@ pub async fn search_tool(
     let db = open_db()?;
     let (paper_repo, search_repo, _, _, _) = db.repositories();
 
-    paper_repo.save_many(&papers).map_err(|e| e.to_string())?;
-    search_repo.save(&search_record).map_err(|e| e.to_string())?;
+    let id_remap = paper_repo.save_many(&papers).map_err(|e| e.to_string())?;
+    search_repo
+        .save(&search_record)
+        .map_err(|e| e.to_string())?;
 
     for sr in &mut search_results {
         sr.search_id = search_record.id.clone();
+        if let Some(new_id) = id_remap.get(&sr.paper_id) {
+            sr.paper_id = new_id.clone();
+        }
     }
     search_repo
         .save_results(&search_results)
         .map_err(|e| e.to_string())?;
 
-    let outcomes: Vec<String> = search_record
+    let outcome_lines: Vec<String> = search_record
         .source_outcomes
         .iter()
         .map(|o| {
@@ -106,20 +117,36 @@ pub async fn search_tool(
         })
         .collect();
 
-    Ok(format!(
+    let summary = format!(
         "Search ID: {}\nQuery: {query}\nSources: {}\nTotal candidates: {}\nUnique papers after dedup: {}\n{}",
         search_record.id,
         source_list.join(", "),
         search_record.total_candidates,
         papers.len(),
-        outcomes.join("\n")
-    ))
+        outcome_lines.join("\n")
+    );
+
+    // Structured payload: agents introspect per-source status + counts
+    // without parsing the summary string. `summary` field kept so
+    // existing string-consuming clients keep working.
+    let payload = serde_json::json!({
+        "search_id": search_record.id.as_str(),
+        "query": search_record.query,
+        "sources": search_record.source_outcomes,
+        "total_candidates": search_record.total_candidates,
+        "total_unique_papers": papers.len(),
+        "summary": summary,
+    });
+
+    serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())
 }
 
 pub fn list_searches_tool(limit: i64) -> Result<String, String> {
     let db = open_db()?;
     let (_, search_repo, _, _, _) = db.repositories();
-    let searches = search_repo.list_searches(limit).map_err(|e| e.to_string())?;
+    let searches = search_repo
+        .list_searches(limit)
+        .map_err(|e| e.to_string())?;
 
     if searches.is_empty() {
         return Ok("No search history found.".into());
@@ -176,17 +203,19 @@ pub fn get_papers_tool(search_id: &str) -> Result<String, String> {
     )];
 
     for (i, p) in papers.iter().enumerate() {
-        let authors = p.authors.iter().take(3).cloned().collect::<Vec<_>>().join("; ");
+        let authors = p
+            .authors
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ");
         let authors_suffix = if p.authors.len() > 3 {
             format!(" et al. ({} total)", p.authors.len())
         } else {
             String::new()
         };
-        let abstract_preview = if p.r#abstract.len() > 300 {
-            format!("{}...", &p.r#abstract[..300])
-        } else {
-            p.r#abstract.clone()
-        };
+        let (abstract_preview, _) = truncate_abstract(&p.r#abstract, 300);
 
         out.push(format!(
             "[{}] {}\n    Authors: {}{}\n    Year: {}  Journal: {}\n    DOI: {}  ID: {}\n    Abstract: {}\n",
@@ -252,7 +281,10 @@ pub fn create_question_tool(text: &str, description: &str) -> Result<String, Str
     question.description = description.to_string();
     q_repo.save_question(&question).map_err(|e| e.to_string())?;
 
-    Ok(format!("Question created: {}\nText: {text}", question.id.short()))
+    Ok(format!(
+        "Question created: {}\nText: {text}",
+        question.id.short()
+    ))
 }
 
 pub fn list_questions_tool() -> Result<String, String> {
@@ -282,7 +314,7 @@ pub fn list_questions_tool() -> Result<String, String> {
 pub fn add_search_terms_tool(
     question_id: &str,
     terms: &[String],
-    query_string: &str,
+    query_string: Option<&str>,
 ) -> Result<String, String> {
     let db = open_db()?;
     let (_, _, q_repo, _, _) = db.repositories();
@@ -292,10 +324,9 @@ pub fn add_search_terms_tool(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Question '{question_id}' not found."))?;
 
-    let query_str = if query_string.is_empty() {
-        terms.join(" ")
-    } else {
-        query_string.to_string()
+    let query_str = match query_string {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => terms.join(" "),
     };
 
     let mut term = SearchTerm::new(question.id.clone());
@@ -375,7 +406,10 @@ pub fn get_assessments_tool(
                 .get(a.paper_id.as_str())
                 .ok()
                 .flatten()
-                .map_or_else(|| "Unknown".into(), |p| p.title[..p.title.len().min(50)].to_string());
+                .map_or_else(
+                    || "Unknown".into(),
+                    |p| p.title[..p.title.len().min(50)].to_string(),
+                );
             format!(
                 "Score: {:.2}  Paper: {}  Assessor: {}  {}\n  Reasoning: {}",
                 a.score,
@@ -435,9 +469,7 @@ pub fn save_assessment_tool(
     reasoning: &str,
 ) -> Result<String, String> {
     if !(0.0..=1.0).contains(&score) {
-        return Err(format!(
-            "Score must be between 0.0 and 1.0, got {score:.2}"
-        ));
+        return Err(format!("Score must be between 0.0 and 1.0, got {score:.2}"));
     }
 
     let db = open_db()?;
@@ -467,6 +499,355 @@ pub fn save_assessment_tool(
         &question.text[..question.text.len().min(60)],
         &reasoning[..reasoning.len().min(200)]
     ))
+}
+
+/// Download a paper. If `paper_id` is provided, uses the full multi-source chain
+/// (arxiv → openalex → doi/Unpaywall → publisher) against the stored Paper record.
+/// Otherwise falls back to DOI-only.
+pub async fn download_paper_tool(
+    paper_id: Option<&str>,
+    doi: Option<&str>,
+    output_dir: Option<&str>,
+) -> Result<String, String> {
+    let config = load_config();
+    let out_dir = output_dir.map_or_else(|| config.papers_dir(), std::path::PathBuf::from);
+
+    let downloader =
+        scitadel_adapters::download::PaperDownloader::new(config.openalex.api_key.clone(), 60.0);
+
+    let result = if let Some(pid) = paper_id {
+        let db = open_db()?;
+        let (paper_repo, _, _, _, _) = db.repositories();
+        let paper = paper_repo
+            .get(pid)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("paper not found: {pid}"))?;
+        downloader
+            .download_paper(&paper, &out_dir)
+            .await
+            .map_err(|e| e.to_string())?
+    } else if let Some(d) = doi {
+        downloader
+            .download(d, &out_dir)
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        return Err("need either paper_id or doi".into());
+    };
+
+    Ok(format!(
+        "Downloaded paper: {}\nFormat: {}\nSource: {}\nAccess: {}\nSize: {} bytes\nPath: {}",
+        result.doi,
+        result.format,
+        result.source,
+        result.access,
+        result.bytes,
+        result.path.display()
+    ))
+}
+
+/// Extract text from a paper's downloaded file (PDF or HTML).
+///
+/// Looks up the paper in the DB, locates its cached file under `papers_dir()`,
+/// and returns the extracted text. Truncated to `max_chars` (default 20_000) to
+/// keep responses manageable for the host LLM.
+pub async fn read_paper_tool(paper_id: &str, max_chars: Option<usize>) -> Result<String, String> {
+    let config = load_config();
+    let db = open_db()?;
+    let (paper_repo, _, _, _, _) = db.repositories();
+    let paper = paper_repo
+        .get(paper_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("paper not found: {paper_id}"))?;
+
+    // Cache hit: skip the (slow) PDF extract if the text was already
+    // persisted on a previous call. Same envelope as the cold path.
+    let mut text: Option<String> = paper.full_text.clone();
+    let mut path: Option<std::path::PathBuf> = None;
+
+    let mut extractor: Option<&'static str> = None;
+    if text.is_none() {
+        let p = scitadel_adapters::download::find_cached_file(&paper, &config.papers_dir())
+            .ok_or_else(|| "paper not downloaded yet. Call download_paper first.".to_string())?;
+        let extracted = match p.extension().and_then(|e| e.to_str()) {
+            Some("pdf") => {
+                // Layout-aware pdftotext when available, else
+                // pdf-extract — see crate::extract for rationale (#145).
+                let (body, used) = crate::extract::extract_pdf_text(&p).await?;
+                extractor = Some(used.as_str());
+                body
+            }
+            Some("html") => {
+                let bytes = tokio::fs::read(&p).await.map_err(|e| e.to_string())?;
+                let html = String::from_utf8_lossy(&bytes);
+                extractor = Some("html2text");
+                html_to_text(&html)
+            }
+            other => return Err(format!("unsupported file type: {other:?}")),
+        };
+        // Persist so future reads hit the cache (and the TUI two-pane
+        // reader has something to render). Failure is non-fatal; we
+        // still return what we just extracted.
+        if let Err(e) = paper_repo.update_full_text(paper_id, &extracted) {
+            tracing::warn!(paper_id, error = %e, "failed to cache full_text");
+        }
+        path = Some(p);
+        text = Some(extracted);
+    }
+
+    let path_display = path
+        .as_ref()
+        .map_or_else(|| "(cached in db)".to_string(), |p| p.display().to_string());
+    let text = text.expect("text populated above");
+
+    let limit = max_chars.unwrap_or(20_000);
+    let truncated = if text.chars().count() > limit {
+        let head: String = text.chars().take(limit).collect();
+        format!(
+            "{head}\n\n[... truncated, {} of {} chars shown ...]",
+            limit,
+            text.chars().count()
+        )
+    } else {
+        text
+    };
+
+    let extractor_line = extractor.map_or_else(String::new, |e| format!("Extractor: {e}\n"));
+    Ok(format!(
+        "Paper: {}\nPath: {}\n{extractor_line}\n{}",
+        paper.title, path_display, truncated
+    ))
+}
+
+// ---------- Citation graph (#59 iter 1) ----------
+
+/// Fetch the OpenAlex `referenced_works` for a paper, materialise each
+/// cited work as a `Paper` row, and persist the citation edges. Returns
+/// JSON: `{ source_paper_id, count, references: [paper rows...] }`.
+///
+/// Iter 1 of #59. Forward-citation only (cited_by + snowball
+/// orchestration ship in later iters). Idempotent: existing papers
+/// upsert on the OpenAlex id, citation edges have a uniqueness
+/// constraint so re-runs are no-ops.
+pub async fn get_references_tool(paper_id: &str) -> Result<String, String> {
+    let stored = fetch_and_store_references(paper_id).await?;
+    let entries: Vec<serde_json::Value> = stored
+        .papers
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "id": p.id.as_str(),
+                "title": p.title,
+                "authors": p.authors,
+                "year": p.year,
+                "doi": p.doi,
+                "openalex_id": p.openalex_id,
+            })
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "source_paper_id": paper_id,
+        "count": stored.papers.len(),
+        "references": entries,
+    });
+    serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())
+}
+
+/// Fetch the works that cite a given paper (`cited_by` direction).
+/// Mirrors `get_references_tool`; bounded by `limit` (default 25, cap
+/// 200 per the OpenAlex API).
+pub async fn get_citations_tool(paper_id: &str, limit: Option<usize>) -> Result<String, String> {
+    let stored = fetch_and_store_citations(paper_id, limit.unwrap_or(25)).await?;
+    let entries: Vec<serde_json::Value> = stored
+        .papers
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "id": p.id.as_str(),
+                "title": p.title,
+                "authors": p.authors,
+                "year": p.year,
+                "doi": p.doi,
+                "openalex_id": p.openalex_id,
+            })
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "source_paper_id": paper_id,
+        "count": stored.papers.len(),
+        "citations": entries,
+    });
+    serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())
+}
+
+struct CitationFetchOutcome {
+    papers: Vec<scitadel_core::models::Paper>,
+}
+
+async fn fetch_and_store_references(paper_id: &str) -> Result<CitationFetchOutcome, String> {
+    let config = load_config();
+    let db = open_db()?;
+    let (paper_repo, _, _, _, citation_repo) = db.repositories();
+
+    let source_paper = paper_repo
+        .get(paper_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Paper '{paper_id}' not found."))?;
+    let source_openalex = source_paper.openalex_id.clone().ok_or_else(|| {
+        format!("Paper '{paper_id}' has no openalex_id; reference fetch needs it.")
+    })?;
+
+    let adapter =
+        scitadel_adapters::openalex::OpenAlexAdapter::new(config.openalex.api_key.clone(), 30.0);
+    let work = adapter
+        .fetch_work_by_id(&source_openalex)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let referenced_ids: Vec<String> = work
+        .get("referenced_works")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .filter_map(scitadel_adapters::openalex::short_openalex_id)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    materialise_and_link(
+        &paper_repo,
+        &citation_repo,
+        &adapter,
+        paper_id,
+        &referenced_ids,
+        scitadel_core::models::CitationDirection::References,
+    )
+    .await
+}
+
+async fn fetch_and_store_citations(
+    paper_id: &str,
+    limit: usize,
+) -> Result<CitationFetchOutcome, String> {
+    let config = load_config();
+    let db = open_db()?;
+    let (paper_repo, _, _, _, citation_repo) = db.repositories();
+
+    let source_paper = paper_repo
+        .get(paper_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Paper '{paper_id}' not found."))?;
+    let source_openalex = source_paper.openalex_id.clone().ok_or_else(|| {
+        format!("Paper '{paper_id}' has no openalex_id; citation fetch needs it.")
+    })?;
+
+    let adapter =
+        scitadel_adapters::openalex::OpenAlexAdapter::new(config.openalex.api_key.clone(), 30.0);
+
+    let citing_works = adapter
+        .fetch_cited_by(&source_openalex, limit)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut citing_ids: Vec<String> = Vec::with_capacity(citing_works.len());
+    for work in &citing_works {
+        if let Some(id) = work
+            .get("id")
+            .and_then(|v| v.as_str())
+            .and_then(scitadel_adapters::openalex::short_openalex_id)
+        {
+            citing_ids.push(id);
+        }
+    }
+
+    // Persist the works inline (we already have the metadata).
+    let papers: Vec<scitadel_core::models::Paper> = citing_works
+        .iter()
+        .map(scitadel_adapters::openalex::work_to_paper)
+        .collect();
+    paper_repo.save_many(&papers).map_err(|e| e.to_string())?;
+
+    let mut edges = Vec::with_capacity(citing_ids.len());
+    for cid in &citing_ids {
+        edges.push(scitadel_core::models::Citation {
+            source_paper_id: scitadel_core::models::PaperId::from(paper_id),
+            target_paper_id: scitadel_core::models::PaperId::from(cid.clone()),
+            direction: scitadel_core::models::CitationDirection::CitedBy,
+            discovered_by: "openalex".into(),
+            depth: 1,
+            snowball_run_id: None,
+        });
+    }
+    citation_repo.save_many(&edges).map_err(|e| e.to_string())?;
+    Ok(CitationFetchOutcome { papers })
+}
+
+async fn materialise_and_link(
+    paper_repo: &scitadel_db::sqlite::SqlitePaperRepository,
+    citation_repo: &scitadel_db::sqlite::SqliteCitationRepository,
+    adapter: &scitadel_adapters::openalex::OpenAlexAdapter,
+    source_paper_id: &str,
+    target_openalex_ids: &[String],
+    direction: scitadel_core::models::CitationDirection,
+) -> Result<CitationFetchOutcome, String> {
+    if target_openalex_ids.is_empty() {
+        return Ok(CitationFetchOutcome { papers: Vec::new() });
+    }
+    // Batch-fetch metadata in chunks of 50 (OpenAlex `openalex_id:`
+    // filter cap).
+    let mut all_papers: Vec<scitadel_core::models::Paper> = Vec::new();
+    for chunk in target_openalex_ids.chunks(50) {
+        let works = adapter
+            .fetch_works_by_ids(chunk)
+            .await
+            .map_err(|e| e.to_string())?;
+        for work in &works {
+            all_papers.push(scitadel_adapters::openalex::work_to_paper(work));
+        }
+    }
+    paper_repo
+        .save_many(&all_papers)
+        .map_err(|e| e.to_string())?;
+
+    let mut edges = Vec::with_capacity(all_papers.len());
+    for paper in &all_papers {
+        edges.push(scitadel_core::models::Citation {
+            source_paper_id: scitadel_core::models::PaperId::from(source_paper_id),
+            target_paper_id: paper.id.clone(),
+            direction: direction.clone(),
+            discovered_by: "openalex".into(),
+            depth: 1,
+            snowball_run_id: None,
+        });
+    }
+    citation_repo.save_many(&edges).map_err(|e| e.to_string())?;
+
+    Ok(CitationFetchOutcome { papers: all_papers })
+}
+
+fn html_to_text(html: &str) -> String {
+    let doc = scraper::Html::parse_document(html);
+    let mut text = String::new();
+    for node in doc.root_element().descendants() {
+        let Some(t) = node.value().as_text() else {
+            continue;
+        };
+        let skip_subtree = node.ancestors().any(|a| {
+            a.value()
+                .as_element()
+                .is_some_and(|el| matches!(el.name(), "script" | "style" | "noscript"))
+        });
+        if skip_subtree {
+            continue;
+        }
+        let trimmed = t.trim();
+        if !trimmed.is_empty() {
+            text.push_str(trimmed);
+            text.push(' ');
+        }
+    }
+    text
 }
 
 /// Prepare batch assessments for all papers in a search.
@@ -537,11 +918,7 @@ pub fn prepare_batch_assessments_tool(
         } else {
             String::new()
         };
-        let abstract_preview = if p.r#abstract.len() > 300 {
-            format!("{}...", &p.r#abstract[..300])
-        } else {
-            p.r#abstract.clone()
-        };
+        let (abstract_preview, _) = truncate_abstract(&p.r#abstract, 300);
 
         out.push(format!(
             "[{}] {}\n\
@@ -571,4 +948,877 @@ pub fn prepare_batch_assessments_tool(
     ));
 
     Ok(out.join("\n"))
+}
+
+// ---------- Annotations (#49 iter 4 + 5) ----------
+
+/// Record that `reader` has seen the current state of one or more
+/// annotations. Idempotent: repeat calls just bump the `seen_at`.
+pub fn mark_seen_tool(annotation_ids: Vec<String>, reader: &str) -> Result<String, String> {
+    if reader.trim().is_empty() {
+        return Err("reader is required".into());
+    }
+    let refs: Vec<&str> = annotation_ids.iter().map(String::as_str).collect();
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+    repo.mark_seen(&refs, reader).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "Marked {} annotation(s) seen for '{reader}'.",
+        refs.len()
+    ))
+}
+
+/// Mark a whole thread (root + all replies) as seen by `reader`.
+pub fn mark_thread_seen_tool(root_id: &str, reader: &str) -> Result<String, String> {
+    if reader.trim().is_empty() {
+        return Err("reader is required".into());
+    }
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+    repo.mark_thread_seen(root_id, reader)
+        .map_err(|e| e.to_string())?;
+    Ok(format!("Thread {root_id} marked seen for '{reader}'."))
+}
+
+/// List annotations `reader` hasn't seen since the last modification.
+/// Optional `paper_id` scopes the query. Returns the same JSON shape as
+/// `list_annotations` for easy consumption.
+pub fn list_unread_tool(reader: &str, paper_id: Option<&str>) -> Result<String, String> {
+    if reader.trim().is_empty() {
+        return Err("reader is required".into());
+    }
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+    let rows = repo
+        .list_unread(reader, paper_id)
+        .map_err(|e| e.to_string())?;
+
+    let entries: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "id": a.id.as_str(),
+                "parent_id": a.parent_id.as_ref().map(|p| p.as_str()),
+                "paper_id": a.paper_id.as_str(),
+                "question_id": a.question_id.as_ref().map(|q| q.as_str()),
+                "anchor": {
+                    "char_range": a.anchor.char_range,
+                    "quote": a.anchor.quote,
+                    "status": a.anchor.status.as_str(),
+                },
+                "note": a.note,
+                "author": a.author,
+                "updated_at": a.updated_at.to_rfc3339(),
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())
+}
+
+// ---------- Annotations (#49 iter 4) ----------
+
+/// Create a root-level annotation anchored to a passage in a paper.
+/// Replies use `reply_annotation_tool` since they inherit the anchor.
+#[allow(clippy::too_many_arguments)]
+pub fn create_annotation_tool(
+    paper_id: &str,
+    quote: &str,
+    note: &str,
+    author: &str,
+    prefix: Option<&str>,
+    suffix: Option<&str>,
+    question_id: Option<&str>,
+    color: Option<&str>,
+    tags: Option<Vec<String>>,
+) -> Result<String, String> {
+    if author.trim().is_empty() {
+        return Err("author is required (pass an identity string)".into());
+    }
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+
+    let anchor = scitadel_core::models::Anchor {
+        quote: Some(quote.to_string()),
+        prefix: prefix.map(str::to_string),
+        suffix: suffix.map(str::to_string),
+        status: scitadel_core::models::AnchorStatus::Ok,
+        ..Default::default()
+    };
+
+    let mut ann = scitadel_core::models::Annotation::new_root(
+        scitadel_core::models::PaperId::from(paper_id),
+        author.to_string(),
+        note.to_string(),
+        anchor,
+    );
+    if let Some(qid) = question_id {
+        ann.question_id = Some(scitadel_core::models::QuestionId::from(qid));
+    }
+    if let Some(c) = color {
+        ann.color = Some(c.to_string());
+    }
+    if let Some(t) = tags {
+        ann.tags = t;
+    }
+
+    repo.create(&ann).map_err(|e| e.to_string())?;
+    // Trust-on-first-use audit log: `author` is whatever string the
+    // MCP client supplied. rmcp 0.1.5 doesn't surface a peer identity
+    // to tool handlers, so this is the best we can do until auth lands
+    // (see ADR-003 "Phase-5 auth"). #100.
+    tracing::info!(
+        op = "create_annotation",
+        annotation_id = ann.id.as_str(),
+        paper_id = paper_id,
+        author = author,
+        "annotation write (trust-on-first-use)"
+    );
+    Ok(ann.id.as_str().to_string())
+}
+
+/// Add a reply to an existing annotation. Inherits paper_id and
+/// question_id from the parent.
+pub fn reply_annotation_tool(parent_id: &str, note: &str, author: &str) -> Result<String, String> {
+    if author.trim().is_empty() {
+        return Err("author is required".into());
+    }
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+    let parent = repo
+        .get(parent_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Annotation '{parent_id}' not found."))?;
+    let reply =
+        scitadel_core::models::Annotation::new_reply(&parent, author.to_string(), note.to_string());
+    repo.create(&reply).map_err(|e| e.to_string())?;
+    tracing::info!(
+        op = "reply_annotation",
+        annotation_id = reply.id.as_str(),
+        parent_id = parent_id,
+        author = author,
+        "annotation write (trust-on-first-use)"
+    );
+    Ok(reply.id.as_str().to_string())
+}
+
+/// Update mutable fields on an existing annotation.
+pub fn update_annotation_tool(
+    id: &str,
+    note: Option<&str>,
+    color: Option<&str>,
+    tags: Option<Vec<String>>,
+) -> Result<String, String> {
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+    let existing = repo
+        .get(id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Annotation '{id}' not found."))?;
+    let original_author = existing.author.clone();
+    let new_note = note.unwrap_or(&existing.note);
+    let new_color = color.or(existing.color.as_deref());
+    let new_tags = tags.unwrap_or(existing.tags);
+    repo.update_note(id, new_note, new_color, &new_tags)
+        .map_err(|e| e.to_string())?;
+    tracing::info!(
+        op = "update_annotation",
+        annotation_id = id,
+        author = original_author.as_str(),
+        "annotation write (trust-on-first-use)"
+    );
+    Ok(format!("Annotation {id} updated."))
+}
+
+/// Soft-delete an annotation. Keeps the row so threads are preserved;
+/// `list_annotations` hides it.
+pub fn delete_annotation_tool(id: &str) -> Result<String, String> {
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+    repo.soft_delete(id).map_err(|e| e.to_string())?;
+    tracing::info!(
+        op = "delete_annotation",
+        annotation_id = id,
+        "annotation write (trust-on-first-use)"
+    );
+    Ok(format!("Annotation {id} deleted (soft)."))
+}
+
+/// List annotations filtered by paper / question / author. Returns a
+/// JSON array with id, parent_id, anchor, note, tags, author,
+/// timestamps, and anchor_status.
+pub fn list_annotations_tool(
+    paper_id: Option<&str>,
+    author: Option<&str>,
+) -> Result<String, String> {
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+    let rows = match paper_id {
+        Some(pid) => repo.list_by_paper(pid).map_err(|e| e.to_string())?,
+        None => return Err("paper_id is required for now (cross-paper lists come later)".into()),
+    };
+    let filtered: Vec<_> = rows
+        .into_iter()
+        .filter(|a| author.is_none_or(|want| a.author == want))
+        .collect();
+
+    let entries: Vec<serde_json::Value> = filtered
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "id": a.id.as_str(),
+                "parent_id": a.parent_id.as_ref().map(|p| p.as_str()),
+                "paper_id": a.paper_id.as_str(),
+                "question_id": a.question_id.as_ref().map(|q| q.as_str()),
+                "anchor": {
+                    "char_range": a.anchor.char_range,
+                    "quote": a.anchor.quote,
+                    "prefix": a.anchor.prefix,
+                    "suffix": a.anchor.suffix,
+                    "status": a.anchor.status.as_str(),
+                },
+                "note": a.note,
+                "color": a.color,
+                "tags": a.tags,
+                "author": a.author,
+                "created_at": a.created_at.to_rfc3339(),
+                "updated_at": a.updated_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())
+}
+
+/// Return the paper text + every live annotation anchored to it as a
+/// single structured JSON document, so an agent can reason over offsets
+/// without re-deriving the mapping from `get_paper` + `list_annotations`.
+///
+/// Soft-deleted annotations are excluded. Replies are flat with
+/// `parent_id` and `root_id` so threads can be reconstructed without
+/// extra round-trips.
+pub fn get_annotated_paper_tool(paper_id: &str) -> Result<String, String> {
+    let db = open_db()?;
+    build_annotated_paper(&db, paper_id)
+}
+
+fn build_annotated_paper(db: &Database, paper_id: &str) -> Result<String, String> {
+    use std::collections::HashMap;
+
+    let (paper_repo, _, _, _, _) = db.repositories();
+    let paper = paper_repo
+        .get(paper_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Paper '{paper_id}' not found."))?;
+
+    let ann_repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db.clone());
+    let annotations = ann_repo
+        .list_by_paper(paper_id)
+        .map_err(|e| e.to_string())?;
+
+    let by_id: HashMap<&str, &scitadel_core::models::Annotation> =
+        annotations.iter().map(|a| (a.id.as_str(), a)).collect();
+    let root_of = |start: &scitadel_core::models::Annotation| -> String {
+        let mut cur = start;
+        // Bounded chase to avoid pathological loops if data is malformed.
+        for _ in 0..64 {
+            match &cur.parent_id {
+                None => return cur.id.as_str().to_string(),
+                Some(pid) => match by_id.get(pid.as_str()) {
+                    Some(parent) => cur = parent,
+                    None => return cur.id.as_str().to_string(),
+                },
+            }
+        }
+        cur.id.as_str().to_string()
+    };
+
+    let source_version = annotations
+        .iter()
+        .find_map(|a| a.anchor.source_version.clone());
+
+    let entries: Vec<serde_json::Value> = annotations
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "id": a.id.as_str(),
+                "parent_id": a.parent_id.as_ref().map(|p| p.as_str()),
+                "root_id": root_of(a),
+                "paper_id": a.paper_id.as_str(),
+                "question_id": a.question_id.as_ref().map(|q| q.as_str()),
+                "anchor": {
+                    "char_range": a.anchor.char_range,
+                    "quote": a.anchor.quote,
+                    "prefix": a.anchor.prefix,
+                    "suffix": a.anchor.suffix,
+                    "sentence_id": a.anchor.sentence_id,
+                    "source_version": a.anchor.source_version,
+                    "status": a.anchor.status.as_str(),
+                },
+                "note": a.note,
+                "color": a.color,
+                "tags": a.tags,
+                "author": a.author,
+                "created_at": a.created_at.to_rfc3339(),
+                "updated_at": a.updated_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    let response = serde_json::json!({
+        "paper": {
+            "id": paper.id.as_str(),
+            "title": paper.title,
+            "abstract": paper.r#abstract,
+            "full_text": paper.full_text,
+        },
+        "annotations": entries,
+        "source_version": source_version,
+    });
+
+    serde_json::to_string_pretty(&response).map_err(|e| e.to_string())
+}
+
+/// Full-text search over stored search queries. Returns a JSON array of
+/// past searches matching `query` (lower `rank` = more relevant per
+/// BM25). Agents should call this before running a fresh search to
+/// avoid re-doing work that's already in the DB.
+pub fn find_similar_searches_tool(query: &str, limit: Option<i64>) -> Result<String, String> {
+    let limit = limit.unwrap_or(10).max(1);
+    let db = open_db()?;
+    let (_, search_repo, _, _, _) = db.repositories();
+    let hits = search_repo
+        .find_similar(query, limit)
+        .map_err(|e| e.to_string())?;
+
+    let entries: Vec<serde_json::Value> = hits
+        .into_iter()
+        .map(|(s, rank)| {
+            serde_json::json!({
+                "search_id": s.id.as_str(),
+                "query": s.query,
+                "total_papers": s.total_papers,
+                "created_at": s.created_at.to_rfc3339(),
+                "rank": rank,
+            })
+        })
+        .collect();
+
+    serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())
+}
+
+/// Return the scitadel assessment rubric (scoring criteria, score scale,
+/// response format) so an agent can fetch it once and cache, rather than
+/// re-fetching via `prepare_assessment` for every paper it evaluates.
+///
+/// Today the rubric is a static prompt shared across all questions;
+/// if per-question rubrics ever land, this function becomes the
+/// customization point.
+pub fn get_rubric_tool() -> Result<String, String> {
+    Ok(scitadel_scoring::SCORING_SYSTEM_PROMPT.to_string())
+}
+
+/// Summarize every paper in a search as JSON — title, abstract, access
+/// status, identifiers — in a single call. Saves round-trips vs. the
+/// agent iterating `get_paper` per result.
+///
+/// `max_papers` caps the output (default 50). Abstracts are truncated
+/// at `abstract_char_limit` (default 500) with an ellipsis if cut.
+pub fn summarize_search_tool(
+    search_id: &str,
+    max_papers: Option<usize>,
+    abstract_char_limit: Option<usize>,
+) -> Result<String, String> {
+    let max_papers = max_papers.unwrap_or(50);
+    let abstract_char_limit = abstract_char_limit.unwrap_or(500);
+
+    let db = open_db()?;
+    let (paper_repo, search_repo, _, _, _) = db.repositories();
+
+    let search = search_repo
+        .get(search_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Search '{search_id}' not found."))?;
+
+    let results = search_repo
+        .get_results(search.id.as_str())
+        .map_err(|e| e.to_string())?;
+
+    // Unique paper IDs in the order they were returned by the adapters.
+    let mut seen = std::collections::HashSet::new();
+    let mut ordered_ids: Vec<&str> = Vec::new();
+    for r in &results {
+        if seen.insert(r.paper_id.as_str()) {
+            ordered_ids.push(r.paper_id.as_str());
+        }
+    }
+    ordered_ids.truncate(max_papers);
+
+    let papers: Vec<Paper> = ordered_ids
+        .iter()
+        .filter_map(|id| paper_repo.get(id).ok().flatten())
+        .collect();
+
+    let summaries: Vec<serde_json::Value> = papers
+        .iter()
+        .map(|p| {
+            let (abstract_text, truncated) = truncate_abstract(&p.r#abstract, abstract_char_limit);
+            serde_json::json!({
+                "paper_id": p.id.as_str(),
+                "title": p.title,
+                "authors": p.authors,
+                "year": p.year,
+                "journal": p.journal,
+                "doi": p.doi,
+                "arxiv_id": p.arxiv_id,
+                "openalex_id": p.openalex_id,
+                "abstract": abstract_text,
+                "abstract_truncated": truncated,
+            })
+        })
+        .collect();
+
+    let payload = serde_json::json!({
+        "search_id": search.id.as_str(),
+        "query": search.query,
+        "total_papers": search.total_papers,
+        "returned": summaries.len(),
+        "papers": summaries,
+    });
+
+    serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())
+}
+
+/// Truncate an abstract at a char boundary. Returns `(text, was_truncated)`
+/// so the caller can signal truncation in the JSON payload. Appends an
+/// ellipsis only when actually cut.
+fn truncate_abstract(text: &str, max_chars: usize) -> (String, bool) {
+    if text.chars().count() <= max_chars {
+        return (text.to_string(), false);
+    }
+    let mut out: String = text.chars().take(max_chars).collect();
+    out.push_str("...");
+    (out, true)
+}
+
+/// Static descriptor for one source adapter — used by `list_sources_tool`.
+struct SourceInfo {
+    name: &'static str,
+    description: &'static str,
+    /// Which keychain / env fields need to be populated before this
+    /// adapter can actually make requests. Empty = no credentials needed.
+    credential_fields: &'static [&'static str],
+    rate_limit_hint: &'static str,
+}
+
+const SOURCE_REGISTRY: &[SourceInfo] = &[
+    SourceInfo {
+        name: "pubmed",
+        description: "US NLM biomedical/life-sciences literature via the NCBI E-utilities API.",
+        credential_fields: &["api_key"],
+        rate_limit_hint: "3 req/s without key, 10 req/s with key.",
+    },
+    SourceInfo {
+        name: "arxiv",
+        description: "Preprint server for physics, CS, math, and adjacent fields.",
+        credential_fields: &[],
+        rate_limit_hint: "1 req every 3s per the arXiv API terms.",
+    },
+    SourceInfo {
+        name: "openalex",
+        description: "Open scholarly-works graph covering most disciplines. The polite-pool email gets 10 req/s; without it you share the global 10 req/s pool.",
+        // Stored under `openalex.api_key` in config for historical reasons;
+        // users authenticate by putting their contact email there, not a real key.
+        credential_fields: &["polite_pool_email"],
+        rate_limit_hint: "10 req/s in the polite pool (with email), otherwise shared.",
+    },
+    SourceInfo {
+        name: "inspire",
+        description: "INSPIRE-HEP: high-energy physics literature and preprints.",
+        credential_fields: &[],
+        rate_limit_hint: "15 req/5s per their API guidelines.",
+    },
+    SourceInfo {
+        name: "patentsview",
+        description: "USPTO PatentsView API — US patent metadata.",
+        credential_fields: &["api_key"],
+        rate_limit_hint: "45 req/min (documented).",
+    },
+    SourceInfo {
+        name: "lens",
+        description: "Lens.org scholarly + patent metadata.",
+        credential_fields: &["api_token"],
+        rate_limit_hint: "Varies by plan; monthly quota enforced.",
+    },
+    SourceInfo {
+        name: "epo",
+        description: "European Patent Office OPS API (consumer_key + consumer_secret).",
+        credential_fields: &["consumer_key", "consumer_secret"],
+        rate_limit_hint: "10 req/min per OPS free tier.",
+    },
+];
+
+/// Return a JSON array describing every source scitadel knows about, with
+/// each one's credential requirements and whether they're configured in
+/// the current environment. Read-only; safe to call freely.
+pub fn list_sources_tool() -> Result<String, String> {
+    let config = load_config();
+
+    let entries: Vec<serde_json::Value> = SOURCE_REGISTRY
+        .iter()
+        .map(|src| {
+            let configured = is_source_configured(src, &config);
+            serde_json::json!({
+                "name": src.name,
+                "description": src.description,
+                "requires_credentials": !src.credential_fields.is_empty(),
+                "credential_fields": src.credential_fields,
+                "configured": configured,
+                "rate_limit_hint": src.rate_limit_hint,
+            })
+        })
+        .collect();
+
+    serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())
+}
+
+fn is_source_configured(src: &SourceInfo, config: &scitadel_core::config::Config) -> bool {
+    match src.name {
+        // Sources with no credentials are always considered configured.
+        "arxiv" | "inspire" => true,
+        "pubmed" => !config.pubmed.api_key.is_empty(),
+        // OpenAlex stores the polite-pool email under `openalex.api_key`
+        // (historical naming); an empty string means polite pool is off
+        // but the adapter still works, so we report configured only when
+        // the email is actually present.
+        "openalex" => !config.openalex.api_key.is_empty(),
+        "patentsview" => !config.patentsview.api_key.is_empty(),
+        "lens" => !config.lens.api_key.is_empty(),
+        "epo" => !config.epo.consumer_key.is_empty() && !config.epo.consumer_secret.is_empty(),
+        _ => false,
+    }
+}
+
+// ===== TUI selection tool (#122) =====
+
+/// Read the singleton `tui_state` row written by the open scitadel TUI.
+/// Returns JSON: `{ tab, paper_id?, search_id?, question_id?,
+/// annotation_id?, updated_at, stale }`. `stale` is true when the
+/// row is older than 60s (TUI may have been closed).
+pub fn get_current_selection_tool() -> Result<String, String> {
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqliteTuiStateRepository::new(db);
+    match repo.get().map_err(|e| e.to_string())? {
+        Some(row) => {
+            let stale = chrono::DateTime::parse_from_rfc3339(&row.updated_at).map_or(true, |t| {
+                chrono::Utc::now().signed_duration_since(t.with_timezone(&chrono::Utc))
+                    > chrono::Duration::seconds(60)
+            });
+            Ok(serde_json::json!({
+                "tab": row.tab,
+                "paper_id": row.paper_id,
+                "search_id": row.search_id,
+                "question_id": row.question_id,
+                "annotation_id": row.annotation_id,
+                "updated_at": row.updated_at,
+                "stale": stale,
+            })
+            .to_string())
+        }
+        None => Ok(serde_json::json!({
+            "tab": null,
+            "stale": true,
+            "note": "no TUI has written state yet — start `scitadel tui` to populate"
+        })
+        .to_string()),
+    }
+}
+
+// ===== Star / paper-state tools (#120) =====
+
+/// Toggle the starred flag for `paper_id` under `reader`. Returns the
+/// new value as JSON: `{"paper_id": "...", "starred": true|false}`.
+pub fn toggle_star_tool(paper_id: &str, reader: &str) -> Result<String, String> {
+    if reader.trim().is_empty() {
+        return Err("reader is required (pass an identity string)".into());
+    }
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqlitePaperStateRepository::new(db);
+    let starred = repo
+        .toggle_starred(paper_id, reader)
+        .map_err(|e| e.to_string())?;
+    tracing::info!(
+        op = "toggle_star",
+        paper_id,
+        reader,
+        starred,
+        "star write (trust-on-first-use)"
+    );
+    Ok(serde_json::json!({ "paper_id": paper_id, "starred": starred }).to_string())
+}
+
+/// Idempotent "ensure starred state" — sets `starred` to the requested
+/// value regardless of current. Returns the same JSON shape as toggle.
+pub fn set_star_tool(paper_id: &str, starred: bool, reader: &str) -> Result<String, String> {
+    if reader.trim().is_empty() {
+        return Err("reader is required".into());
+    }
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqlitePaperStateRepository::new(db);
+    let existing = repo.get(paper_id, reader).map_err(|e| e.to_string())?;
+    let new_state = scitadel_db::sqlite::PaperState {
+        paper_id: paper_id.into(),
+        reader: reader.into(),
+        starred,
+        to_read: existing.as_ref().is_some_and(|s| s.to_read),
+        read_at: existing.and_then(|s| s.read_at),
+    };
+    repo.set(&new_state).map_err(|e| e.to_string())?;
+    tracing::info!(
+        op = "set_star",
+        paper_id,
+        reader,
+        starred,
+        "star write (trust-on-first-use)"
+    );
+    Ok(serde_json::json!({ "paper_id": paper_id, "starred": starred }).to_string())
+}
+
+/// List all paper IDs `reader` has starred. Returns a JSON array of
+/// strings (paper IDs only — call `get_paper` for each if you need
+/// metadata).
+pub fn list_starred_tool(reader: &str) -> Result<String, String> {
+    if reader.trim().is_empty() {
+        return Err("reader is required".into());
+    }
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqlitePaperStateRepository::new(db);
+    let ids = repo.starred_ids(reader).map_err(|e| e.to_string())?;
+    let mut sorted: Vec<String> = ids.into_iter().collect();
+    sorted.sort();
+    serde_json::to_string(&sorted).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        SOURCE_REGISTRY, build_annotated_paper, html_to_text, is_source_configured,
+        truncate_abstract,
+    };
+    use scitadel_core::config::Config;
+    use scitadel_core::models::{Anchor, Annotation, Paper, PaperId};
+    use scitadel_core::ports::PaperRepository;
+    use scitadel_db::sqlite::{Database, SqliteAnnotationRepository};
+
+    fn fresh_db() -> Database {
+        let db = Database::open_in_memory().expect("open in-memory db");
+        db.migrate().expect("migrate");
+        db
+    }
+
+    fn save_paper(db: &Database, id: &str, title: &str, full_text: Option<&str>) -> PaperId {
+        let (paper_repo, _, _, _, _) = db.repositories();
+        let mut p = Paper::new(title);
+        p.id = PaperId::from(id);
+        p.r#abstract = "abs".into();
+        p.full_text = full_text.map(str::to_string);
+        paper_repo.save(&p).expect("save paper");
+        p.id
+    }
+
+    #[test]
+    fn get_annotated_paper_roundtrip_includes_offsets_and_quote() {
+        let db = fresh_db();
+        let pid = save_paper(
+            &db,
+            "p-1",
+            "Neutron stars",
+            Some("Neutron stars are dense."),
+        );
+        let repo = SqliteAnnotationRepository::new(db.clone());
+        let mut ann = Annotation::new_root(
+            pid.clone(),
+            "lars".into(),
+            "key claim".into(),
+            Anchor {
+                char_range: Some((0, 13)),
+                quote: Some("Neutron stars".into()),
+                prefix: None,
+                suffix: Some(" are dense.".into()),
+                ..Anchor::default()
+            },
+        );
+        ann.tags = vec!["physics".into()];
+        repo.create(&ann).expect("create ann");
+
+        let json = build_annotated_paper(&db, "p-1").expect("build");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(v["paper"]["id"], "p-1");
+        assert_eq!(v["paper"]["full_text"], "Neutron stars are dense.");
+        let arr = v["annotations"].as_array().expect("annotations array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["anchor"]["quote"], "Neutron stars");
+        assert_eq!(arr[0]["anchor"]["char_range"][0], 0);
+        assert_eq!(arr[0]["anchor"]["char_range"][1], 13);
+        assert_eq!(arr[0]["root_id"], arr[0]["id"]);
+        assert!(arr[0]["parent_id"].is_null());
+    }
+
+    #[test]
+    fn get_annotated_paper_excludes_soft_deleted() {
+        let db = fresh_db();
+        let pid = save_paper(&db, "p-2", "T", None);
+        let repo = SqliteAnnotationRepository::new(db.clone());
+        let live = Annotation::new_root(
+            pid.clone(),
+            "lars".into(),
+            "live".into(),
+            Anchor {
+                quote: Some("q1".into()),
+                ..Anchor::default()
+            },
+        );
+        let doomed = Annotation::new_root(
+            pid,
+            "lars".into(),
+            "gone".into(),
+            Anchor {
+                quote: Some("q2".into()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&live).unwrap();
+        repo.create(&doomed).unwrap();
+        repo.soft_delete(doomed.id.as_str()).unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-2").unwrap()).unwrap();
+        let arr = v["annotations"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["note"], "live");
+    }
+
+    #[test]
+    fn get_annotated_paper_zero_annotations_returns_empty_array() {
+        let db = fresh_db();
+        save_paper(&db, "p-3", "Empty", None);
+        let v: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-3").unwrap()).unwrap();
+        assert_eq!(v["annotations"].as_array().unwrap().len(), 0);
+        assert!(v["source_version"].is_null());
+    }
+
+    #[test]
+    fn get_annotated_paper_replies_carry_root_id() {
+        let db = fresh_db();
+        let pid = save_paper(&db, "p-4", "T", None);
+        let repo = SqliteAnnotationRepository::new(db.clone());
+        let root = Annotation::new_root(
+            pid,
+            "lars".into(),
+            "root note".into(),
+            Anchor {
+                quote: Some("q".into()),
+                ..Anchor::default()
+            },
+        );
+        let reply = Annotation::new_reply(&root, "claude".into(), "agreed".into());
+        repo.create(&root).unwrap();
+        repo.create(&reply).unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-4").unwrap()).unwrap();
+        let arr = v["annotations"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        let reply_entry = arr
+            .iter()
+            .find(|a| a["parent_id"].is_string())
+            .expect("has reply");
+        assert_eq!(reply_entry["root_id"], root.id.as_str());
+    }
+
+    #[test]
+    fn get_annotated_paper_unknown_paper_errors() {
+        let db = fresh_db();
+        let err = build_annotated_paper(&db, "nope").unwrap_err();
+        assert!(err.contains("not found"));
+    }
+
+    #[test]
+    fn truncate_abstract_shorter_than_limit_untouched() {
+        let (out, truncated) = truncate_abstract("short text", 100);
+        assert_eq!(out, "short text");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn truncate_abstract_over_limit_appends_ellipsis() {
+        let input = "a".repeat(120);
+        let (out, truncated) = truncate_abstract(&input, 100);
+        assert!(truncated);
+        assert!(out.ends_with("..."));
+        assert_eq!(out.chars().count(), 103);
+    }
+
+    #[test]
+    fn truncate_abstract_respects_multibyte_boundary() {
+        // U+2019 is 3 bytes; the truncation must slice on char boundaries.
+        let input = "D\u{2019}Ippolito ".repeat(60);
+        let (out, _) = truncate_abstract(&input, 50);
+        assert_eq!(out.chars().count(), 53);
+    }
+
+    #[test]
+    fn strips_tags_and_script() {
+        let html = "<html><body><p>Hello <b>world</b>.</p><script>var x=1;</script></body></html>";
+        let out = html_to_text(html);
+        assert!(out.contains("Hello"));
+        assert!(out.contains("world"));
+        assert!(!out.contains("var x"));
+    }
+
+    #[test]
+    fn source_registry_covers_every_adapter_name_used_by_build_adapters_full() {
+        // These are the names accepted by scitadel_adapters::build_adapters_full;
+        // the registry must stay in lockstep so the MCP tool stays honest.
+        let expected = [
+            "pubmed",
+            "arxiv",
+            "openalex",
+            "inspire",
+            "patentsview",
+            "lens",
+            "epo",
+        ];
+        for name in expected {
+            assert!(
+                SOURCE_REGISTRY.iter().any(|s| s.name == name),
+                "missing registry entry for adapter {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_flips_on_credential_presence() {
+        let mut config = Config::default();
+        config.openalex.api_key.clear();
+        let oa = SOURCE_REGISTRY
+            .iter()
+            .find(|s| s.name == "openalex")
+            .unwrap();
+        assert!(!is_source_configured(oa, &config));
+        config.openalex.api_key = "lars@example.org".into();
+        assert!(is_source_configured(oa, &config));
+    }
+
+    #[test]
+    fn sources_without_credentials_are_always_configured() {
+        let config = Config::default();
+        for name in ["arxiv", "inspire"] {
+            let src = SOURCE_REGISTRY.iter().find(|s| s.name == name).unwrap();
+            assert!(
+                is_source_configured(src, &config),
+                "{name} should always be configured"
+            );
+        }
+    }
 }

@@ -1,0 +1,74 @@
+name: Resolve devcontainer image
+description: Resolve and validate the devcontainer image tag for CI jobs
+
+inputs:
+  image-tag:
+    description: Optional image tag override
+    required: false
+    default: ''
+
+outputs:
+  image-tag:
+    description: Resolved image tag
+    value: ${{ steps.resolve.outputs.tag }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve image tag
+      id: resolve
+      shell: bash
+      env:
+        INPUT_IMAGE_TAG: ${{ inputs.image-tag }}
+      run: |
+        set -euo pipefail
+
+        if [[ -n "$INPUT_IMAGE_TAG" ]]; then
+          echo "tag=$INPUT_IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        if [[ -f .vig-os ]]; then
+          VERSION=""
+          while IFS= read -r line || [[ -n "${line:-}" ]]; do
+            [[ -z "${line//[[:space:]]/}" ]] && continue
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+            case "$line" in
+              DEVCONTAINER_VERSION=*)
+                VERSION="${line#*=}"
+                VERSION="${VERSION#"${VERSION%%[![:space:]]*}"}"
+                VERSION="${VERSION%"${VERSION##*[![:space:]]}"}"
+
+                if [[ "$VERSION" =~ ^\".*\"$ ]]; then
+                  VERSION="${VERSION:1:-1}"
+                elif [[ "$VERSION" =~ ^\'.*\'$ ]]; then
+                  VERSION="${VERSION:1:-1}"
+                fi
+                break
+                ;;
+            esac
+          done < .vig-os
+
+          if [[ -n "$VERSION" ]]; then
+            echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+        fi
+
+        echo "ERROR: Could not resolve DEVCONTAINER_VERSION from .vig-os and no image-tag override was provided."
+        exit 1
+
+    - name: Validate image accessibility
+      shell: bash
+      env:
+        IMAGE_TAG: ${{ steps.resolve.outputs.tag }}
+      run: |
+        set -euo pipefail
+        IMAGE="ghcr.io/vig-os/devcontainer:${IMAGE_TAG}"
+        echo "Validating image availability: $IMAGE"
+        if ! docker manifest inspect "$IMAGE" > /dev/null 2>&1; then
+          echo "ERROR: Cannot access image manifest: $IMAGE"
+          echo "Check whether the tag exists and whether this workflow has access to GHCR."
+          exit 1
+        fi

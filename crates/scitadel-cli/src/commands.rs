@@ -1,8 +1,10 @@
+use std::io::Write;
 use std::path::PathBuf;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use scitadel_core::config::load_config;
+use scitadel_core::credentials;
 use scitadel_core::models::{ResearchQuestion, SearchTerm};
 use scitadel_core::ports::{
     AssessmentRepository, PaperRepository, QuestionRepository, SearchRepository,
@@ -21,7 +23,10 @@ fn resolve_prefix<'a, T, F>(items: &'a [T], prefix: &str, get_id: F) -> Result<&
 where
     F: Fn(&T) -> &str,
 {
-    let matches: Vec<&T> = items.iter().filter(|item| get_id(item).starts_with(prefix)).collect();
+    let matches: Vec<&T> = items
+        .iter()
+        .filter(|item| get_id(item).starts_with(prefix))
+        .collect();
     match matches.len() {
         0 => bail!("no match for prefix '{prefix}'"),
         1 => Ok(matches[0]),
@@ -29,18 +34,191 @@ where
     }
 }
 
-pub fn tui() -> Result<()> {
-    let config = load_config();
-    scitadel_tui::run(&config.db_path)?;
+pub async fn mcp() -> Result<()> {
+    use rmcp::ServiceExt;
+    let transport = rmcp::transport::io::stdio();
+    let server = scitadel_mcp::server::ScitadelServer::new();
+    let service = server.serve(transport).await?;
+    service.waiting().await?;
     Ok(())
 }
 
-pub fn init(db_path: Option<PathBuf>) -> Result<()> {
+pub fn tui() -> Result<()> {
     let config = load_config();
-    let path = db_path.unwrap_or(config.db_path);
-    let db = Database::open(&path).context("failed to open database")?;
+    let email = config.openalex.api_key.clone();
+    let papers_dir = config.papers_dir();
+    let reader = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
+    scitadel_tui::run(
+        &config.db_path,
+        email,
+        papers_dir,
+        config.ui.show_institutional_hint,
+        reader,
+    )?;
+    Ok(())
+}
+
+/// Options for the `init` wizard — forwarded from the CLI.
+#[derive(Debug, Default)]
+pub struct InitOptions {
+    pub db_path: Option<PathBuf>,
+    pub email: Option<String>,
+    pub sources: Option<Vec<String>>,
+    /// Non-interactive: never prompt. Missing values keep their existing
+    /// or default config value silently.
+    pub yes: bool,
+}
+
+pub fn init(opts: InitOptions) -> Result<()> {
+    let mut config = load_config();
+
+    // Resolve db path early so we can report it at the end.
+    if let Some(p) = opts.db_path.clone() {
+        config.db_path = p;
+    }
+
+    // Collect values to write: CLI flags first, then interactive prompts,
+    // then fall back to whatever load_config() resolved.
+    let interactive = !opts.yes && std::io::IsTerminal::is_terminal(&std::io::stdin());
+
+    let email = opts
+        .email
+        .or_else(|| {
+            if interactive && config.openalex.api_key.is_empty() {
+                prompt_line(
+                    "OpenAlex / Unpaywall email (used for OA PDF lookups, recommended)",
+                    "",
+                )
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| config.openalex.api_key.clone());
+
+    let sources = opts
+        .sources
+        .or_else(|| {
+            if interactive {
+                let joined = config.default_sources.join(",");
+                prompt_line("Enabled sources (comma-separated)", &joined).map(parse_sources_csv)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| config.default_sources.clone());
+
+    config.openalex.api_key.clone_from(&email);
+    config.default_sources.clone_from(&sources);
+
+    let config_path = config_path_for_db(&config.db_path);
+    write_config_toml(&config_path, &config)
+        .with_context(|| format!("failed to write config to {}", config_path.display()))?;
+
+    // Always init the DB last so the config points at something real.
+    let db = Database::open(&config.db_path).context("failed to open database")?;
     db.migrate().context("migration failed")?;
-    println!("Database initialized at: {}", path.display());
+
+    println!();
+    println!("  Config written: {}", config_path.display());
+    println!("  Database:       {}", config.db_path.display());
+    if !email.is_empty() {
+        println!("  OA email:       {email}");
+    }
+    println!("  Sources:        {}", sources.join(", "));
+
+    let keyed_sources_needed: Vec<&str> = sources
+        .iter()
+        .filter_map(|s| match s.as_str() {
+            "patentsview" | "lens" | "epo" => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    if !keyed_sources_needed.is_empty() {
+        println!();
+        println!("  Credentials still needed for:");
+        for s in &keyed_sources_needed {
+            println!("    - {s} (run: scitadel auth login {s})");
+        }
+    }
+
+    println!();
+    println!(
+        "  Try it: scitadel search \"machine learning\" --sources {}",
+        sources.join(",")
+    );
+    Ok(())
+}
+
+/// Read one line from stdin, showing `prompt [default]:`. Returns `None` if
+/// the user hits enter without input and `default` is empty; otherwise the
+/// trimmed input or the default.
+fn prompt_line(prompt: &str, default: &str) -> Option<String> {
+    use std::io::{BufRead, Write};
+    let mut out = std::io::stdout();
+    if default.is_empty() {
+        let _ = write!(out, "  {prompt}: ");
+    } else {
+        let _ = write!(out, "  {prompt} [{default}]: ");
+    }
+    let _ = out.flush();
+
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    if stdin.lock().read_line(&mut line).is_err() {
+        return None;
+    }
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        if default.is_empty() {
+            None
+        } else {
+            Some(default.to_string())
+        }
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Parse a comma-separated source list, trimming whitespace and dropping blanks.
+fn parse_sources_csv(s: String) -> Vec<String> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Config file lives next to the DB under a `.scitadel/` directory.
+fn config_path_for_db(db_path: &std::path::Path) -> PathBuf {
+    db_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("config.toml")
+}
+
+/// Write a minimal, human-editable config.toml. We only write the fields
+/// the user explicitly set so defaults can continue to evolve in-code.
+fn write_config_toml(path: &std::path::Path, config: &scitadel_core::config::Config) -> Result<()> {
+    use std::fmt::Write as _;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut out = String::new();
+    out.push_str("# scitadel config — generated by `scitadel init`. Edit freely.\n\n");
+    let sources = config
+        .default_sources
+        .iter()
+        .map(|s| format!("\"{s}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    writeln!(out, "default_sources = [{sources}]").unwrap();
+    if !config.openalex.api_key.is_empty() {
+        out.push_str("\n[openalex]\n");
+        writeln!(out, "api_key = \"{}\"", config.openalex.api_key).unwrap();
+    }
+    std::fs::write(path, out)?;
     Ok(())
 }
 
@@ -97,10 +275,14 @@ pub async fn search(
     let query = query.context("Provide a QUERY argument or use --question")?;
     let source_list: Vec<String> = sources.split(',').map(|s| s.trim().to_string()).collect();
 
-    let adapters = scitadel_adapters::build_adapters(
+    let adapters = scitadel_adapters::build_adapters_full(
         &source_list,
         &config.pubmed.api_key,
         &config.openalex.api_key,
+        &config.patentsview.api_key,
+        &config.lens.api_key,
+        &config.epo.consumer_key,
+        &config.epo.consumer_secret,
     )
     .context("failed to build adapters")?;
 
@@ -150,7 +332,10 @@ pub async fn search(
             && let Ok(Some(existing)) = paper_repo.find_by_doi(doi)
             && existing.id != paper.id
         {
-            id_map.insert(paper.id.as_str().to_string(), existing.id.as_str().to_string());
+            id_map.insert(
+                paper.id.as_str().to_string(),
+                existing.id.as_str().to_string(),
+            );
         }
     }
 
@@ -330,7 +515,11 @@ pub fn question_add_terms(
     term.query_string.clone_from(&query_str);
     q_repo.save_term(&term)?;
 
-    println!("  Terms added to question {}: {:?}", question.id.short(), terms);
+    println!(
+        "  Terms added to question {}: {:?}",
+        question.id.short(),
+        terms
+    );
     println!("  Query string: {query_str}");
     Ok(())
 }
@@ -367,7 +556,11 @@ pub async fn assess(
         .filter_map(|id| paper_repo.get(id).ok().flatten())
         .collect();
 
-    println!("Scoring {} papers against: \"{}\"", papers.len(), question.text);
+    println!(
+        "Scoring {} papers against: \"{}\"",
+        papers.len(),
+        question.text
+    );
     println!("  Model: {model}  Temperature: {temperature}  Backend: {scorer_backend}");
 
     let backend = match scorer_backend {
@@ -438,6 +631,83 @@ pub async fn assess(
     Ok(())
 }
 
+pub async fn download(doi: &str, output_dir: Option<PathBuf>) -> Result<()> {
+    let config = load_config();
+    let out_dir = output_dir.unwrap_or_else(|| config.papers_dir());
+
+    let downloader =
+        scitadel_adapters::download::PaperDownloader::new(config.openalex.api_key.clone(), 60.0);
+
+    println!("Downloading paper: {doi}");
+    println!("  Output dir: {}", out_dir.display());
+
+    let result = downloader.download(doi, &out_dir).await;
+
+    // Persist outcome on the matching paper row (#112) before reporting
+    // so the Papers table reflects the attempt regardless of outcome.
+    persist_cli_download_outcome(&config, doi, result.as_ref().ok());
+
+    let result = result.context("download failed")?;
+
+    println!("  Format: {}", result.format);
+    println!("  Source: {}", result.source);
+    println!("  Access: {}", result.access);
+    println!("  Size:   {} bytes", result.bytes);
+    println!("  Saved:  {}", result.path.display());
+
+    Ok(())
+}
+
+fn persist_cli_download_outcome(
+    config: &scitadel_core::config::Config,
+    doi: &str,
+    success: Option<&scitadel_adapters::download::DownloadResult>,
+) {
+    use scitadel_adapters::download::AccessStatus;
+    use scitadel_core::models::DownloadStatus;
+    use scitadel_core::ports::PaperRepository as _;
+
+    let db = match scitadel_db::sqlite::Database::open(&config.db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not open DB to persist download outcome");
+            return;
+        }
+    };
+    if let Err(e) = db.migrate() {
+        tracing::warn!(error = %e, "DB migration failed while persisting download outcome");
+        return;
+    }
+    let (paper_repo, _, _, _, _) = db.repositories();
+    let paper = match paper_repo.find_by_doi(doi) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            tracing::debug!(doi, "no paper row for DOI; skipping download-state write");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(doi, error = %e, "DOI lookup failed");
+            return;
+        }
+    };
+
+    let (path, status) = match success {
+        Some(r) => {
+            let ds = match r.access {
+                AccessStatus::FullText => DownloadStatus::Downloaded,
+                AccessStatus::Abstract | AccessStatus::Paywall | AccessStatus::Unknown => {
+                    DownloadStatus::Paywall
+                }
+            };
+            (Some(r.path.to_string_lossy().into_owned()), ds)
+        }
+        None => (None, DownloadStatus::Failed),
+    };
+    if let Err(e) = paper_repo.update_download_state(paper.id.as_str(), path.as_deref(), status) {
+        tracing::warn!(error = %e, "failed to persist download outcome");
+    }
+}
+
 #[allow(clippy::unnecessary_wraps)]
 pub fn snowball(
     _search_id: &str,
@@ -452,4 +722,93 @@ pub fn snowball(
     println!("Snowball command is not yet implemented in the Rust version.");
     println!("Use the Python version for snowballing: python -m scitadel snowball ...");
     Ok(())
+}
+
+pub fn auth_login(source: &str) -> Result<()> {
+    let creds = find_source_credentials(source)?;
+
+    println!("Storing credentials for '{source}' in system keychain.");
+
+    for key in creds.keys {
+        let value = prompt_credential(key.label, key.secret)?;
+        credentials::store(key.keychain_key, &value).map_err(|e| anyhow::anyhow!("{e}"))?;
+        println!("  Stored: {}", key.keychain_key);
+    }
+
+    println!("Done. Credentials saved to system keychain.");
+    Ok(())
+}
+
+pub fn auth_logout(source: &str) -> Result<()> {
+    let creds = find_source_credentials(source)?;
+
+    for key in creds.keys {
+        match credentials::delete(key.keychain_key) {
+            Ok(()) => println!("  Removed: {}", key.keychain_key),
+            Err(e) => println!("  Skip: {} ({e})", key.keychain_key),
+        }
+    }
+
+    println!("Credentials for '{source}' removed.");
+    Ok(())
+}
+
+pub fn auth_status() -> Result<()> {
+    println!("Source credentials status:\n");
+
+    for creds in credentials::ALL_SOURCES {
+        let status = match credentials::check_source(creds) {
+            Ok(()) => "configured",
+            Err(_) => "not configured",
+        };
+
+        let icon = if status == "configured" { "+" } else { "-" };
+        println!("  [{icon}] {:<14} {status}", creds.source);
+
+        for key in creds.keys {
+            let loc = if credentials::get_keychain(key.keychain_key).is_some() {
+                "keychain"
+            } else if std::env::var(key.env_var)
+                .ok()
+                .as_ref()
+                .is_some_and(|v| !v.is_empty())
+            {
+                "env"
+            } else {
+                "missing"
+            };
+            println!("      {}: {loc}", key.label);
+        }
+    }
+
+    println!("\nSources without credentials (no auth needed):");
+    println!("  [+] arxiv");
+    Ok(())
+}
+
+fn find_source_credentials(source: &str) -> Result<&'static credentials::SourceCredentials> {
+    credentials::ALL_SOURCES
+        .iter()
+        .find(|c| c.source == source)
+        .copied()
+        .ok_or_else(|| {
+            let names: Vec<&str> = credentials::ALL_SOURCES.iter().map(|c| c.source).collect();
+            anyhow::anyhow!("Unknown source '{source}'. Available: {}", names.join(", "))
+        })
+}
+
+fn prompt_credential(label: &str, secret: bool) -> Result<String> {
+    if secret {
+        // Read without echo
+        print!("  {label}: ");
+        std::io::stdout().flush()?;
+        let value = rpassword::read_password().context("failed to read password")?;
+        Ok(value)
+    } else {
+        print!("  {label}: ");
+        std::io::stdout().flush()?;
+        let mut value = String::new();
+        std::io::stdin().read_line(&mut value)?;
+        Ok(value.trim().to_string())
+    }
 }

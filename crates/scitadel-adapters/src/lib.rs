@@ -1,8 +1,12 @@
-pub mod error;
-pub mod pubmed;
 pub mod arxiv;
-pub mod openalex;
+pub mod download;
+pub mod epo;
+pub mod error;
 pub mod inspire;
+pub mod lens;
+pub mod openalex;
+pub mod patentsview;
+pub mod pubmed;
 
 use scitadel_core::ports::SourceAdapter;
 
@@ -11,6 +15,19 @@ pub fn build_adapters(
     sources: &[String],
     pubmed_api_key: &str,
     openalex_email: &str,
+) -> Result<Vec<Box<dyn SourceAdapter>>, error::AdapterError> {
+    build_adapters_full(sources, pubmed_api_key, openalex_email, "", "", "", "")
+}
+
+/// Build adapter instances with all credential options.
+pub fn build_adapters_full(
+    sources: &[String],
+    pubmed_api_key: &str,
+    openalex_email: &str,
+    patentsview_key: &str,
+    lens_token: &str,
+    epo_key: &str,
+    epo_secret: &str,
 ) -> Result<Vec<Box<dyn SourceAdapter>>, error::AdapterError> {
     let mut adapters: Vec<Box<dyn SourceAdapter>> = Vec::new();
 
@@ -33,6 +50,25 @@ pub fn build_adapters(
             }
             "inspire" => {
                 adapters.push(Box::new(inspire::InspireAdapter::new(30.0)));
+            }
+            "patentsview" => {
+                adapters.push(Box::new(patentsview::PatentsViewAdapter::new(
+                    patentsview_key.to_string(),
+                    30.0,
+                )));
+            }
+            "lens" => {
+                adapters.push(Box::new(lens::LensAdapter::new(
+                    lens_token.to_string(),
+                    30.0,
+                )));
+            }
+            "epo" => {
+                adapters.push(Box::new(epo::EpoOpsAdapter::new(
+                    epo_key.to_string(),
+                    epo_secret.to_string(),
+                    30.0,
+                )));
             }
             other => {
                 return Err(error::AdapterError::UnknownSource(other.to_string()));

@@ -18,7 +18,6 @@
                 "nefrob.vscode-just-syntax"
             ],
             "settings": {
-                "terminal.integrated.defaultProfile.linux": "bash",
                 "python.defaultInterpreterPath": "/root/assets/workspace/.venv/bin/python",
                 "[python]": {
                     "editor.defaultFormatter": "charliermarsh.ruff",
@@ -51,7 +50,7 @@
         "--group-add=0"
     ],
     "initializeCommand": ".devcontainer/scripts/initialize.sh",
-    "postStartCommand": "/bin/bash /workspace/scitadel/.devcontainer/scripts/post-start.sh",
-    "postAttachCommand": "/bin/bash /workspace/scitadel/.devcontainer/scripts/post-attach.sh",
-    "postCreateCommand": "/bin/bash /workspace/scitadel/.devcontainer/scripts/post-create.sh"
+    "postStartCommand": "/workspace/scitadel/.devcontainer/scripts/post-start.sh",
+    "postAttachCommand": "/workspace/scitadel/.devcontainer/scripts/post-attach.sh",
+    "postCreateCommand": "/workspace/scitadel/.devcontainer/scripts/post-create.sh"
 }

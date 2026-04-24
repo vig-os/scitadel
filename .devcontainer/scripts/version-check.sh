@@ -190,17 +190,35 @@ record_check() {
 # VERSION DETECTION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Get current installed version from docker-compose.yml
+# Get current installed version from root .vig-os config
 get_current_version() {
-    local compose_file="$DEVCONTAINER_DIR/docker-compose.yml"
+    local config_file="$DEVCONTAINER_DIR/../.vig-os"
+    local line
+    local version=""
 
-    if [[ ! -f "$compose_file" ]]; then
+    if [[ ! -f "$config_file" ]]; then
         return 1
     fi
 
-    # Extract version from image tag (e.g., ghcr.io/vig-os/devcontainer:1.0.0)
-    local version
-    version=$(grep -o 'ghcr\.io/vig-os/devcontainer:[^"]*' "$compose_file" 2>/dev/null | head -1 | cut -d: -f2)
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "${line//[[:space:]]/}" ]] && continue
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        case "$line" in
+            DEVCONTAINER_VERSION=*)
+                version="${line#*=}"
+                version="${version#"${version%%[![:space:]]*}"}"
+                version="${version%"${version##*[![:space:]]}"}"
+
+                if [[ "$version" =~ ^\".*\"$ ]]; then
+                    version="${version:1:-1}"
+                elif [[ "$version" =~ ^\'.*\'$ ]]; then
+                    version="${version:1:-1}"
+                fi
+                break
+                ;;
+        esac
+    done < "$config_file"
 
     if [[ -z "$version" || "$version" == "dev" || "$version" == "latest" ]]; then
         return 1  # Not a pinned version

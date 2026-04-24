@@ -3,7 +3,7 @@ use tracing::debug;
 
 use scitadel_core::models::{Assessment, Paper, ResearchQuestion};
 
-use crate::claude::{build_user_prompt, parse_scoring_response, SCORING_SYSTEM_PROMPT};
+use crate::claude::{SCORING_SYSTEM_PROMPT, build_user_prompt, parse_scoring_response};
 use crate::error::ScoringError;
 use crate::scorer::Scorer;
 

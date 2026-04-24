@@ -1,16 +1,45 @@
+use std::collections::HashMap;
+
 use crate::error::CoreError;
 use crate::models::{
-    Assessment, Citation, Paper, ResearchQuestion, Search, SearchResult, SearchTerm, SnowballRun,
+    Assessment, Citation, DownloadStatus, Paper, PaperId, ResearchQuestion, Search, SearchResult,
+    SearchTerm, SnowballRun,
 };
 
 /// Port for paper persistence.
 pub trait PaperRepository: Send + Sync {
     fn save(&self, paper: &Paper) -> Result<(), CoreError>;
-    fn save_many(&self, papers: &[Paper]) -> Result<(), CoreError>;
+    /// Save multiple papers, resolving DOI conflicts with existing records.
+    /// Returns a map of original_id → resolved_id for papers whose ID was
+    /// remapped to an existing record (callers should use this to fix up
+    /// search_results and other references).
+    fn save_many(&self, papers: &[Paper]) -> Result<HashMap<PaperId, PaperId>, CoreError>;
     fn get(&self, paper_id: &str) -> Result<Option<Paper>, CoreError>;
     fn find_by_doi(&self, doi: &str) -> Result<Option<Paper>, CoreError>;
     fn find_by_title(&self, title: &str) -> Result<Option<Paper>, CoreError>;
     fn list_all(&self, limit: i64, offset: i64) -> Result<Vec<Paper>, CoreError>;
+    /// Persist extracted full text for a paper. Used by `read_paper_tool`
+    /// after the first PDF/HTML extraction so subsequent reads (TUI
+    /// reader, MCP `get_annotated_paper`) hit the DB instead of
+    /// re-running pdf-extract. Idempotent — overwrites the existing
+    /// `full_text` column.
+    fn update_full_text(&self, paper_id: &str, text: &str) -> Result<(), CoreError>;
+    /// Persist the outcome of a download attempt. `local_path` is the
+    /// absolute path to the saved file on success (any non-`Failed`
+    /// status); pass `None` for `Failed`. `last_attempt_at` is set to
+    /// `now()` automatically. See #112.
+    fn update_download_state(
+        &self,
+        paper_id: &str,
+        local_path: Option<&str>,
+        status: DownloadStatus,
+    ) -> Result<(), CoreError>;
+    /// Assign a stable citation key to a paper. Called once per paper
+    /// by the 0.6.0 backfill migration (and per-paper on new ingest).
+    /// Must be unique across the DB — the caller is responsible for
+    /// running the Better-BibTeX algorithm + disambiguation before
+    /// calling this. See ADR-006 + `scitadel-export::bibtex::assign_keys`.
+    fn update_bibtex_key(&self, paper_id: &str, key: &str) -> Result<(), CoreError>;
 }
 
 /// Port for search run persistence.

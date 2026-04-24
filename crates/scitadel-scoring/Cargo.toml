@@ -3,13 +3,20 @@ name = "scitadel-scoring"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Claude-powered paper relevance scoring for scitadel."
+readme = "../../README.md"
 
 [features]
 default = ["scoring"]
 scoring = []
 
 [dependencies]
-scitadel-core = { path = "../scitadel-core" }
+scitadel-core = { path = "../scitadel-core", version = "0.5.0" }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

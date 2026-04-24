@@ -1,13 +1,21 @@
 use std::collections::HashMap;
 
-use crate::models::{CandidatePaper, Paper, SearchResult, SearchId};
+use tracing::warn;
+
+use crate::models::{CandidatePaper, Paper, SearchId, SearchResult, normalize_doi, validate_doi};
 
 /// Normalize title for fuzzy matching: lowercase, strip punctuation/whitespace.
 fn normalize_title(title: &str) -> String {
     let lowered = title.to_lowercase();
     let stripped: String = lowered
         .chars()
-        .map(|c: char| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
+        .map(|c: char| {
+            if c.is_alphanumeric() || c.is_whitespace() {
+                c
+            } else {
+                ' '
+            }
+        })
         .collect();
     stripped.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -32,8 +40,11 @@ fn title_similarity(a: &str, b: &str) -> f64 {
 
 /// Merge a candidate's metadata into an existing paper (fill gaps).
 fn merge_candidate_into_paper(paper: &mut Paper, candidate: &CandidatePaper) {
-    if paper.doi.is_none() && candidate.doi.is_some() {
-        paper.doi.clone_from(&candidate.doi);
+    if paper.doi.is_none()
+        && let Some(doi) = candidate.doi.as_deref()
+        && validate_doi(doi)
+    {
+        paper.doi = Some(normalize_doi(doi));
     }
     if paper.arxiv_id.is_none() && candidate.arxiv_id.is_some() {
         paper.arxiv_id.clone_from(&candidate.arxiv_id);
@@ -60,7 +71,9 @@ fn merge_candidate_into_paper(paper: &mut Paper, candidate: &CandidatePaper) {
         paper.authors.clone_from(&candidate.authors);
     }
     if let Some(url) = &candidate.url {
-        paper.source_urls.insert(candidate.source.clone(), url.clone());
+        paper
+            .source_urls
+            .insert(candidate.source.clone(), url.clone());
     }
 }
 
@@ -80,12 +93,28 @@ pub fn deduplicate(
     for candidate in candidates {
         let mut matched_idx = None;
 
-        // 1. DOI exact match
-        if let Some(doi) = &candidate.doi {
-            let doi_lower = doi.to_lowercase();
-            if let Some(&idx) = doi_index.get(&doi_lower) {
-                matched_idx = Some(idx);
+        // Validate and normalize DOI before using it for matching
+        let valid_doi = candidate.doi.as_deref().and_then(|doi| {
+            if validate_doi(doi) {
+                Some(normalize_doi(doi))
+            } else {
+                if !doi.is_empty() {
+                    warn!(
+                        source = %candidate.source,
+                        title = %candidate.title,
+                        doi = %doi,
+                        "rejecting malformed DOI from candidate"
+                    );
+                }
+                None
             }
+        });
+
+        // 1. DOI exact match
+        if let Some(ref doi) = valid_doi
+            && let Some(&idx) = doi_index.get(doi)
+        {
+            matched_idx = Some(idx);
         }
 
         // 2. Fuzzy title match (only if no DOI match)
@@ -109,7 +138,7 @@ pub fn deduplicate(
             let mut paper = Paper::new(&candidate.title);
             paper.authors.clone_from(&candidate.authors);
             paper.r#abstract.clone_from(&candidate.r#abstract);
-            paper.doi.clone_from(&candidate.doi);
+            paper.doi.clone_from(&valid_doi);
             paper.arxiv_id.clone_from(&candidate.arxiv_id);
             paper.pubmed_id.clone_from(&candidate.pubmed_id);
             paper.inspire_id.clone_from(&candidate.inspire_id);
@@ -118,14 +147,16 @@ pub fn deduplicate(
             paper.journal.clone_from(&candidate.journal);
             paper.url.clone_from(&candidate.url);
             if let Some(url) = &candidate.url {
-                paper.source_urls.insert(candidate.source.clone(), url.clone());
+                paper
+                    .source_urls
+                    .insert(candidate.source.clone(), url.clone());
             }
 
             let idx = papers.len();
             matched_idx = Some(idx);
 
-            if let Some(doi) = &candidate.doi {
-                doi_index.insert(doi.to_lowercase(), idx);
+            if let Some(ref doi) = valid_doi {
+                doi_index.insert(doi.clone(), idx);
             }
             if !candidate.title.is_empty() {
                 title_index.insert(normalize_title(&candidate.title), idx);
@@ -160,7 +191,10 @@ mod tests {
 
     #[test]
     fn test_title_similarity_identical() {
-        let sim = title_similarity("Machine Learning for Science", "Machine Learning for Science");
+        let sim = title_similarity(
+            "Machine Learning for Science",
+            "Machine Learning for Science",
+        );
         assert!((sim - 1.0).abs() < f64::EPSILON);
     }
 

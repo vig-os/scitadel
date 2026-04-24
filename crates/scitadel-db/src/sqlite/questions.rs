@@ -1,4 +1,4 @@
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use scitadel_core::error::CoreError;
 use scitadel_core::models::{QuestionId, ResearchQuestion, SearchTerm, SearchTermId};
 use scitadel_core::ports::QuestionRepository;

@@ -2,6 +2,8 @@
 # Uses:
 # - sync-issues action from this public repository (vig-os/sync-issues-action)
 # - commit-action from the public repository (vig-os/commit-action)
+# NOTE: This workspace workflow is intentionally decoupled from upstream
+# `.github/workflows/sync-issues.yml` and maintained separately.
 
 name: Sync Issues and PRs
 
@@ -36,8 +38,32 @@ on:  # yamllint disable-line rule:truthy
 permissions: {}  # restrict default; job declares its own
 
 jobs:
-  sync:
+  resolve-image:
+    name: Resolve image tag
     runs-on: ubuntu-22.04
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    outputs:
+      image-tag: ${{ steps.resolve.outputs.image-tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          sparse-checkout: |
+            .vig-os
+            .github/actions/resolve-image
+          sparse-checkout-cone-mode: false
+
+      - name: Resolve container image
+        id: resolve
+        uses: ./.github/actions/resolve-image
+
+  sync:
+    needs: [resolve-image]
+    runs-on: ubuntu-22.04
+    container:
+      image: ghcr.io/vig-os/devcontainer:${{ needs.resolve-image.outputs.image-tag }}
     timeout-minutes: 10
     # Prevent concurrent runs to avoid race conditions when committing and cache collisions
     concurrency:
@@ -52,10 +78,10 @@ jobs:
     steps:
       - name: Generate a token
         id: generate-token
-        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf  # v2
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859  # v3
         with:
-          app-id: ${{ secrets.APP_SYNC_ISSUES_ID }}
-          private-key: ${{ secrets.APP_SYNC_ISSUES_PRIVATE_KEY }}
+          app-id: ${{ secrets.COMMIT_APP_ID }}
+          private-key: ${{ secrets.COMMIT_APP_PRIVATE_KEY }}
 
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -83,10 +109,12 @@ jobs:
           sleep 2
           # Try to delete cache using GitHub API
           CACHE_KEY="sync-issues-state-${{ github.repository }}"
-          CACHE_ID=$(gh api repos/${{ github.repository }}/actions/caches --jq ".actions_caches[] | select(.key == \"$CACHE_KEY\") | .id" | head -1)
+          CACHE_ID=$(retry --retries 3 --backoff 3 --max-backoff 15 -- \
+            gh api repos/${{ github.repository }}/actions/caches --jq ".actions_caches[] | select(.key == \"$CACHE_KEY\") | .id" | head -1)
           if [ -n "$CACHE_ID" ]; then
             echo "Found cache ID: $CACHE_ID, attempting deletion..."
-            gh api repos/${{ github.repository }}/actions/caches/$CACHE_ID -X DELETE && echo "Cache deleted successfully" || echo "Cache deletion failed (may be locked or already deleted)"
+            retry --retries 3 --backoff 3 --max-backoff 15 -- \
+              gh api repos/${{ github.repository }}/actions/caches/$CACHE_ID -X DELETE && echo "Cache deleted successfully" || echo "Cache deletion failed (may be locked or already deleted)"
           else
             echo "No cache found with key: $CACHE_KEY (this is OK for first run)"
           fi
@@ -95,8 +123,8 @@ jobs:
         id: sync
         uses: vig-os/sync-issues-action@bad447d330526a7313ffddae084010c39b335fc1  # v0.2.2
         with:
-          app-id: ${{ secrets.APP_SYNC_ISSUES_ID }}
-          app-private-key: ${{ secrets.APP_SYNC_ISSUES_PRIVATE_KEY }}
+          app-id: ${{ secrets.COMMIT_APP_ID }}
+          app-private-key: ${{ secrets.COMMIT_APP_PRIVATE_KEY }}
           output-dir: ${{ github.event.inputs.output-dir || 'docs' }}
           sync-issues: 'true'
           sync-prs: 'true'
@@ -107,12 +135,13 @@ jobs:
       - name: Commit and push changes via API
         id: commit
         if: steps.sync.outputs.modified-files != ''
-        uses: vig-os/commit-action@b70c2d87acd0f146c40e8d88a9bda40b76c084b5  # v0.1.3
+        uses: vig-os/commit-action@1bc004353d08d9332a0cb54920b148256220c8e0  # v0.2.0
         env:
           # Use App token so push can bypass branch protection when App is in bypass list
-          GH_TOKEN: ${{ steps.generate-token.outputs.token || github.token }}
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           TARGET_BRANCH: refs/heads/${{ github.event.inputs.target-branch || 'dev' }}
+          MAX_ATTEMPTS: "3"
           COMMIT_MESSAGE: "${{ github.event.inputs.commit-msg || 'chore: sync issues and PRs' }}"
           FILE_PATHS: ${{ steps.sync.outputs.modified-files }}
 

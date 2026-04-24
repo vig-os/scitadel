@@ -7,7 +7,11 @@ use tracing_subscriber::EnvFilter;
 mod commands;
 
 #[derive(Parser)]
-#[command(name = "scitadel", version, about = "Programmable, reproducible scientific literature retrieval")]
+#[command(
+    name = "scitadel",
+    version,
+    about = "Programmable, reproducible scientific literature retrieval"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -15,11 +19,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize the scitadel database
+    /// Initialize scitadel: write a config and create the database.
+    /// Runs as an interactive wizard unless --yes or stdin is non-interactive.
     Init {
         /// Database path
         #[arg(long)]
         db: Option<PathBuf>,
+        /// OpenAlex / Unpaywall email (used for OA PDF lookups)
+        #[arg(long)]
+        email: Option<String>,
+        /// Comma-separated sources to enable (e.g. pubmed,arxiv,openalex)
+        #[arg(long)]
+        sources: Option<String>,
+        /// Non-interactive: use provided flags + defaults, never prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
     /// Run a federated literature search
     Search {
@@ -86,6 +100,21 @@ enum Commands {
         #[arg(long, default_value = "auto")]
         scorer: String,
     },
+    /// Download a paper (PDF or HTML) by DOI
+    Download {
+        /// DOI of the paper to download
+        doi: String,
+        /// Output directory (default: .scitadel/papers/)
+        #[arg(short, long)]
+        output_dir: Option<PathBuf>,
+    },
+    /// Manage source credentials (keychain storage)
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
+    /// Launch MCP server on stdio
+    Mcp,
     /// Launch interactive TUI dashboard
     Tui,
     /// Run citation chaining (snowballing)
@@ -108,6 +137,22 @@ enum Commands {
         #[arg(short, long, default_value = "claude-sonnet-4-6")]
         model: String,
     },
+}
+
+#[derive(Subcommand)]
+enum AuthCommands {
+    /// Store credentials for a source in the system keychain
+    Login {
+        /// Source name (pubmed, openalex, lens, epo)
+        source: String,
+    },
+    /// Remove stored credentials for a source
+    Logout {
+        /// Source name
+        source: String,
+    },
+    /// Show which sources have credentials configured
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -144,7 +189,23 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Init { db } => commands::init(db),
+        Commands::Init {
+            db,
+            email,
+            sources,
+            yes,
+        } => commands::init(commands::InitOptions {
+            db_path: db,
+            email,
+            sources: sources.map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            }),
+            yes,
+        }),
         Commands::Search {
             query,
             sources,
@@ -158,10 +219,7 @@ async fn main() -> Result<()> {
             format,
             output,
         } => commands::export(&search_id, &format, output),
-        Commands::Diff {
-            search_a,
-            search_b,
-        } => commands::diff(&search_a, &search_b),
+        Commands::Diff { search_a, search_b } => commands::diff(&search_a, &search_b),
         Commands::Question { command } => match command {
             QuestionCommands::Create { text, description } => {
                 commands::question_create(&text, &description)
@@ -173,6 +231,13 @@ async fn main() -> Result<()> {
                 query,
             } => commands::question_add_terms(&question_id, &terms, query),
         },
+        Commands::Auth { command } => match command {
+            AuthCommands::Login { source } => commands::auth_login(&source),
+            AuthCommands::Logout { source } => commands::auth_logout(&source),
+            AuthCommands::Status => commands::auth_status(),
+        },
+        Commands::Download { doi, output_dir } => commands::download(&doi, output_dir).await,
+        Commands::Mcp => commands::mcp().await,
         Commands::Tui => commands::tui(),
         Commands::Assess {
             search_id,
@@ -188,8 +253,6 @@ async fn main() -> Result<()> {
             threshold,
             direction,
             model,
-        } => {
-            commands::snowball(&search_id, &question, depth, threshold, &direction, &model)
-        }
+        } => commands::snowball(&search_id, &question, depth, threshold, &direction, &model),
     }
 }

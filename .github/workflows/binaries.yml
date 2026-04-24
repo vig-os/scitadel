@@ -1,0 +1,71 @@
+# Builds prebuilt scitadel binaries when a semver tag is pushed, and
+# attaches platform tarballs + SHA256 sums to the GitHub Release.
+#
+# Triggered on tags matching X.Y.Z (and pre-releases like X.Y.Z-rcN).
+# The Release object should already exist (created by release.yml or
+# manually via `gh release create`); this workflow uploads assets to it.
+
+name: Binaries
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-*'
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: scitadel
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }} -p scitadel-cli
+
+      - name: Package tarball
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          DIST_NAME="${BINARY_NAME}-${VERSION}-${{ matrix.target }}"
+          STAGE=$(mktemp -d)
+          mkdir -p "${STAGE}/${DIST_NAME}"
+          cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${STAGE}/${DIST_NAME}/"
+          cp README.md LICENSE-APACHE LICENSE-MIT CHANGELOG.md "${STAGE}/${DIST_NAME}/"
+          TAR="${DIST_NAME}.tar.gz"
+          (cd "$STAGE" && tar czf "$TAR" "$DIST_NAME")
+          mv "${STAGE}/${TAR}" .
+          shasum -a 256 "$TAR" > "${TAR}.sha256"
+          echo "tarball=$TAR" >> "$GITHUB_OUTPUT"
+          echo "checksum=${TAR}.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.package.outputs.tarball }}
+            ${{ steps.package.outputs.checksum }}
+          fail_on_unmatched_files: true

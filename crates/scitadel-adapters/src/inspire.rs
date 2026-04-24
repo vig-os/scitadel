@@ -31,8 +31,7 @@ impl SourceAdapter for InspireAdapter {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs_f64(self.timeout))
             .build()
-            .map_err(|e| CoreError::Adapter("inspire".into(), e.to_string(),
-            ))?;
+            .map_err(|e| CoreError::Adapter("inspire".into(), e.to_string()))?;
 
         let params = [
             ("q", query.to_string()),
@@ -49,11 +48,12 @@ impl SourceAdapter for InspireAdapter {
             .query(&params)
             .send()
             .await
-            .map_err(|e| CoreError::Adapter("inspire".into(), e.to_string(),
-            ))?;
+            .map_err(|e| CoreError::Adapter("inspire".into(), e.to_string()))?;
 
-        let data: serde_json::Value = resp.json().await.map_err(|e| CoreError::Adapter("inspire".into(), e.to_string(),
-        ))?;
+        let data: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| CoreError::Adapter("inspire".into(), e.to_string()))?;
 
         Ok(parse_inspire_results(&data))
     }
@@ -73,7 +73,11 @@ pub fn parse_inspire_results(data: &serde_json::Value) -> Vec<CandidatePaper> {
             let meta = hit.get("metadata").cloned().unwrap_or_default();
             let inspire_id = hit
                 .get("id")
-                .and_then(|v| v.as_i64().map(|n| n.to_string()).or_else(|| v.as_str().map(String::from)))
+                .and_then(|v| {
+                    v.as_i64()
+                        .map(|n| n.to_string())
+                        .or_else(|| v.as_str().map(String::from))
+                })
                 .unwrap_or_default();
 
             let title = meta
@@ -90,7 +94,11 @@ pub fn parse_inspire_results(data: &serde_json::Value) -> Vec<CandidatePaper> {
                 .and_then(|a| a.as_array())
                 .map(|arr| {
                     arr.iter()
-                        .filter_map(|a| a.get("full_name").and_then(|n| n.as_str()).map(String::from))
+                        .filter_map(|a| {
+                            a.get("full_name")
+                                .and_then(|n| n.as_str())
+                                .map(String::from)
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
@@ -127,7 +135,10 @@ pub fn parse_inspire_results(data: &serde_json::Value) -> Vec<CandidatePaper> {
 
             let year = pub_info
                 .and_then(|p| p.get("year"))
-                .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                .and_then(|v| {
+                    v.as_i64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                })
                 .map(|y| y as i32);
 
             let journal = pub_info

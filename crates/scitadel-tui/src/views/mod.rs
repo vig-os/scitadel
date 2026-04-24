@@ -1,4 +1,10 @@
+pub mod annotation_prompt;
+pub mod dashboard;
 pub mod detail;
 pub mod papers;
 pub mod questions;
+pub mod queue;
+pub mod reader;
 pub mod searches;
+pub mod tasks;
+pub(crate) mod util;

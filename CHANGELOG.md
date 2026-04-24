@@ -9,10 +9,399 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Layout-aware PDF text extraction** (#145). `read_paper` now prefers
+  `pdftotext -layout -nopgbrk` (poppler) when on PATH, falling back to
+  the existing `pdf-extract` crate when not. Two-column scientific
+  papers come out in correct reading order instead of left/right
+  interleaved; the response envelope includes an `Extractor:` line so
+  downstream agents can tell which tier produced the text. No new
+  mandatory dependency — pdftotext is already common via Homebrew /
+  poppler-utils, and absence of it is transparent.
+- **`O` keybind in TUI Detail overlay** (#144). Spawns the OS default
+  viewer (`open` / `xdg-open` / `cmd /c start`) on `paper.local_path`
+  for figure/math/table-heavy PDFs that don't survive plain-text
+  extraction. Failures (no local file, exec error) surface in the
+  task panel as a Failed row. Status bar now: `D: download | O: open
+  externally | R: reader | n: new | J: focus`.
+- **Stable BibTeX citation keys + deterministic export** (#132). Migration 009
+  adds `papers.bibtex_key TEXT UNIQUE`. Algorithm lives in
+  `scitadel-core::bibtex_key` (Better-BibTeX-style `{lastname}{year}{firstword}`,
+  ASCII-folded via NFKD, `a`/`b`/`c` suffix on collision, tiebroken by
+  paper UUID lexicographic). Keys are assigned on first encounter
+  (backfill migration runs on every `Database::migrate`) and never
+  recomputed — the freeze contract is what makes `\cite{muller2024quantum}`
+  resolve tomorrow regardless of upstream metadata churn. `export_bibtex`
+  now sorts alphabetically by key, uses fixed field order, NFC-normalised
+  UTF-8, and emits a `algo_hash`-pinned header without timestamps so
+  `git diff` on a committed `.bib` is meaningful. Algorithm-hash pinning
+  test locks in the contract: any drift in the source fails CI loudly
+  and forces an explicit migration. See [ADR-006](docs/decisions/ADR-006-2026-04-21-bibtex-key-algorithm.md).
+  CLI surface (`scitadel bib export` / `snapshot` / `verify`), `.scitadel-bib.lock`
+  sidecar, import and watch ship in 0.6.1 (#134) and 0.6.2 (#135).
+- **Question Dashboard** (#133). New TUI overlay accessed via `Enter`
+  on the Questions tab. Split pane: left 40% shows papers scored
+  against the question, ranked by score DESC; right 60% shows the
+  focused paper's rationale + abstract + metadata. `c` toggles a
+  citation shortlist (persisted per `(question_id, reader)`) marked
+  with `●`. `Enter` opens the focused paper in the existing detail
+  overlay; `Esc`/`q` returns to Questions. Shortlist membership feeds
+  `bib snapshot <question_id>` in 0.6.1 (#134). Migration 010 adds
+  the `shortlist_members` table. MCP `get_question_dashboard` /
+  `toggle_shortlist` / `list_shortlist` tools ship in a follow-up.
+- **Dalton Dark theme + central `theme.rs` abstraction** (#136). TUI now
+  pulls colours through semantic roles (`emphasis`, `muted`,
+  `selection_bg`, `quote`, `info`, `success`, `warning`, `danger`, plus
+  an 8-slot highlight palette) rather than hardcoding `Color::Yellow` /
+  `Color::Rgb(...)`. Default palette is [Dalton
+  Dark](https://github.com/gerchowl/dalton-colorscheme), a
+  colourblind-friendly scheme tuned for deuteranopia and protanopia.
+  Light mode and auto-detection ship in #137.
+
+## [0.5.0] - 2026-04-21
+
+The 2-pane workflow release. Combines the agent-side affordances
+shipped under the 0.4.0 milestone (citation graph, MCP progress
+notifications, rmcp 0.17 upgrade, annotations CRUD via TUI + MCP,
+two-pane reader, get_annotated_paper, multi-selector resolver) with
+the 0.5.0 milestone's affordance-gap closures (download-state column,
+task-panel flush, star MCP tools, get_current_selection, SQLite
+cross-process visibility) and the meta-pivot away from a bundled LLM
+abstraction (#60/#61 closed as superseded) toward MCP-driven
+2-pane workflow as the primary recommendation.
+
+`Cargo.toml` workspace version is bumped 0.1.0 → 0.5.0 to align with
+the changelog narrative; this is the first release where the on-disk
+crate version actually matches the documented release. Earlier 0.2.x
+and 0.3.x sections in this file are CHANGELOG-only milestones — no
+git tags exist for them.
+
+### Fixed
+
+- **SQLite cross-process write visibility** (#121). Added `synchronous=NORMAL`
+  to the WAL pairing (already had `journal_mode=WAL` and `busy_timeout=5000`)
+  and a `cross_process_write_visible_within_one_redraw` integration test
+  that opens two `Database` handles on the same file and verifies a write
+  through one is visible through the other on the very next read. This is
+  the property the 2-pane workflow (TUI in one pane, `scitadel mcp` in
+  another) depends on — without it the TUI shows stale state after every
+  agent-driven edit.
+- **VHS tape PATH ordering** (#116). All 9 tapes now put
+  `$PWD/target/release` before `$HOME/.cargo/bin` so a stale installed
+  `scitadel` can no longer shadow the project build. This was the
+  root cause of false-positive bug reports #114 and #115 — both
+  symptoms (R reader not opening, status bar truncated) disappeared
+  once the tape used the freshly built binary.
+
 ### Changed
+
+- **TUI task panel flush policy** (#113). Done downloads auto-flush
+  after 5 s, Failed after 30 s — long enough for the user to see the
+  result, short enough that they don't crowd the panel. The 10-task
+  cap now only evicts terminal tasks; an in-flight Queued or Running
+  download is never dropped to make room. New `c` keybind clears all
+  completed/failed tasks immediately (visible in the tab-mode status
+  bar).
+- **CI vhs gate now asserts distinct snapshots** (#116). After
+  rendering each tape, the workflow checks that every tape declaring
+  `N` `Screenshot` calls produced at least `N` PNGs and that they're
+  not all byte-identical. This catches the dead-tape class of bugs
+  where a tape was committed but never actually exercised the feature
+  (the failure mode that hid #97's reader being unverified for two
+  PRs).
+
+### Added
+
+- **MCP `get_current_selection`** (#122). The TUI publishes its
+  current selection (active tab, open paper/search/question, focused
+  annotation) to a singleton `tui_state` row on every focus change.
+  Agents in the adjacent pane can now ask "what is the user looking
+  at right now?" without the user pasting IDs. Result includes a
+  `stale: bool` flag (true when the row is >60s old) so an agent can
+  tell the TUI was closed. Migration 008. Dedup by selection key —
+  no UPDATE traffic when the user isn't moving.
+- **MCP star tools — `toggle_star`, `set_star`, `list_starred`** (#120).
+  Closes the only TUI-only affordance gap so an agent in an adjacent
+  pane (the recommended 2-pane workflow) can drive every state change
+  the user can drive in the TUI. Trust-on-first-use `reader` identity,
+  matching the existing annotation tools (#100). Audit logged.
+- **Papers-table download-state column** (#112). Migration 007 adds
+  `local_path`, `download_status`, and `last_attempt_at` columns to
+  `papers`. The TUI Papers table renders a one-char symbol next to
+  each row: blank (never tried), `↻` (in flight), `✓` (downloaded),
+  `⊘` (paywalled / abstract-only), `✗` (failed). Both the TUI's
+  `D` keybind and the `scitadel download` CLI persist the outcome
+  back to the row so the symbol survives restarts. The in-flight
+  symbol is derived from the live task list — no DB write while
+  running.
+- **MCP progress notifications** (#58). The `search`,
+  `download_paper`, and `prepare_batch_assessments` tools now emit
+  `notifications/progress` frames when the caller supplies a
+  `progressToken` in the request `_meta`. Bracketing pattern: a
+  start frame at progress=0 (with a human-readable message naming
+  the operation), then a done frame at progress=total on success or
+  with the error string on failure. Per-source / per-paper
+  granularity is a follow-up that needs the orchestrator to thread a
+  callback through each adapter loop. Built on the rmcp 0.17 upgrade
+  that landed earlier in 0.4.0.
+- **TUI two-pane annotation reader** (#97, iter 1). Toggled with `R`
+  on the paper detail overlay: left pane renders the paper body
+  (`full_text` if cached, else the abstract) with background-color
+  highlights over annotated ranges, palette hashed by thread root_id
+  so a thread keeps the same color on every render. Right pane
+  threads root annotations + replies, focused row syncs with the
+  highlight underline. `J` / `K` hop between highlights. Single-
+  pane fallback message when no body text is available yet.
+  Multi-line gutter bars and PDF overlay are deferred.
+- **`PaperRepository::update_full_text`** + caching in
+  `read_paper_tool` (#97 prep). The MCP read tool now persists the
+  extracted text on first call so subsequent reads — including the
+  new TUI reader — hit the DB instead of re-running pdf-extract.
+  Failure to cache is non-fatal (extraction still returns).
+- **TUI-native annotation create / edit / reply / delete** (#92,
+  iter 3b of #49). New keybindings on the paper detail overlay:
+  `n` opens a two-stage Create prompt (quote → note); `Shift+J`
+  enters annotation focus mode; `e` edits the focused note inline;
+  `r` opens a reply prompt; `d` opens a y/n delete confirmation.
+  The state machine lives in
+  `crates/scitadel-tui/src/views/annotation_prompt.rs` (pure, fully
+  tested). $EDITOR integration + visual-mode char-range selection
+  remain out of scope — see #97 for the two-pane reader.
+- **Citation graph — iter 1** (#59). New OpenAlex helpers
+  (`fetch_work_by_id`, `fetch_works_by_ids`, `fetch_cited_by`,
+  `short_openalex_id`, `work_to_paper`) plus two MCP tools:
+  - `get_references(paper_id)` — fetches the works this paper cites
+    via OpenAlex's `referenced_works`, materialises each as a Paper
+    row, and persists the citation edges. Source paper must have an
+    `openalex_id`.
+  - `get_citations(paper_id, limit?)` — fetches the works that cite
+    this paper (`cites:` filter; default 25, capped at 200).
+  Idempotent: existing papers upsert on the OpenAlex id, and the
+  citation edge has a uniqueness constraint so re-runs are no-ops.
+  TUI graph view + snowball orchestration (`snowball(seed_paper_ids,
+  depth, stop_condition)`) ship in iter 2.
+- **`sentence_id` + `normalize_sentence` in `scitadel-core`** (#96):
+  SHA1 of NFKC-composed, lowercased, whitespace-collapsed sentence
+  text. Spec pinned in [ADR-004](docs/decisions/ADR-004-2026-04-19-sentence-id-normalization.md).
+- **MCP `get_annotated_paper`** (#95): one-call JSON of a paper +
+  every live annotation anchored to it (with `parent_id` / `root_id`
+  for thread reconstruction and the full anchor incl.
+  char_range/quote/prefix/suffix/sentence_id/source_version/status).
+  Replaces `get_paper` + `list_annotations` for agents that reason
+  over offsets.
+- **VHS coverage for CLI search + question subcommands** (#99): two
+  new tapes (`tests/vhs/cli-search.tape`,
+  `tests/vhs/cli-question-workflow.tape`) plus a `Shift+Tab`
+  (BackTab) + `d`/`u` page-scroll addition to `tui-launch.tape` to
+  close the gaps flagged in the 0.4.0 coverage audit.
+
+### Changed
+
+- **rmcp upgrade 0.1.5 → 0.17** (#58 prep). Mechanical rewrite of
+  `crates/scitadel-mcp/src/server.rs` against the new `tool_router`
+  macro: each tool is a method with a `Parameters<T>` extractor;
+  `ToolRouter<Self>` field on the server; `ServerHandler` delegates
+  via `#[tool_handler]`. Per-param structs added for tools that
+  used `#[tool(param)]` in 0.1.5. Behaviour unchanged — every
+  existing tool still works the same — but the new API unlocks the
+  `Peer<RoleServer>` extractor that #58 (MCP progress notifications)
+  will use as a follow-up. Workspace `schemars` bumped 0.8 → 1 to
+  match rmcp 0.17's transitive dep.
+- **MCP tool-signature + return-shape consistency pass** (#98):
+  - `add_search_terms.query_string` is now `Option<String>` to match
+    its description (was a required `String` clients couldn't omit).
+  - Every MCP tool description now telegraphs its return shape
+    (`Returns: JSON` / `Returns: text`); enforced by a new style test
+    in `crates/scitadel-mcp/src/server.rs`.
+  - `get_assessments` description now says "at least one of paper_id
+    or question_id is required" — the handler error is unchanged.
+  - `list_annotations` description now states paper_id is required and
+    cross-paper listing is not yet implemented (matches the schema +
+    handler).
+  - `prepare_assessment` and `get_rubric` cross-reference each other
+    so an LLM doesn't redundantly fetch the rubric twice.
+- **Annotation anchor resolver** (#96): completes the four-step
+  W3C-style pipeline shipped half-done in 0.3.0. Adds
+  prefix/suffix-based disambiguation for repeated quotes, sliding-
+  window fuzzy match (Jaro-Winkler ≥ 0.9 default; tunable via
+  `resolve_anchor_with_threshold`), sentence-id fallback, and
+  bounds-checking on `char_range` so malformed rows return
+  `Orphan` instead of panicking.
+- **MCP annotation tool descriptions** (#100): `create_annotation`,
+  `reply_annotation`, `update_annotation`, `delete_annotation`, and
+  `list_unread` now flag trust-on-first-use author identity (real auth
+  ships with the Phase-5 Dolt sync layer) and the wall-clock-based
+  read-receipt race window (`seen_at < updated_at`). Every annotation
+  write now emits a `tracing::info!` audit record (op + ids + author).
 
 ### Removed
 
 ### Fixed
 
 ### Security
+
+## [0.3.0] - 2026-04-19
+
+Agent DX polish + annotations. 14 PRs merged to `dev` under a
+loop-driven autonomous execution session (ADR-003). Everything behind
+the VHS coverage gate and the existing Rust CI bar.
+
+Note on scope: #58 (MCP progress notifications) was deferred to 0.4.0
+after discovering rmcp 0.1.5's tool macro doesn't inject a `Peer`
+reference into handlers — see ADR-003 for the rationale.
+
+### Added
+
+- **MCP `list_sources`** (#54): per-source metadata (name, description,
+  required credential fields, configured-in-this-env flag, rate-limit
+  hint) so agents can introspect instead of guessing.
+- **MCP `summarize_search`** (#53): one-call JSON digest of every
+  paper in a search with truncated abstracts, saves N round-trips.
+- **MCP `get_rubric`** (#56): cacheable access to the static scoring
+  rubric so agents don't pay for it per-paper via
+  `prepare_assessment`.
+- **MCP `search` returns structured JSON** (#55): per-source
+  `status / result_count / latency_ms / error` alongside a
+  `summary` string for back-compat with human readers.
+- **MCP `find_similar_searches`** (#57): FTS5 (porter + unicode61)
+  over stored query strings; backed by new migration 006 with a
+  trigger-based sync. FTS5-operator sanitizer so arbitrary user
+  input doesn't raise syntax errors.
+- **Annotations** (#49) — shipped across 5 iterations:
+  - **iter 1 — data model + schema**: `annotations` +
+    `annotation_reads` tables (migration 005), W3C-style multi-
+    selector anchor (position, quote + context, sentence-id),
+    threaded replies, soft-delete tombstones.
+  - **iter 2 — repo + anchoring resolver**:
+    `SqliteAnnotationRepository` with CRUD + thread loading;
+    `resolve_anchor` tries position → quote-substring → orphan
+    (fuzzy + sentence-id deferred to 3b).
+  - **iter 3 — TUI view-only rendering**: annotations listed in
+    the paper detail overlay; threaded replies indented.
+  - **iter 4 — MCP CRUD**: `create_annotation`, `reply_annotation`,
+    `update_annotation`, `delete_annotation`, `list_annotations`.
+    Author identity is mandatory on writes.
+  - **iter 5 — read receipts**: `mark_seen`, `mark_thread_seen`,
+    `list_unread`. Edits auto-resurface rows as unread.
+- **ADR-003** — 0.3.0 execution tracker + decision log.
+
+### Changed
+
+- **`search` tool response shape** is now JSON (still carries a
+  `summary` string for back-compat). External clients that parsed
+  the old string should read `summary` or pivot to the structured
+  fields.
+- `get_papers_tool` + `prepare_batch_assessments_tool` now use
+  `truncate_abstract` (char-safe) instead of the byte-slice
+  `&s[..300]` that panicked on non-ASCII content.
+- `list_sources` OpenAlex credential field renamed from `email` to
+  `polite_pool_email` to match how config actually stores it.
+
+### Removed
+
+- Python-era release workflows (`release.yml`, `release-core.yml`,
+  `release-publish.yml`, `release-extension.yml`,
+  `prepare-release.yml`, `promote-release.yml`) — all superseded by
+  the Rust-native `binaries.yml` + `publish-crates.yml` shipped in
+  0.2.0.
+
+### Deferred to later milestones
+
+- **MCP progress notifications (#58)** — 0.4.0. Waits for rmcp
+  upgrade or custom tool-handler wrapper.
+- **TUI-native annotation create/edit/delete (#92)** — 0.4.0.
+  MCP CRUD covers it for now.
+- **Fuzzy anchor matching + sentence-id resolver** — follow-up
+  once the TUI surfaces orphans.
+- **`get_annotated_paper` composite endpoint** — waits for the
+  two-pane reader design.
+
+## [0.2.0] - 2026-04-18
+
+Onboarding and reading workflow. Eight PRs, every UX/TUI change backed
+by a VHS tape, CI gate prevents future UI work from skipping tapes.
+
+Note on original scope: #49 annotations is deferred to 0.3.0 — it is
+an architectural effort (multi-selector anchoring, threaded replies,
+two-pane reader, full MCP CRUD) that benefits from its own focused
+release rather than being rushed alongside the onboarding work.
+
+### Added
+
+- **`scitadel init` wizard** (#47): interactive first-run setup with
+  prompts for email + sources, non-interactive `--yes` mode, writes
+  `config.toml`, migrates the DB, prints a ready-to-run sample query.
+- **Star papers in the TUI** (#48, v1): `s` toggles a per-reader ★ flag
+  on the Papers tab. New `paper_state` table scoped by reader; the
+  schema already has `to_read` / `read_at` columns for the upcoming
+  Queue tab in a follow-up.
+- **Institutional-access hint on paywalled downloads** (#50): when
+  `AccessStatus::Paywall` is detected, the task panel shows the live
+  publisher URL + a note that an institutional IP range may grant
+  access. Gated by `UiConfig.show_institutional_hint` (default on).
+- **OFFLINE indicator** (#51, v1): startup network probe; yellow bold
+  `[OFFLINE]` in the status bar when the probe fails. Reads continue
+  to work from local SQLite. `SCITADEL_FORCE_OFFLINE=1` env var
+  bypasses the probe for testing.
+- **Prebuilt binaries** (#64): new `binaries.yml` workflow builds
+  scitadel-cli on linux-x64 + macos-x64 + macos-arm64 on every semver
+  tag push, tarballs + SHA256 sums attached to the GitHub Release.
+- **Crates.io publishing pipeline** (#65): `publish-crates.yml`
+  dry-runs metadata on every PR, sequential live-publish on tag
+  push in dependency order (core → db → adapters → scoring → export
+  → mcp → tui → cli). Requires `CARGO_REGISTRY_TOKEN` secret.
+- **VHS walkthrough-tape harness** (#62): `tests/vhs/` + `just vhs`
+  recipes + CI workflow that installs vhs on ubuntu, runs every tape
+  on PR/push, uploads snapshots as artifacts. Coverage gate: PRs that
+  touch TUI/CLI source must add or update a tape (or include
+  `[tape-exempt: <reason>]` in a commit).
+
+### Changed
+
+- Every merged UX/TUI PR in this release ships with a VHS tape. Any
+  future PR that misses the gate will be blocked by CI.
+
+### Deferred
+
+- **Annotations** (#49) — threaded notes, read receipts, multi-selector
+  anchoring, two-pane reader. Moved to 0.3.0.
+- **Reading queue: `r`/`R` keybindings + Queue tab** — data model exists;
+  UI is a follow-up.
+- **Offline retry queue** — the indicator ships; queued retries don't.
+
+## [0.1.0] - 2026-04-18
+
+Initial release. Rust workspace implementing the scitadel MVP: federated
+scientific literature search with structured storage and retrieval/assessment
+tooling across CLI, MCP server, and TUI surfaces.
+
+### Added
+
+- **Core domain** (`scitadel-core`): paper / search / question / assessment
+  models, keychain + env-var credential resolution, strict DOI validation and
+  canonicalization.
+- **SQLite persistence** (`scitadel-db`): schema + migrations, deduplication on
+  DOI / OpenAlex / arxiv identifiers, upsert with conflict resolution (#40).
+- **Source adapters** (`scitadel-adapters`): PubMed, arXiv, OpenAlex,
+  INSPIRE-HEP, EPO OPS, PatentsView, Lens. Paper download chain (arxiv →
+  OpenAlex → Unpaywall → publisher HTML) with paywall detection.
+- **Scoring** (`scitadel-scoring`): Claude API scorer for automated relevance
+  assessment.
+- **Export** (`scitadel-export`): BibTeX, JSON, CSV.
+- **CLI** (`scitadel-cli`): `search`, `history`, `export`, `download`, `score`,
+  `auth`, `tui`, `mcp` subcommands.
+- **MCP server** (`scitadel-mcp`): 14 tools for agent-driven literature
+  workflows, including `search`, `get_papers`, `assess_paper`,
+  `prepare_assessment`, `download_paper`, `read_paper`.
+- **TUI** (`scitadel-tui`): ratatui-based browser with Searches / Papers /
+  Questions tabs, async download task panel, paper reader, vim-ish keybindings.
+- **Nix flake + direnv** reproducible devshell.
+- **vig-os/devcontainer 0.3.3** workflow/release standards.
+- **Dual-license**: MIT OR Apache-2.0.
+
+### Known limitations
+
+- No citation graph / snowball (planned for 0.4.0, see #59).
+- No in-TUI annotations (planned for 0.2.0, see #49).
+- No prebuilt binaries; install via `cargo install --path crates/scitadel-cli`
+  (cargo-dist tracked in #64).
+- Not yet published to crates.io (tracked in #65).
