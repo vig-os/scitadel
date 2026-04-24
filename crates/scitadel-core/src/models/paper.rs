@@ -42,6 +42,14 @@ pub struct Paper {
     /// "tried weeks ago, retry might work".
     #[serde(default)]
     pub last_attempt_at: Option<DateTime<Utc>>,
+    /// Stable citation key used in BibTeX / BibLaTeX export (#132).
+    /// Assigned on first encounter via the Better-BibTeX-style
+    /// algorithm in `scitadel-export::bibtex::generate_key` and frozen
+    /// thereafter — the freeze contract is why we persist it rather
+    /// than recompute. `None` means the paper predates migration 009
+    /// and will be backfilled on next `Database::migrate` call.
+    #[serde(default)]
+    pub bibtex_key: Option<String>,
 }
 
 impl Paper {
@@ -69,6 +77,7 @@ impl Paper {
             local_path: None,
             download_status: None,
             last_attempt_at: None,
+            bibtex_key: None,
         }
     }
 }

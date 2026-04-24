@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Stable BibTeX citation keys + deterministic export** (#132). Migration 009
+  adds `papers.bibtex_key TEXT UNIQUE`. Algorithm lives in
+  `scitadel-core::bibtex_key` (Better-BibTeX-style `{lastname}{year}{firstword}`,
+  ASCII-folded via NFKD, `a`/`b`/`c` suffix on collision, tiebroken by
+  paper UUID lexicographic). Keys are assigned on first encounter
+  (backfill migration runs on every `Database::migrate`) and never
+  recomputed — the freeze contract is what makes `\cite{muller2024quantum}`
+  resolve tomorrow regardless of upstream metadata churn. `export_bibtex`
+  now sorts alphabetically by key, uses fixed field order, NFC-normalised
+  UTF-8, and emits a `algo_hash`-pinned header without timestamps so
+  `git diff` on a committed `.bib` is meaningful. Algorithm-hash pinning
+  test locks in the contract: any drift in the source fails CI loudly
+  and forces an explicit migration. See [ADR-006](docs/decisions/ADR-006-2026-04-21-bibtex-key-algorithm.md).
+  CLI surface (`scitadel bib export` / `snapshot` / `verify`), `.scitadel-bib.lock`
+  sidecar, import and watch ship in 0.6.1 (#134) and 0.6.2 (#135).
 - **Dalton Dark theme + central `theme.rs` abstraction** (#136). TUI now
   pulls colours through semantic roles (`emphasis`, `muted`,
   `selection_bg`, `quote`, `info`, `success`, `warning`, `danger`, plus

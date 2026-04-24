@@ -1,3 +1,4 @@
+pub mod bibtex_key;
 pub mod config;
 pub mod credentials;
 pub mod error;

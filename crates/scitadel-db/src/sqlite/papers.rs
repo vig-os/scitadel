@@ -120,6 +120,7 @@ fn row_to_paper(row: &rusqlite::Row) -> rusqlite::Result<Paper> {
     let local_path: Option<String> = row.get("local_path").ok();
     let download_status_raw: Option<String> = row.get("download_status").ok();
     let last_attempt_at_raw: Option<String> = row.get("last_attempt_at").ok();
+    let bibtex_key: Option<String> = row.get("bibtex_key").ok();
 
     Ok(Paper {
         id: PaperId::from(id),
@@ -147,6 +148,7 @@ fn row_to_paper(row: &rusqlite::Row) -> rusqlite::Result<Paper> {
             .as_deref()
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&chrono::Utc)),
+        bibtex_key,
     })
 }
 
@@ -307,6 +309,16 @@ impl PaperRepository for SqlitePaperRepository {
             "UPDATE papers SET local_path = ?1, download_status = ?2, last_attempt_at = ?3, \
              updated_at = ?3 WHERE id = ?4",
             params![local_path, status.as_str(), now, paper_id],
+        )
+        .map_err(DbError::Sqlite)?;
+        Ok(())
+    }
+
+    fn update_bibtex_key(&self, paper_id: &str, key: &str) -> Result<(), CoreError> {
+        let conn = self.db.conn()?;
+        conn.execute(
+            "UPDATE papers SET bibtex_key = ?1 WHERE id = ?2",
+            params![key, paper_id],
         )
         .map_err(DbError::Sqlite)?;
         Ok(())
