@@ -34,6 +34,12 @@ pub trait PaperRepository: Send + Sync {
         local_path: Option<&str>,
         status: DownloadStatus,
     ) -> Result<(), CoreError>;
+    /// Assign a stable citation key to a paper. Called once per paper
+    /// by the 0.6.0 backfill migration (and per-paper on new ingest).
+    /// Must be unique across the DB — the caller is responsible for
+    /// running the Better-BibTeX algorithm + disambiguation before
+    /// calling this. See ADR-006 + `scitadel-export::bibtex::assign_keys`.
+    fn update_bibtex_key(&self, paper_id: &str, key: &str) -> Result<(), CoreError>;
 }
 
 /// Port for search run persistence.

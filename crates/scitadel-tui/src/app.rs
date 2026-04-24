@@ -18,7 +18,9 @@ use tokio::sync::mpsc;
 use crate::data::DataStore;
 use crate::tasks::{Task, TaskKind, TaskStatus, TaskUpdate, spawn_download_paper};
 use crate::views::annotation_prompt::{AnnotationPrompt, PromptCommit, PromptSubmission};
-use crate::views::{annotation_prompt, detail, papers, questions, searches, tasks as tasks_view};
+use crate::views::{
+    annotation_prompt, dashboard, detail, papers, questions, queue, searches, tasks as tasks_view,
+};
 use crate::widgets::status_bar;
 
 /// Active tab in the TUI.
@@ -27,16 +29,22 @@ pub enum Tab {
     Searches,
     Papers,
     Questions,
+    /// Cross-search aggregator showing all starred papers (#48).
+    /// Reuses the Papers-tab rendering + Enter-to-open-detail flow
+    /// but backs the data by `paper_state.starred = 1` instead of
+    /// a single search.
+    Queue,
 }
 
 impl Tab {
-    const ALL: [Self; 3] = [Self::Searches, Self::Papers, Self::Questions];
+    const ALL: [Self; 4] = [Self::Searches, Self::Papers, Self::Questions, Self::Queue];
 
     fn index(self) -> usize {
         match self {
             Self::Searches => 0,
             Self::Papers => 1,
             Self::Questions => 2,
+            Self::Queue => 3,
         }
     }
 
@@ -44,15 +52,17 @@ impl Tab {
         match self {
             Self::Searches => Self::Papers,
             Self::Papers => Self::Questions,
-            Self::Questions => Self::Searches,
+            Self::Questions => Self::Queue,
+            Self::Queue => Self::Searches,
         }
     }
 
     fn prev(self) -> Self {
         match self {
-            Self::Searches => Self::Questions,
+            Self::Searches => Self::Queue,
             Self::Papers => Self::Searches,
             Self::Questions => Self::Papers,
+            Self::Queue => Self::Questions,
         }
     }
 }
@@ -82,6 +92,13 @@ pub enum Overlay {
         search_id: String,
         selected: usize,
     },
+    /// Question Dashboard (#133). Split-pane ranked-by-score view of
+    /// papers assessed against the question, with a citation shortlist
+    /// curated via `c`.
+    QuestionDashboard {
+        question_id: String,
+        selected: usize,
+    },
 }
 
 /// Main application state.
@@ -94,6 +111,7 @@ pub struct App {
     pub search_selected: usize,
     pub paper_selected: usize,
     pub question_selected: usize,
+    pub queue_selected: usize,
 
     pub tasks: Vec<Task>,
     /// Last `TuiState` written to the DB, used by `publish_tui_state`
@@ -141,6 +159,7 @@ impl App {
             search_selected: 0,
             paper_selected: 0,
             question_selected: 0,
+            queue_selected: 0,
             tasks: Vec::new(),
             last_published_state: None,
             unpaywall_email,
@@ -203,6 +222,7 @@ impl App {
             Tab::Searches => "Searches",
             Tab::Papers => "Papers",
             Tab::Questions => "Questions",
+            Tab::Queue => "Queue",
         };
         let (paper_id, search_id, annotation_id) = match &self.overlay {
             Some(Overlay::PaperDetail {
@@ -223,17 +243,21 @@ impl App {
                 (Some(paper_id.clone()), None, ann_id)
             }
             Some(Overlay::SearchPapers { search_id, .. }) => (None, Some(search_id.clone()), None),
-            None => (None, None, None),
+            Some(Overlay::QuestionDashboard { .. }) | None => (None, None, None),
         };
-        // Question id only when the user is actually on the Questions tab.
-        let question_id = if matches!(self.tab, Tab::Questions) {
-            self.data.load_questions().ok().and_then(|qs| {
-                qs.get(self.question_selected)
-                    .map(|q| q.id.as_str().to_string())
-            })
-        } else {
-            None
-        };
+        // Question id: from the overlay (dashboard open) or the
+        // Questions-tab cursor. Dashboard wins since it's more specific.
+        let question_id =
+            if let Some(Overlay::QuestionDashboard { question_id, .. }) = &self.overlay {
+                Some(question_id.clone())
+            } else if matches!(self.tab, Tab::Questions) {
+                self.data.load_questions().ok().and_then(|qs| {
+                    qs.get(self.question_selected)
+                        .map(|q| q.id.as_str().to_string())
+                })
+            } else {
+                None
+            };
         scitadel_db::sqlite::TuiState {
             tab: tab.to_string(),
             paper_id,
@@ -268,9 +292,12 @@ impl App {
                         .iter()
                         .find(|t| t.id == id)
                         .map(|t| match &t.kind {
-                            TaskKind::Download { paper_id, .. } => paper_id.clone(),
+                            TaskKind::Download { paper_id, .. } => (paper_id.clone(), true),
+                            TaskKind::OpenExternal { paper_id, .. } => (paper_id.clone(), false),
                         });
-                    if let Some(pid) = paper_id {
+                    if let Some((pid, persist)) = paper_id
+                        && persist
+                    {
                         self.persist_download_outcome(&pid, &status);
                     }
                     if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
@@ -301,9 +328,9 @@ impl App {
         self.tasks
             .iter()
             .filter(|t| matches!(t.status, TaskStatus::Queued | TaskStatus::Running))
-            .map(|t| {
-                let TaskKind::Download { paper_id, .. } = &t.kind;
-                paper_id.clone()
+            .filter_map(|t| match &t.kind {
+                TaskKind::Download { paper_id, .. } => Some(paper_id.clone()),
+                TaskKind::OpenExternal { .. } => None,
             })
             .collect()
     }
@@ -390,6 +417,51 @@ impl App {
                     let sel = *selected;
                     if let Ok(papers) = self.data.load_papers_for_search(&search_id_clone)
                         && let Some(paper) = papers.get(sel)
+                    {
+                        self.overlay = Some(Overlay::PaperDetail {
+                            paper_id: paper.id.as_str().to_string(),
+                            scroll: 0,
+                            annotation_focus: None,
+                            prompt: None,
+                            reader: false,
+                            highlight_focus: None,
+                        });
+                    }
+                }
+                _ => {}
+            },
+            Some(Overlay::QuestionDashboard {
+                ref question_id,
+                ref mut selected,
+            }) => match code {
+                KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
+                KeyCode::Char('j') | KeyCode::Down => {
+                    let count = dashboard::row_count(&self.data, question_id);
+                    if count > 0 {
+                        *selected = (*selected + 1).min(count - 1);
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    *selected = selected.saturating_sub(1);
+                }
+                KeyCode::Char('c') => {
+                    let qid = question_id.clone();
+                    let sel = *selected;
+                    if let Ok(rows) = self.data.load_question_dashboard(&qid)
+                        && let Some((paper, _)) = rows.get(sel)
+                    {
+                        let pid = paper.id.as_str().to_string();
+                        let _ = self.data.toggle_shortlist(&qid, &pid, &self.reader);
+                    }
+                }
+                KeyCode::Enter => {
+                    // Open the focused paper's detail overlay on top of
+                    // the dashboard — same overlay mechanic as the
+                    // SearchPapers flow. Esc returns to the dashboard.
+                    let qid = question_id.clone();
+                    let sel = *selected;
+                    if let Ok(rows) = self.data.load_question_dashboard(&qid)
+                        && let Some((paper, _)) = rows.get(sel)
                     {
                         self.overlay = Some(Overlay::PaperDetail {
                             paper_id: paper.id.as_str().to_string(),
@@ -563,7 +635,53 @@ impl App {
                 *reader = true;
                 *highlight_focus = if count > 0 { Some(0) } else { None };
             }
+            KeyCode::Char('O') => {
+                // #144: open the locally downloaded file in the OS
+                // default viewer. PDFs that are unreadable as plain
+                // text (figures, math, tables) are the main motivator —
+                // R is for the in-TUI reader, O escapes to the real one.
+                let pid = paper_id.clone();
+                self.open_paper_externally(&pid);
+            }
             _ => {}
+        }
+    }
+
+    /// Spawn the OS default viewer for the paper's local file. Surfaces
+    /// errors (no local file, exec failure) via a transient task panel
+    /// row — success is implicit because the user sees the viewer pop up.
+    fn open_paper_externally(&self, paper_id: &str) {
+        let Ok(Some(paper)) = self.data.load_paper(paper_id) else {
+            return;
+        };
+        let path = paper.local_path.as_ref().map(std::path::PathBuf::from);
+        if let Some(p) = path {
+            crate::tasks::spawn_open_external(self.task_tx.clone(), &paper, p);
+        } else {
+            // Synthesize a Failed task so the user sees feedback rather
+            // than a silent no-op when they haven't downloaded yet.
+            let id = uuid::Uuid::new_v4();
+            let ref_id = paper
+                .doi
+                .clone()
+                .filter(|s| !s.is_empty())
+                .or_else(|| paper.arxiv_id.clone().filter(|s| !s.is_empty()))
+                .unwrap_or_else(|| paper.id.as_str().chars().take(8).collect());
+            let task = crate::tasks::Task {
+                id,
+                kind: TaskKind::OpenExternal {
+                    paper_id: paper.id.as_str().to_string(),
+                    ref_id,
+                    title: paper.title.clone(),
+                },
+                status: TaskStatus::Queued,
+                terminal_at: None,
+            };
+            let _ = self.task_tx.send(crate::tasks::TaskUpdate::New(task));
+            let _ = self.task_tx.send(crate::tasks::TaskUpdate::Status {
+                id,
+                status: TaskStatus::Failed("no local file — press D to download first".to_string()),
+            });
         }
     }
 
@@ -681,6 +799,64 @@ impl App {
                     KeyCode::Char('k') | KeyCode::Up => {
                         self.question_selected = self.question_selected.saturating_sub(1);
                     }
+                    KeyCode::Enter => {
+                        if let Ok(questions) = self.data.load_questions()
+                            && let Some(q) = questions.get(self.question_selected)
+                        {
+                            self.overlay = Some(Overlay::QuestionDashboard {
+                                question_id: q.id.as_str().to_string(),
+                                selected: 0,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Tab::Queue => {
+                let count = self
+                    .data
+                    .load_starred_papers(&self.reader)
+                    .map_or(0, |p| p.len());
+                match code {
+                    KeyCode::Char('j') | KeyCode::Down if count > 0 => {
+                        self.queue_selected = (self.queue_selected + 1).min(count - 1);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.queue_selected = self.queue_selected.saturating_sub(1);
+                    }
+                    KeyCode::Enter => {
+                        if let Ok(papers) = self.data.load_starred_papers(&self.reader)
+                            && let Some(paper) = papers.get(self.queue_selected)
+                        {
+                            self.overlay = Some(Overlay::PaperDetail {
+                                paper_id: paper.id.as_str().to_string(),
+                                scroll: 0,
+                                annotation_focus: None,
+                                prompt: None,
+                                reader: false,
+                                highlight_focus: None,
+                            });
+                        }
+                    }
+                    KeyCode::Char('s') => {
+                        // Unstar: consistent with Papers tab behaviour.
+                        if let Ok(papers) = self.data.load_starred_papers(&self.reader)
+                            && let Some(paper) = papers.get(self.queue_selected)
+                        {
+                            let pid = paper.id.as_str().to_string();
+                            self.toggle_star(&pid);
+                            // Clamp cursor — list just shrank by one.
+                            let new_count = self
+                                .data
+                                .load_starred_papers(&self.reader)
+                                .map_or(0, |p| p.len());
+                            if new_count > 0 {
+                                self.queue_selected = self.queue_selected.min(new_count - 1);
+                            } else {
+                                self.queue_selected = 0;
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -768,6 +944,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 Tab::Searches => "Searches",
                 Tab::Papers => "Papers",
                 Tab::Questions => "Questions",
+                Tab::Queue => "Queue",
             };
             Line::from(Span::raw(label))
         })
@@ -823,6 +1000,19 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 &app.downloading_paper_ids(),
             );
         }
+        Some(Overlay::QuestionDashboard {
+            question_id,
+            selected,
+        }) => {
+            dashboard::draw(
+                frame,
+                chunks[1],
+                &app.data,
+                question_id,
+                &app.reader,
+                *selected,
+            );
+        }
         None => match app.tab {
             Tab::Searches => searches::draw(frame, chunks[1], &app.data, app.search_selected),
             Tab::Papers => papers::draw(
@@ -836,6 +1026,14 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             Tab::Questions => {
                 questions::draw(frame, chunks[1], &app.data, app.question_selected);
             }
+            Tab::Queue => queue::draw(
+                frame,
+                chunks[1],
+                &app.data,
+                &app.reader,
+                app.queue_selected,
+                &app.downloading_paper_ids(),
+            ),
         },
     }
 
@@ -868,7 +1066,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                         "Esc: leave focus | j/k: navigate | n: new | e: edit | r: reply | d: delete"
                     }
                     (None, None) => {
-                        "Esc/q: back | j/k: scroll | d/u: page | D: download | n: new | J: focus | R: reader"
+                        "Esc/q: back | j/k: scroll | d/u: page | D: download | O: open externally | R: reader | n: new | J: focus"
                     }
                 }
             }
@@ -876,8 +1074,11 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         (Some(Overlay::SearchPapers { .. }), _) => {
             "Esc/q: back | j/k: navigate | Enter: open paper"
         }
-        (None, Tab::Papers) => {
-            "Tab: switch tabs | j/k: navigate | Enter: open | s: star | c: clear tasks | q: quit"
+        (Some(Overlay::QuestionDashboard { .. }), _) => {
+            "Esc/q: back | j/k: navigate | Enter: open paper | c: toggle shortlist"
+        }
+        (None, Tab::Papers | Tab::Queue) => {
+            "Tab: switch tabs | j/k: navigate | Enter: open | s: (un)star | c: clear tasks | q: quit"
         }
         (None, _) => {
             "Tab/Shift-Tab: switch tabs | j/k: navigate | Enter: select | c: clear tasks | q: quit"

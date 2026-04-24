@@ -34,6 +34,15 @@ pub enum TaskKind {
         ref_id: String,
         title: String,
     },
+    /// Spawn the OS file viewer for an already-downloaded paper (#144).
+    /// Fire-and-forget: success surfaces as the viewer opening, so this
+    /// task only sticks around long enough to flash the failure message
+    /// when no local file exists or the spawn errored.
+    OpenExternal {
+        paper_id: String,
+        ref_id: String,
+        title: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +114,67 @@ pub fn synthesize_offline_failure(tx: UnboundedSender<TaskUpdate>, paper: &Paper
         ),
     });
     id
+}
+
+/// Spawn the OS default viewer for `path` and return a task tracking the
+/// outcome (#144). Success is implicit (the viewer pops up), so we
+/// transition to `Done` immediately with a synthetic path/access on the
+/// task — only failures (no opener on PATH, exec errored) actually need
+/// a visible row. `paper` provides the ref_id/title for the panel.
+pub fn spawn_open_external(tx: UnboundedSender<TaskUpdate>, paper: &Paper, path: PathBuf) -> Uuid {
+    let id = Uuid::new_v4();
+    let ref_id = paper
+        .doi
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or_else(|| paper.arxiv_id.clone().filter(|s| !s.is_empty()))
+        .or_else(|| paper.openalex_id.clone().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| paper.id.as_str().chars().take(8).collect());
+    let task = Task {
+        id,
+        kind: TaskKind::OpenExternal {
+            paper_id: paper.id.as_str().to_string(),
+            ref_id,
+            title: paper.title.clone(),
+        },
+        status: TaskStatus::Queued,
+        terminal_at: None,
+    };
+    let _ = tx.send(TaskUpdate::New(task));
+
+    let status = match open_with_system_viewer(&path) {
+        Ok(()) => TaskStatus::Done {
+            path,
+            format: DownloadFormat::Pdf,
+            access: AccessStatus::FullText,
+            publisher_url: None,
+        },
+        Err(e) => TaskStatus::Failed(e),
+    };
+    let _ = tx.send(TaskUpdate::Status { id, status });
+    id
+}
+
+/// Cross-platform "open this file with the OS default app". Returns a
+/// human-readable error string so failures can land in the task panel.
+fn open_with_system_viewer(path: &std::path::Path) -> Result<(), String> {
+    if !path.exists() {
+        return Err(format!("file not found: {}", path.display()));
+    }
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("open");
+    #[cfg(target_os = "linux")]
+    let mut cmd = std::process::Command::new("xdg-open");
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", ""]);
+        c
+    };
+    cmd.arg(path);
+    cmd.spawn()
+        .map(|_| ())
+        .map_err(|e| format!("failed to launch viewer: {e}"))
 }
 
 /// Spawn a download for a full `Paper` (uses all available identifiers).

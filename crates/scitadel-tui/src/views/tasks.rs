@@ -36,17 +36,21 @@ fn render_row(task: &Task, show_institutional_hint: bool) -> ListItem<'_> {
         TaskStatus::Failed(_) => ("✗", t.danger),
     };
 
-    let (title, ref_id) = match &task.kind {
-        TaskKind::Download { title, ref_id, .. } => (truncate(title, 55), ref_id.as_str()),
+    let (title, ref_id, kind_label) = match &task.kind {
+        TaskKind::Download { title, ref_id, .. } => (truncate(title, 55), ref_id.as_str(), ""),
+        TaskKind::OpenExternal { title, ref_id, .. } => {
+            (truncate(title, 55), ref_id.as_str(), "open: ")
+        }
     };
 
-    let status_tail = status_tail_text(&task.status, show_institutional_hint);
+    let status_tail = status_tail_text(&task.status, show_institutional_hint, &task.kind);
 
     ListItem::new(Line::from(vec![
         Span::styled(
             format!("{icon} "),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
+        Span::styled(kind_label, Style::default().fg(crate::theme::theme().muted)),
         Span::raw(title),
         Span::raw("  "),
         Span::styled(
@@ -60,7 +64,7 @@ fn render_row(task: &Task, show_institutional_hint: bool) -> ListItem<'_> {
     ]))
 }
 
-fn status_tail_text(status: &TaskStatus, show_institutional_hint: bool) -> String {
+fn status_tail_text(status: &TaskStatus, show_institutional_hint: bool, kind: &TaskKind) -> String {
     match status {
         TaskStatus::Queued => "queued".to_string(),
         TaskStatus::Running => "downloading…".to_string(),
@@ -70,10 +74,14 @@ fn status_tail_text(status: &TaskStatus, show_institutional_hint: bool) -> Strin
             path,
             publisher_url,
         } => {
+            // OpenExternal "Done" just means "viewer was launched" — the
+            // download metadata fields are placeholders, so don't print
+            // them as if they describe a real download.
+            if matches!(kind, TaskKind::OpenExternal { .. }) {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+                return format!("opened {name}");
+            }
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("saved");
-            // On paywall, tell the user where to get the live page — an
-            // institutional IP range will often grant access that the
-            // headless fetcher can't.
             if *access == AccessStatus::Paywall
                 && show_institutional_hint
                 && let Some(url) = publisher_url
@@ -97,6 +105,31 @@ mod tests {
 
     use super::*;
 
+    fn dl_kind() -> TaskKind {
+        TaskKind::Download {
+            paper_id: "p".into(),
+            ref_id: "ref".into(),
+            title: "title".into(),
+        }
+    }
+
+    #[test]
+    fn open_external_done_shows_opened_filename() {
+        let status = TaskStatus::Done {
+            path: PathBuf::from("/tmp/paper.pdf"),
+            format: DownloadFormat::Pdf,
+            access: AccessStatus::FullText,
+            publisher_url: None,
+        };
+        let kind = TaskKind::OpenExternal {
+            paper_id: "p".into(),
+            ref_id: "ref".into(),
+            title: "title".into(),
+        };
+        let text = status_tail_text(&status, true, &kind);
+        assert_eq!(text, "opened paper.pdf");
+    }
+
     #[test]
     fn paywall_with_hint_includes_url() {
         let status = TaskStatus::Done {
@@ -105,7 +138,7 @@ mod tests {
             access: AccessStatus::Paywall,
             publisher_url: Some("https://doi.org/10.1234/x".into()),
         };
-        let text = status_tail_text(&status, true);
+        let text = status_tail_text(&status, true, &dl_kind());
         assert!(text.contains("https://doi.org/10.1234/x"));
         assert!(text.contains("institutional IP may grant access"));
     }
@@ -118,7 +151,7 @@ mod tests {
             access: AccessStatus::Paywall,
             publisher_url: Some("https://doi.org/10.1234/x".into()),
         };
-        let text = status_tail_text(&status, false);
+        let text = status_tail_text(&status, false, &dl_kind());
         assert!(!text.contains("https://doi.org/10.1234/x"));
         assert!(text.contains("paywall"));
     }
@@ -131,7 +164,7 @@ mod tests {
             access: AccessStatus::FullText,
             publisher_url: Some("https://example.org".into()),
         };
-        let text = status_tail_text(&status, true);
+        let text = status_tail_text(&status, true, &dl_kind());
         assert!(!text.contains("institutional IP"));
     }
 }
