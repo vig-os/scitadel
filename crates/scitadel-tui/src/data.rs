@@ -75,6 +75,21 @@ impl DataStore {
         Ok(SqlitePaperStateRepository::new(self.db.clone()).starred_ids(reader)?)
     }
 
+    /// Load starred papers for this reader in most-recently-starred-first
+    /// order, fully hydrated. Drives the Queue tab (#48) — a cross-
+    /// search aggregator of starred papers across all questions.
+    pub fn load_starred_papers(&self, reader: &str) -> Result<Vec<Paper>> {
+        let ids = SqlitePaperStateRepository::new(self.db.clone()).starred_ids_ordered(reader)?;
+        let (paper_repo, _, _, _, _) = self.db.repositories();
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Ok(Some(p)) = paper_repo.get(&id) {
+                out.push(p);
+            }
+        }
+        Ok(out)
+    }
+
     /// Load live annotations for a paper (roots + replies), ordered oldest-first.
     pub fn load_annotations_for_paper(&self, paper_id: &str) -> Result<Vec<Annotation>> {
         Ok(SqliteAnnotationRepository::new(self.db.clone()).list_by_paper(paper_id)?)
