@@ -12,7 +12,7 @@ description = "BibTeX, JSON, and CSV exporters for scitadel search results."
 readme = "../../README.md"
 
 [dependencies]
-scitadel-core = { path = "../scitadel-core", version = "0.5.0" }
+scitadel-core = { path = "../scitadel-core", version = "0.6.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 csv = "1"
