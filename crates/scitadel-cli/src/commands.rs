@@ -43,11 +43,16 @@ pub async fn mcp() -> Result<()> {
     Ok(())
 }
 
-pub fn tui() -> Result<()> {
+pub fn tui(theme_override: Option<&str>) -> Result<()> {
     let config = load_config();
     let email = config.openalex.api_key.clone();
     let papers_dir = config.papers_dir();
     let reader = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
+    // Resolve theme before any rendering so the very first frame uses
+    // the right palette. Order: --theme > SCITADEL_THEME > ui.theme >
+    // auto-detect (#137).
+    let resolved = scitadel_tui::theme::resolve(theme_override, &config.ui.theme);
+    scitadel_tui::theme::init(resolved);
     scitadel_tui::run(
         &config.db_path,
         email,
