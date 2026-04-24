@@ -19,7 +19,7 @@ use crate::data::DataStore;
 use crate::tasks::{Task, TaskKind, TaskStatus, TaskUpdate, spawn_download_paper};
 use crate::views::annotation_prompt::{AnnotationPrompt, PromptCommit, PromptSubmission};
 use crate::views::{
-    annotation_prompt, detail, papers, questions, queue, searches, tasks as tasks_view,
+    annotation_prompt, dashboard, detail, papers, questions, queue, searches, tasks as tasks_view,
 };
 use crate::widgets::status_bar;
 
@@ -90,6 +90,13 @@ pub enum Overlay {
     },
     SearchPapers {
         search_id: String,
+        selected: usize,
+    },
+    /// Question Dashboard (#133). Split-pane ranked-by-score view of
+    /// papers assessed against the question, with a citation shortlist
+    /// curated via `c`.
+    QuestionDashboard {
+        question_id: String,
         selected: usize,
     },
 }
@@ -236,17 +243,21 @@ impl App {
                 (Some(paper_id.clone()), None, ann_id)
             }
             Some(Overlay::SearchPapers { search_id, .. }) => (None, Some(search_id.clone()), None),
-            None => (None, None, None),
+            Some(Overlay::QuestionDashboard { .. }) | None => (None, None, None),
         };
-        // Question id only when the user is actually on the Questions tab.
-        let question_id = if matches!(self.tab, Tab::Questions) {
-            self.data.load_questions().ok().and_then(|qs| {
-                qs.get(self.question_selected)
-                    .map(|q| q.id.as_str().to_string())
-            })
-        } else {
-            None
-        };
+        // Question id: from the overlay (dashboard open) or the
+        // Questions-tab cursor. Dashboard wins since it's more specific.
+        let question_id =
+            if let Some(Overlay::QuestionDashboard { question_id, .. }) = &self.overlay {
+                Some(question_id.clone())
+            } else if matches!(self.tab, Tab::Questions) {
+                self.data.load_questions().ok().and_then(|qs| {
+                    qs.get(self.question_selected)
+                        .map(|q| q.id.as_str().to_string())
+                })
+            } else {
+                None
+            };
         scitadel_db::sqlite::TuiState {
             tab: tab.to_string(),
             paper_id,
@@ -403,6 +414,51 @@ impl App {
                     let sel = *selected;
                     if let Ok(papers) = self.data.load_papers_for_search(&search_id_clone)
                         && let Some(paper) = papers.get(sel)
+                    {
+                        self.overlay = Some(Overlay::PaperDetail {
+                            paper_id: paper.id.as_str().to_string(),
+                            scroll: 0,
+                            annotation_focus: None,
+                            prompt: None,
+                            reader: false,
+                            highlight_focus: None,
+                        });
+                    }
+                }
+                _ => {}
+            },
+            Some(Overlay::QuestionDashboard {
+                ref question_id,
+                ref mut selected,
+            }) => match code {
+                KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
+                KeyCode::Char('j') | KeyCode::Down => {
+                    let count = dashboard::row_count(&self.data, question_id);
+                    if count > 0 {
+                        *selected = (*selected + 1).min(count - 1);
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    *selected = selected.saturating_sub(1);
+                }
+                KeyCode::Char('c') => {
+                    let qid = question_id.clone();
+                    let sel = *selected;
+                    if let Ok(rows) = self.data.load_question_dashboard(&qid)
+                        && let Some((paper, _)) = rows.get(sel)
+                    {
+                        let pid = paper.id.as_str().to_string();
+                        let _ = self.data.toggle_shortlist(&qid, &pid, &self.reader);
+                    }
+                }
+                KeyCode::Enter => {
+                    // Open the focused paper's detail overlay on top of
+                    // the dashboard — same overlay mechanic as the
+                    // SearchPapers flow. Esc returns to the dashboard.
+                    let qid = question_id.clone();
+                    let sel = *selected;
+                    if let Ok(rows) = self.data.load_question_dashboard(&qid)
+                        && let Some((paper, _)) = rows.get(sel)
                     {
                         self.overlay = Some(Overlay::PaperDetail {
                             paper_id: paper.id.as_str().to_string(),
@@ -694,6 +750,16 @@ impl App {
                     KeyCode::Char('k') | KeyCode::Up => {
                         self.question_selected = self.question_selected.saturating_sub(1);
                     }
+                    KeyCode::Enter => {
+                        if let Ok(questions) = self.data.load_questions()
+                            && let Some(q) = questions.get(self.question_selected)
+                        {
+                            self.overlay = Some(Overlay::QuestionDashboard {
+                                question_id: q.id.as_str().to_string(),
+                                selected: 0,
+                            });
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -885,6 +951,19 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 &app.downloading_paper_ids(),
             );
         }
+        Some(Overlay::QuestionDashboard {
+            question_id,
+            selected,
+        }) => {
+            dashboard::draw(
+                frame,
+                chunks[1],
+                &app.data,
+                question_id,
+                &app.reader,
+                *selected,
+            );
+        }
         None => match app.tab {
             Tab::Searches => searches::draw(frame, chunks[1], &app.data, app.search_selected),
             Tab::Papers => papers::draw(
@@ -945,6 +1024,9 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         }
         (Some(Overlay::SearchPapers { .. }), _) => {
             "Esc/q: back | j/k: navigate | Enter: open paper"
+        }
+        (Some(Overlay::QuestionDashboard { .. }), _) => {
+            "Esc/q: back | j/k: navigate | Enter: open paper | c: toggle shortlist"
         }
         (None, Tab::Papers | Tab::Queue) => {
             "Tab: switch tabs | j/k: navigate | Enter: open | s: (un)star | c: clear tasks | q: quit"

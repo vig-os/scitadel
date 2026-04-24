@@ -1,4 +1,5 @@
 pub mod annotation_prompt;
+pub mod dashboard;
 pub mod detail;
 pub mod papers;
 pub mod questions;
