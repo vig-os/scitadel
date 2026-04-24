@@ -725,10 +725,45 @@ impl ScitadelServer {
 }
 
 #[tool_handler(router = self.tool_router)]
-impl ServerHandler for ScitadelServer {}
+impl ServerHandler for ScitadelServer {
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
+        ServerInfo {
+            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            server_info: Implementation {
+                name: "scitadel".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
+    use rmcp::ServerHandler;
+
+    /// An MCP server that does not declare the `tools` capability in its
+    /// `initialize` response will never have `tools/list` called by the
+    /// client — the server appears to expose zero tools even though the
+    /// router is fully populated. `#[tool_handler]` does NOT emit a
+    /// `get_info()` override, so `ServerHandler`'s default kicks in and
+    /// returns empty capabilities. Guard against the regression.
+    #[test]
+    fn get_info_declares_tools_capability_and_server_name() {
+        let info = super::ScitadelServer::new().get_info();
+        assert!(
+            info.capabilities.tools.is_some(),
+            "get_info() must advertise `tools` capability — otherwise clients skip tools/list. capabilities={:?}",
+            info.capabilities
+        );
+        assert_eq!(
+            info.server_info.name, "scitadel",
+            "server_info.name should be 'scitadel', not rmcp's default"
+        );
+    }
+
     /// Style gate (#98): every `#[tool(description = "...")]` must
     /// telegraph its return shape so an LLM client can parse the
     /// response without trial and error. Accepts any of:

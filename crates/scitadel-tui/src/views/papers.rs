@@ -51,14 +51,15 @@ pub fn draw_for_search(
 /// `↻` if a download is currently running for this paper, otherwise
 /// derived from the persisted `download_status` (#112).
 fn download_cell(paper: &Paper, downloading: &HashSet<String>) -> (&'static str, Color) {
+    let t = crate::theme::theme();
     if downloading.contains(paper.id.as_str()) {
-        return ("↻", Color::Yellow);
+        return ("↻", t.warning);
     }
     match paper.download_status {
-        Some(DownloadStatus::Downloaded) => ("✓", Color::Green),
-        Some(DownloadStatus::Paywall) => ("⊘", Color::Yellow),
-        Some(DownloadStatus::Failed) => ("✗", Color::Red),
-        None => (" ", Color::DarkGray),
+        Some(DownloadStatus::Downloaded) => ("✓", t.success),
+        Some(DownloadStatus::Paywall) => ("⊘", t.warning),
+        Some(DownloadStatus::Failed) => ("✗", t.danger),
+        None => (" ", t.muted),
     }
 }
 
@@ -90,7 +91,7 @@ fn render_paper_table(
     ])
     .style(
         Style::default()
-            .fg(Color::Yellow)
+            .fg(crate::theme::theme().emphasis)
             .add_modifier(Modifier::BOLD),
     );
 
@@ -109,7 +110,7 @@ fn render_paper_table(
 
             Row::new(vec![
                 Cell::from((i + 1).to_string()),
-                Cell::from(star).style(Style::default().fg(Color::Yellow)),
+                Cell::from(star).style(Style::default().fg(crate::theme::theme().emphasis)),
                 Cell::from(dl_symbol).style(Style::default().fg(dl_color)),
                 Cell::from(truncate(&p.title, 60)),
                 Cell::from(truncate(&authors, 30)),
@@ -136,7 +137,7 @@ fn render_paper_table(
         )
         .row_highlight_style(
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(crate::theme::theme().selection_bg)
                 .add_modifier(Modifier::BOLD),
         );
 

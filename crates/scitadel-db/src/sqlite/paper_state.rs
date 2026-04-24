@@ -104,6 +104,22 @@ impl SqlitePaperStateRepository {
         }
         Ok(out)
     }
+
+    /// Paper IDs starred by `reader`, ordered by when the star was set
+    /// (most recent first). Drives the Queue tab (#48) — a cross-search
+    /// aggregator of starred papers. The partial index on
+    /// `paper_state(starred) WHERE starred = 1` keeps this cheap even
+    /// with thousands of rows.
+    pub fn starred_ids_ordered(&self, reader: &str) -> Result<Vec<String>, DbError> {
+        let conn = self.db.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT paper_id FROM paper_state
+             WHERE reader = ?1 AND starred = 1
+             ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map(params![reader], |row| row.get::<_, String>(0))?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
 }
 
 #[cfg(test)]
@@ -150,5 +166,40 @@ mod tests {
         repo.toggle_starred("p1", "me").unwrap();
         let ids = repo.starred_ids("me").unwrap();
         assert!(ids.contains("p1"));
+    }
+
+    #[test]
+    fn starred_ids_ordered_returns_most_recent_first() {
+        let db = fresh_db();
+        // Add a second paper so we can observe ordering.
+        db.conn()
+            .unwrap()
+            .execute(
+                "INSERT INTO papers (id, title, created_at, updated_at)
+                 VALUES ('p2', 't2', datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+        let repo = SqlitePaperStateRepository::new(db);
+
+        // Star p1 first, then p2; the Queue tab (#48) expects the most
+        // recently starred to surface at the top of the list.
+        repo.toggle_starred("p1", "lars").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        repo.toggle_starred("p2", "lars").unwrap();
+
+        let ordered = repo.starred_ids_ordered("lars").unwrap();
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0], "p2", "most recent first");
+        assert_eq!(ordered[1], "p1");
+    }
+
+    #[test]
+    fn starred_ids_ordered_drops_unstarred() {
+        let db = fresh_db();
+        let repo = SqlitePaperStateRepository::new(db);
+        repo.toggle_starred("p1", "lars").unwrap();
+        repo.toggle_starred("p1", "lars").unwrap(); // back to unstarred
+        assert!(repo.starred_ids_ordered("lars").unwrap().is_empty());
     }
 }

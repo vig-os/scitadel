@@ -7,6 +7,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [0.6.0] - 2026-04-24
+
+The "actually read what you found" release. Closes the workflow gap
+that motivated 0.6.0: agents and the TUI now agree on a stable
+citation key, the Queue tab + Question Dashboard make multi-question
+research navigable, and pressing `O` on any downloaded paper escapes
+to your OS PDF viewer for the figure/math-heavy work that doesn't
+survive plain-text extraction. `read_paper` is also materially better
+on 2-column scientific PDFs via `pdftotext -layout` when available.
+
+### Added
+
+- **Layout-aware PDF text extraction** (#145). `read_paper` now prefers
+  `pdftotext -layout -nopgbrk` (poppler) when on PATH, falling back to
+  the existing `pdf-extract` crate when not. Two-column scientific
+  papers come out in correct reading order instead of left/right
+  interleaved; the response envelope includes an `Extractor:` line so
+  downstream agents can tell which tier produced the text. No new
+  mandatory dependency — pdftotext is already common via Homebrew /
+  poppler-utils, and absence of it is transparent.
+- **`O` keybind in TUI Detail overlay** (#144). Spawns the OS default
+  viewer (`open` / `xdg-open` / `cmd /c start`) on `paper.local_path`
+  for figure/math/table-heavy PDFs that don't survive plain-text
+  extraction. Failures (no local file, exec error) surface in the
+  task panel as a Failed row. Status bar now: `D: download | O: open
+  externally | R: reader | n: new | J: focus`.
+- **Stable BibTeX citation keys + deterministic export** (#132). Migration 009
+  adds `papers.bibtex_key TEXT UNIQUE`. Algorithm lives in
+  `scitadel-core::bibtex_key` (Better-BibTeX-style `{lastname}{year}{firstword}`,
+  ASCII-folded via NFKD, `a`/`b`/`c` suffix on collision, tiebroken by
+  paper UUID lexicographic). Keys are assigned on first encounter
+  (backfill migration runs on every `Database::migrate`) and never
+  recomputed — the freeze contract is what makes `\cite{muller2024quantum}`
+  resolve tomorrow regardless of upstream metadata churn. `export_bibtex`
+  now sorts alphabetically by key, uses fixed field order, NFC-normalised
+  UTF-8, and emits a `algo_hash`-pinned header without timestamps so
+  `git diff` on a committed `.bib` is meaningful. Algorithm-hash pinning
+  test locks in the contract: any drift in the source fails CI loudly
+  and forces an explicit migration. See [ADR-006](docs/decisions/ADR-006-2026-04-21-bibtex-key-algorithm.md).
+  CLI surface (`scitadel bib export` / `snapshot` / `verify`), `.scitadel-bib.lock`
+  sidecar, import and watch ship in 0.6.1 (#134) and 0.6.2 (#135).
+- **Question Dashboard** (#133). New TUI overlay accessed via `Enter`
+  on the Questions tab. Split pane: left 40% shows papers scored
+  against the question, ranked by score DESC; right 60% shows the
+  focused paper's rationale + abstract + metadata. `c` toggles a
+  citation shortlist (persisted per `(question_id, reader)`) marked
+  with `●`. `Enter` opens the focused paper in the existing detail
+  overlay; `Esc`/`q` returns to Questions. Shortlist membership feeds
+  `bib snapshot <question_id>` in 0.6.1 (#134). Migration 010 adds
+  the `shortlist_members` table. MCP `get_question_dashboard` /
+  `toggle_shortlist` / `list_shortlist` tools ship in a follow-up.
+- **Dalton Dark theme + central `theme.rs` abstraction** (#136). TUI now
+  pulls colours through semantic roles (`emphasis`, `muted`,
+  `selection_bg`, `quote`, `info`, `success`, `warning`, `danger`, plus
+  an 8-slot highlight palette) rather than hardcoding `Color::Yellow` /
+  `Color::Rgb(...)`. Default palette is [Dalton
+  Dark](https://github.com/gerchowl/dalton-colorscheme), a
+  colourblind-friendly scheme tuned for deuteranopia and protanopia.
+  Light mode and auto-detection ship in #137.
+- **Cross-search Queue tab** (#48 reduced, #140). Fourth tab in the
+  TUI aggregates every starred paper across searches into one ranked
+  view, sorted most-recently-starred first. Reuses the Papers-tab
+  rendering, so `s` (un)stars from the Queue and `Enter` opens the
+  detail overlay just like the per-search view. Closes the
+  "everything I've flagged" workflow that previously required jumping
+  between searches.
+
+### Changed
+
+- **CI tape suite retries up to 3 times on flake** (#143). Replaces
+  the prior retry-once policy after the `annotations-in-detail.tape`
+  kept tripping the distinct-snapshot gate intermittently; sleeps
+  bumped 3500/2500/3500ms → 5s/3500ms/5s on that tape too. Combined,
+  these turn the tape gate from "occasionally red on green PRs" into
+  reliably gating real regressions.
+- **CI dependencies refreshed**: `actions/checkout` v4 → v6 (#37);
+  `github/codeql-action`, `actions/create-github-app-token`,
+  `actions/cache` minor bumps (#63).
+
 ## [0.5.0] - 2026-04-21
 
 The 2-pane workflow release. Combines the agent-side affordances
