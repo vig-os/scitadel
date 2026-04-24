@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Layout-aware PDF text extraction** (#145). `read_paper` now prefers
+  `pdftotext -layout -nopgbrk` (poppler) when on PATH, falling back to
+  the existing `pdf-extract` crate when not. Two-column scientific
+  papers come out in correct reading order instead of left/right
+  interleaved; the response envelope includes an `Extractor:` line so
+  downstream agents can tell which tier produced the text. No new
+  mandatory dependency — pdftotext is already common via Homebrew /
+  poppler-utils, and absence of it is transparent.
+- **`O` keybind in TUI Detail overlay** (#144). Spawns the OS default
+  viewer (`open` / `xdg-open` / `cmd /c start`) on `paper.local_path`
+  for figure/math/table-heavy PDFs that don't survive plain-text
+  extraction. Failures (no local file, exec error) surface in the
+  task panel as a Failed row. Status bar now: `D: download | O: open
+  externally | R: reader | n: new | J: focus`.
 - **Stable BibTeX citation keys + deterministic export** (#132). Migration 009
   adds `papers.bibtex_key TEXT UNIQUE`. Algorithm lives in
   `scitadel-core::bibtex_key` (Better-BibTeX-style `{lastname}{year}{firstword}`,
