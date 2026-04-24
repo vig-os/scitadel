@@ -19,8 +19,7 @@ use crate::data::DataStore;
 use crate::tasks::{Task, TaskKind, TaskStatus, TaskUpdate, spawn_download_paper};
 use crate::views::annotation_prompt::{AnnotationPrompt, PromptCommit, PromptSubmission};
 use crate::views::{
-    annotation_prompt, dashboard, detail, papers, questions, queue, searches,
-    tasks as tasks_view,
+    annotation_prompt, dashboard, detail, papers, questions, queue, searches, tasks as tasks_view,
 };
 use crate::widgets::status_bar;
 
