@@ -6,6 +6,7 @@ mod paper_state;
 mod papers;
 mod questions;
 mod searches;
+mod shortlist;
 mod tui_state;
 
 pub use annotations::{SqliteAnnotationRepository, resolve_anchor};
@@ -16,6 +17,7 @@ pub use paper_state::{PaperState, SqlitePaperStateRepository};
 pub use papers::SqlitePaperRepository;
 pub use questions::SqliteQuestionRepository;
 pub use searches::SqliteSearchRepository;
+pub use shortlist::SqliteShortlistRepository;
 pub use tui_state::{SqliteTuiStateRepository, TuiState};
 
 use r2d2::Pool;
