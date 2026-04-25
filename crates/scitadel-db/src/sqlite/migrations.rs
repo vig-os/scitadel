@@ -12,6 +12,7 @@ const MIGRATION_007: &str = include_str!("../../migrations/007_paper_download_st
 const MIGRATION_008: &str = include_str!("../../migrations/008_tui_state.sql");
 const MIGRATION_009: &str = include_str!("../../migrations/009_bibtex_keys.sql");
 const MIGRATION_010: &str = include_str!("../../migrations/010_shortlists.sql");
+const MIGRATION_011: &str = include_str!("../../migrations/011_paper_aliases.sql");
 
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, MIGRATION_001),
@@ -24,6 +25,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (8, MIGRATION_008),
     (9, MIGRATION_009),
     (10, MIGRATION_010),
+    (11, MIGRATION_011),
 ];
 
 /// Run all pending migrations, skipping already-applied ones.
@@ -95,6 +97,7 @@ mod tests {
         assert!(tables.contains(&"annotations".to_string()));
         assert!(tables.contains(&"annotation_reads".to_string()));
         assert!(tables.contains(&"searches_fts".to_string()));
+        assert!(tables.contains(&"paper_aliases".to_string()));
         assert!(tables.contains(&"schema_version".to_string()));
     }
 }

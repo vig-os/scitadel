@@ -1,0 +1,22 @@
+//! `.bib` import pipeline (#134 iter 2).
+//!
+//! Parses BibTeX / BibLaTeX source into intermediate [`BibEntry`]
+//! records and matches them against existing papers via the narrow
+//! [`PaperLookup`] trait. Merge strategies and Zotero-compat
+//! (note/keywords/file) land in subsequent commits.
+//!
+//! Lives in `scitadel-export` alongside the export direction
+//! (`bibtex.rs`) because the parse+write-back loop for the round-trip
+//! invariant is easier to reason about when both directions share a
+//! crate. The matcher uses a trait rather than concrete DB types so
+//! the test suite can exercise the cascade without a SQLite fixture.
+
+pub mod matcher;
+pub mod merge;
+pub mod parse;
+pub mod side_effects;
+
+pub use matcher::{MatchOutcome, MatchStrategy, PaperLookup, match_entry};
+pub use merge::{MergeAction, MergeOutcome, MergeStrategy, paper_from_bib, resolve};
+pub use parse::{BibEntry, ParseError, parse_bibtex};
+pub use side_effects::{ALIAS_SOURCE, AliasRecord, SideEffects, compute as compute_side_effects};

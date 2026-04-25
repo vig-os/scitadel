@@ -108,6 +108,108 @@ impl SqlitePaperRepository {
             Box::new(paper.updated_at.to_rfc3339()),
         ]
     }
+
+    /// Snapshot of every `bibtex_key` currently assigned in the DB —
+    /// used as the `taken` set when assigning keys to newly-imported
+    /// papers via `scitadel_core::bibtex_key::assign_keys`. Mirrors
+    /// the seed in `Database::backfill_bibtex_keys`.
+    pub fn taken_bibtex_keys(&self) -> Result<std::collections::HashSet<String>, CoreError> {
+        let conn = self.db.conn()?;
+        let keys = conn
+            .prepare("SELECT bibtex_key FROM papers WHERE bibtex_key IS NOT NULL")
+            .map_err(DbError::Sqlite)?
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(DbError::Sqlite)?
+            .filter_map(Result::ok)
+            .collect();
+        Ok(keys)
+    }
+
+    /// Lookup-by-id helpers used by the bib-import matcher (#134).
+    /// Inherent (not on `PaperRepository`) so the port surface stays
+    /// minimal — these are only consumed by the import wiring layer.
+    pub fn find_id_by_arxiv_id(&self, arxiv_id: &str) -> Result<Option<String>, CoreError> {
+        let conn = self.db.conn()?;
+        let id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM papers WHERE arxiv_id = ?1",
+                params![arxiv_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(DbError::Sqlite)?;
+        Ok(id)
+    }
+
+    pub fn find_id_by_pubmed_id(&self, pubmed_id: &str) -> Result<Option<String>, CoreError> {
+        let conn = self.db.conn()?;
+        let id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM papers WHERE pubmed_id = ?1",
+                params![pubmed_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(DbError::Sqlite)?;
+        Ok(id)
+    }
+
+    pub fn find_id_by_openalex_id(&self, openalex_id: &str) -> Result<Option<String>, CoreError> {
+        let conn = self.db.conn()?;
+        let id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM papers WHERE openalex_id = ?1",
+                params![openalex_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(DbError::Sqlite)?;
+        Ok(id)
+    }
+
+    pub fn find_id_by_bibtex_key(&self, key: &str) -> Result<Option<String>, CoreError> {
+        let conn = self.db.conn()?;
+        let id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM papers WHERE bibtex_key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(DbError::Sqlite)?;
+        Ok(id)
+    }
+
+    /// Case-insensitive title match, optionally constrained by year.
+    /// Year `None` means "any year". Title comparison uses `LOWER()`
+    /// like `find_by_title`; whitespace normalization is the caller's
+    /// responsibility (the matcher passes title verbatim today —
+    /// good enough for the issue's stated "exact match only" intent).
+    pub fn find_id_by_title_and_year(
+        &self,
+        title: &str,
+        year: Option<i32>,
+    ) -> Result<Option<String>, CoreError> {
+        let conn = self.db.conn()?;
+        let id: Option<String> = match year {
+            Some(y) => conn
+                .query_row(
+                    "SELECT id FROM papers WHERE LOWER(title) = LOWER(?1) AND year = ?2",
+                    params![title, y],
+                    |r| r.get(0),
+                )
+                .optional(),
+            None => conn
+                .query_row(
+                    "SELECT id FROM papers WHERE LOWER(title) = LOWER(?1)",
+                    params![title],
+                    |r| r.get(0),
+                )
+                .optional(),
+        }
+        .map_err(DbError::Sqlite)?;
+        Ok(id)
+    }
 }
 
 fn row_to_paper(row: &rusqlite::Row) -> rusqlite::Result<Paper> {
