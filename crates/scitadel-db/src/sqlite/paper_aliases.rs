@@ -13,6 +13,11 @@ use crate::sqlite::Database;
 /// Free-form source tag recorded alongside an alias.
 pub const SOURCE_BIBTEX_IMPORT: &str = "bibtex-import";
 
+/// Source tag for aliases preserved by `scitadel bib rekey` — the
+/// pre-rekey citation key gets recorded so manuscripts that still
+/// cite the paper by its old key continue to resolve via lookup.
+pub const SOURCE_REKEY: &str = "rekey";
+
 #[derive(Clone)]
 pub struct SqlitePaperAliasRepository {
     db: Database,
