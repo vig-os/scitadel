@@ -170,6 +170,21 @@ enum BibCommands {
         #[arg(short, long)]
         verbose: bool,
     },
+    /// Reassign a paper's citation key. Without `--key`, re-runs the
+    /// #132 algorithm against current paper metadata; with `--key`,
+    /// sets an explicit key. Old key is preserved as an alias so
+    /// manuscripts that still cite by the old key keep resolving.
+    /// Fails loudly on collision with another paper's existing key.
+    Rekey {
+        /// Paper id to rekey (full id or unambiguous prefix).
+        paper_id: String,
+        /// Explicit citation key. If omitted, the algorithm picks one.
+        #[arg(long)]
+        key: Option<String>,
+        /// Identity recorded in the audit log. Defaults to $USER.
+        #[arg(long)]
+        reader: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -286,6 +301,11 @@ async fn main() -> Result<()> {
                 reader,
                 verbose,
             } => commands::bib_import(&path, &strategy, reader, verbose),
+            BibCommands::Rekey {
+                paper_id,
+                key,
+                reader,
+            } => commands::bib_rekey(&paper_id, key.as_deref(), reader),
         },
         Commands::Snowball {
             search_id,

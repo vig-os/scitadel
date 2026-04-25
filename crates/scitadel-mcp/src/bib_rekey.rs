@@ -70,35 +70,32 @@ pub fn rekey_paper(
         .ok_or_else(|| RekeyError::PaperNotFound(paper_id.to_string()))?;
     let old_key = paper.bibtex_key.clone();
 
-    let new_key = match explicit_key {
-        Some(k) => {
-            let trimmed = k.trim();
-            if !is_valid_citekey(trimmed) {
-                return Err(RekeyError::InvalidKey(trimmed.to_string()));
-            }
-            // Collision check: another paper already owns this key?
-            if let Some(owner) = papers.find_id_by_bibtex_key(trimmed)? {
-                if owner != paper_id {
-                    return Err(RekeyError::KeyCollision {
-                        key: trimmed.to_string(),
-                        owner,
-                    });
-                }
-            }
-            trimmed.to_string()
+    let new_key = if let Some(k) = explicit_key {
+        let trimmed = k.trim();
+        if !is_valid_citekey(trimmed) {
+            return Err(RekeyError::InvalidKey(trimmed.to_string()));
         }
-        None => {
-            // Recompute against current metadata. Exclude the paper's
-            // own current key so the disambiguator can pick a fresh
-            // suffix; if metadata still produces the same key, the
-            // call short-circuits below as a no-op.
-            let mut taken = papers.taken_bibtex_keys()?;
-            if let Some(k) = old_key.as_deref() {
-                taken.remove(k);
-            }
-            let base = generate_key(&paper);
-            disambiguate(&base, &taken)
+        // Collision check: another paper already owns this key?
+        if let Some(owner) = papers.find_id_by_bibtex_key(trimmed)?
+            && owner != paper_id
+        {
+            return Err(RekeyError::KeyCollision {
+                key: trimmed.to_string(),
+                owner,
+            });
         }
+        trimmed.to_string()
+    } else {
+        // Recompute against current metadata. Exclude the paper's own
+        // current key so the disambiguator can pick a fresh suffix;
+        // if metadata still produces the same key, the call short-
+        // circuits below as a no-op.
+        let mut taken = papers.taken_bibtex_keys()?;
+        if let Some(k) = old_key.as_deref() {
+            taken.remove(k);
+        }
+        let base = generate_key(&paper);
+        disambiguate(&base, &taken)
     };
 
     let changed = old_key.as_deref() != Some(new_key.as_str());
@@ -183,8 +180,14 @@ mod tests {
         // Algorithm yields "curie1903quantum"
         assert_eq!(p.bibtex_key.as_deref(), Some("curie1903quantum"));
 
-        let out = rekey_paper(&papers, &aliases, p.id.as_str(), Some("curie-radium"), "lars")
-            .unwrap();
+        let out = rekey_paper(
+            &papers,
+            &aliases,
+            p.id.as_str(),
+            Some("curie-radium"),
+            "lars",
+        )
+        .unwrap();
         assert!(out.changed);
         assert_eq!(out.old_key.as_deref(), Some("curie1903quantum"));
         assert_eq!(out.new_key, "curie-radium");
@@ -194,7 +197,11 @@ mod tests {
 
         // Old key is now an alias under source = "rekey".
         let alias_rows = aliases.list_for(p.id.as_str()).unwrap();
-        assert!(alias_rows.iter().any(|(a, s)| a == "curie1903quantum" && s == "rekey"));
+        assert!(
+            alias_rows
+                .iter()
+                .any(|(a, s)| a == "curie1903quantum" && s == "rekey")
+        );
     }
 
     #[test]
@@ -226,8 +233,7 @@ mod tests {
         let p = seed(&papers, "Same Key", "Author, A", 2024);
         let current = p.bibtex_key.clone().unwrap();
 
-        let out =
-            rekey_paper(&papers, &aliases, p.id.as_str(), Some(&current), "lars").unwrap();
+        let out = rekey_paper(&papers, &aliases, p.id.as_str(), Some(&current), "lars").unwrap();
         assert!(!out.changed);
         assert_eq!(out.new_key, current);
         // No alias should be recorded — nothing changed.
@@ -240,7 +246,10 @@ mod tests {
         let p = seed(&papers, "Stable", "Author, A", 2024);
 
         let out = rekey_paper(&papers, &aliases, p.id.as_str(), None, "lars").unwrap();
-        assert!(!out.changed, "algorithmic rekey on unchanged metadata is a no-op");
+        assert!(
+            !out.changed,
+            "algorithmic rekey on unchanged metadata is a no-op"
+        );
         assert_eq!(out.new_key, p.bibtex_key.unwrap());
     }
 

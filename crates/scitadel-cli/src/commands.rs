@@ -808,6 +808,67 @@ pub fn bib_import(
     Ok(())
 }
 
+/// `scitadel bib rekey` — reassign a paper's citation key.
+/// Prints the `old → new` mapping so users can `sed` their
+/// manuscripts. Fails loudly on collision; logs the op for audit.
+pub fn bib_rekey(paper_id: &str, key: Option<&str>, reader: Option<String>) -> Result<()> {
+    use scitadel_db::sqlite::{SqlitePaperAliasRepository, SqlitePaperRepository};
+    use scitadel_mcp::bib_rekey::{RekeyError, rekey_paper};
+
+    let reader = reader.unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "rekey".into()));
+    let db = open_db()?;
+    let papers = SqlitePaperRepository::new(db.clone());
+    let aliases = SqlitePaperAliasRepository::new(db);
+
+    // Allow id-prefix resolution like other CLI commands.
+    let resolved_id = {
+        let all = papers.list_all(10_000, 0)?;
+        let matches: Vec<&scitadel_core::models::Paper> = all
+            .iter()
+            .filter(|p| p.id.as_str().starts_with(paper_id))
+            .collect();
+        match matches.len() {
+            0 => bail!("no paper matches id prefix '{paper_id}'"),
+            1 => matches[0].id.as_str().to_string(),
+            n => bail!("ambiguous paper id prefix '{paper_id}' — matches {n} records"),
+        }
+    };
+
+    match rekey_paper(&papers, &aliases, &resolved_id, key, &reader) {
+        Ok(out) => {
+            if out.changed {
+                println!(
+                    "rekeyed {}: {} → {}",
+                    &out.paper_id[..out.paper_id.len().min(8)],
+                    out.old_key.as_deref().unwrap_or("<none>"),
+                    out.new_key,
+                );
+                if let Some(old) = out.old_key {
+                    println!(
+                        "  old key preserved as alias; existing citations \\cite{{{old}}} still resolve"
+                    );
+                }
+            } else {
+                println!(
+                    "rekey was a no-op — paper {} already has key '{}'",
+                    &out.paper_id[..out.paper_id.len().min(8)],
+                    out.new_key,
+                );
+            }
+            Ok(())
+        }
+        Err(RekeyError::PaperNotFound(id)) => bail!("paper '{id}' not found"),
+        Err(RekeyError::KeyCollision { key, owner }) => bail!(
+            "citation key '{key}' is already used by paper {} — pick a different key or rekey that paper first",
+            &owner[..owner.len().min(8)],
+        ),
+        Err(RekeyError::InvalidKey(k)) => bail!(
+            "invalid citation key '{k}': must start with a letter and contain only letters, digits, '-', '_', or ':'"
+        ),
+        Err(RekeyError::Core(e)) => Err(e.into()),
+    }
+}
+
 pub fn auth_login(source: &str) -> Result<()> {
     let creds = find_source_credentials(source)?;
 
