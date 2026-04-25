@@ -7,8 +7,13 @@
 //! identical across surfaces.
 //!
 //! Persistence order per row, on a non-Rejected outcome:
-//! 1. Save the resolved paper (which assigns a `bibtex_key` for new
-//!    papers via the #132 algorithm).
+//! 1. Save the resolved paper. For newly-created papers (no DB match),
+//!    assign and persist a `bibtex_key` via the #132 algorithm right
+//!    after save — `SqlitePaperRepository::save` does NOT write the
+//!    `bibtex_key` column itself; without this step, freshly-imported
+//!    papers stay keyless until the next process startup re-runs
+//!    `Database::migrate`'s backfill, breaking the BibtexKey step of
+//!    the next import's match cascade.
 //! 2. Record the imported citekey on `paper_aliases`.
 //! 3. Save the unanchored annotation built from `note=` (if any).
 //!
@@ -18,6 +23,7 @@
 
 use std::path::Path;
 
+use scitadel_core::bibtex_key::assign_keys;
 use scitadel_core::error::CoreError;
 use scitadel_core::ports::PaperRepository;
 use scitadel_db::sqlite::{
@@ -60,7 +66,7 @@ pub struct SqliteBibLookup<'a> {
     pub aliases: &'a SqlitePaperAliasRepository,
 }
 
-impl<'a> PaperLookup for SqliteBibLookup<'a> {
+impl PaperLookup for SqliteBibLookup<'_> {
     fn find_by_doi(&self, doi: &str) -> Result<Option<String>, CoreError> {
         Ok(self.papers.find_by_doi(doi)?.map(|p| p.id.as_str().to_string()))
     }
@@ -150,6 +156,27 @@ pub fn import_bibtex_file(
     import_bibtex_str(&src, options, papers, aliases, annotations)
 }
 
+/// Assign and persist a stable `bibtex_key` for a newly-saved paper.
+/// Snapshots the existing key set, runs the #132 algorithm with the
+/// paper's title/authors/year, and writes the result back. Idempotent
+/// only if the paper already has a key (the algorithm's collision
+/// disambiguator may pick a different suffix on re-run when the
+/// `taken` set differs).
+fn assign_and_persist_bibtex_key(
+    papers: &SqlitePaperRepository,
+    paper: &scitadel_core::models::Paper,
+) -> Result<(), CoreError> {
+    if paper.bibtex_key.is_some() {
+        return Ok(());
+    }
+    let mut taken = papers.taken_bibtex_keys()?;
+    let assigned = assign_keys(std::slice::from_ref(paper), &mut taken);
+    if let Some(key) = assigned.into_iter().next() {
+        papers.update_bibtex_key(paper.id.as_str(), &key)?;
+    }
+    Ok(())
+}
+
 fn import_one(
     entry: &BibEntry,
     options: &ImportOptions,
@@ -185,16 +212,26 @@ fn import_one(
     };
     let merge = resolve_merge(db_paper, entry, options.strategy);
 
-    // 3. Persist the paper (Created or Updated only — Unchanged and
-    //    Rejected don't write).
-    let persisted_id = match (&merge.action, &merge.paper) {
-        (MergeAction::Created | MergeAction::Updated, Some(p)) => {
-            papers.save(p)?;
-            Some(p.id.as_str().to_string())
-        }
-        (MergeAction::Unchanged, Some(p)) => Some(p.id.as_str().to_string()),
-        (MergeAction::Rejected, _) => None,
-        _ => None,
+    // 3. Persist the paper. Created/Updated write the row; Created
+    //    additionally needs an explicit bibtex_key assignment because
+    //    `SqlitePaperRepository::save` does not write the column —
+    //    skipping this leaves new papers keyless until the next
+    //    `migrate` run and silently degrades subsequent imports'
+    //    BibtexKey cascade step.
+    let persisted_id = match merge.action {
+        MergeAction::Rejected => None,
+        _ => match merge.paper.as_ref() {
+            None => None,
+            Some(p) => {
+                if matches!(merge.action, MergeAction::Created | MergeAction::Updated) {
+                    papers.save(p)?;
+                }
+                if merge.action == MergeAction::Created {
+                    assign_and_persist_bibtex_key(papers, p)?;
+                }
+                Some(p.id.as_str().to_string())
+            }
+        },
     };
 
     // 4. Side effects (alias / annotation / verbose-log items) — only
@@ -262,16 +299,79 @@ mod tests {
         }
     }
 
+    /// Blocker fix: `SqlitePaperRepository::save` does not write the
+    /// `bibtex_key` column, so newly-imported papers are keyless until
+    /// the next `migrate()` runs the backfill — which would silently
+    /// degrade the BibtexKey cascade step on subsequent imports. This
+    /// test proves that `import_one` now assigns and persists a key
+    /// for every Created paper.
+    #[test]
+    fn imported_new_paper_gets_persisted_bibtex_key() {
+        let (papers, aliases, annotations) = fresh();
+        let src = r"
+@article{ignored2025x,
+    title = {Bibtex Key Persistence Test},
+    author = {Smith, John},
+    year = {2025}
+}";
+        let report = import_bibtex_str(src, &opts_merge("lars"), &papers, &aliases, &annotations)
+            .unwrap();
+        let pid = report.rows[0].paper_id.as_deref().unwrap();
+        let p = papers.get(pid).unwrap().unwrap();
+        assert!(
+            p.bibtex_key.is_some(),
+            "Created paper must have bibtex_key persisted; got None"
+        );
+        assert_eq!(p.bibtex_key.as_deref(), Some("smith2025bibtex"));
+    }
+
+    /// Blocker fix: prove the BibtexKey cascade step is actually
+    /// exercised on round-trip — a key-only import (no DOI / arxiv /
+    /// title-year hit) must still resolve to the existing paper.
+    #[test]
+    fn round_trip_resolves_via_bibtex_key_step_when_other_ids_absent() {
+        let (papers, aliases, annotations) = fresh();
+        // Seed a paper with a known bibtex_key and no external ids.
+        let mut p = Paper::new("Cascade Anchor");
+        p.authors = vec!["Anchor, A".into()];
+        p.year = Some(2099);
+        papers.save(&p).unwrap();
+        // The save above doesn't persist the key, so do it explicitly
+        // for the seed (mirrors what `migrate`'s backfill does).
+        papers
+            .update_bibtex_key(p.id.as_str(), "anchor2099cascade")
+            .unwrap();
+
+        // Bib carries only the citekey + title, deliberately missing
+        // every other identifier. Title differs in case, so title+year
+        // would still resolve via LOWER() — slap a different year on
+        // the bib so title+year *cannot* match. Only BibtexKey can.
+        let src = r"
+@article{anchor2099cascade,
+    title = {Different Title For Cascade Probe},
+    year = {1900}
+}";
+        let report = import_bibtex_str(src, &opts_merge("lars"), &papers, &aliases, &annotations)
+            .unwrap();
+        let row = &report.rows[0];
+        assert_eq!(
+            row.action,
+            MergeAction::Unchanged,
+            "BibtexKey step should resolve to the seeded paper, leaving it Unchanged"
+        );
+        assert_eq!(row.paper_id.as_deref(), Some(p.id.as_str()));
+    }
+
     #[test]
     fn unmatched_entry_creates_new_paper_with_alias() {
         let (papers, aliases, annotations) = fresh();
-        let src = r#"
+        let src = r"
 @article{novel2025widget,
     title = {A Novel Widget},
     author = {Smith, John},
     year = {2025},
     doi = {10.1/widget}
-}"#;
+}";
         let report = import_bibtex_str(src, &opts_merge("lars"), &papers, &aliases, &annotations)
             .unwrap();
         assert_eq!(report.rows.len(), 1);
@@ -292,13 +392,13 @@ mod tests {
         existing.authors = vec!["Original, Author".into()];
         papers.save(&existing).unwrap();
 
-        let src = r#"
+        let src = r"
 @article{shouldNotWin,
     title = {Bib Title — different},
     author = {Different, Author},
     year = {2024},
     doi = {10.1/X}
-}"#;
+}";
         let report = import_bibtex_str(src, &opts_merge("lars"), &papers, &aliases, &annotations)
             .unwrap();
         let row = &report.rows[0];
@@ -312,13 +412,13 @@ mod tests {
     #[test]
     fn note_field_creates_annotation_under_reader_identity() {
         let (papers, aliases, annotations) = fresh();
-        let src = r#"
+        let src = r"
 @article{withNote,
     title = {Some Paper},
     author = {A, B},
     year = {2024},
     note = {Skim showed weak methods}
-}"#;
+}";
         let report = import_bibtex_str(src, &opts_merge("lars"), &papers, &aliases, &annotations)
             .unwrap();
         let row = &report.rows[0];
@@ -331,16 +431,18 @@ mod tests {
         assert_eq!(listed[0].note, "Skim showed weak methods");
     }
 
-    /// Round-trip invariant (#134 🔴 pitfall): a scitadel-exported
-    /// `.bib` re-imported into the SAME database must produce zero
-    /// new papers, zero new annotations, and identical bibtex_keys.
+    /// Round-trip invariant (#134 🔴 pitfall): re-importing a
+    /// scitadel-exported `.bib` into a DB that has *already absorbed
+    /// it* must produce zero diff in any table — papers, annotations,
+    /// or paper_aliases. The export → import → import sequence is
+    /// what catches the worst regressions: the FIRST import normalizes
+    /// (legitimately creating aliases / matching), but the SECOND
+    /// import is the actual no-op test.
     #[test]
     fn round_trip_export_then_import_touches_zero_rows() {
         use scitadel_export::export_bibtex;
 
         let (papers, aliases, annotations) = fresh();
-        // Seed three diverse papers so the export covers DOI / arxiv /
-        // title-only matching paths.
         let mut p1 = Paper::new("Quantum Advantage");
         p1.authors = vec!["Smith, John".into()];
         p1.year = Some(2024);
@@ -356,56 +458,75 @@ mod tests {
         for p in [&p1, &p2, &p3] {
             papers.save(p).unwrap();
         }
+        let seeded_ids: Vec<String> =
+            [&p1, &p2, &p3].iter().map(|p| p.id.as_str().to_string()).collect();
 
-        // Export, then refetch the saved (now-keyed) papers — the
-        // export needs the persisted bibtex_key to round-trip cleanly.
-        let saved: Vec<Paper> = [&p1, &p2, &p3]
+        let saved: Vec<Paper> = seeded_ids
             .iter()
-            .map(|p| papers.get(p.id.as_str()).unwrap().unwrap())
+            .map(|id| papers.get(id).unwrap().unwrap())
             .collect();
         let bib_a = export_bibtex(&saved);
 
-        // Snapshot row counts BEFORE the import.
-        let papers_before = papers.list_all(100, 0).unwrap().len();
-        let annotations_before: usize = saved
-            .iter()
-            .map(|p| annotations.list_by_paper(p.id.as_str()).unwrap().len())
-            .sum();
+        // First import: legitimate normalization pass — creates the
+        // aliases for the seeded papers' citekeys. Result must report
+        // every row as Unchanged (the cascade resolves via DOI / arxiv
+        // / title-year and the merge strategy is db-wins under Merge).
+        let report1 =
+            import_bibtex_str(&bib_a, &opts_merge("lars"), &papers, &aliases, &annotations)
+                .unwrap();
+        assert!(report1.failed.is_empty());
+        for row in &report1.rows {
+            assert_eq!(row.action, MergeAction::Unchanged);
+        }
 
-        // Re-import into the same DB.
-        let report = import_bibtex_str(
-            &bib_a,
-            &opts_merge("lars"),
-            &papers,
-            &aliases,
-            &annotations,
-        )
-        .unwrap();
-        assert!(report.failed.is_empty(), "no rows should fail");
-        assert_eq!(report.rows.len(), 3);
-        for row in &report.rows {
+        // Snapshot row counts AFTER the first import — that's the
+        // "zero diff" baseline for the second import.
+        let papers_baseline = papers.list_all(100, 0).unwrap().len();
+        let annotations_baseline: usize = seeded_ids
+            .iter()
+            .map(|id| annotations.list_by_paper(id).unwrap().len())
+            .sum();
+        let aliases_baseline: usize = seeded_ids
+            .iter()
+            .map(|id| aliases.list_for(id).unwrap().len())
+            .sum();
+        assert_eq!(aliases_baseline, 3, "first import seeds one alias per paper");
+
+        // Second import: the actual round-trip test. Must touch zero
+        // rows in any table (paper_aliases is the canary against
+        // accidental duplicate-row inflation).
+        let report2 =
+            import_bibtex_str(&bib_a, &opts_merge("lars"), &papers, &aliases, &annotations)
+                .unwrap();
+        assert!(report2.failed.is_empty());
+        assert_eq!(report2.rows.len(), 3);
+        for row in &report2.rows {
             assert_eq!(
                 row.action,
                 MergeAction::Unchanged,
                 "round-trip row {} must be Unchanged, got {:?}",
                 row.citekey,
-                row.action
+                row.action,
             );
         }
 
-        // Row counts must be identical.
         let papers_after = papers.list_all(100, 0).unwrap().len();
-        let annotations_after: usize = saved
+        let annotations_after: usize = seeded_ids
             .iter()
-            .map(|p| annotations.list_by_paper(p.id.as_str()).unwrap().len())
+            .map(|id| annotations.list_by_paper(id).unwrap().len())
             .sum();
-        assert_eq!(papers_before, papers_after, "no new papers");
-        assert_eq!(annotations_before, annotations_after, "no new annotations");
+        let aliases_after: usize = seeded_ids
+            .iter()
+            .map(|id| aliases.list_for(id).unwrap().len())
+            .sum();
+        assert_eq!(papers_baseline, papers_after, "no new papers");
+        assert_eq!(annotations_baseline, annotations_after, "no new annotations");
+        assert_eq!(aliases_baseline, aliases_after, "no duplicate aliases");
 
         // Re-export must be byte-identical.
-        let saved2: Vec<Paper> = [&p1, &p2, &p3]
+        let saved2: Vec<Paper> = seeded_ids
             .iter()
-            .map(|p| papers.get(p.id.as_str()).unwrap().unwrap())
+            .map(|id| papers.get(id).unwrap().unwrap())
             .collect();
         let bib_b = export_bibtex(&saved2);
         assert_eq!(bib_a, bib_b, "round-trip export must be byte-identical");
@@ -422,11 +543,11 @@ mod tests {
         // is one document); per-row resilience under `lenient` only
         // applies once we're inside the loop. This test confirms the
         // happy path doesn't panic on a mixed batch.
-        let src = r#"
+        let src = r"
 @article{a, title = {A}, year = {2001}}
 @article{b, title = {B}, year = {2002}}
 @article{c, title = {C}, year = {2003}}
-"#;
+";
         let report = import_bibtex_str(src, &opts_merge("lars"), &papers, &aliases, &annotations)
             .unwrap();
         assert_eq!(report.rows.len(), 3);

@@ -109,6 +109,22 @@ impl SqlitePaperRepository {
         ]
     }
 
+    /// Snapshot of every `bibtex_key` currently assigned in the DB —
+    /// used as the `taken` set when assigning keys to newly-imported
+    /// papers via `scitadel_core::bibtex_key::assign_keys`. Mirrors
+    /// the seed in `Database::backfill_bibtex_keys`.
+    pub fn taken_bibtex_keys(&self) -> Result<std::collections::HashSet<String>, CoreError> {
+        let conn = self.db.conn()?;
+        let keys = conn
+            .prepare("SELECT bibtex_key FROM papers WHERE bibtex_key IS NOT NULL")
+            .map_err(DbError::Sqlite)?
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(DbError::Sqlite)?
+            .filter_map(Result::ok)
+            .collect();
+        Ok(keys)
+    }
+
     /// Lookup-by-id helpers used by the bib-import matcher (#134).
     /// Inherent (not on `PaperRepository`) so the port surface stays
     /// minimal — these are only consumed by the import wiring layer.

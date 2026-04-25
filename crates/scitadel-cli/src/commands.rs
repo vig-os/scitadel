@@ -733,6 +733,8 @@ pub fn bib_import(
     reader: Option<String>,
     verbose: bool,
 ) -> Result<()> {
+    use std::fmt::Write as _;
+
     use scitadel_db::sqlite::{
         SqliteAnnotationRepository, SqlitePaperAliasRepository, SqlitePaperRepository,
     };
@@ -759,9 +761,7 @@ pub fn bib_import(
     for row in &report.rows {
         let id_short = row
             .paper_id
-            .as_deref()
-            .map(|s| s.chars().take(8).collect::<String>())
-            .unwrap_or_else(|| "—".into());
+            .as_deref().map_or_else(|| "—".into(), |s| s.chars().take(8).collect::<String>());
         let action = match row.action {
             MergeAction::Created => "created",
             MergeAction::Updated => "updated",
@@ -770,10 +770,10 @@ pub fn bib_import(
         };
         let mut line = format!("  {action:<9} {id_short}  {}", row.citekey);
         if !row.from_bib.is_empty() {
-            line.push_str(&format!(" — bib:[{}]", row.from_bib.join(",")));
+            let _ = write!(line, " — bib:[{}]", row.from_bib.join(","));
         }
         if !row.kept_from_db.is_empty() {
-            line.push_str(&format!(" — kept_db:[{}]", row.kept_from_db.join(",")));
+            let _ = write!(line, " — kept_db:[{}]", row.kept_from_db.join(","));
         }
         if row.annotation_created {
             line.push_str(" + annotation");

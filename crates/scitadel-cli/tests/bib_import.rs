@@ -91,11 +91,12 @@ fn re_importing_same_fixture_is_idempotent() {
         .stdout
         .clone();
     let stdout = String::from_utf8_lossy(&out);
-    // Second pass must produce zero `created` rows — the alias step
-    // of the cascade resolves every entry back to its first-pass paper.
+    // Second pass must report 0 created — the alias / bibtex_key
+    // steps of the cascade resolve every entry back to its first-pass
+    // paper.
     assert!(
-        !stdout.contains("0 created") || stdout.contains("created, 0"),
-        "second-pass output should report 0 created; got:\n{stdout}"
+        stdout.contains("0 created"),
+        "second-pass output must report 0 created; got:\n{stdout}"
     );
     assert!(
         stdout.contains("unchanged"),

@@ -103,21 +103,17 @@ pub fn resolve(
             from_bib: vec![],
             kept_from_db: vec![],
         },
-        MergeStrategy::DbWins => MergeOutcome {
-            paper: Some(db.clone()),
+        // DbWins and Merge leave the Paper row identical — Merge
+        // adds value via side effects (annotations from `note=`,
+        // tags from `keywords=`) wired in step 4, not by mutating
+        // owned columns. Collapsed to one arm to keep clippy happy.
+        MergeStrategy::DbWins | MergeStrategy::Merge => MergeOutcome {
+            paper: Some(db),
             action: MergeAction::Unchanged,
             from_bib: vec![],
             kept_from_db: bib_present_owned_fields(bib),
         },
         MergeStrategy::BibWins => bib_wins(db, bib),
-        // Merge leaves owned fields alone; side effects (annotations
-        // from `note=`, tags from `keywords=`) land in step 4.
-        MergeStrategy::Merge => MergeOutcome {
-            paper: Some(db.clone()),
-            action: MergeAction::Unchanged,
-            from_bib: vec![],
-            kept_from_db: bib_present_owned_fields(bib),
-        },
     }
 }
 
@@ -129,12 +125,12 @@ pub fn resolve(
 pub fn paper_from_bib(bib: &BibEntry) -> Paper {
     let title = bib.title.clone().unwrap_or_default();
     let mut p = Paper::new(title);
-    p.authors = bib.authors.clone();
+    p.authors.clone_from(&bib.authors);
     p.year = bib.year;
-    p.doi = bib.doi.clone();
-    p.arxiv_id = bib.arxiv_id.clone();
-    p.pubmed_id = bib.pubmed_id.clone();
-    p.openalex_id = bib.openalex_id.clone();
+    p.doi.clone_from(&bib.doi);
+    p.arxiv_id.clone_from(&bib.arxiv_id);
+    p.pubmed_id.clone_from(&bib.pubmed_id);
+    p.openalex_id.clone_from(&bib.openalex_id);
     if let Some(j) = bib.extra.get("journal").or_else(|| bib.extra.get("journaltitle")) {
         p.journal = Some(j.clone());
     }
@@ -142,7 +138,7 @@ pub fn paper_from_bib(bib: &BibEntry) -> Paper {
         p.url = Some(u.clone());
     }
     if let Some(a) = bib.extra.get("abstract") {
-        p.r#abstract = a.clone();
+        p.r#abstract.clone_from(a);
     }
     p
 }
@@ -168,14 +164,14 @@ fn bib_wins(db: Paper, bib: &BibEntry) -> MergeOutcome {
         };
     }
 
-    if let Some(t) = bib.title.as_ref() {
-        if &out.title != t {
-            out.title = t.clone();
-            from_bib.push("title");
-        }
+    if let Some(t) = bib.title.as_ref()
+        && &out.title != t
+    {
+        out.title.clone_from(t);
+        from_bib.push("title");
     }
     if !bib.authors.is_empty() && bib.authors != out.authors {
-        out.authors = bib.authors.clone();
+        out.authors.clone_from(&bib.authors);
         from_bib.push("authors");
     } else if bib.authors.is_empty() && !out.authors.is_empty() {
         kept_from_db.push("authors");

@@ -60,6 +60,26 @@ pub fn parse_bibtex(src: &str) -> Result<Vec<BibEntry>, ParseError> {
     Ok(bib.into_vec().into_iter().map(entry_to_bibentry).collect())
 }
 
+/// Field names extracted into typed slots on `BibEntry`. Anything
+/// not in this list rides along in `extra` for the merge layer.
+const EXTRACTED_FIELDS: &[&str] = &[
+    "title",
+    "author",
+    "year",
+    "date",
+    "doi",
+    "eprint",
+    "eprinttype",
+    "archiveprefix",
+    "pmid",
+    "pubmed",
+    "openalex",
+    "note",
+    "keywords",
+    "file",
+    "pdf",
+];
+
 fn entry_to_bibentry(e: biblatex::Entry) -> BibEntry {
     let citekey = e.key.clone();
     let title = e.title().ok().map(|chunks| chunks.format_verbatim());
@@ -92,29 +112,10 @@ fn entry_to_bibentry(e: biblatex::Entry) -> BibEntry {
         })
         .unwrap_or_default();
     let file = e.file().ok();
-
-    // Well-known fields we already extracted — keep `extra` to the rest.
-    const EXTRACTED: &[&str] = &[
-        "title",
-        "author",
-        "year",
-        "date",
-        "doi",
-        "eprint",
-        "eprinttype",
-        "archiveprefix",
-        "pmid",
-        "pubmed",
-        "openalex",
-        "note",
-        "keywords",
-        "file",
-        "pdf",
-    ];
     let extra: HashMap<String, String> = e
         .fields
         .iter()
-        .filter(|(k, _)| !EXTRACTED.contains(&k.as_str()))
+        .filter(|(k, _)| !EXTRACTED_FIELDS.contains(&k.as_str()))
         .map(|(k, v)| (k.clone(), v.format_verbatim()))
         .collect();
 
@@ -158,15 +159,14 @@ fn person_to_string(p: &biblatex::Person) -> String {
 
 fn extract_year(e: &biblatex::Entry) -> Option<i32> {
     // BibLaTeX `date = {2024-05-01}` — preferred.
-    if let Ok(date) = e.date() {
-        if let PermissiveType::Typed(d) = date {
+    if let Ok(date) = e.date()
+        && let PermissiveType::Typed(d) = date {
             let y = match d.value {
                 DateValue::At(dt) | DateValue::After(dt) | DateValue::Before(dt) => dt.year,
                 DateValue::Between(start, _) => start.year,
             };
             return Some(y);
         }
-    }
     // BibTeX `year = {2024}` fallback — just parse the first 4 digits.
     let raw = extract_raw(e, "year")?;
     let digits: String = raw.chars().filter(char::is_ascii_digit).take(4).collect();
@@ -214,14 +214,14 @@ mod tests {
 
     #[test]
     fn parses_canonical_article() {
-        let src = r#"
+        let src = r"
 @article{smith2024quantum,
     title = {Quantum Advantage},
     author = {Smith, John and Doe, Jane},
     year = {2024},
     journal = {Nature},
     doi = {10.1038/ABC.2024.001}
-}"#;
+}";
         let entries = parse_bibtex(src).unwrap();
         assert_eq!(entries.len(), 1);
         let e = &entries[0];
@@ -248,36 +248,36 @@ mod tests {
 
     #[test]
     fn extracts_arxiv_id_from_eprint_with_archiveprefix() {
-        let src = r#"
+        let src = r"
 @article{a,
     title = {T},
     eprint = {2301.00001},
     archivePrefix = {arXiv}
-}"#;
+}";
         let e = &parse_bibtex(src).unwrap()[0];
         assert_eq!(e.arxiv_id.as_deref(), Some("2301.00001"));
     }
 
     #[test]
     fn extracts_arxiv_id_from_eprint_with_eprinttype() {
-        let src = r#"
+        let src = r"
 @article{a,
     title = {T},
     eprint = {2301.99999},
     eprinttype = {arxiv}
-}"#;
+}";
         let e = &parse_bibtex(src).unwrap()[0];
         assert_eq!(e.arxiv_id.as_deref(), Some("2301.99999"));
     }
 
     #[test]
     fn extracts_pubmed_and_openalex_ids() {
-        let src = r#"
+        let src = r"
 @article{a,
     title = {T},
     pmid = {12345678},
     openalex = {W1234567890}
-}"#;
+}";
         let e = &parse_bibtex(src).unwrap()[0];
         assert_eq!(e.pubmed_id.as_deref(), Some("12345678"));
         assert_eq!(e.openalex_id.as_deref(), Some("W1234567890"));
@@ -285,13 +285,13 @@ mod tests {
 
     #[test]
     fn parses_zotero_note_keywords_file() {
-        let src = r#"
+        let src = r"
 @article{z,
     title = {T},
     note = {Read twice, felt it},
     keywords = {alpha, beta, gamma},
     file = {/path/to/paper.pdf}
-}"#;
+}";
         let e = &parse_bibtex(src).unwrap()[0];
         assert_eq!(e.note.as_deref(), Some("Read twice, felt it"));
         assert_eq!(e.keywords, vec!["alpha", "beta", "gamma"]);
@@ -300,11 +300,11 @@ mod tests {
 
     #[test]
     fn year_falls_back_from_biblatex_date() {
-        let src = r#"
+        let src = r"
 @article{d,
     title = {T},
     date = {2023-05-01}
-}"#;
+}";
         let e = &parse_bibtex(src).unwrap()[0];
         assert_eq!(e.year, Some(2023));
     }
@@ -317,13 +317,13 @@ mod tests {
 
     #[test]
     fn extra_fields_preserved_for_merge_strategy() {
-        let src = r#"
+        let src = r"
 @article{a,
     title = {T},
     author = {X, Y},
     publisher = {Elsevier},
     month = {may}
-}"#;
+}";
         let e = &parse_bibtex(src).unwrap()[0];
         assert_eq!(e.extra.get("publisher").map(String::as_str), Some("Elsevier"));
         assert_eq!(e.extra.get("month").map(String::as_str), Some("may"));
@@ -332,11 +332,11 @@ mod tests {
 
     #[test]
     fn author_person_prefix_and_suffix_rendered() {
-        let src = r#"
+        let src = r"
 @article{v,
     title = {T},
     author = {von Neumann, Jr., John}
-}"#;
+}";
         let e = &parse_bibtex(src).unwrap()[0];
         // "von Neumann" (prefix "von" + family "Neumann"), suffix "Jr.", given "John"
         assert_eq!(e.authors, vec!["von Neumann, Jr., John"]);

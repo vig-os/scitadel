@@ -92,26 +92,22 @@ impl MatchStrategy {
 
 /// Run the full cascade on one entry. Short-circuits on the first hit.
 pub fn match_entry(entry: &BibEntry, lookup: &dyn PaperLookup) -> Result<MatchOutcome, CoreError> {
-    if let Some(doi) = entry.doi.as_deref() {
-        if let Some(id) = lookup.find_by_doi(doi)? {
+    if let Some(doi) = entry.doi.as_deref()
+        && let Some(id) = lookup.find_by_doi(doi)? {
             return Ok(MatchOutcome::Matched(id, MatchStrategy::Doi));
         }
-    }
-    if let Some(arxiv) = entry.arxiv_id.as_deref() {
-        if let Some(id) = lookup.find_by_arxiv_id(arxiv)? {
+    if let Some(arxiv) = entry.arxiv_id.as_deref()
+        && let Some(id) = lookup.find_by_arxiv_id(arxiv)? {
             return Ok(MatchOutcome::Matched(id, MatchStrategy::ArxivId));
         }
-    }
-    if let Some(pmid) = entry.pubmed_id.as_deref() {
-        if let Some(id) = lookup.find_by_pubmed_id(pmid)? {
+    if let Some(pmid) = entry.pubmed_id.as_deref()
+        && let Some(id) = lookup.find_by_pubmed_id(pmid)? {
             return Ok(MatchOutcome::Matched(id, MatchStrategy::PubmedId));
         }
-    }
-    if let Some(oa) = entry.openalex_id.as_deref() {
-        if let Some(id) = lookup.find_by_openalex_id(oa)? {
+    if let Some(oa) = entry.openalex_id.as_deref()
+        && let Some(id) = lookup.find_by_openalex_id(oa)? {
             return Ok(MatchOutcome::Matched(id, MatchStrategy::OpenalexId));
         }
-    }
     // Scitadel-own key: catches export→import round-trip cleanly.
     if let Some(id) = lookup.find_by_bibtex_key(&entry.citekey)? {
         return Ok(MatchOutcome::Matched(id, MatchStrategy::BibtexKey));
@@ -127,19 +123,17 @@ pub fn match_entry(entry: &BibEntry, lookup: &dyn PaperLookup) -> Result<MatchOu
             // fall through so the per-paper strategy still runs
             // title+year and potentially converts the ambiguous alias
             // into a clean title match.
-            if let Some(title) = entry.title.as_deref() {
-                if let Some(id) = lookup.find_by_title_and_year(title, entry.year)? {
+            if let Some(title) = entry.title.as_deref()
+                && let Some(id) = lookup.find_by_title_and_year(title, entry.year)? {
                     return Ok(MatchOutcome::Matched(id, MatchStrategy::TitleAndYear));
                 }
-            }
             return Ok(MatchOutcome::AmbiguousAlias(alias_hits));
         }
     }
-    if let Some(title) = entry.title.as_deref() {
-        if let Some(id) = lookup.find_by_title_and_year(title, entry.year)? {
+    if let Some(title) = entry.title.as_deref()
+        && let Some(id) = lookup.find_by_title_and_year(title, entry.year)? {
             return Ok(MatchOutcome::Matched(id, MatchStrategy::TitleAndYear));
         }
-    }
     Ok(MatchOutcome::NoMatch)
 }
 
@@ -220,7 +214,7 @@ mod tests {
             note: None,
             keywords: vec![],
             file: None,
-            extra: Default::default(),
+            extra: HashMap::default(),
         }
     }
 

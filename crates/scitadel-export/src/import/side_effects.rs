@@ -102,7 +102,7 @@ pub fn compute(
                 note.to_string(),
                 Anchor::default(),
             );
-            a.tags = bib.keywords.clone();
+            a.tags.clone_from(&bib.keywords);
             (Some(a), vec![])
         }
         _ => (None, bib.keywords.clone()),
