@@ -12,7 +12,9 @@
 //! the test suite can exercise the cascade without a SQLite fixture.
 
 pub mod matcher;
+pub mod merge;
 pub mod parse;
 
-pub use matcher::{MatchOutcome, PaperLookup, match_entry};
+pub use matcher::{MatchOutcome, MatchStrategy, PaperLookup, match_entry};
+pub use merge::{MergeAction, MergeOutcome, MergeStrategy, paper_from_bib, resolve};
 pub use parse::{BibEntry, ParseError, parse_bibtex};
