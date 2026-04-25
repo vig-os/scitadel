@@ -1598,6 +1598,76 @@ pub fn list_starred_tool(reader: &str) -> Result<String, String> {
     serde_json::to_string(&sorted).map_err(|e| e.to_string())
 }
 
+/// `import_bibtex` MCP tool — parse a `.bib` file at `path` and apply
+/// the import pipeline. Returns a JSON summary mirroring what the CLI
+/// prints, so downstream agents can decide whether to follow up
+/// (resolve ambiguous aliases, retry rejected entries, etc).
+pub fn import_bibtex_tool(
+    path: &str,
+    strategy: Option<&str>,
+    reader: &str,
+) -> Result<String, String> {
+    use crate::bib_import::{ImportOptions, import_bibtex_file};
+    use scitadel_db::sqlite::{
+        SqliteAnnotationRepository, SqlitePaperAliasRepository, SqlitePaperRepository,
+    };
+    use scitadel_export::import::MergeStrategy;
+
+    let strategy = strategy.unwrap_or("merge");
+    let strategy = MergeStrategy::parse(strategy).ok_or_else(|| {
+        format!("unknown strategy '{strategy}'; valid: reject, db-wins, bib-wins, merge")
+    })?;
+
+    let db = open_db()?;
+    let papers = SqlitePaperRepository::new(db.clone());
+    let aliases = SqlitePaperAliasRepository::new(db.clone());
+    let annotations = SqliteAnnotationRepository::new(db);
+
+    let options = ImportOptions {
+        strategy,
+        reader: reader.to_string(),
+        lenient: true,
+    };
+    let report =
+        import_bibtex_file(std::path::Path::new(path), &options, &papers, &aliases, &annotations)
+            .map_err(|e| e.to_string())?;
+
+    let rows: Vec<serde_json::Value> = report
+        .rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "citekey": r.citekey,
+                "paper_id": r.paper_id,
+                "action": match r.action {
+                    scitadel_export::import::MergeAction::Created => "created",
+                    scitadel_export::import::MergeAction::Updated => "updated",
+                    scitadel_export::import::MergeAction::Unchanged => "unchanged",
+                    scitadel_export::import::MergeAction::Rejected => "rejected",
+                },
+                "from_bib": r.from_bib,
+                "kept_from_db": r.kept_from_db,
+                "annotation_created": r.annotation_created,
+                "dropped_keywords": r.dropped_keywords,
+                "dropped_file": r.dropped_file,
+            })
+        })
+        .collect();
+    let summary = serde_json::json!({
+        "rows": rows,
+        "failed": report.failed.iter().map(|(k, e)| serde_json::json!({"citekey": k, "error": e})).collect::<Vec<_>>(),
+        "totals": {
+            "total":     report.rows.len(),
+            "created":   report.count(scitadel_export::import::MergeAction::Created),
+            "updated":   report.count(scitadel_export::import::MergeAction::Updated),
+            "unchanged": report.count(scitadel_export::import::MergeAction::Unchanged),
+            "rejected":  report.count(scitadel_export::import::MergeAction::Rejected),
+            "failed":    report.failed.len(),
+        }
+    });
+    serde_json::to_string_pretty(&summary).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

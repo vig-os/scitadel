@@ -302,6 +302,18 @@ pub struct SearchQuestionRequest {
     pub question_id: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ImportBibtexRequest {
+    /// Path to the `.bib` file (Zotero / Mendeley export)
+    pub path: String,
+    /// Merge strategy: `reject`, `db-wins`, `bib-wins`, `merge` (default).
+    #[serde(default)]
+    pub strategy: Option<String>,
+    /// Identity attached to imported annotations (`note=` field).
+    /// Required so the resulting Annotation rows have a real author.
+    pub reader: String,
+}
+
 // ---------- Server ----------
 
 #[derive(Debug, Clone)]
@@ -721,6 +733,16 @@ impl ScitadelServer {
     )]
     fn list_starred(&self, Parameters(req): Parameters<ReaderRequest>) -> Result<String, String> {
         tools::list_starred_tool(&req.reader)
+    }
+
+    #[tool(
+        description = "Import a `.bib` file (BibTeX or BibLaTeX). Matches entries against existing papers via DOI → arXiv → PubMed → OpenAlex → scitadel citekey → previously-imported alias → title+year. Imported citekeys are recorded as aliases so re-importing the same file is a no-op (round-trip safe). Zotero `note=` becomes an unanchored Annotation under `reader`; `keywords=` ride along as that annotation's tags; `file=` paths are dropped (foreign-machine paths are meaningless) and surfaced in the report. Strategies (default `merge`): `reject` skips on match, `db-wins` keeps DB untouched, `bib-wins` overwrites DB fields with bib values where present, `merge` keeps DB on owned fields and folds in non-owned side effects. Returns: JSON `{rows, failed, totals}` per-paper summary."
+    )]
+    fn import_bibtex(
+        &self,
+        Parameters(req): Parameters<ImportBibtexRequest>,
+    ) -> Result<String, String> {
+        tools::import_bibtex_tool(&req.path, req.strategy.as_deref(), &req.reader)
     }
 }
 

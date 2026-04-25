@@ -117,6 +117,11 @@ enum Commands {
     Mcp,
     /// Launch interactive TUI dashboard
     Tui,
+    /// Bibliographic operations: import / export / rekey / watch (#134)
+    Bib {
+        #[command(subcommand)]
+        command: BibCommands,
+    },
     /// Run citation chaining (snowballing)
     Snowball {
         /// Search ID
@@ -136,6 +141,28 @@ enum Commands {
         /// Model for scoring
         #[arg(short, long, default_value = "claude-sonnet-4-6")]
         model: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum BibCommands {
+    /// Import a `.bib` file (BibTeX or BibLaTeX), matching entries
+    /// against existing papers via DOI/arXiv/PubMed/OpenAlex/citekey/
+    /// title+year. Imported citekeys are recorded as aliases so
+    /// re-importing is a no-op.
+    Import {
+        /// Path to the .bib file (Zotero / Mendeley export)
+        path: PathBuf,
+        /// Merge strategy: reject | db-wins | bib-wins | merge
+        #[arg(long, default_value = "merge")]
+        strategy: String,
+        /// Identity attached to imported annotations (`note=` field).
+        /// Defaults to $USER.
+        #[arg(long)]
+        reader: Option<String>,
+        /// Show per-row trace output (dropped files, dropped keywords).
+        #[arg(short, long)]
+        verbose: bool,
     },
 }
 
@@ -246,6 +273,14 @@ async fn main() -> Result<()> {
             temperature,
             scorer,
         } => commands::assess(&search_id, &question, &model, temperature, &scorer).await,
+        Commands::Bib { command } => match command {
+            BibCommands::Import {
+                path,
+                strategy,
+                reader,
+                verbose,
+            } => commands::bib_import(&path, &strategy, reader, verbose),
+        },
         Commands::Snowball {
             search_id,
             question,

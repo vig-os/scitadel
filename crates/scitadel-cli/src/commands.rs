@@ -724,6 +724,82 @@ pub fn snowball(
     Ok(())
 }
 
+/// `scitadel bib import` — parse + match + persist a `.bib` file.
+/// Surfaces a per-paper summary line and a final tally; under
+/// `--verbose`, also prints dropped `keywords=` and `file=` fields.
+pub fn bib_import(
+    path: &std::path::Path,
+    strategy: &str,
+    reader: Option<String>,
+    verbose: bool,
+) -> Result<()> {
+    use scitadel_db::sqlite::{
+        SqliteAnnotationRepository, SqlitePaperAliasRepository, SqlitePaperRepository,
+    };
+    use scitadel_export::import::{MergeAction, MergeStrategy};
+    use scitadel_mcp::bib_import::{ImportOptions, import_bibtex_file};
+
+    let strategy = MergeStrategy::parse(strategy)
+        .ok_or_else(|| anyhow::anyhow!("unknown --strategy: {strategy}; valid: reject, db-wins, bib-wins, merge"))?;
+    let reader = reader.unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "import".into()));
+
+    let db = open_db()?;
+    let papers = SqlitePaperRepository::new(db.clone());
+    let aliases = SqlitePaperAliasRepository::new(db.clone());
+    let annotations = SqliteAnnotationRepository::new(db);
+
+    let options = ImportOptions {
+        strategy,
+        reader,
+        lenient: true,
+    };
+    let report = import_bibtex_file(path, &options, &papers, &aliases, &annotations)
+        .with_context(|| format!("import {}", path.display()))?;
+
+    for row in &report.rows {
+        let id_short = row
+            .paper_id
+            .as_deref()
+            .map(|s| s.chars().take(8).collect::<String>())
+            .unwrap_or_else(|| "—".into());
+        let action = match row.action {
+            MergeAction::Created => "created",
+            MergeAction::Updated => "updated",
+            MergeAction::Unchanged => "unchanged",
+            MergeAction::Rejected => "rejected",
+        };
+        let mut line = format!("  {action:<9} {id_short}  {}", row.citekey);
+        if !row.from_bib.is_empty() {
+            line.push_str(&format!(" — bib:[{}]", row.from_bib.join(",")));
+        }
+        if !row.kept_from_db.is_empty() {
+            line.push_str(&format!(" — kept_db:[{}]", row.kept_from_db.join(",")));
+        }
+        if row.annotation_created {
+            line.push_str(" + annotation");
+        }
+        println!("{line}");
+        if verbose {
+            if !row.dropped_keywords.is_empty() {
+                println!("    dropped keywords: {}", row.dropped_keywords.join(", "));
+            }
+            if let Some(f) = &row.dropped_file {
+                println!("    dropped file: {f}");
+            }
+        }
+    }
+    println!(
+        "\nimported {} entries: {} created, {} updated, {} unchanged, {} rejected, {} failed",
+        report.rows.len(),
+        report.count(MergeAction::Created),
+        report.count(MergeAction::Updated),
+        report.count(MergeAction::Unchanged),
+        report.count(MergeAction::Rejected),
+        report.failed.len(),
+    );
+    Ok(())
+}
+
 pub fn auth_login(source: &str) -> Result<()> {
     let creds = find_source_credentials(source)?;
 
