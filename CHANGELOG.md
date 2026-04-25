@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Light mode + auto-detect** (#137, theme iter 2). Adds
+  `Theme::DALTON_BRIGHT` (Dalton Bright palette ported from upstream)
+  and runtime theme resolution: `--theme <name>` CLI flag on
+  `scitadel tui` (highest precedence) → `SCITADEL_THEME` env var →
+  `[ui] theme = "..."` in config → `auto`. `auto` probes `COLORFGBG`
+  to pick light vs dark and falls back to dark when unset/unparseable.
+  OSC 11 fallback intentionally deferred (raw-tty + timeout dance);
+  `--theme` is the documented escape hatch when `COLORFGBG` is wrong.
+  Theme is locked once at startup — restart the TUI if the terminal
+  flips light/dark mid-session.
+
+## [0.6.0] - 2026-04-24
+
+The "actually read what you found" release. Closes the workflow gap
+that motivated 0.6.0: agents and the TUI now agree on a stable
+citation key, the Queue tab + Question Dashboard make multi-question
+research navigable, and pressing `O` on any downloaded paper escapes
+to your OS PDF viewer for the figure/math-heavy work that doesn't
+survive plain-text extraction. `read_paper` is also materially better
+on 2-column scientific PDFs via `pdftotext -layout` when available.
+
+### Added
+
 - **Layout-aware PDF text extraction** (#145). `read_paper` now prefers
   `pdftotext -layout -nopgbrk` (poppler) when on PATH, falling back to
   the existing `pdf-extract` crate when not. Two-column scientific

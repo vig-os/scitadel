@@ -116,7 +116,13 @@ enum Commands {
     /// Launch MCP server on stdio
     Mcp,
     /// Launch interactive TUI dashboard
-    Tui,
+    Tui {
+        /// Override the active theme for this session (#137).
+        /// Accepts: `auto` | `dark` | `light` | `dalton-dark` | `dalton-bright`.
+        /// Precedence: this flag > `SCITADEL_THEME` env > config > auto.
+        #[arg(long)]
+        theme: Option<String>,
+    },
     /// Bibliographic operations: import / export / rekey / watch (#134)
     Bib {
         #[command(subcommand)]
@@ -265,7 +271,7 @@ async fn main() -> Result<()> {
         },
         Commands::Download { doi, output_dir } => commands::download(&doi, output_dir).await,
         Commands::Mcp => commands::mcp().await,
-        Commands::Tui => commands::tui(),
+        Commands::Tui { theme } => commands::tui(theme.as_deref()),
         Commands::Assess {
             search_id,
             question,

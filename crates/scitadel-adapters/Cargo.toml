@@ -16,7 +16,7 @@ default = []
 contract-tests = []
 
 [dependencies]
-scitadel-core = { path = "../scitadel-core", version = "0.5.0" }
+scitadel-core = { path = "../scitadel-core", version = "0.6.0" }
 reqwest = { workspace = true }
 quick-xml = { workspace = true }
 serde = { workspace = true }
