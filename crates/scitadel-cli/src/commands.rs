@@ -746,9 +746,11 @@ pub fn bib_import(
     use scitadel_export::import::{MergeAction, MergeStrategy};
     use scitadel_mcp::bib_import::{ImportOptions, import_bibtex_file};
 
-    let strategy = MergeStrategy::parse(strategy)
-        .ok_or_else(|| anyhow::anyhow!("unknown --strategy: {strategy}; valid: reject, db-wins, bib-wins, merge"))?;
-    let reader = reader.unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "import".into()));
+    let strategy = MergeStrategy::parse(strategy).ok_or_else(|| {
+        anyhow::anyhow!("unknown --strategy: {strategy}; valid: reject, db-wins, bib-wins, merge")
+    })?;
+    let reader =
+        reader.unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "import".into()));
 
     let db = open_db()?;
     let papers = SqlitePaperRepository::new(db.clone());
@@ -766,7 +768,8 @@ pub fn bib_import(
     for row in &report.rows {
         let id_short = row
             .paper_id
-            .as_deref().map_or_else(|| "—".into(), |s| s.chars().take(8).collect::<String>());
+            .as_deref()
+            .map_or_else(|| "—".into(), |s| s.chars().take(8).collect::<String>());
         let action = match row.action {
             MergeAction::Created => "created",
             MergeAction::Updated => "updated",

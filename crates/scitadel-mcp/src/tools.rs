@@ -1628,9 +1628,14 @@ pub fn import_bibtex_tool(
         reader: reader.to_string(),
         lenient: true,
     };
-    let report =
-        import_bibtex_file(std::path::Path::new(path), &options, &papers, &aliases, &annotations)
-            .map_err(|e| e.to_string())?;
+    let report = import_bibtex_file(
+        std::path::Path::new(path),
+        &options,
+        &papers,
+        &aliases,
+        &annotations,
+    )
+    .map_err(|e| e.to_string())?;
 
     let rows: Vec<serde_json::Value> = report
         .rows

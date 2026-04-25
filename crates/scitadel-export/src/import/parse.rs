@@ -160,13 +160,14 @@ fn person_to_string(p: &biblatex::Person) -> String {
 fn extract_year(e: &biblatex::Entry) -> Option<i32> {
     // BibLaTeX `date = {2024-05-01}` — preferred.
     if let Ok(date) = e.date()
-        && let PermissiveType::Typed(d) = date {
-            let y = match d.value {
-                DateValue::At(dt) | DateValue::After(dt) | DateValue::Before(dt) => dt.year,
-                DateValue::Between(start, _) => start.year,
-            };
-            return Some(y);
-        }
+        && let PermissiveType::Typed(d) = date
+    {
+        let y = match d.value {
+            DateValue::At(dt) | DateValue::After(dt) | DateValue::Before(dt) => dt.year,
+            DateValue::Between(start, _) => start.year,
+        };
+        return Some(y);
+    }
     // BibTeX `year = {2024}` fallback — just parse the first 4 digits.
     let raw = extract_raw(e, "year")?;
     let digits: String = raw.chars().filter(char::is_ascii_digit).take(4).collect();
@@ -325,9 +326,15 @@ mod tests {
     month = {may}
 }";
         let e = &parse_bibtex(src).unwrap()[0];
-        assert_eq!(e.extra.get("publisher").map(String::as_str), Some("Elsevier"));
+        assert_eq!(
+            e.extra.get("publisher").map(String::as_str),
+            Some("Elsevier")
+        );
         assert_eq!(e.extra.get("month").map(String::as_str), Some("may"));
-        assert!(!e.extra.contains_key("title"), "title is extracted, not extra");
+        assert!(
+            !e.extra.contains_key("title"),
+            "title is extracted, not extra"
+        );
     }
 
     #[test]

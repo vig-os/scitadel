@@ -78,12 +78,7 @@ impl SideEffects {
 /// Compute side effects for an import row. `paper_id` is the resolved
 /// paper id (post-match or post-create); `reader` is the import-time
 /// identity used as `Annotation.author` to mirror TUI/MCP conventions.
-pub fn compute(
-    paper_id: &str,
-    reader: &str,
-    bib: &BibEntry,
-    action: MergeAction,
-) -> SideEffects {
+pub fn compute(paper_id: &str, reader: &str, bib: &BibEntry, action: MergeAction) -> SideEffects {
     if action == MergeAction::Rejected {
         return SideEffects::rejected();
     }
@@ -174,7 +169,11 @@ mod tests {
         assert_eq!(a.note, "Read twice; methodology questionable");
         assert_eq!(a.paper_id.as_str(), "p-x");
         assert!(a.parent_id.is_none(), "root annotation");
-        assert_eq!(a.anchor, Anchor::default(), "unanchored — no source text yet");
+        assert_eq!(
+            a.anchor,
+            Anchor::default(),
+            "unanchored — no source text yet"
+        );
     }
 
     #[test]
@@ -215,10 +214,7 @@ mod tests {
         let mut b = bib("k");
         b.file = Some("/somebody/elses/path.pdf".into());
         let se = compute("p1", "lars", &b, MergeAction::Created);
-        assert_eq!(
-            se.dropped_file.as_deref(),
-            Some("/somebody/elses/path.pdf")
-        );
+        assert_eq!(se.dropped_file.as_deref(), Some("/somebody/elses/path.pdf"));
     }
 
     #[test]

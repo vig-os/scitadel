@@ -50,7 +50,11 @@ fn import_zotero_fixture_succeeds_and_creates_papers() {
     let db_path = init_db(&tmp);
 
     let fixture = fixture_path();
-    assert!(fixture.exists(), "fixture must exist: {}", fixture.display());
+    assert!(
+        fixture.exists(),
+        "fixture must exist: {}",
+        fixture.display()
+    );
 
     cmd(&db_path)
         .arg("bib")

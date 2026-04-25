@@ -82,11 +82,7 @@ pub struct MergeOutcome {
 
 /// Resolve the outcome of importing one bib entry. `db_paper = None`
 /// means no match — a fresh paper is created regardless of strategy.
-pub fn resolve(
-    db_paper: Option<Paper>,
-    bib: &BibEntry,
-    strategy: MergeStrategy,
-) -> MergeOutcome {
+pub fn resolve(db_paper: Option<Paper>, bib: &BibEntry, strategy: MergeStrategy) -> MergeOutcome {
     let Some(db) = db_paper else {
         return MergeOutcome {
             paper: Some(paper_from_bib(bib)),
@@ -131,7 +127,11 @@ pub fn paper_from_bib(bib: &BibEntry) -> Paper {
     p.arxiv_id.clone_from(&bib.arxiv_id);
     p.pubmed_id.clone_from(&bib.pubmed_id);
     p.openalex_id.clone_from(&bib.openalex_id);
-    if let Some(j) = bib.extra.get("journal").or_else(|| bib.extra.get("journaltitle")) {
+    if let Some(j) = bib
+        .extra
+        .get("journal")
+        .or_else(|| bib.extra.get("journaltitle"))
+    {
         p.journal = Some(j.clone());
     }
     if let Some(u) = bib.extra.get("url") {
@@ -192,7 +192,11 @@ fn bib_wins(db: Paper, bib: &BibEntry) -> MergeOutcome {
     // Extra fields: journal / url / abstract are scitadel-owned but
     // come through `extra` because biblatex doesn't expose dedicated
     // accessors for all of them. Override only when bib has them.
-    if let Some(j) = bib.extra.get("journal").or_else(|| bib.extra.get("journaltitle")) {
+    if let Some(j) = bib
+        .extra
+        .get("journal")
+        .or_else(|| bib.extra.get("journaltitle"))
+    {
         if out.journal.as_deref() != Some(j.as_str()) {
             out.journal = Some(j.clone());
             from_bib.push("journal");
@@ -379,7 +383,10 @@ mod tests {
         bib.doi = None;
         let out = resolve(Some(db_paper()), &bib, MergeStrategy::BibWins);
         let p = out.paper.unwrap();
-        assert_eq!(p.title, "DB Title", "absent bib title must not blank DB title");
+        assert_eq!(
+            p.title, "DB Title",
+            "absent bib title must not blank DB title"
+        );
         assert_eq!(p.year, Some(2020));
         assert_eq!(p.doi.as_deref(), Some("10.1/db"));
         assert!(out.kept_from_db.contains(&"year"));
@@ -397,11 +404,14 @@ mod tests {
         bib.pubmed_id = None;
         bib.openalex_id = None;
         bib.extra.clear();
-        bib.extra
-            .insert("journal".into(), "DB Journal".into());
+        bib.extra.insert("journal".into(), "DB Journal".into());
 
         let out = resolve(Some(db_paper()), &bib, MergeStrategy::BibWins);
-        assert_eq!(out.action, MergeAction::Unchanged, "identical bib = no diff");
+        assert_eq!(
+            out.action,
+            MergeAction::Unchanged,
+            "identical bib = no diff"
+        );
         assert!(out.from_bib.is_empty());
     }
 

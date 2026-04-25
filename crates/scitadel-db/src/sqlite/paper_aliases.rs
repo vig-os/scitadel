@@ -112,7 +112,10 @@ mod tests {
     #[test]
     fn record_and_lookup_round_trip() {
         let repo = fresh();
-        assert!(repo.record("p1", "smith2024old", SOURCE_BIBTEX_IMPORT).unwrap());
+        assert!(
+            repo.record("p1", "smith2024old", SOURCE_BIBTEX_IMPORT)
+                .unwrap()
+        );
         assert_eq!(repo.lookup("smith2024old").unwrap().as_deref(), Some("p1"));
         assert_eq!(repo.lookup("nonexistent").unwrap(), None);
     }
@@ -131,9 +134,11 @@ mod tests {
     #[test]
     fn alias_collision_earliest_created_wins() {
         let repo = fresh();
-        repo.record("p2", "shared2024", SOURCE_BIBTEX_IMPORT).unwrap();
+        repo.record("p2", "shared2024", SOURCE_BIBTEX_IMPORT)
+            .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
-        repo.record("p1", "shared2024", SOURCE_BIBTEX_IMPORT).unwrap();
+        repo.record("p1", "shared2024", SOURCE_BIBTEX_IMPORT)
+            .unwrap();
         assert_eq!(
             repo.lookup("shared2024").unwrap().as_deref(),
             Some("p2"),
@@ -176,7 +181,8 @@ mod tests {
         repo.record("p1", "k2", SOURCE_BIBTEX_IMPORT).unwrap();
         {
             let conn = repo.db.conn().unwrap();
-            conn.execute("DELETE FROM papers WHERE id = 'p1'", []).unwrap();
+            conn.execute("DELETE FROM papers WHERE id = 'p1'", [])
+                .unwrap();
         }
         assert_eq!(repo.lookup("k1").unwrap(), None);
         assert_eq!(repo.lookup("k2").unwrap(), None);

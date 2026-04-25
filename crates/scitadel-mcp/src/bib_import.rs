@@ -68,7 +68,10 @@ pub struct SqliteBibLookup<'a> {
 
 impl PaperLookup for SqliteBibLookup<'_> {
     fn find_by_doi(&self, doi: &str) -> Result<Option<String>, CoreError> {
-        Ok(self.papers.find_by_doi(doi)?.map(|p| p.id.as_str().to_string()))
+        Ok(self
+            .papers
+            .find_by_doi(doi)?
+            .map(|p| p.id.as_str().to_string()))
     }
     fn find_by_arxiv_id(&self, id: &str) -> Result<Option<String>, CoreError> {
         self.papers.find_id_by_arxiv_id(id)
@@ -314,8 +317,8 @@ mod tests {
     author = {Smith, John},
     year = {2025}
 }";
-        let report = import_bibtex_str(src, &opts_merge("lars"), &papers, &aliases, &annotations)
-            .unwrap();
+        let report =
+            import_bibtex_str(src, &opts_merge("lars"), &papers, &aliases, &annotations).unwrap();
         let pid = report.rows[0].paper_id.as_deref().unwrap();
         let p = papers.get(pid).unwrap().unwrap();
         assert!(
@@ -351,8 +354,8 @@ mod tests {
     title = {Different Title For Cascade Probe},
     year = {1900}
 }";
-        let report = import_bibtex_str(src, &opts_merge("lars"), &papers, &aliases, &annotations)
-            .unwrap();
+        let report =
+            import_bibtex_str(src, &opts_merge("lars"), &papers, &aliases, &annotations).unwrap();
         let row = &report.rows[0];
         assert_eq!(
             row.action,
@@ -372,8 +375,8 @@ mod tests {
     year = {2025},
     doi = {10.1/widget}
 }";
-        let report = import_bibtex_str(src, &opts_merge("lars"), &papers, &aliases, &annotations)
-            .unwrap();
+        let report =
+            import_bibtex_str(src, &opts_merge("lars"), &papers, &aliases, &annotations).unwrap();
         assert_eq!(report.rows.len(), 1);
         let row = &report.rows[0];
         assert_eq!(row.action, MergeAction::Created);
@@ -399,12 +402,15 @@ mod tests {
     year = {2024},
     doi = {10.1/X}
 }";
-        let report = import_bibtex_str(src, &opts_merge("lars"), &papers, &aliases, &annotations)
-            .unwrap();
+        let report =
+            import_bibtex_str(src, &opts_merge("lars"), &papers, &aliases, &annotations).unwrap();
         let row = &report.rows[0];
         assert_eq!(row.action, MergeAction::Unchanged);
 
-        let resaved = papers.get(row.paper_id.as_deref().unwrap()).unwrap().unwrap();
+        let resaved = papers
+            .get(row.paper_id.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
         assert_eq!(resaved.title, "Existing Title");
         assert_eq!(resaved.year, Some(2020));
     }
@@ -419,8 +425,8 @@ mod tests {
     year = {2024},
     note = {Skim showed weak methods}
 }";
-        let report = import_bibtex_str(src, &opts_merge("lars"), &papers, &aliases, &annotations)
-            .unwrap();
+        let report =
+            import_bibtex_str(src, &opts_merge("lars"), &papers, &aliases, &annotations).unwrap();
         let row = &report.rows[0];
         assert!(row.annotation_created);
 
@@ -458,8 +464,10 @@ mod tests {
         for p in [&p1, &p2, &p3] {
             papers.save(p).unwrap();
         }
-        let seeded_ids: Vec<String> =
-            [&p1, &p2, &p3].iter().map(|p| p.id.as_str().to_string()).collect();
+        let seeded_ids: Vec<String> = [&p1, &p2, &p3]
+            .iter()
+            .map(|p| p.id.as_str().to_string())
+            .collect();
 
         let saved: Vec<Paper> = seeded_ids
             .iter()
@@ -490,7 +498,10 @@ mod tests {
             .iter()
             .map(|id| aliases.list_for(id).unwrap().len())
             .sum();
-        assert_eq!(aliases_baseline, 3, "first import seeds one alias per paper");
+        assert_eq!(
+            aliases_baseline, 3,
+            "first import seeds one alias per paper"
+        );
 
         // Second import: the actual round-trip test. Must touch zero
         // rows in any table (paper_aliases is the canary against
@@ -520,7 +531,10 @@ mod tests {
             .map(|id| aliases.list_for(id).unwrap().len())
             .sum();
         assert_eq!(papers_baseline, papers_after, "no new papers");
-        assert_eq!(annotations_baseline, annotations_after, "no new annotations");
+        assert_eq!(
+            annotations_baseline, annotations_after,
+            "no new annotations"
+        );
         assert_eq!(aliases_baseline, aliases_after, "no duplicate aliases");
 
         // Re-export must be byte-identical.
@@ -548,8 +562,8 @@ mod tests {
 @article{b, title = {B}, year = {2002}}
 @article{c, title = {C}, year = {2003}}
 ";
-        let report = import_bibtex_str(src, &opts_merge("lars"), &papers, &aliases, &annotations)
-            .unwrap();
+        let report =
+            import_bibtex_str(src, &opts_merge("lars"), &papers, &aliases, &annotations).unwrap();
         assert_eq!(report.rows.len(), 3);
         assert!(report.failed.is_empty());
     }
