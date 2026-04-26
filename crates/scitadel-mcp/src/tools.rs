@@ -1673,6 +1673,38 @@ pub fn import_bibtex_tool(
     serde_json::to_string_pretty(&summary).map_err(|e| e.to_string())
 }
 
+/// `rekey_paper` MCP tool — reassign a paper's citation key. Returns
+/// JSON `{paper_id, old_key, new_key, changed}` so downstream agents
+/// can update referenced manuscripts.
+pub fn rekey_paper_tool(
+    paper_id: &str,
+    explicit_key: Option<&str>,
+    reader: &str,
+) -> Result<String, String> {
+    use crate::bib_rekey::{RekeyError, rekey_paper};
+    use scitadel_db::sqlite::{SqlitePaperAliasRepository, SqlitePaperRepository};
+
+    let db = open_db()?;
+    let papers = SqlitePaperRepository::new(db.clone());
+    let aliases = SqlitePaperAliasRepository::new(db);
+
+    match rekey_paper(&papers, &aliases, paper_id, explicit_key, reader) {
+        Ok(out) => serde_json::to_string_pretty(&serde_json::json!({
+            "paper_id": out.paper_id,
+            "old_key": out.old_key,
+            "new_key": out.new_key,
+            "changed": out.changed,
+        }))
+        .map_err(|e| e.to_string()),
+        Err(RekeyError::PaperNotFound(id)) => Err(format!("paper '{id}' not found")),
+        Err(RekeyError::KeyCollision { key, owner }) => Err(format!(
+            "citation key '{key}' already used by paper '{owner}'"
+        )),
+        Err(RekeyError::InvalidKey(k)) => Err(format!("invalid citation key '{k}'")),
+        Err(RekeyError::Core(e)) => Err(e.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

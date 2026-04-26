@@ -14,7 +14,7 @@ pub use annotations::{SqliteAnnotationRepository, resolve_anchor};
 pub use assessments::SqliteAssessmentRepository;
 pub use citations::SqliteCitationRepository;
 pub use migrations::run_migrations;
-pub use paper_aliases::{SOURCE_BIBTEX_IMPORT, SqlitePaperAliasRepository};
+pub use paper_aliases::{SOURCE_BIBTEX_IMPORT, SOURCE_REKEY, SqlitePaperAliasRepository};
 pub use paper_state::{PaperState, SqlitePaperStateRepository};
 pub use papers::SqlitePaperRepository;
 pub use questions::SqliteQuestionRepository;

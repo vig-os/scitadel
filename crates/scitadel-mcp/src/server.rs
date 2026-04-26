@@ -314,6 +314,19 @@ pub struct ImportBibtexRequest {
     pub reader: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RekeyPaperRequest {
+    /// Paper id to rekey.
+    pub paper_id: String,
+    /// Explicit citation key. If omitted, the algorithm picks one
+    /// from current paper metadata (and the disambiguator excludes
+    /// the paper's own existing key so a fresh suffix is possible).
+    #[serde(default)]
+    pub explicit_key: Option<String>,
+    /// Identity recorded in the audit log.
+    pub reader: String,
+}
+
 // ---------- Server ----------
 
 #[derive(Debug, Clone)]
@@ -743,6 +756,16 @@ impl ScitadelServer {
         Parameters(req): Parameters<ImportBibtexRequest>,
     ) -> Result<String, String> {
         tools::import_bibtex_tool(&req.path, req.strategy.as_deref(), &req.reader)
+    }
+
+    #[tool(
+        description = "Reassign a paper's citation key (escape hatch for the #132 stable-key contract). Without `explicit_key`, re-runs the algorithm against the paper's current metadata; with it, sets that key directly. The pre-rekey key is preserved as an alias on `paper_aliases` so manuscripts still citing by the old key continue resolving via the import-match cascade's alias step. Fails loudly on collision with another paper's existing key. Audit-logged via `tracing::info!` with op=bib_rekey. Returns: JSON `{paper_id, old_key, new_key, changed}`."
+    )]
+    fn rekey_paper(
+        &self,
+        Parameters(req): Parameters<RekeyPaperRequest>,
+    ) -> Result<String, String> {
+        tools::rekey_paper_tool(&req.paper_id, req.explicit_key.as_deref(), &req.reader)
     }
 }
 
