@@ -192,20 +192,36 @@ fn import_one(
     let outcome = match_entry(entry, lookup)?;
     let matched_id = match outcome {
         MatchOutcome::Matched(id, _) => Some(id),
-        MatchOutcome::AmbiguousAlias(ids) => {
-            // Surface as a warning; treat as no-match (create new
-            // paper) rather than silently picking. The caller can
-            // later add a `--strategy interactive` mode (P1) to
-            // prompt; today we err on the side of "new paper" so
-            // user data isn't silently merged into the wrong row.
-            tracing::warn!(
-                citekey = %entry.citekey,
-                candidates = ?ids,
-                "ambiguous alias — creating new paper instead of guessing"
-            );
-            None
-        }
         MatchOutcome::NoMatch => None,
+        MatchOutcome::AmbiguousAlias(ids) => {
+            // Both alias AND title+year ambiguous (the matcher
+            // already tried title+year before falling back to this
+            // arm). Refuse to act: silently creating a new paper
+            // here causes the SAME citekey to fork into yet another
+            // alias row, ratcheting the collision on every re-import.
+            // Equally, picking one of the candidates risks merging
+            // the user's bib metadata into the wrong row.
+            //
+            // Bubble up as a Validation error; the lenient-mode
+            // handler in `import_bibtex_str` records it in
+            // `report.failed` so the user sees exactly which entries
+            // need manual resolution (typically: `bib rekey` one
+            // of the candidates so its alias no longer collides).
+            // See #160. Interactive resolution lands with #161.
+            let preview: Vec<String> = ids.iter().take(3).cloned().collect();
+            let suffix = if ids.len() > preview.len() {
+                format!(" (+{} more)", ids.len() - preview.len())
+            } else {
+                String::new()
+            };
+            return Err(CoreError::Validation(format!(
+                "ambiguous alias '{}' matches {} papers [{}]{}; resolve via `scitadel bib rekey` on one of them, or use --strategy interactive once it lands (#161)",
+                entry.citekey,
+                ids.len(),
+                preview.join(", "),
+                suffix,
+            )));
+        }
     };
 
     // 2. Resolve via the strategy.
@@ -544,6 +560,64 @@ mod tests {
             .collect();
         let bib_b = export_bibtex(&saved2);
         assert_eq!(bib_a, bib_b, "round-trip export must be byte-identical");
+    }
+
+    /// Regression test for #160: ambiguous alias must not silently
+    /// create a new paper. Earlier behavior forked the citekey into
+    /// a third alias row, ratcheting the collision on every re-import.
+    /// New behavior: per-row Validation failure, surfaced in
+    /// `report.failed` with all candidate paper IDs.
+    #[test]
+    fn ambiguous_alias_is_a_per_row_failure_not_a_silent_create() {
+        let (papers, aliases, annotations) = fresh();
+
+        // Two papers that legitimately share a citekey "smith2024"
+        // (e.g. two distinct .bib files were both imported earlier
+        // with the same Zotero-assigned key).
+        let mut p1 = Paper::new("First Paper");
+        p1.year = Some(2024);
+        let mut p2 = Paper::new("Second Paper");
+        p2.year = Some(2024);
+        papers.save(&p1).unwrap();
+        papers.save(&p2).unwrap();
+        aliases
+            .record(p1.id.as_str(), "smith2024", "bibtex-import")
+            .unwrap();
+        aliases
+            .record(p2.id.as_str(), "smith2024", "bibtex-import")
+            .unwrap();
+
+        let papers_before = papers.list_all(100, 0).unwrap().len();
+        let aliases_before = aliases.lookup_all("smith2024").unwrap().len();
+
+        // A bib with the colliding citekey + a title that doesn't
+        // match either seeded paper — forces the matcher's title+year
+        // step to fail, so the cascade ends in AmbiguousAlias.
+        let src = r"
+@article{smith2024,
+    title = {Some Other Title Entirely},
+    year = {1999}
+}";
+        let report =
+            import_bibtex_str(src, &opts_merge("lars"), &papers, &aliases, &annotations).unwrap();
+
+        assert!(
+            report.rows.is_empty(),
+            "no row should land on success path; got {:?}",
+            report.rows
+        );
+        assert_eq!(report.failed.len(), 1);
+        let (citekey, msg) = &report.failed[0];
+        assert_eq!(citekey, "smith2024");
+        assert!(msg.contains("ambiguous alias"), "got: {msg}");
+        assert!(msg.contains("matches 2 papers"), "got: {msg}");
+
+        // The canary: papers + aliases counts unchanged.
+        assert_eq!(papers.list_all(100, 0).unwrap().len(), papers_before);
+        assert_eq!(
+            aliases.lookup_all("smith2024").unwrap().len(),
+            aliases_before
+        );
     }
 
     #[test]
