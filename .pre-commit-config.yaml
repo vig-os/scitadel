@@ -69,6 +69,19 @@ repos:
         files: ^justfile(\..*)?$
         pass_filenames: false
 
+  # Rust formatting (fast — under 1s on a warm cache). Clippy is
+  # NOT a pre-commit hook because it's too slow for every commit;
+  # run `just lint` before push or `just verify` before opening a
+  # PR. See #156.
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt --check
+        entry: cargo fmt --all -- --check
+        language: system
+        files: \.rs$
+        pass_filenames: false
+
   # Typo Linting
   - repo: https://github.com/crate-ci/typos
     rev: 07d900b8fa1097806b8adb6391b0d3e0ac2fdea7  # v1.39.0
