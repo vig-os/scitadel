@@ -869,6 +869,97 @@ pub fn bib_rekey(paper_id: &str, key: Option<&str>, reader: Option<String>) -> R
     }
 }
 
+/// `scitadel bib watch <question_id>` — long-running snapshot.
+/// Polls SQLite, debounces bursts, hash-and-skips no-op writes,
+/// flushes pending change on SIGINT/SIGTERM.
+pub async fn bib_watch(
+    question_id: &str,
+    output: &std::path::Path,
+    reader: Option<String>,
+    min_score: Option<f64>,
+    debounce_ms: u64,
+    poll_ms: u64,
+) -> Result<()> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use scitadel_core::ports::QuestionRepository;
+    use scitadel_db::sqlite::{
+        SqliteAssessmentRepository, SqlitePaperRepository, SqliteQuestionRepository,
+        SqliteShortlistRepository,
+    };
+    use scitadel_mcp::bib_watch::{WatchOptions, run_watch_loop};
+
+    let reader = reader.unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "watch".into()));
+    let db = open_db()?;
+    let papers = SqlitePaperRepository::new(db.clone());
+    let assessments = SqliteAssessmentRepository::new(db.clone());
+    let shortlist = SqliteShortlistRepository::new(db.clone());
+    let questions = SqliteQuestionRepository::new(db);
+
+    // Validate the question id (prefix-resolve like other CLI ops) so
+    // a typo doesn't silently watch nothing.
+    let resolved_question_id = {
+        let all = questions.list_questions()?;
+        let matches: Vec<&scitadel_core::models::ResearchQuestion> = all
+            .iter()
+            .filter(|q| q.id.as_str().starts_with(question_id))
+            .collect();
+        match matches.len() {
+            0 => bail!("no question matches id prefix '{question_id}'"),
+            1 => matches[0].id.as_str().to_string(),
+            n => bail!("ambiguous question id prefix '{question_id}' — matches {n} records"),
+        }
+    };
+
+    let opts = WatchOptions {
+        question_id: resolved_question_id.clone(),
+        reader,
+        output: output.to_path_buf(),
+        debounce: Duration::from_millis(debounce_ms),
+        poll_interval: Duration::from_millis(poll_ms),
+        min_score,
+    };
+
+    println!(
+        "watching question {} → {} (debounce={}ms, poll={}ms{}); press Ctrl-C to stop",
+        &resolved_question_id[..resolved_question_id.len().min(8)],
+        output.display(),
+        debounce_ms,
+        poll_ms,
+        match min_score {
+            Some(s) => format!(", min_score={s}"),
+            None => String::new(),
+        },
+    );
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let signal_flag = Arc::clone(&shutdown);
+    tokio::spawn(async move {
+        // Listen for both Ctrl-C and SIGTERM (e.g. systemd stop).
+        let mut sigterm =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to install SIGTERM handler; Ctrl-C only");
+                    let _ = tokio::signal::ctrl_c().await;
+                    signal_flag.store(true, Ordering::SeqCst);
+                    return;
+                }
+            };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+        signal_flag.store(true, Ordering::SeqCst);
+    });
+
+    run_watch_loop(opts, papers, assessments, shortlist, shutdown).await?;
+    println!("watch stopped — final snapshot flushed if pending");
+    Ok(())
+}
+
 pub fn auth_login(source: &str) -> Result<()> {
     let creds = find_source_credentials(source)?;
 

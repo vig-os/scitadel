@@ -101,6 +101,48 @@ impl SqliteShortlistRepository {
     ) -> Result<std::collections::HashSet<String>, DbError> {
         Ok(self.list(question_id, reader)?.into_iter().collect())
     }
+
+    /// Latest update timestamp across the tables that the `bib watch`
+    /// engine considers shared-document state for `question_id`:
+    /// `papers` rows referenced by the shortlist, `paper_state` rows
+    /// for those papers, and `shortlist_members` membership changes.
+    /// Returns `None` when the question has no shortlist or all
+    /// touched tables are empty. Caller compares string equality
+    /// (RFC3339 timestamps are lex-comparable per ISO 8601).
+    ///
+    /// Note: stars are personal-view state and are filtered at the
+    /// watch-engine layer, NOT excluded here — the engine ignores
+    /// changes whose only signal is `paper_state.starred` flipping.
+    /// This query also doesn't join `annotations` directly: the
+    /// import-side bib-content build folds annotation `note=` text
+    /// through the paper row, so a meaningful annotation change
+    /// surfaces via `papers.updated_at`.
+    pub fn max_updated_at_for_question(
+        &self,
+        question_id: &str,
+    ) -> Result<Option<String>, DbError> {
+        let conn = self.db.conn()?;
+        let ts: Option<String> = conn
+            .query_row(
+                "SELECT MAX(t) FROM (
+                    SELECT MAX(updated_at) AS t FROM papers
+                        WHERE id IN (SELECT paper_id FROM shortlist_members
+                                     WHERE question_id = ?1)
+                    UNION ALL
+                    SELECT MAX(updated_at) AS t FROM paper_state
+                        WHERE paper_id IN (SELECT paper_id FROM shortlist_members
+                                           WHERE question_id = ?1)
+                    UNION ALL
+                    SELECT MAX(added_at) AS t FROM shortlist_members
+                        WHERE question_id = ?1
+                 )",
+                params![question_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(ts)
+    }
 }
 
 #[cfg(test)]

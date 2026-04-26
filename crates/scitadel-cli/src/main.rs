@@ -185,6 +185,34 @@ enum BibCommands {
         #[arg(long)]
         reader: Option<String>,
     },
+    /// Live `.bib` snapshot for a research question's shortlist.
+    /// Polls SQLite at 1s, debounces bursts of edits, and skips
+    /// the file write when the rendered content is byte-identical
+    /// (hash-and-skip) so unrelated DB churn doesn't thrash the
+    /// output. SIGINT/SIGTERM flushes any pending change before exit.
+    Watch {
+        /// Research question id (full or unambiguous prefix).
+        question_id: String,
+        /// Output `.bib` path. Will be (re)written each time the
+        /// shortlist's content changes.
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Reader scope for the shortlist. Defaults to $USER.
+        #[arg(long)]
+        reader: Option<String>,
+        /// Drop papers whose max assessment score for this question
+        /// is below this threshold. Default: include everything.
+        #[arg(long)]
+        min_score: Option<f64>,
+        /// Debounce window in milliseconds — bursts of edits within
+        /// this window coalesce into a single write.
+        #[arg(long, default_value = "300")]
+        debounce_ms: u64,
+        /// Polling interval in milliseconds. Lower = lower latency
+        /// but more SQLite reads.
+        #[arg(long, default_value = "1000")]
+        poll_ms: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -306,6 +334,24 @@ async fn main() -> Result<()> {
                 key,
                 reader,
             } => commands::bib_rekey(&paper_id, key.as_deref(), reader),
+            BibCommands::Watch {
+                question_id,
+                output,
+                reader,
+                min_score,
+                debounce_ms,
+                poll_ms,
+            } => {
+                commands::bib_watch(
+                    &question_id,
+                    &output,
+                    reader,
+                    min_score,
+                    debounce_ms,
+                    poll_ms,
+                )
+                .await
+            }
         },
         Commands::Snowball {
             search_id,

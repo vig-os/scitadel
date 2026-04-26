@@ -1,5 +1,6 @@
 pub mod bib_import;
 pub mod bib_rekey;
+pub mod bib_watch;
 pub mod extract;
 #[allow(clippy::unused_self, clippy::needless_pass_by_value)]
 pub mod server;
