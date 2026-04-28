@@ -172,6 +172,27 @@ impl DataStore {
         Ok(ann.id.as_str().to_string())
     }
 
+    /// Create a paper-level note: commentary on the publication as a
+    /// whole, with no quote / char_range. The anchor carries only the
+    /// `paper-note:<paper_id>` sentinel and the resolver short-circuits
+    /// it to Ok. (#185)
+    #[allow(dead_code)] // wired up in C3 (TUI Pp keybind)
+    pub fn create_paper_note(&self, paper_id: &str, note: &str, author: &str) -> Result<String> {
+        let anchor = Anchor {
+            sentence_id: Some(scitadel_core::models::paper_note_sentence_id(paper_id)),
+            status: AnchorStatus::Ok,
+            ..Anchor::default()
+        };
+        let ann = Annotation::new_root(
+            PaperId::from(paper_id),
+            author.to_string(),
+            note.to_string(),
+            anchor,
+        );
+        SqliteAnnotationRepository::new(self.db.clone()).create(&ann)?;
+        Ok(ann.id.as_str().to_string())
+    }
+
     /// Reply to an existing annotation; inherits paper_id + question_id
     /// from the parent.
     pub fn reply_annotation(&self, parent_id: &str, note: &str, author: &str) -> Result<String> {
@@ -420,5 +441,63 @@ mod tests {
         assert_eq!(store.load_unread_for_paper("lars", "p-a").unwrap().len(), 1);
         assert_eq!(store.load_unread_for_paper("lars", "p-b").unwrap().len(), 1);
         assert_eq!(store.load_unread_count("lars").unwrap(), 2);
+    }
+
+    #[test]
+    fn create_paper_note_persists_with_paper_note_sentinel() {
+        let store = DataStore::for_tests();
+        save_paper(&store, "p-a", "Alpha");
+        let id = store
+            .create_paper_note("p-a", "overall: methodology weak", "lars")
+            .unwrap();
+        let anns = store.load_annotations_for_paper("p-a").unwrap();
+        assert_eq!(anns.len(), 1);
+        let ann = &anns[0];
+        assert_eq!(ann.id.as_str(), id);
+        assert_eq!(ann.note, "overall: methodology weak");
+        assert!(
+            ann.anchor.is_paper_note(),
+            "paper note should be recognised by Anchor::is_paper_note(); got anchor={:?}",
+            ann.anchor
+        );
+        assert!(ann.anchor.quote.is_none(), "no quote on paper-level note");
+        assert!(
+            ann.anchor.char_range.is_none(),
+            "no char_range on paper-level note"
+        );
+    }
+
+    #[test]
+    fn create_paper_note_appears_in_load_annotations_for_paper() {
+        // Sanity: paper-note + a regular root annotation co-exist on
+        // the same paper. The TUI later partitions them into two
+        // sections via Anchor::is_paper_note() (#185 PR4 C3).
+        use scitadel_core::models::{Anchor, Annotation};
+        use scitadel_db::sqlite::SqliteAnnotationRepository;
+
+        let store = DataStore::for_tests();
+        save_paper(&store, "p-a", "A");
+        let _ = store
+            .create_paper_note("p-a", "global thought", "lars")
+            .unwrap();
+        let repo = SqliteAnnotationRepository::new(store.db.clone());
+        let anchored = Annotation::new_root(
+            PaperId::from("p-a"),
+            "claude".into(),
+            "passage thought".into(),
+            Anchor {
+                quote: Some("specific phrase".into()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&anchored).unwrap();
+
+        let anns = store.load_annotations_for_paper("p-a").unwrap();
+        assert_eq!(anns.len(), 2);
+        let paper_notes: Vec<_> = anns.iter().filter(|a| a.anchor.is_paper_note()).collect();
+        let anchored_count = anns.iter().filter(|a| !a.anchor.is_paper_note()).count();
+        assert_eq!(paper_notes.len(), 1);
+        assert_eq!(anchored_count, 1);
+        assert_eq!(paper_notes[0].note, "global thought");
     }
 }

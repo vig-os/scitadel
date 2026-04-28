@@ -1166,6 +1166,54 @@ pub fn reply_annotation_tool(parent_id: &str, note: &str, author: &str) -> Resul
     Ok(reply.id.as_str().to_string())
 }
 
+/// Create a paper-level note: commentary on the publication as a
+/// whole, with no quote / char_range / fuzzy match. The anchor
+/// carries only a synthetic `paper-note:<paper_id>` sentence_id and
+/// the resolver short-circuits it to Ok. (#185)
+pub fn create_paper_note_tool(paper_id: &str, note: &str, author: &str) -> Result<String, String> {
+    if author.trim().is_empty() {
+        return Err("author is required (pass an identity string)".into());
+    }
+    if note.trim().is_empty() {
+        return Err("note is required".into());
+    }
+    let db = open_db()?;
+    // Verify the paper exists. Without this, a typo in `paper_id`
+    // would create a dangling note with no UI surface to find it
+    // again — a bigger footfun than a clean error here.
+    {
+        let (paper_repo, _, _, _, _) = db.repositories();
+        if scitadel_core::ports::PaperRepository::get(&paper_repo, paper_id)
+            .map_err(|e| e.to_string())?
+            .is_none()
+        {
+            return Err(format!("Paper '{paper_id}' not found."));
+        }
+    }
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+
+    let anchor = scitadel_core::models::Anchor {
+        sentence_id: Some(scitadel_core::models::paper_note_sentence_id(paper_id)),
+        status: scitadel_core::models::AnchorStatus::Ok,
+        ..Default::default()
+    };
+    let ann = scitadel_core::models::Annotation::new_root(
+        scitadel_core::models::PaperId::from(paper_id),
+        author.to_string(),
+        note.to_string(),
+        anchor,
+    );
+    repo.create(&ann).map_err(|e| e.to_string())?;
+    tracing::info!(
+        op = "create_paper_note",
+        annotation_id = ann.id.as_str(),
+        paper_id = paper_id,
+        author = author,
+        "annotation write (trust-on-first-use)"
+    );
+    Ok(ann.id.as_str().to_string())
+}
+
 /// Update mutable fields on an existing annotation.
 pub fn update_annotation_tool(
     id: &str,

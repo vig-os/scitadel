@@ -139,6 +139,16 @@ pub struct ReplyAnnotationRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct CreatePaperNoteRequest {
+    /// Paper ID this note comments on. Must already exist.
+    pub paper_id: String,
+    /// Note body — markdown allowed.
+    pub note: String,
+    /// Author identity (e.g. agent slug, user name).
+    pub author: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeleteAnnotationRequest {
     /// Annotation ID
     pub id: String,
@@ -574,6 +584,26 @@ impl ScitadelServer {
                 },
             );
         }
+        Ok(id)
+    }
+
+    #[tool(
+        description = "Comment on a paper as a whole — quote-less, anchor-less commentary. Use this when the observation isn't tied to a specific passage (overall reaction, methodology critique, taxonomy tag). The TUI renders these in a dedicated 'paper-level notes' section above the threaded annotations. NOTE: author identity is trust-on-first-use (see create_annotation); writes are tracing-logged. Emits an MCP-spec `notifications/resources/updated` to active `subscribe_annotations` clients (#185). Returns: text (the new annotation ID)."
+    )]
+    fn create_paper_note(
+        &self,
+        Parameters(req): Parameters<CreatePaperNoteRequest>,
+    ) -> Result<String, String> {
+        let id = tools::create_paper_note_tool(&req.paper_id, &req.note, &req.author)?;
+        crate::events::emit(
+            &self.event_tx,
+            AnnotationEvent {
+                paper_id: req.paper_id.clone(),
+                annotation_id: id.clone(),
+                kind: AnnotationEventKind::Created,
+                reader: None,
+            },
+        );
         Ok(id)
     }
 
@@ -1145,6 +1175,14 @@ mod tests {
         assert_eq!(super::subscription_uri(Some("")), "scitadel://annotations/");
     }
 
+    /// All env-var-mutating tests in this module share a single
+    /// mutex so SCITADEL_DB doesn't get clobbered by parallel runs.
+    /// The lock is held for the duration of each test; the Database
+    /// is opened from the env var inside the same lock, so the
+    /// effective DB path is stable per test even though
+    /// `cargo test` launches them concurrently.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// End-to-end: a real `create_annotation` call goes through the
     /// tool surface and emits a `Created` event on the broadcast
     /// channel. Insurance against a future refactor that re-routes a
@@ -1155,49 +1193,153 @@ mod tests {
     /// (#185 PR3 review)
     #[tokio::test]
     async fn create_annotation_through_server_emits_created_event() {
-        // Each test gets its own SCITADEL_DB path. No other lib test
-        // in this crate touches SCITADEL_DB (the rest go through
-        // `Database::open_in_memory()` directly in their test
-        // helpers), so the env var isn't a parallel-test hazard
-        // here.
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("test.db");
-        // Safety: we own the env var for the lifetime of this test
-        // and no parallel test in this crate reads SCITADEL_DB.
-        unsafe {
-            std::env::set_var("SCITADEL_DB", &db_path);
-        }
+        // Hold the env-var lock for the sync setup (env-var write +
+        // db open + repo save + server.create_*). All those calls
+        // are sync; we drop the guard *before* the only .await so
+        // the lock isn't held across an await point. Each test
+        // releases the lock as soon as the broadcast Sender has
+        // already been populated for *this* server instance, so a
+        // parallel test taking the lock next can't disturb us.
+        let (id, mut rx) = {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let tmp = tempfile::tempdir().unwrap();
+            let db_path = tmp.path().join("test.db");
+            unsafe {
+                std::env::set_var("SCITADEL_DB", &db_path);
+            }
 
-        // Seed one paper so the annotation has somewhere to anchor.
-        let db = scitadel_db::sqlite::Database::open(&db_path).unwrap();
-        db.migrate().unwrap();
-        let mut p = scitadel_core::models::Paper::new("e2e");
-        p.id = scitadel_core::models::PaperId::from("p-e2e");
-        let (paper_repo, _, _, _, _) = db.repositories();
-        scitadel_core::ports::PaperRepository::save(&paper_repo, &p).unwrap();
+            let db = scitadel_db::sqlite::Database::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            let mut p = scitadel_core::models::Paper::new("e2e");
+            p.id = scitadel_core::models::PaperId::from("p-e2e");
+            let (paper_repo, _, _, _, _) = db.repositories();
+            scitadel_core::ports::PaperRepository::save(&paper_repo, &p).unwrap();
 
-        let server = super::ScitadelServer::new();
-        let mut rx = server.subscribe_events();
-        let req = super::CreateAnnotationRequest {
-            paper_id: "p-e2e".into(),
-            quote: "Q".into(),
-            note: "N".into(),
-            author: "claude".into(),
-            prefix: None,
-            suffix: None,
-            question_id: None,
-            color: None,
-            tags: None,
+            let server = super::ScitadelServer::new();
+            let rx = server.subscribe_events();
+            let req = super::CreateAnnotationRequest {
+                paper_id: "p-e2e".into(),
+                quote: "Q".into(),
+                note: "N".into(),
+                author: "claude".into(),
+                prefix: None,
+                suffix: None,
+                question_id: None,
+                color: None,
+                tags: None,
+            };
+            let id = server
+                .create_annotation(rmcp::handler::server::wrapper::Parameters(req))
+                .expect("create_annotation succeeds");
+            (id, rx)
         };
-        let id = server
-            .create_annotation(rmcp::handler::server::wrapper::Parameters(req))
-            .expect("create_annotation succeeds");
-
+        // Lock dropped — safe to await on a broadcast channel that's
+        // already populated for *our* `rx`.
         let event = rx.recv().await.expect("event arrives");
         assert_eq!(event.paper_id, "p-e2e");
         assert_eq!(event.kind, super::AnnotationEventKind::Created);
         assert_eq!(event.annotation_id, id);
         assert!(event.reader.is_none(), "create events have no reader");
+    }
+
+    /// End-to-end paper-note write: the new MCP tool persists with
+    /// the `paper-note:<paper_id>` sentinel and emits a `Created`
+    /// event on the broadcast channel. (#185 PR4)
+    #[tokio::test]
+    async fn create_paper_note_through_server_persists_and_emits() {
+        // Same lock-then-drop-before-await pattern as the
+        // create_annotation e2e test above — sync setup + write
+        // happen under the lock, the .await is on an already-
+        // populated broadcast channel.
+        let (id, mut rx, db) = {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let tmp = tempfile::tempdir().unwrap();
+            let db_path = tmp.path().join("test.db");
+            unsafe {
+                std::env::set_var("SCITADEL_DB", &db_path);
+            }
+            let db = scitadel_db::sqlite::Database::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            let mut p = scitadel_core::models::Paper::new("paper-note-target");
+            p.id = scitadel_core::models::PaperId::from("p-pn");
+            let (paper_repo, _, _, _, _) = db.repositories();
+            scitadel_core::ports::PaperRepository::save(&paper_repo, &p).unwrap();
+
+            let server = super::ScitadelServer::new();
+            let rx = server.subscribe_events();
+            let req = super::CreatePaperNoteRequest {
+                paper_id: "p-pn".into(),
+                note: "overall: methodology weak".into(),
+                author: "claude".into(),
+            };
+            let id = server
+                .create_paper_note(rmcp::handler::server::wrapper::Parameters(req))
+                .expect("create_paper_note succeeds");
+            (id, rx, db)
+        };
+
+        let event = rx.recv().await.expect("event arrives");
+        assert_eq!(event.paper_id, "p-pn");
+        assert_eq!(event.annotation_id, id);
+        assert_eq!(event.kind, super::AnnotationEventKind::Created);
+
+        let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+        let stored = repo.get(&id).unwrap().expect("annotation persisted");
+        assert!(stored.anchor.is_paper_note());
+        assert!(stored.anchor.quote.is_none());
+    }
+
+    /// `create_paper_note` rejects an empty note and a missing paper
+    /// at the boundary so a typo doesn't create a dangling note with
+    /// no UI surface to find it again.
+    #[tokio::test]
+    async fn create_paper_note_rejects_empty_note_and_missing_paper() {
+        // The std::sync::Mutex guard would normally need to drop
+        // before .await, but the env-var protection here only needs
+        // to hold for the duration of THIS test's setup +
+        // server.create_*() call (which is sync). The single .await
+        // afterwards (rx.recv) waits on a broadcast already populated
+        // synchronously, so holding the guard is benign in practice.
+        #[allow(clippy::await_holding_lock)]
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        unsafe {
+            std::env::set_var("SCITADEL_DB", &db_path);
+        }
+        let db = scitadel_db::sqlite::Database::open(&db_path).unwrap();
+        db.migrate().unwrap();
+
+        let server = super::ScitadelServer::new();
+
+        let err = server
+            .create_paper_note(rmcp::handler::server::wrapper::Parameters(
+                super::CreatePaperNoteRequest {
+                    paper_id: "p-missing".into(),
+                    note: "any".into(),
+                    author: "claude".into(),
+                },
+            ))
+            .expect_err("missing paper should reject");
+        assert!(err.contains("not found"));
+
+        // Seed a paper so the second case (empty note) is the only
+        // failure mode under test.
+        let mut p = scitadel_core::models::Paper::new("p");
+        p.id = scitadel_core::models::PaperId::from("p-pn-empty");
+        let (paper_repo, _, _, _, _) = db.repositories();
+        scitadel_core::ports::PaperRepository::save(&paper_repo, &p).unwrap();
+
+        let err = server
+            .create_paper_note(rmcp::handler::server::wrapper::Parameters(
+                super::CreatePaperNoteRequest {
+                    paper_id: "p-pn-empty".into(),
+                    note: "   ".into(),
+                    author: "claude".into(),
+                },
+            ))
+            .expect_err("whitespace-only note should reject");
+        assert!(err.contains("note"));
     }
 
     /// `subscribe_events` must hand out a receiver that observes
