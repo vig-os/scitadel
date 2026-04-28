@@ -159,7 +159,7 @@ enum BibCommands {
     Import {
         /// Path to the .bib file (Zotero / Mendeley export)
         path: PathBuf,
-        /// Merge strategy: reject | db-wins | bib-wins | merge
+        /// Merge strategy: reject | db-wins | bib-wins | merge | interactive
         #[arg(long, default_value = "merge")]
         strategy: String,
         /// Identity attached to imported annotations (`note=` field).
