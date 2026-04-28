@@ -284,8 +284,17 @@ pub struct DownloadPaperRequest {
 pub struct ReadPaperRequest {
     /// Paper ID
     pub paper_id: String,
-    /// Max characters to return (default 20000)
+    /// Max characters of `full_text` to return (default 20000). When
+    /// truncated, the JSON response carries `truncated: true` and
+    /// `total_chars` so the agent can request more.
     pub max_chars: Option<usize>,
+    /// When true (the default), the response is a JSON envelope that
+    /// also includes every live annotation anchored to the paper. When
+    /// false, the response is the legacy text format with no annotation
+    /// information. Default-true closes the silent-miss bug where an
+    /// agent calling `read_paper` would never observe a human comment.
+    /// (#185)
+    pub with_annotations: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -582,7 +591,7 @@ impl ScitadelServer {
     }
 
     #[tool(
-        description = "Returns: JSON {paper {id,title,abstract,full_text}, annotations[] (live only, with parent_id/root_id and full anchor incl. char_range/quote/prefix/suffix/sentence_id/source_version/status), source_version}. One call replaces get_paper + list_annotations when an agent needs to reason over offsets."
+        description = "Returns: JSON {paper {id,title,abstract,full_text}, annotations[] (live only, with parent_id/root_id and full anchor incl. char_range/quote/prefix/suffix/sentence_id/source_version/status), source_version}. One call replaces get_paper + list_annotations when an agent needs to reason over offsets. NOTE: `read_paper` (with default `with_annotations: true`) returns the same envelope plus extractor metadata and PDF/HTML extraction; prefer it when you need the full text. (#185)"
     )]
     fn get_annotated_paper(
         &self,
@@ -728,13 +737,13 @@ impl ScitadelServer {
     }
 
     #[tool(
-        description = "Extract the text from an already-downloaded paper's PDF or HTML. Call download_paper first. Returns: text (paper title, path, extracted body, possibly truncated)."
+        description = "Extract the text from an already-downloaded paper's PDF or HTML. Call download_paper first. By default (`with_annotations: true`, #185) Returns: JSON `{paper {id,title,abstract,full_text}, annotations[] (live, with parent_id/root_id and full anchor), source_version, extractor, path, truncated, total_chars}` so an agent never silently misses comments — pass `with_annotations: false` for the legacy text shape (paper title + path + extractor + body)."
     )]
     async fn read_paper(
         &self,
         Parameters(req): Parameters<ReadPaperRequest>,
     ) -> Result<String, String> {
-        tools::read_paper_tool(&req.paper_id, req.max_chars).await
+        tools::read_paper_tool(&req.paper_id, req.max_chars, req.with_annotations).await
     }
 
     #[tool(

@@ -558,9 +558,19 @@ pub async fn download_paper_tool(
 /// Extract text from a paper's downloaded file (PDF or HTML).
 ///
 /// Looks up the paper in the DB, locates its cached file under `papers_dir()`,
-/// and returns the extracted text. Truncated to `max_chars` (default 20_000) to
-/// keep responses manageable for the host LLM.
-pub async fn read_paper_tool(paper_id: &str, max_chars: Option<usize>) -> Result<String, String> {
+/// and returns the extracted text. Truncated to `max_chars` (default 20_000)
+/// to keep responses manageable for the host LLM.
+///
+/// When `with_annotations` is `None` or `Some(true)` (the default), the
+/// response is a JSON envelope that folds in live annotations alongside the
+/// extracted text — closes the silent-miss bug where an agent calling
+/// `read_paper` would never observe a human comment (#185). Pass
+/// `Some(false)` for the legacy text shape.
+pub async fn read_paper_tool(
+    paper_id: &str,
+    max_chars: Option<usize>,
+    with_annotations: Option<bool>,
+) -> Result<String, String> {
     let config = load_config();
     let db = open_db()?;
     let (paper_repo, _, _, _, _) = db.repositories();
@@ -610,21 +620,73 @@ pub async fn read_paper_tool(paper_id: &str, max_chars: Option<usize>) -> Result
     let text = text.expect("text populated above");
 
     let limit = max_chars.unwrap_or(20_000);
-    let truncated = if text.chars().count() > limit {
-        let head: String = text.chars().take(limit).collect();
-        format!(
-            "{head}\n\n[... truncated, {} of {} chars shown ...]",
-            limit,
-            text.chars().count()
-        )
+    assemble_read_paper_response(
+        &db,
+        paper_id,
+        &paper.title,
+        text,
+        extractor,
+        &path_display,
+        limit,
+        with_annotations.unwrap_or(true),
+    )
+}
+
+/// Format the extracted text + (optionally) annotations into the
+/// `read_paper` response. Factored out of `read_paper_tool` so the
+/// JSON-shape contract can be exercised with an in-memory DB without
+/// wiring a real PDF fixture.
+#[allow(clippy::too_many_arguments)]
+fn assemble_read_paper_response(
+    db: &Database,
+    paper_id: &str,
+    paper_title: &str,
+    extracted_text: String,
+    extractor: Option<&str>,
+    path_display: &str,
+    max_chars: usize,
+    with_annotations: bool,
+) -> Result<String, String> {
+    let total_chars = extracted_text.chars().count();
+    let was_truncated = total_chars > max_chars;
+    let body: String = if was_truncated {
+        extracted_text.chars().take(max_chars).collect()
     } else {
-        text
+        extracted_text
     };
 
+    if with_annotations {
+        let (paper_repo, _, _, _, _) = db.repositories();
+        let paper = paper_repo
+            .get(paper_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("paper not found: {paper_id}"))?;
+        let (annotations, source_version) = build_annotations_json(db, paper_id)?;
+        let response = serde_json::json!({
+            "paper": {
+                "id": paper.id.as_str(),
+                "title": paper.title,
+                "abstract": paper.r#abstract,
+                "full_text": body,
+            },
+            "annotations": annotations,
+            "source_version": source_version,
+            "extractor": extractor,
+            "path": path_display,
+            "truncated": was_truncated,
+            "total_chars": total_chars,
+        });
+        return serde_json::to_string_pretty(&response).map_err(|e| e.to_string());
+    }
+
+    let body_with_marker = if was_truncated {
+        format!("{body}\n\n[... truncated, {max_chars} of {total_chars} chars shown ...]")
+    } else {
+        body
+    };
     let extractor_line = extractor.map_or_else(String::new, |e| format!("Extractor: {e}\n"));
     Ok(format!(
-        "Paper: {}\nPath: {}\n{extractor_line}\n{}",
-        paper.title, path_display, truncated
+        "Paper: {paper_title}\nPath: {path_display}\n{extractor_line}\n{body_with_marker}"
     ))
 }
 
@@ -1210,14 +1272,14 @@ pub fn get_annotated_paper_tool(paper_id: &str) -> Result<String, String> {
     build_annotated_paper(&db, paper_id)
 }
 
-fn build_annotated_paper(db: &Database, paper_id: &str) -> Result<String, String> {
+/// Build the annotation array + source_version block shared by
+/// `read_paper` (when `with_annotations=true`) and `get_annotated_paper`.
+/// Soft-deleted annotations are excluded by `list_by_paper`.
+fn build_annotations_json(
+    db: &Database,
+    paper_id: &str,
+) -> Result<(Vec<serde_json::Value>, Option<String>), String> {
     use std::collections::HashMap;
-
-    let (paper_repo, _, _, _, _) = db.repositories();
-    let paper = paper_repo
-        .get(paper_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Paper '{paper_id}' not found."))?;
 
     let ann_repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db.clone());
     let annotations = ann_repo
@@ -1272,6 +1334,18 @@ fn build_annotated_paper(db: &Database, paper_id: &str) -> Result<String, String
             })
         })
         .collect();
+
+    Ok((entries, source_version))
+}
+
+fn build_annotated_paper(db: &Database, paper_id: &str) -> Result<String, String> {
+    let (paper_repo, _, _, _, _) = db.repositories();
+    let paper = paper_repo
+        .get(paper_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Paper '{paper_id}' not found."))?;
+
+    let (entries, source_version) = build_annotations_json(db, paper_id)?;
 
     let response = serde_json::json!({
         "paper": {
@@ -2005,8 +2079,8 @@ pub fn bib_diff_tool(
 #[cfg(test)]
 mod tests {
     use super::{
-        SOURCE_REGISTRY, build_annotated_paper, html_to_text, is_source_configured,
-        truncate_abstract,
+        SOURCE_REGISTRY, assemble_read_paper_response, build_annotated_paper, html_to_text,
+        is_source_configured, truncate_abstract,
     };
     use scitadel_core::config::Config;
     use scitadel_core::models::{Anchor, Annotation, Paper, PaperId};
@@ -2144,6 +2218,180 @@ mod tests {
     fn get_annotated_paper_unknown_paper_errors() {
         let db = fresh_db();
         let err = build_annotated_paper(&db, "nope").unwrap_err();
+        assert!(err.contains("not found"));
+    }
+
+    // -- read_paper #185: with_annotations folds the annotation array
+    //    into the response so an agent never silently misses comments.
+
+    #[test]
+    fn read_paper_with_annotations_default_true_returns_json_envelope() {
+        let db = fresh_db();
+        let pid = save_paper(&db, "p-rp1", "Cosmic rays", Some("body text"));
+        let repo = SqliteAnnotationRepository::new(db.clone());
+        let ann = Annotation::new_root(
+            pid,
+            "lars".into(),
+            "interesting".into(),
+            Anchor {
+                quote: Some("body".into()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&ann).unwrap();
+
+        let out = assemble_read_paper_response(
+            &db,
+            "p-rp1",
+            "Cosmic rays",
+            "body text".into(),
+            Some("pdftotext"),
+            "/tmp/p-rp1.pdf",
+            100,
+            true,
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(v["paper"]["id"], "p-rp1");
+        assert_eq!(v["paper"]["full_text"], "body text");
+        assert_eq!(v["extractor"], "pdftotext");
+        assert_eq!(v["path"], "/tmp/p-rp1.pdf");
+        assert_eq!(v["truncated"], false);
+        assert_eq!(v["total_chars"], 9);
+        assert_eq!(v["annotations"].as_array().unwrap().len(), 1);
+        assert_eq!(v["annotations"][0]["note"], "interesting");
+    }
+
+    #[test]
+    fn read_paper_with_annotations_false_returns_text_shape() {
+        let db = fresh_db();
+        save_paper(&db, "p-rp2", "Old format", Some("hello"));
+        let out = assemble_read_paper_response(
+            &db,
+            "p-rp2",
+            "Old format",
+            "hello".into(),
+            Some("pdftotext"),
+            "/tmp/p-rp2.pdf",
+            100,
+            false,
+        )
+        .unwrap();
+        // Legacy text shape: must NOT be JSON, must include the title
+        // and extractor lines exactly as before #185.
+        assert!(serde_json::from_str::<serde_json::Value>(&out).is_err());
+        assert!(out.starts_with("Paper: Old format\n"));
+        assert!(out.contains("Path: /tmp/p-rp2.pdf"));
+        assert!(out.contains("Extractor: pdftotext"));
+        assert!(out.contains("hello"));
+    }
+
+    #[test]
+    fn read_paper_with_annotations_truncates_full_text_and_flags_it() {
+        let db = fresh_db();
+        save_paper(&db, "p-rp3", "Long", Some(""));
+        let long: String = "a".repeat(50);
+        let out =
+            assemble_read_paper_response(&db, "p-rp3", "Long", long, None, "(cached)", 10, true)
+                .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["total_chars"], 50);
+        assert_eq!(
+            v["paper"]["full_text"].as_str().unwrap().chars().count(),
+            10
+        );
+    }
+
+    #[test]
+    fn read_paper_text_shape_appends_truncation_marker() {
+        let db = fresh_db();
+        save_paper(&db, "p-rp4", "Long", Some(""));
+        let long: String = "a".repeat(50);
+        let out =
+            assemble_read_paper_response(&db, "p-rp4", "Long", long, None, "(cached)", 10, false)
+                .unwrap();
+        assert!(out.contains("[... truncated, 10 of 50 chars shown ...]"));
+    }
+
+    #[test]
+    fn read_paper_with_annotations_excludes_soft_deleted() {
+        let db = fresh_db();
+        let pid = save_paper(&db, "p-rp5", "T", Some(""));
+        let repo = SqliteAnnotationRepository::new(db.clone());
+        let live = Annotation::new_root(
+            pid.clone(),
+            "lars".into(),
+            "live".into(),
+            Anchor {
+                quote: Some("q1".into()),
+                ..Anchor::default()
+            },
+        );
+        let doomed = Annotation::new_root(
+            pid,
+            "lars".into(),
+            "gone".into(),
+            Anchor {
+                quote: Some("q2".into()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&live).unwrap();
+        repo.create(&doomed).unwrap();
+        repo.soft_delete(doomed.id.as_str()).unwrap();
+
+        let out = assemble_read_paper_response(
+            &db,
+            "p-rp5",
+            "T",
+            "body".into(),
+            None,
+            "(cached)",
+            100,
+            true,
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let arr = v["annotations"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["note"], "live");
+    }
+
+    #[test]
+    fn read_paper_with_annotations_zero_annotations_returns_empty_array() {
+        let db = fresh_db();
+        save_paper(&db, "p-rp6", "Empty", Some(""));
+        let out = assemble_read_paper_response(
+            &db,
+            "p-rp6",
+            "Empty",
+            "body".into(),
+            None,
+            "(cached)",
+            100,
+            true,
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["annotations"].as_array().unwrap().len(), 0);
+        assert!(v["source_version"].is_null());
+    }
+
+    #[test]
+    fn read_paper_with_annotations_unknown_paper_errors() {
+        let db = fresh_db();
+        let err = assemble_read_paper_response(
+            &db,
+            "nope",
+            "T",
+            "body".into(),
+            None,
+            "(cached)",
+            100,
+            true,
+        )
+        .unwrap_err();
         assert!(err.contains("not found"));
     }
 
