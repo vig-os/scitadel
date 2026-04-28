@@ -11,6 +11,7 @@ mod shortlist;
 mod tui_state;
 
 pub use annotations::{SqliteAnnotationRepository, resolve_anchor};
+
 pub use assessments::SqliteAssessmentRepository;
 pub use citations::SqliteCitationRepository;
 pub use migrations::run_migrations;
@@ -18,15 +19,37 @@ pub use paper_aliases::{SOURCE_BIBTEX_IMPORT, SOURCE_REKEY, SqlitePaperAliasRepo
 pub use paper_state::{PaperState, SqlitePaperStateRepository};
 pub use papers::SqlitePaperRepository;
 pub use questions::SqliteQuestionRepository;
+/// Re-export of `rusqlite::Transaction` so downstream crates (e.g.
+/// `scitadel-mcp`'s bib-import orchestrator in #157) can drive multi-
+/// repo transactions without taking a direct rusqlite dependency.
+pub use rusqlite::Transaction as SqliteTransaction;
 pub use searches::SqliteSearchRepository;
 pub use shortlist::SqliteShortlistRepository;
 pub use tui_state::{SqliteTuiStateRepository, TuiState};
 
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::functions::FunctionFlags;
 use std::path::Path;
 
 use crate::error::DbError;
+
+/// Register `unicode_lower(text)` — a Unicode-aware lowercase scalar
+/// function for SQL queries. SQLite's built-in `LOWER()` is ASCII-only
+/// (`Ü` stays `Ü`), so case-insensitive title comparisons miss
+/// non-ASCII case variants. Registered on every connection at init
+/// time so any pooled handle can use it. (#159)
+fn register_unicode_lower(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.create_scalar_function(
+        "unicode_lower",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let s = ctx.get::<Option<String>>(0)?;
+            Ok(s.map(|v| v.to_lowercase()))
+        },
+    )
+}
 
 /// Parse an RFC3339 timestamp string, falling back to now on parse errors.
 pub(crate) fn parse_rfc3339_or_now(s: &str) -> chrono::DateTime<chrono::Utc> {
@@ -60,6 +83,7 @@ impl Database {
                      PRAGMA foreign_keys=ON;
                      PRAGMA busy_timeout=5000;",
             )?;
+            register_unicode_lower(conn)?;
             Ok(())
         });
 
@@ -75,6 +99,7 @@ impl Database {
                 "PRAGMA journal_mode=WAL;
                      PRAGMA foreign_keys=ON;",
             )?;
+            register_unicode_lower(conn)?;
             Ok(())
         });
 

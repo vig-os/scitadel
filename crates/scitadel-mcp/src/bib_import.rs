@@ -17,6 +17,11 @@
 //! 2. Record the imported citekey on `paper_aliases`.
 //! 3. Save the unanchored annotation built from `note=` (if any).
 //!
+//! All three writes are wrapped in a single per-row SQLite transaction
+//! (#157) so a mid-row failure can never strand an orphaned `papers`
+//! row without its alias — the next re-import would otherwise miss
+//! the orphan via the alias step and either DOI-merge or duplicate it.
+//!
 //! Failures on a single row are logged and counted but never abort
 //! the run — a 5000-paper Zotero dump must survive a couple bad
 //! entries.
@@ -26,8 +31,10 @@ use std::path::Path;
 use scitadel_core::bibtex_key::assign_keys;
 use scitadel_core::error::CoreError;
 use scitadel_core::ports::PaperRepository;
+use scitadel_db::error::DbError;
 use scitadel_db::sqlite::{
     SqliteAnnotationRepository, SqlitePaperAliasRepository, SqlitePaperRepository,
+    SqliteTransaction,
 };
 use scitadel_export::import::{
     BibEntry, MatchOutcome, MergeAction, MergeStrategy, PaperLookup, SideEffects,
@@ -134,8 +141,14 @@ pub fn import_bibtex_str(
     let lookup = SqliteBibLookup { papers, aliases };
     let mut report = ImportReport::default();
 
+    // `annotations` is unused below — the per-row tx grabs a connection
+    // from `papers.db()` and calls `SqliteAnnotationRepository::create_in_tx`
+    // statically. Kept on the outer signature so callers (CLI, MCP) don't
+    // need to change construction order (#157).
+    let _ = annotations;
+
     for entry in entries {
-        match import_one(&entry, options, &lookup, papers, aliases, annotations) {
+        match import_one(&entry, options, &lookup, papers) {
             Ok(row) => report.rows.push(row),
             Err(e) if options.lenient => {
                 tracing::warn!(citekey = %entry.citekey, error = %e, "import row failed; continuing");
@@ -159,23 +172,24 @@ pub fn import_bibtex_file(
     import_bibtex_str(&src, options, papers, aliases, annotations)
 }
 
-/// Assign and persist a stable `bibtex_key` for a newly-saved paper.
-/// Snapshots the existing key set, runs the #132 algorithm with the
-/// paper's title/authors/year, and writes the result back. Idempotent
-/// only if the paper already has a key (the algorithm's collision
-/// disambiguator may pick a different suffix on re-run when the
-/// `taken` set differs).
-fn assign_and_persist_bibtex_key(
-    papers: &SqlitePaperRepository,
+/// Assign and persist a stable `bibtex_key` for a newly-saved paper
+/// inside an in-flight transaction. Snapshots the existing key set
+/// (within the tx, so it sees the row we just upserted), runs the
+/// #132 algorithm with the paper's title/authors/year, and writes
+/// the result back. Tx-only sibling of the original
+/// `assign_and_persist_bibtex_key` — pulled inline now that the
+/// orchestrator owns the transaction (#157).
+fn assign_and_persist_bibtex_key_in_tx(
+    tx: &SqliteTransaction<'_>,
     paper: &scitadel_core::models::Paper,
 ) -> Result<(), CoreError> {
     if paper.bibtex_key.is_some() {
         return Ok(());
     }
-    let mut taken = papers.taken_bibtex_keys()?;
+    let mut taken = SqlitePaperRepository::taken_bibtex_keys_in_tx(tx)?;
     let assigned = assign_keys(std::slice::from_ref(paper), &mut taken);
     if let Some(key) = assigned.into_iter().next() {
-        papers.update_bibtex_key(paper.id.as_str(), &key)?;
+        SqlitePaperRepository::update_bibtex_key_in_tx(tx, paper.id.as_str(), &key)?;
     }
     Ok(())
 }
@@ -185,10 +199,9 @@ fn import_one(
     options: &ImportOptions,
     lookup: &SqliteBibLookup<'_>,
     papers: &SqlitePaperRepository,
-    aliases: &SqlitePaperAliasRepository,
-    annotations: &SqliteAnnotationRepository,
 ) -> Result<ImportRow, CoreError> {
-    // 1. Match cascade.
+    // 1. Match cascade. Read-only; runs against committed state, so
+    //    no need to be inside the per-row transaction.
     let outcome = match_entry(entry, lookup)?;
     let matched_id = match outcome {
         MatchOutcome::Matched(id, _) => Some(id),
@@ -231,30 +244,35 @@ fn import_one(
     };
     let merge = resolve_merge(db_paper, entry, options.strategy);
 
-    // 3. Persist the paper. Created/Updated write the row; Created
-    //    additionally needs an explicit bibtex_key assignment because
-    //    `SqlitePaperRepository::save` does not write the column —
-    //    skipping this leaves new papers keyless until the next
-    //    `migrate` run and silently degrades subsequent imports'
-    //    BibtexKey cascade step.
+    // 3+4. Persistence — wrapped in a single transaction (#157) so
+    //      paper-save / bibtex-key-assignment / alias-record /
+    //      annotation-create commit (or roll back) atomically. Without
+    //      this, a mid-row failure (e.g. transient SQLite error during
+    //      a 5000-paper Zotero import) could leave an orphaned papers
+    //      row with no alias — invisible to the next re-import's alias
+    //      step, defeating the whole point of recording the citekey.
+    let mut conn = papers.db().conn().map_err(CoreError::from)?;
+    let tx = conn
+        .transaction()
+        .map_err(DbError::from)
+        .map_err(CoreError::from)?;
+
     let persisted_id = match merge.action {
         MergeAction::Rejected => None,
         _ => match merge.paper.as_ref() {
             None => None,
             Some(p) => {
                 if matches!(merge.action, MergeAction::Created | MergeAction::Updated) {
-                    papers.save(p)?;
+                    SqlitePaperRepository::save_in_tx(&tx, p)?;
                 }
                 if merge.action == MergeAction::Created {
-                    assign_and_persist_bibtex_key(papers, p)?;
+                    assign_and_persist_bibtex_key_in_tx(&tx, p)?;
                 }
                 Some(p.id.as_str().to_string())
             }
         },
     };
 
-    // 4. Side effects (alias / annotation / verbose-log items) — only
-    //    when we have a paper to attach them to.
     let (annotation_created, dropped_keywords, dropped_file) = if let Some(pid) = &persisted_id {
         let SideEffects {
             alias,
@@ -263,12 +281,11 @@ fn import_one(
             dropped_file,
         } = compute_side_effects(pid, &options.reader, entry, merge.action);
         if let Some(a) = alias {
-            aliases
-                .record(&a.paper_id, &a.alias, a.source)
+            SqlitePaperAliasRepository::record_in_tx(&tx, &a.paper_id, &a.alias, a.source)
                 .map_err(CoreError::from)?;
         }
         let created = if let Some(annot) = annotation {
-            annotations.create(&annot)?;
+            SqliteAnnotationRepository::create_in_tx(&tx, &annot).map_err(CoreError::from)?;
             true
         } else {
             false
@@ -277,6 +294,10 @@ fn import_one(
     } else {
         (false, vec![], None)
     };
+
+    tx.commit()
+        .map_err(DbError::from)
+        .map_err(CoreError::from)?;
 
     Ok(ImportRow {
         citekey: entry.citekey.clone(),
@@ -618,6 +639,67 @@ mod tests {
             aliases.lookup_all("smith2024").unwrap().len(),
             aliases_before
         );
+    }
+
+    /// Per-row tx invariant (#157): paper-save + alias-record + annotation-
+    /// create must commit (or roll back) atomically. Without this, a
+    /// transient failure on the alias write after a successful paper
+    /// save would leave an orphan papers row that the next re-import
+    /// can't see via the alias step — silently DOI-merging or
+    /// duplicating instead of resolving to the orphan.
+    ///
+    /// Drive the primitive directly: open the orchestrator's tx, save
+    /// a paper, then trigger an FK violation (alias → bogus paper_id)
+    /// and drop the tx without committing. Assert papers row count is
+    /// zero after rollback.
+    #[test]
+    fn per_row_tx_rolls_back_when_alias_record_fails() {
+        let (papers, aliases, _annotations) = fresh();
+        let mut p = Paper::new("Will Be Rolled Back");
+        p.year = Some(2026);
+
+        let papers_before = papers.list_all(100, 0).unwrap().len();
+        assert_eq!(papers_before, 0);
+
+        // Mirror what `import_one` does: grab one connection, open a
+        // single tx, save the paper inside it, then attempt an alias
+        // record that violates the FK (paper_aliases.paper_id REFERENCES
+        // papers(id)). The error must propagate and — critically —
+        // dropping `tx` without `commit()` must roll back the paper save.
+        let mut conn = papers.db().conn().unwrap();
+        let tx = conn.transaction().unwrap();
+        SqlitePaperRepository::save_in_tx(&tx, &p).unwrap();
+        // Inside the tx, the paper IS visible to subsequent queries.
+        let mid_count: i64 = tx
+            .query_row("SELECT COUNT(*) FROM papers", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            mid_count, 1,
+            "paper must be visible inside its own tx before commit"
+        );
+        // Force the failure: alias points at a non-existent paper.
+        let err = SqlitePaperAliasRepository::record_in_tx(
+            &tx,
+            "no-such-paper-id",
+            "ghostkey",
+            "bibtex-import",
+        );
+        assert!(err.is_err(), "FK violation must surface as Err");
+        // Drop without commit → rollback.
+        drop(tx);
+        drop(conn);
+
+        // The canary: papers count is back to zero. Without per-row tx
+        // wrapping (#134 PR-A behavior), the paper would persist as an
+        // orphan and the subsequent re-import wouldn't know about it.
+        let papers_after = papers.list_all(100, 0).unwrap().len();
+        assert_eq!(
+            papers_after, 0,
+            "paper save must roll back when a later step in the same row's tx fails; \
+             got {papers_after} orphan(s)"
+        );
+        // And no alias was recorded either.
+        assert!(aliases.lookup("ghostkey").unwrap().is_none());
     }
 
     #[test]
