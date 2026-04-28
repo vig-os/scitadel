@@ -122,6 +122,10 @@ enum Commands {
         /// Precedence: this flag > `SCITADEL_THEME` env > config > auto.
         #[arg(long)]
         theme: Option<String>,
+        /// Print the registered themes (with one-line descriptions) and
+        /// exit without launching the TUI (#137).
+        #[arg(long, conflicts_with = "theme")]
+        list_themes: bool,
     },
     /// Bibliographic operations: import / export / rekey / watch (#134)
     Bib {
@@ -314,7 +318,13 @@ async fn main() -> Result<()> {
         },
         Commands::Download { doi, output_dir } => commands::download(&doi, output_dir).await,
         Commands::Mcp => commands::mcp().await,
-        Commands::Tui { theme } => commands::tui(theme.as_deref()),
+        Commands::Tui { theme, list_themes } => {
+            if list_themes {
+                commands::list_themes()
+            } else {
+                commands::tui(theme.as_deref())
+            }
+        }
         Commands::Assess {
             search_id,
             question,

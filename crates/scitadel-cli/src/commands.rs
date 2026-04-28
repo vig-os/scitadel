@@ -43,6 +43,21 @@ pub async fn mcp() -> Result<()> {
     Ok(())
 }
 
+/// Print every theme advertised by `scitadel-tui::theme::Theme::registry`
+/// in `name — description` form. Pure stdout + exit-0 — meant as a
+/// discovery aid for `--theme` (#137).
+pub fn list_themes() -> Result<()> {
+    let entries = scitadel_tui::theme::Theme::registry();
+    let width = entries.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+    println!("Available themes (use with --theme or set ui.theme in config.toml):");
+    for (name, desc) in entries {
+        println!("  {name:<width$}  {desc}", width = width);
+    }
+    println!();
+    println!("Resolution order: --theme flag > SCITADEL_THEME env > [ui] theme in config > auto.");
+    Ok(())
+}
+
 pub fn tui(theme_override: Option<&str>) -> Result<()> {
     let config = load_config();
     let email = config.openalex.api_key.clone();
@@ -51,14 +66,17 @@ pub fn tui(theme_override: Option<&str>) -> Result<()> {
     // Resolve theme before any rendering so the very first frame uses
     // the right palette. Order: --theme > SCITADEL_THEME > ui.theme >
     // auto-detect (#137).
-    let resolved = scitadel_tui::theme::resolve(theme_override, &config.ui.theme);
+    let (resolved, label) =
+        scitadel_tui::theme::resolve_with_label(theme_override, &config.ui.theme);
     scitadel_tui::theme::init(resolved);
+    let toast = format!("theme: {label}");
     scitadel_tui::run(
         &config.db_path,
         email,
         papers_dir,
         config.ui.show_institutional_hint,
         reader,
+        Some(toast),
     )?;
     Ok(())
 }
@@ -112,8 +130,24 @@ pub fn init(opts: InitOptions) -> Result<()> {
         })
         .unwrap_or_else(|| config.default_sources.clone());
 
+    // Theme prompt (#137). Default `auto` keeps the existing dark
+    // behaviour when COLORFGBG is unset; users on light terminals get
+    // an automatically-readable palette without per-machine config.
+    let theme = if interactive {
+        let current = config.ui.theme.clone();
+        prompt_line(
+            "TUI theme (auto|light|dark|dalton-dark|dalton-light)",
+            &current,
+        )
+        .map(|s| sanitize_theme_input(&s))
+        .unwrap_or(current)
+    } else {
+        config.ui.theme.clone()
+    };
+
     config.openalex.api_key.clone_from(&email);
     config.default_sources.clone_from(&sources);
+    config.ui.theme.clone_from(&theme);
 
     let config_path = config_path_for_db(&config.db_path);
     write_config_toml(&config_path, &config)
@@ -130,6 +164,7 @@ pub fn init(opts: InitOptions) -> Result<()> {
         println!("  OA email:       {email}");
     }
     println!("  Sources:        {}", sources.join(", "));
+    println!("  Theme:          {theme}");
 
     let keyed_sources_needed: Vec<&str> = sources
         .iter()
@@ -184,6 +219,19 @@ fn prompt_line(prompt: &str, default: &str) -> Option<String> {
     }
 }
 
+/// Normalise free-form theme input from the init wizard to a value the
+/// resolver understands. Unknown strings fall back to `auto` rather
+/// than being written verbatim — `[ui] theme = "dalton-pink"` would
+/// silently fold to Auto at TUI launch anyway, and a typo in the
+/// config file is harder to debug than one caught at write time.
+fn sanitize_theme_input(s: &str) -> String {
+    let trimmed = s.trim().to_ascii_lowercase();
+    match trimmed.as_str() {
+        "auto" | "dark" | "light" | "dalton-dark" | "dalton-bright" | "dalton-light" => trimmed,
+        _ => "auto".into(),
+    }
+}
+
 /// Parse a comma-separated source list, trimming whitespace and dropping blanks.
 fn parse_sources_csv(s: String) -> Vec<String> {
     s.split(',')
@@ -222,6 +270,13 @@ fn write_config_toml(path: &std::path::Path, config: &scitadel_core::config::Con
     if !config.openalex.api_key.is_empty() {
         out.push_str("\n[openalex]\n");
         writeln!(out, "api_key = \"{}\"", config.openalex.api_key).unwrap();
+    }
+    // Only persist `ui.theme` when it diverges from the default so
+    // users who never picked a non-default value keep an empty `[ui]`
+    // section out of their config (#137).
+    if config.ui.theme != "auto" {
+        out.push_str("\n[ui]\n");
+        writeln!(out, "theme = \"{}\"", config.ui.theme).unwrap();
     }
     std::fs::write(path, out)?;
     Ok(())

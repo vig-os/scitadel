@@ -107,6 +107,32 @@ impl Theme {
         ],
     };
 
+    /// Registered themes, surfaced by `scitadel tui --list-themes`
+    /// (#137). Tuple is `(canonical-name, one-line description)`.
+    /// `auto` is included as a meta-entry so the listing matches what
+    /// users can actually pass — even though it doesn't map to a fixed
+    /// palette. New named palettes plug in here.
+    #[must_use]
+    pub fn registry() -> &'static [(&'static str, &'static str)] {
+        &[
+            (
+                "auto",
+                "detect terminal background (COLORFGBG → fall back to dark)",
+            ),
+            (
+                "dark",
+                "alias for dalton-dark (default colourblind-friendly dark palette)",
+            ),
+            ("light", "alias for dalton-bright"),
+            ("dalton-dark", "Dalton colourblind-friendly dark palette"),
+            (
+                "dalton-bright",
+                "Dalton colourblind-friendly light palette (warm cream bg)",
+            ),
+            ("dalton-light", "alias for dalton-bright"),
+        ]
+    }
+
     /// Pick a highlight colour for a string key (e.g. annotation
     /// root_id). djb2 hash modulo palette size so the mapping is
     /// stable across runs.
@@ -179,20 +205,30 @@ impl ThemeChoice {
 /// `SCITADEL_THEME` sits between them in precedence.
 #[must_use]
 pub fn resolve(cli: Option<&str>, config_value: &str) -> Theme {
+    resolve_with_label(cli, config_value).0
+}
+
+/// Like [`resolve`] but also returns a short label describing the
+/// resolved palette and how it was picked (e.g.
+/// `"dalton-dark (auto)"`). Used by the startup status-bar toast (#137).
+#[must_use]
+pub fn resolve_with_label(cli: Option<&str>, config_value: &str) -> (Theme, String) {
     let raw = cli
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .or_else(|| std::env::var("SCITADEL_THEME").ok())
         .unwrap_or_else(|| config_value.to_string());
     match ThemeChoice::parse(&raw) {
-        ThemeChoice::Dark => Theme::DALTON_DARK,
-        ThemeChoice::Light => Theme::DALTON_BRIGHT,
+        ThemeChoice::Dark => (Theme::DALTON_DARK, "dalton-dark".into()),
+        ThemeChoice::Light => (Theme::DALTON_BRIGHT, "dalton-bright".into()),
         ThemeChoice::Auto => match detect_terminal_background() {
-            Some(TerminalBackground::Light) => Theme::DALTON_BRIGHT,
+            Some(TerminalBackground::Light) => {
+                (Theme::DALTON_BRIGHT, "dalton-bright (auto)".into())
+            }
             // Dark or unknown → dark. Dark is the safer default
             // because most dev terminals are dark and Dalton Dark
             // was the previous behaviour.
-            _ => Theme::DALTON_DARK,
+            _ => (Theme::DALTON_DARK, "dalton-dark (auto)".into()),
         },
     }
 }
@@ -322,6 +358,50 @@ mod tests {
         // No probe signal → dark fallback.
         let t = resolve(None, "auto");
         assert_eq!(t.emphasis, Theme::DALTON_DARK.emphasis);
+    }
+
+    #[test]
+    fn registry_lists_every_user_facing_name() {
+        // Every name advertised by `--list-themes` must round-trip
+        // through `ThemeChoice::parse` to a non-Auto variant *or* be
+        // the literal "auto" entry. Otherwise `--list-themes` would
+        // print a value that the resolver silently folds to Auto.
+        let names: Vec<&str> = Theme::registry().iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&"auto"));
+        assert!(names.contains(&"dark"));
+        assert!(names.contains(&"light"));
+        assert!(names.contains(&"dalton-dark"));
+        assert!(names.contains(&"dalton-bright"));
+        for name in &names {
+            if *name == "auto" {
+                assert_eq!(ThemeChoice::parse(name), ThemeChoice::Auto);
+            } else {
+                assert_ne!(
+                    ThemeChoice::parse(name),
+                    ThemeChoice::Auto,
+                    "registry name '{name}' parses to Auto — listing it would mislead users",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_with_label_marks_auto_branch() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            std::env::remove_var("SCITADEL_THEME");
+            std::env::remove_var("COLORFGBG");
+        }
+        let (_, label) = resolve_with_label(None, "auto");
+        assert!(label.contains("(auto)"), "got label {label:?}");
+        let (_, label) = resolve_with_label(Some("dark"), "auto");
+        assert!(
+            !label.contains("(auto)"),
+            "explicit cli should not be tagged auto: {label:?}"
+        );
+        assert!(label.contains("dalton-dark"));
     }
 
     #[test]
