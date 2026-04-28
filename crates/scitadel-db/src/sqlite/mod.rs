@@ -11,6 +11,7 @@ mod shortlist;
 mod tui_state;
 
 pub use annotations::{SqliteAnnotationRepository, resolve_anchor};
+
 pub use assessments::SqliteAssessmentRepository;
 pub use citations::SqliteCitationRepository;
 pub use migrations::run_migrations;
@@ -18,6 +19,10 @@ pub use paper_aliases::{SOURCE_BIBTEX_IMPORT, SOURCE_REKEY, SqlitePaperAliasRepo
 pub use paper_state::{PaperState, SqlitePaperStateRepository};
 pub use papers::SqlitePaperRepository;
 pub use questions::SqliteQuestionRepository;
+/// Re-export of `rusqlite::Transaction` so downstream crates (e.g.
+/// `scitadel-mcp`'s bib-import orchestrator in #157) can drive multi-
+/// repo transactions without taking a direct rusqlite dependency.
+pub use rusqlite::Transaction as SqliteTransaction;
 pub use searches::SqliteSearchRepository;
 pub use shortlist::SqliteShortlistRepository;
 pub use tui_state::{SqliteTuiStateRepository, TuiState};

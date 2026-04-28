@@ -41,6 +41,23 @@ impl SqlitePaperAliasRepository {
         Ok(rows > 0)
     }
 
+    /// Transactional sibling of [`Self::record`] (#157). Used by the
+    /// bib-import orchestrator so paper-save + alias-record + annotation-
+    /// create commit (or roll back) as a single unit per row.
+    pub fn record_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        paper_id: &str,
+        alias: &str,
+        source: &str,
+    ) -> Result<bool, DbError> {
+        let rows = tx.execute(
+            "INSERT OR IGNORE INTO paper_aliases (paper_id, alias, source, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![paper_id, alias, source, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// Look up a paper by alias. When two papers share an alias (legal —
     /// two different imports may collide on citekey) this returns the
     /// earliest-created row so the lookup is deterministic. Secondary

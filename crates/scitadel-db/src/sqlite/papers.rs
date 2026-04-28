@@ -41,6 +41,14 @@ impl SqlitePaperRepository {
         Self { db }
     }
 
+    /// Borrow the underlying `Database` so callers (e.g. the bib-import
+    /// orchestrator in #157) can drive a multi-repo transaction over a
+    /// single pooled connection. Read-only access — repos remain the
+    /// canonical write surface.
+    pub fn db(&self) -> &Database {
+        &self.db
+    }
+
     /// If a paper with the same DOI already exists, return a clone with the existing ID
     /// so the upsert merges into the existing row instead of violating the DOI unique index.
     fn resolve_doi_conflict(
@@ -115,6 +123,21 @@ impl SqlitePaperRepository {
     /// the seed in `Database::backfill_bibtex_keys`.
     pub fn taken_bibtex_keys(&self) -> Result<std::collections::HashSet<String>, CoreError> {
         let conn = self.db.conn()?;
+        Self::taken_bibtex_keys_inner(&conn)
+    }
+
+    /// Transactional sibling of [`Self::taken_bibtex_keys`] (#157). Runs
+    /// the snapshot inside an in-flight transaction so the bib-import
+    /// orchestrator's per-row tx sees its own pending writes.
+    pub fn taken_bibtex_keys_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+    ) -> Result<std::collections::HashSet<String>, CoreError> {
+        Self::taken_bibtex_keys_inner(tx)
+    }
+
+    fn taken_bibtex_keys_inner(
+        conn: &rusqlite::Connection,
+    ) -> Result<std::collections::HashSet<String>, CoreError> {
         let keys = conn
             .prepare("SELECT bibtex_key FROM papers WHERE bibtex_key IS NOT NULL")
             .map_err(DbError::Sqlite)?
@@ -123,6 +146,59 @@ impl SqlitePaperRepository {
             .filter_map(Result::ok)
             .collect();
         Ok(keys)
+    }
+
+    /// Transactional sibling of [`PaperRepository::save`] (#157). Same
+    /// upsert + DOI-conflict-retry logic, but runs against the caller's
+    /// transaction so a multi-step import operation can roll back as a
+    /// unit on partial failure.
+    pub fn save_in_tx(tx: &rusqlite::Transaction<'_>, paper: &Paper) -> Result<(), CoreError> {
+        let paper = Self::resolve_doi_conflict_tx(tx, paper)?;
+        let p = Self::paper_params(&paper);
+        let params: Vec<&dyn rusqlite::types::ToSql> = p.iter().map(|b| b.as_ref()).collect();
+        match tx.execute(UPSERT_SQL, params.as_slice()) {
+            Ok(_) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                if let Some(doi) = &paper.doi {
+                    let existing_id: Option<String> = tx
+                        .query_row(
+                            "SELECT id FROM papers WHERE doi = ?1",
+                            params![doi],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(DbError::Sqlite)?;
+                    if let Some(eid) = existing_id {
+                        let mut retry = paper.clone();
+                        retry.id = PaperId::from(eid);
+                        let p2 = Self::paper_params(&retry);
+                        let params2: Vec<&dyn rusqlite::types::ToSql> =
+                            p2.iter().map(|b| b.as_ref()).collect();
+                        tx.execute(UPSERT_SQL, params2.as_slice())
+                            .map_err(DbError::Sqlite)?;
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => Err(DbError::Sqlite(e).into()),
+        }
+    }
+
+    /// Transactional sibling of
+    /// [`PaperRepository::update_bibtex_key`] (#157).
+    pub fn update_bibtex_key_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        paper_id: &str,
+        key: &str,
+    ) -> Result<(), CoreError> {
+        tx.execute(
+            "UPDATE papers SET bibtex_key = ?1 WHERE id = ?2",
+            params![key, paper_id],
+        )
+        .map_err(DbError::Sqlite)?;
+        Ok(())
     }
 
     /// Lookup-by-id helpers used by the bib-import matcher (#134).
