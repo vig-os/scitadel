@@ -15,6 +15,7 @@ readme = "../../README.md"
 scitadel-core = { path = "../scitadel-core", version = "0.6.0" }
 scitadel-db = { path = "../scitadel-db", version = "0.6.0" }
 scitadel-adapters = { path = "../scitadel-adapters", version = "0.6.0" }
+scitadel-export = { path = "../scitadel-export", version = "0.6.0" }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 anyhow = { workspace = true }
@@ -23,6 +24,9 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 reqwest = { workspace = true }
 chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

@@ -10,7 +10,10 @@ use scitadel_core::models::{
 use scitadel_core::ports::{
     AssessmentRepository, PaperRepository, QuestionRepository, SearchRepository,
 };
-use scitadel_db::sqlite::{Database, SqliteAnnotationRepository, SqlitePaperStateRepository};
+use scitadel_db::sqlite::{
+    Database, SqliteAnnotationRepository, SqlitePaperStateRepository, SqlitePaperTagRepository,
+    SqliteShortlistRepository,
+};
 
 /// Wrapper around the database that loads data for each TUI view.
 pub struct DataStore {
@@ -246,5 +249,38 @@ impl DataStore {
     /// query it (#122).
     pub fn publish_tui_state(&self, state: &scitadel_db::sqlite::TuiState) -> Result<()> {
         Ok(scitadel_db::sqlite::SqliteTuiStateRepository::new(self.db.clone()).set(state)?)
+    }
+
+    /// Load the inputs needed by `scitadel_export::write_snapshot` for a
+    /// question + reader (#135 sub-feature B). Returns the shortlist's
+    /// paper IDs in DB order, the hydrated `Paper` rows, and a
+    /// `paper_id → tags` map. Mirrors `load_shortlist` in `scitadel-cli`
+    /// so the CLI and TUI surfaces produce byte-identical snapshots.
+    pub fn load_snapshot_inputs(
+        &self,
+        question_id: &str,
+        reader: &str,
+    ) -> Result<(
+        Vec<String>,
+        Vec<scitadel_core::models::Paper>,
+        std::collections::HashMap<String, Vec<String>>,
+    )> {
+        let (paper_repo, _, _, _, _) = self.db.repositories();
+        let shortlist = SqliteShortlistRepository::new(self.db.clone());
+        let tag_repo = SqlitePaperTagRepository::new(self.db.clone());
+
+        let paper_ids = shortlist
+            .list(question_id, reader)
+            .context("failed to read shortlist")?;
+        let papers: Vec<_> = paper_ids
+            .iter()
+            .filter_map(|id| paper_repo.get(id).ok().flatten())
+            .collect();
+        let mut tags = std::collections::HashMap::new();
+        for id in &paper_ids {
+            let t = tag_repo.tags_for(id).unwrap_or_default();
+            tags.insert(id.clone(), t);
+        }
+        Ok((paper_ids, papers, tags))
     }
 }
