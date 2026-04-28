@@ -245,6 +245,37 @@ impl SqliteAnnotationRepository {
         let _ = sql; // kept for potential future logging
         Ok(rows)
     }
+
+    /// Same predicate as `list_unread` but returns just the count.
+    /// Called on every TUI draw tick (~10 Hz) to drive the status-bar
+    /// `[N new]` badge — `COUNT(*)` keeps the per-tick cost in
+    /// microseconds even when there are many annotations. (#185)
+    pub fn count_unread(&self, reader: &str, paper_id: Option<&str>) -> Result<i64, DbError> {
+        let conn = self.db.conn()?;
+        let n: i64 = if let Some(pid) = paper_id {
+            conn.query_row(
+                "SELECT COUNT(*) FROM annotations a
+                 LEFT JOIN annotation_reads r
+                   ON r.annotation_id = a.id AND r.reader = ?1
+                 WHERE a.paper_id = ?2
+                   AND a.deleted_at IS NULL
+                   AND (r.seen_at IS NULL OR r.seen_at < a.updated_at)",
+                params![reader, pid],
+                |row| row.get(0),
+            )?
+        } else {
+            conn.query_row(
+                "SELECT COUNT(*) FROM annotations a
+                 LEFT JOIN annotation_reads r
+                   ON r.annotation_id = a.id AND r.reader = ?1
+                 WHERE a.deleted_at IS NULL
+                   AND (r.seen_at IS NULL OR r.seen_at < a.updated_at)",
+                params![reader],
+                |row| row.get(0),
+            )?
+        };
+        Ok(n)
+    }
 }
 
 fn row_to_annotation(row: &rusqlite::Row) -> rusqlite::Result<Annotation> {
@@ -808,6 +839,35 @@ mod tests {
         repo.mark_thread_seen(root.id.as_str(), "lars").unwrap();
         let unread = repo.list_unread("lars", Some("p1")).unwrap();
         assert!(unread.is_empty());
+    }
+
+    #[test]
+    fn count_unread_matches_list_unread_length() {
+        let db = fresh_db_with_paper();
+        let repo = SqliteAnnotationRepository::new(db);
+        let root = sample_root();
+        repo.create(&root).unwrap();
+        let reply = Annotation::new_reply(&root, "claude".into(), "follow-up".into());
+        repo.create(&reply).unwrap();
+
+        // Both unread for lars.
+        assert_eq!(repo.count_unread("lars", None).unwrap(), 2);
+        assert_eq!(repo.count_unread("lars", Some("p1")).unwrap(), 2);
+
+        repo.mark_thread_seen(root.id.as_str(), "lars").unwrap();
+        assert_eq!(repo.count_unread("lars", None).unwrap(), 0);
+        assert_eq!(repo.count_unread("lars", Some("p1")).unwrap(), 0);
+
+        // Soft-delete must not be counted.
+        let solo = Annotation::new_root(
+            scitadel_core::models::PaperId::from("p1"),
+            "lars".into(),
+            "doomed".into(),
+            Anchor::default(),
+        );
+        repo.create(&solo).unwrap();
+        repo.soft_delete(solo.id.as_str()).unwrap();
+        assert_eq!(repo.count_unread("lars", None).unwrap(), 0);
     }
 
     #[test]
