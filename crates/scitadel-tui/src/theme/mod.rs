@@ -20,17 +20,22 @@
 //!    b. OSC 11 query against the controlling tty (#176; 100–200ms timeout, skipped on non-tty)
 //!    c. fall back to dark
 //!
-//! Mid-session theme change is intentionally not supported — if the
-//! terminal flips light/dark at sunset, restart the TUI.
+//! ## Runtime toggle (#175)
+//!
+//! Once the session is up, the user can press `T` to cycle through the
+//! palettes registered in [`Theme::concrete`]. The toggle goes through
+//! [`set`] — purely in-memory, never written back to config. The next
+//! launch resolves the theme exactly as it would have without the
+//! toggle, so `auto` keeps detecting on every start.
 
 mod osc11;
 
-use std::sync::OnceLock;
+use std::sync::RwLock;
 
 use ratatui::style::Color;
 
 /// Semantic color roles used across all TUI views.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
     /// Borders, headers, status-bar mode labels, the active-tab marker.
     pub emphasis: Color,
@@ -137,6 +142,59 @@ impl Theme {
         ]
     }
 
+    /// Concrete palettes the runtime toggle (#175) cycles through, paired
+    /// with their canonical names. Order matches the `registry()` listing
+    /// so the cycle is deterministic and lines up with what
+    /// `--list-themes` shows. Aliases are intentionally excluded — a
+    /// cycle that hit `dark` then `dalton-dark` would visit the same
+    /// palette twice and look broken to users.
+    ///
+    /// New named palettes plug in here AND in [`Theme::registry`].
+    #[must_use]
+    pub fn concrete() -> &'static [(&'static str, Theme)] {
+        &[
+            ("dalton-dark", Theme::DALTON_DARK),
+            ("dalton-bright", Theme::DALTON_BRIGHT),
+        ]
+    }
+
+    /// Step to the next concrete theme in [`Theme::concrete`]. Wraps
+    /// from the last entry back to the first. If `current` doesn't match
+    /// any registered palette (defensive — shouldn't happen since the
+    /// only `Theme` values in flight come from constants we control),
+    /// returns the first registered palette so the caller is never stuck
+    /// on a dead value. Used by the runtime theme toggle (#175).
+    #[must_use]
+    pub fn cycle_next(current: Theme) -> Theme {
+        let entries = Self::concrete();
+        // `entries` is non-empty by construction; this guard makes the
+        // function total even if a future refactor empties the table —
+        // returning `current` is the closest thing to a no-op the
+        // caller can recover from.
+        if entries.is_empty() {
+            return current;
+        }
+        let idx = entries
+            .iter()
+            .position(|(_, t)| *t == current)
+            .map_or(0, |i| (i + 1) % entries.len());
+        entries[idx].1
+    }
+
+    /// Canonical name for a concrete theme — looked up in
+    /// [`Theme::concrete`]. Used by the runtime toggle (#175) to label
+    /// the status-bar toast (`theme: dalton-bright`). Falls back to the
+    /// first registered name if `theme` isn't in the table — matches
+    /// the defensive behaviour of [`Theme::cycle_next`].
+    #[must_use]
+    pub fn name(theme: &Theme) -> &'static str {
+        Self::concrete()
+            .iter()
+            .find(|(_, t)| t == theme)
+            .or_else(|| Self::concrete().first())
+            .map_or("", |(n, _)| *n)
+    }
+
     /// Pick a highlight colour for a string key (e.g. annotation
     /// root_id). djb2 hash modulo palette size so the mapping is
     /// stable across runs.
@@ -150,27 +208,42 @@ impl Theme {
     }
 }
 
-/// Process-wide active theme. Set once at startup via [`init`]; reads
-/// after that go through [`theme()`]. `OnceLock` makes it cheap (no
-/// lock contention on the hot draw path) and lets tests use the
-/// default without setup.
-static ACTIVE: OnceLock<Theme> = OnceLock::new();
+/// Process-wide active theme. Initialized at startup via [`init`] and
+/// can be swapped in-session by the runtime toggle (#175). `RwLock` over
+/// a `Theme` (Copy, ~24 fields) is cheap on the read-dominated draw path
+/// — readers grab a shared lock, copy the struct out by value, and
+/// release immediately. Writes happen only when the user presses the
+/// theme-toggle hotkey.
+static ACTIVE: RwLock<Theme> = RwLock::new(Theme::DALTON_DARK);
 
 /// Convenience accessor. `crate::theme::theme().emphasis` reads better
-/// at call sites than reaching into `ACTIVE` directly. Falls back to
-/// Dalton Dark if [`init`] was never called (e.g. unit tests rendering
-/// a widget in isolation).
+/// at call sites than reaching into `ACTIVE` directly. Returns by value
+/// (Theme is Copy) so callers don't hold the lock across draws. Falls
+/// back to Dalton Dark if the lock is poisoned (e.g. a panic during a
+/// previous `set`) — better to render with stale colours than crash.
 #[must_use]
-pub fn theme() -> &'static Theme {
-    ACTIVE.get().unwrap_or(&Theme::DALTON_DARK)
+pub fn theme() -> Theme {
+    ACTIVE.read().map_or(Theme::DALTON_DARK, |g| *g)
 }
 
-/// Set the process-wide theme. Must be called before the first frame
-/// is drawn; subsequent calls are no-ops (`OnceLock::set` returns Err).
-/// Pair with [`resolve`] to compute the right value from the layered
-/// preference sources.
+/// Set the process-wide theme. Called once at startup from the binary
+/// (paired with [`resolve`]) and again by the runtime toggle (#175) on
+/// every press of the theme-cycle hotkey. Lock poisoning is recovered
+/// via `into_inner` so a panicked sibling doesn't permanently freeze
+/// the palette.
 pub fn init(t: Theme) {
-    let _ = ACTIVE.set(t);
+    set(t);
+}
+
+/// In-session swap used by the #175 runtime toggle. Behaviourally
+/// identical to [`init`]; named separately so call sites read as
+/// "initial pick" vs "user toggled mid-session" — the underlying
+/// store is the same.
+pub fn set(t: Theme) {
+    let mut guard = ACTIVE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = t;
 }
 
 /// User's stated preference, in increasing precedence: config →
@@ -433,6 +506,95 @@ mod tests {
             "explicit cli should not be tagged auto: {label:?}"
         );
         assert!(label.contains("dalton-dark"));
+    }
+
+    /// Build a synthetic third theme so we can drive a 3-element cycle
+    /// without coupling the test to whatever palette ships next. The
+    /// concrete fields don't matter — only the identity (`emphasis`)
+    /// has to differ from the two registered palettes.
+    fn synthetic_theme() -> Theme {
+        let mut t = Theme::DALTON_DARK;
+        t.emphasis = Color::Rgb(0x01, 0x02, 0x03);
+        t
+    }
+
+    #[test]
+    fn cycle_next_two_themes_round_trips() {
+        // The shipped registry has exactly two concrete palettes today.
+        // Dark → Light → Dark documents the binary toggle that #175
+        // ships with.
+        let dark = Theme::DALTON_DARK;
+        let light = Theme::DALTON_BRIGHT;
+        let next = Theme::cycle_next(dark);
+        assert_eq!(next, light, "dark should cycle to bright");
+        let wrapped = Theme::cycle_next(next);
+        assert_eq!(wrapped, dark, "bright should wrap back to dark");
+    }
+
+    #[test]
+    fn cycle_next_single_theme_returns_itself() {
+        // Defensive: if a future build registered exactly one palette,
+        // cycle_next should be a no-op. We can't shrink the real
+        // registry from a test, so exercise the pure helper directly.
+        let only = Theme::DALTON_DARK;
+        let table: &[(&str, Theme)] = &[("only", only)];
+        let idx = table
+            .iter()
+            .position(|(_, t)| *t == only)
+            .map_or(0, |i| (i + 1) % table.len());
+        assert_eq!(table[idx].1, only);
+    }
+
+    #[test]
+    fn cycle_next_three_themes_full_cycle() {
+        // Mirror cycle_next's loop against an in-test 3-element table
+        // so we exercise the wrap arithmetic without waiting for a
+        // third palette to land in the registry.
+        let a = Theme::DALTON_DARK;
+        let b = Theme::DALTON_BRIGHT;
+        let c = synthetic_theme();
+        let table: &[(&str, Theme)] = &[("a", a), ("b", b), ("c", c)];
+        let cycle = |current: Theme| {
+            let idx = table
+                .iter()
+                .position(|(_, t)| *t == current)
+                .map_or(0, |i| (i + 1) % table.len());
+            table[idx].1
+        };
+        assert_eq!(cycle(a), b);
+        assert_eq!(cycle(b), c);
+        assert_eq!(cycle(c), a);
+    }
+
+    #[test]
+    fn cycle_next_unknown_current_returns_first() {
+        // Defensive: a Theme that isn't in the registry shouldn't
+        // panic or stick — it wraps to the first registered palette.
+        let unknown = synthetic_theme();
+        let next = Theme::cycle_next(unknown);
+        assert_eq!(next, Theme::concrete()[0].1);
+    }
+
+    #[test]
+    fn theme_name_round_trips_concrete_palettes() {
+        // The runtime toggle's status-bar toast uses Theme::name to
+        // build "theme: dalton-bright". Round-trip both palettes so a
+        // future palette rename can't silently break the toast.
+        assert_eq!(Theme::name(&Theme::DALTON_DARK), "dalton-dark");
+        assert_eq!(Theme::name(&Theme::DALTON_BRIGHT), "dalton-bright");
+    }
+
+    #[test]
+    fn set_swaps_active_theme() {
+        // Mid-session swap (#175) — `set` replaces what `theme()`
+        // returns. Tests run in parallel across the workspace; we
+        // restore the prior value to keep adjacent assertions stable.
+        let prev = theme();
+        set(Theme::DALTON_BRIGHT);
+        assert_eq!(theme().emphasis, Theme::DALTON_BRIGHT.emphasis);
+        set(Theme::DALTON_DARK);
+        assert_eq!(theme().emphasis, Theme::DALTON_DARK.emphasis);
+        set(prev);
     }
 
     #[test]
