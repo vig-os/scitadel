@@ -4,6 +4,7 @@ mod citations;
 mod migrations;
 mod paper_aliases;
 mod paper_state;
+mod paper_tags;
 mod papers;
 mod questions;
 mod searches;
@@ -17,6 +18,7 @@ pub use citations::SqliteCitationRepository;
 pub use migrations::run_migrations;
 pub use paper_aliases::{SOURCE_BIBTEX_IMPORT, SOURCE_REKEY, SqlitePaperAliasRepository};
 pub use paper_state::{PaperState, SqlitePaperStateRepository};
+pub use paper_tags::{SqlitePaperTagRepository, TAG_SOURCE_BIBTEX_IMPORT};
 pub use papers::SqlitePaperRepository;
 pub use questions::SqliteQuestionRepository;
 /// Re-export of `rusqlite::Transaction` so downstream crates (e.g.

@@ -267,7 +267,16 @@ pub fn export_search_tool(search_id: &str, format: &str) -> Result<String, Strin
 
     match format {
         "csv" => Ok(scitadel_export::export_csv(&papers)),
-        "bibtex" => Ok(scitadel_export::export_bibtex(&papers)),
+        "bibtex" => {
+            // #162: surface paper-level tags as `keywords={…}` so a
+            // Zotero round-trip preserves keyword-only entries.
+            use scitadel_db::sqlite::SqlitePaperTagRepository;
+            let db = open_db()?;
+            let tags = SqlitePaperTagRepository::new(db);
+            Ok(scitadel_export::export_bibtex_with_tags(&papers, |id| {
+                tags.tags_for(id).unwrap_or_default()
+            }))
+        }
         // Default to JSON for unknown formats
         _ => Ok(scitadel_export::export_json(&papers, 2)),
     }
@@ -1610,6 +1619,7 @@ pub fn import_bibtex_tool(
     use crate::bib_import::{ImportOptions, import_bibtex_file};
     use scitadel_db::sqlite::{
         SqliteAnnotationRepository, SqlitePaperAliasRepository, SqlitePaperRepository,
+        SqlitePaperTagRepository,
     };
     use scitadel_export::import::MergeStrategy;
 
@@ -1623,7 +1633,8 @@ pub fn import_bibtex_tool(
     let db = open_db()?;
     let papers = SqlitePaperRepository::new(db.clone());
     let aliases = SqlitePaperAliasRepository::new(db.clone());
-    let annotations = SqliteAnnotationRepository::new(db);
+    let annotations = SqliteAnnotationRepository::new(db.clone());
+    let tags = SqlitePaperTagRepository::new(db);
 
     let options = ImportOptions {
         strategy,
@@ -1640,6 +1651,7 @@ pub fn import_bibtex_tool(
         &papers,
         &aliases,
         &annotations,
+        &tags,
     )
     .map_err(|e| e.to_string())?;
 
@@ -1659,7 +1671,7 @@ pub fn import_bibtex_tool(
                 "from_bib": r.from_bib,
                 "kept_from_db": r.kept_from_db,
                 "annotation_created": r.annotation_created,
-                "dropped_keywords": r.dropped_keywords,
+                "paper_tags_written": r.paper_tags_written,
                 "dropped_file": r.dropped_file,
             })
         })
