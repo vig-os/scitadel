@@ -230,6 +230,34 @@ enum BibCommands {
         #[arg(long, default_value = "text", value_parser = ["text", "json"])]
         format: String,
     },
+    /// Structural diff between two bibliography exports — entry-level
+    /// (added / removed / changed) rather than line-level. Mirrors the
+    /// human-readable "what actually moved" report `bib verify` only
+    /// hints at via its line diff. Auto-detects BibTeX vs CSL-JSON by
+    /// content sniff; the two flavors are interchangeable. Exit codes:
+    /// `0` no diff, `1` diff (mirrors `git diff`).
+    Diff {
+        /// First file (BibTeX or CSL-JSON).
+        file_a: PathBuf,
+        /// Second file. Mutually exclusive with `--question-id`.
+        file_b: Option<PathBuf>,
+        /// Compare `file_a` against a fresh snapshot of this question's
+        /// shortlist from the DB. Mutually exclusive with `<file_b>`.
+        #[arg(long)]
+        question_id: Option<String>,
+        /// Output format: `text` (default, hand-rolled ANSI when
+        /// stdout is a TTY) or `json` (structured, CI-friendly).
+        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+        format: String,
+        /// Force ANSI color off (useful for piping into `less` without
+        /// `-R`). Color is also auto-disabled when stdout is not a TTY.
+        #[arg(long)]
+        no_color: bool,
+        /// Reader scope when comparing against `--question-id`. Defaults
+        /// to $USER. Ignored when `<file_b>` is provided.
+        #[arg(long)]
+        reader: Option<String>,
+    },
     /// Live `.bib` snapshot for a research question's shortlist.
     /// Polls SQLite at 1s, debounces bursts of edits, and skips
     /// the file write when the rendered content is byte-identical
@@ -404,6 +432,24 @@ async fn main() -> Result<()> {
                 format,
             } => {
                 let code = commands::bib_verify(&file, question_id.as_deref(), &format)?;
+                std::process::exit(code);
+            }
+            BibCommands::Diff {
+                file_a,
+                file_b,
+                question_id,
+                format,
+                no_color,
+                reader,
+            } => {
+                let code = commands::bib_diff(
+                    &file_a,
+                    file_b.as_deref(),
+                    question_id.as_deref(),
+                    &format,
+                    no_color,
+                    reader.as_deref(),
+                )?;
                 std::process::exit(code);
             }
             BibCommands::Watch {

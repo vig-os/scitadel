@@ -1495,6 +1495,161 @@ fn print_verify_json(status: &str, message: &str, diff: Option<&str>) {
     println!("{}", serde_json::Value::Object(obj));
 }
 
+// ---------- bib diff (#135 sub-feature C) ----------
+
+/// Detect whether stdout is a TTY so we know whether ANSI color codes
+/// will display correctly. Routed through `IsTerminal` from `std::io`
+/// so we don't pull in a `colored`/`atty` crate just to ask the OS one
+/// question. `--no-color` overrides this to `false` regardless.
+fn stdout_is_tty() -> bool {
+    use std::io::IsTerminal as _;
+    std::io::stdout().is_terminal()
+}
+
+/// Run `scitadel bib diff` against two file paths OR a file vs. a
+/// fresh-from-DB snapshot of `--question-id`. Returns the exit code:
+/// `0` if there's no structural diff, `1` if there is (mirrors
+/// `git diff` semantics so CI scripts can `if cmd; then` them).
+pub fn bib_diff(
+    file_a: &std::path::Path,
+    file_b: Option<&std::path::Path>,
+    question_id: Option<&str>,
+    format: &str,
+    no_color: bool,
+    reader_arg: Option<&str>,
+) -> Result<i32> {
+    // Argument validation up front: exactly one of (file_b, question_id).
+    let (entries_a, fmt_a) =
+        scitadel_export::load_entries_from_path(file_a).map_err(|e| anyhow::anyhow!(e))?;
+    let (entries_b, label_b) = match (file_b, question_id) {
+        (Some(_), Some(_)) => bail!("pass either <file_b> OR --question-id, not both"),
+        (None, None) => bail!("missing second side: pass <file_b> or --question-id <id>"),
+        (Some(b), None) => {
+            let (e, _fmt) =
+                scitadel_export::load_entries_from_path(b).map_err(|err| anyhow::anyhow!(err))?;
+            (e, format!("{}", b.display()))
+        }
+        (None, Some(qid)) => {
+            // Fresh snapshot from DB. Use the same reader resolution
+            // as snapshot/verify so stars and shortlist scoping line up.
+            let reader = reader_arg.map_or_else(current_reader, str::to_string);
+            let (q, _ids, papers, tags) = load_shortlist(qid, &reader)?;
+            // Snapshot in the same flavor as the file side so the
+            // comparison is apples-to-apples (the diff is structural so
+            // either format works, but staying consistent avoids any
+            // round-trip lossiness in the format-neutral lift).
+            let content = match fmt_a {
+                scitadel_export::BibFormat::CslJson => render_csl_json(&papers, &tags),
+                scitadel_export::BibFormat::Bibtex => render_bibtex(&papers, &tags),
+            };
+            let (e, _fmt) = scitadel_export::load_entries_from_str(&content)
+                .map_err(|err| anyhow::anyhow!(err))?;
+            (e, format!("question {}", q.id.as_str()))
+        }
+    };
+
+    let diff = scitadel_export::diff_entries(&entries_a, &entries_b);
+    let exit = i32::from(!diff.is_empty());
+
+    match format {
+        "json" => {
+            print!(
+                "{}",
+                scitadel_export::render_diff_json(&diff)
+                    .context("failed to serialize diff JSON")?
+            );
+        }
+        "text" | "" => {
+            let use_color = !no_color && stdout_is_tty();
+            let header_a = file_a.display().to_string();
+            let text = scitadel_export::render_diff_text(&diff, &header_a, &label_b, use_color);
+            print!("{text}");
+        }
+        other => bail!("unknown --format: {other}; valid: text, json"),
+    }
+    Ok(exit)
+}
+
+#[cfg(test)]
+mod bib_diff_tests {
+    //! Unit tests for the CLI's `bib diff` plumbing. The pure-logic
+    //! tests live in `scitadel-export::diff::tests`; here we just
+    //! sanity-check the wiring (TTY toggle, exit-code derivation,
+    //! format dispatch).
+    use scitadel_export::{BibDiff, ChangedEntry, Entry, FieldChange};
+
+    fn no_diff() -> BibDiff {
+        BibDiff::default()
+    }
+
+    fn with_diff() -> BibDiff {
+        BibDiff {
+            added: vec![],
+            removed: vec![],
+            changed: vec![ChangedEntry {
+                citekey: "k".into(),
+                before_citekey: None,
+                field_changes: vec![FieldChange {
+                    field: "title".into(),
+                    before: Some("Old".into()),
+                    after: Some("New".into()),
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn empty_diff_renders_no_differences_marker() {
+        let out = scitadel_export::render_diff_text(&no_diff(), "A", "B", false);
+        assert!(out.contains("No differences"));
+    }
+
+    #[test]
+    fn non_empty_diff_includes_changed_section() {
+        let out = scitadel_export::render_diff_text(&with_diff(), "A", "B", false);
+        assert!(out.contains("CHANGED (1):"));
+        assert!(out.contains("Old → New"));
+    }
+
+    #[test]
+    fn no_color_strips_ansi() {
+        let out = scitadel_export::render_diff_text(&with_diff(), "A", "B", false);
+        assert!(!out.contains('\x1b'));
+    }
+
+    #[test]
+    fn color_path_emits_ansi() {
+        let out = scitadel_export::render_diff_text(&with_diff(), "A", "B", true);
+        assert!(out.contains('\x1b'));
+    }
+
+    #[test]
+    fn json_format_round_trips_through_serde() {
+        let d = with_diff();
+        let json = scitadel_export::render_diff_json(&d).unwrap();
+        let back: BibDiff = serde_json::from_str(&json).unwrap();
+        assert_eq!(d, back);
+    }
+
+    #[test]
+    fn diff_is_empty_helper_drives_exit_code() {
+        // Simulate the `bib_diff` exit derivation: 0 iff is_empty, else 1.
+        let _no_op = no_diff();
+        assert_eq!(i32::from(!no_diff().is_empty()), 0);
+        assert_eq!(i32::from(!with_diff().is_empty()), 1);
+        // and the "summary one-liner" used in text rendering is robust
+        // when authors empty.
+        let bare = Entry {
+            citekey: "x".into(),
+            ..Default::default()
+        };
+        let mut d = BibDiff::default();
+        d.added.push(bare);
+        let out = scitadel_export::render_diff_text(&d, "A", "B", false);
+        assert!(out.contains("ADDED (1):"));
+    }
+}
+
 fn prompt_credential(label: &str, secret: bool) -> Result<String> {
     if secret {
         // Read without echo
