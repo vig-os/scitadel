@@ -18,8 +18,10 @@ use tokio::sync::mpsc;
 use crate::data::DataStore;
 use crate::tasks::{Task, TaskKind, TaskStatus, TaskUpdate, spawn_download_paper};
 use crate::views::annotation_prompt::{AnnotationPrompt, PromptCommit, PromptSubmission};
+use crate::views::bib_export_prompt::BibExportPrompt;
 use crate::views::{
-    annotation_prompt, dashboard, detail, papers, questions, queue, searches, tasks as tasks_view,
+    annotation_prompt, bib_export_prompt, dashboard, detail, papers, questions, queue, searches,
+    tasks as tasks_view,
 };
 use crate::widgets::status_bar;
 
@@ -94,10 +96,13 @@ pub enum Overlay {
     },
     /// Question Dashboard (#133). Split-pane ranked-by-score view of
     /// papers assessed against the question, with a citation shortlist
-    /// curated via `c`.
+    /// curated via `c`. The optional `export_prompt` field carries the
+    /// state of the `E` path-prompt overlay (#135 sub-feature B); when
+    /// `Some`, the prompt eats every keystroke until Enter / Esc.
     QuestionDashboard {
         question_id: String,
         selected: usize,
+        export_prompt: Option<BibExportPrompt>,
     },
 }
 
@@ -137,6 +142,12 @@ pub struct App {
     /// the 100 ms event-poll cadence, ~30 frames ≈ 3 s) rather than
     /// wall-clock so headless tape runs reproduce the same lifetime.
     startup_toast_frames: u32,
+    /// Transient status-bar toast set by user-facing actions
+    /// (currently: bib export success/failure, #135 sub-feature B).
+    /// Shape mirrors the startup toast so we don't need a second
+    /// rendering branch — both feed the same status-bar slot. Lifetime
+    /// is per-toast so a long error can linger longer than a quick OK.
+    status_toast: Option<StatusToast>,
 
     task_tx: mpsc::UnboundedSender<TaskUpdate>,
     task_rx: mpsc::UnboundedReceiver<TaskUpdate>,
@@ -147,6 +158,23 @@ pub struct App {
 /// 100 ms event-poll cadence this is ~3 seconds — long enough to read,
 /// short enough to clear before the user does anything substantial.
 const STARTUP_TOAST_FRAMES: u32 = 30;
+
+/// Lifetime budget (in draws) for action-success toasts. ~30 frames at
+/// the 100 ms poll cadence ≈ 3 s.
+const STATUS_TOAST_OK_FRAMES: u32 = 30;
+
+/// Lifetime budget (in draws) for action-failure toasts. Doubled so the
+/// user has time to read a longer error message before it clears.
+const STATUS_TOAST_ERR_FRAMES: u32 = 60;
+
+/// Action-driven status toast (success or failure). Mirrors the shape
+/// of `startup_toast` + `startup_toast_frames` but ships them in a
+/// single struct so per-toast lifetime is configurable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StatusToast {
+    pub message: String,
+    pub frames_remaining: u32,
+}
 
 impl App {
     fn new(
@@ -186,6 +214,7 @@ impl App {
             offline: false,
             startup_toast: None,
             startup_toast_frames: 0,
+            status_toast: None,
             task_tx,
             task_rx,
             offline_rx,
@@ -203,6 +232,38 @@ impl App {
         if self.startup_toast_frames > STARTUP_TOAST_FRAMES {
             self.startup_toast = None;
         }
+    }
+
+    /// Decrement the action-toast lifetime by one draw. Mirrors
+    /// `tick_startup_toast` so both toast slots share the same
+    /// per-frame counter cadence — there is no second timing
+    /// subsystem (#135 sub-feature B keeps the existing primitive).
+    fn tick_status_toast(&mut self) {
+        let Some(toast) = self.status_toast.as_mut() else {
+            return;
+        };
+        if toast.frames_remaining == 0 {
+            self.status_toast = None;
+        } else {
+            toast.frames_remaining -= 1;
+        }
+    }
+
+    /// Show a success/info status-bar toast for ~30 frames.
+    pub(crate) fn set_status_ok(&mut self, message: impl Into<String>) {
+        self.status_toast = Some(StatusToast {
+            message: message.into(),
+            frames_remaining: STATUS_TOAST_OK_FRAMES,
+        });
+    }
+
+    /// Show an error status-bar toast for ~60 frames (longer so the
+    /// user has time to read it).
+    pub(crate) fn set_status_err(&mut self, message: impl Into<String>) {
+        self.status_toast = Some(StatusToast {
+            message: message.into(),
+            frames_remaining: STATUS_TOAST_ERR_FRAMES,
+        });
     }
 
     fn drain_offline(&mut self) {
@@ -461,52 +522,184 @@ impl App {
                 }
                 _ => {}
             },
-            Some(Overlay::QuestionDashboard {
-                ref question_id,
-                ref mut selected,
-            }) => match code {
-                KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
-                KeyCode::Char('j') | KeyCode::Down => {
-                    let count = dashboard::row_count(&self.data, question_id);
-                    if count > 0 {
-                        *selected = (*selected + 1).min(count - 1);
-                    }
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    *selected = selected.saturating_sub(1);
-                }
-                KeyCode::Char('c') => {
-                    let qid = question_id.clone();
-                    let sel = *selected;
-                    if let Ok(rows) = self.data.load_question_dashboard(&qid)
-                        && let Some((paper, _)) = rows.get(sel)
-                    {
-                        let pid = paper.id.as_str().to_string();
-                        let _ = self.data.toggle_shortlist(&qid, &pid, &self.reader);
-                    }
-                }
-                KeyCode::Enter => {
-                    // Open the focused paper's detail overlay on top of
-                    // the dashboard — same overlay mechanic as the
-                    // SearchPapers flow. Esc returns to the dashboard.
-                    let qid = question_id.clone();
-                    let sel = *selected;
-                    if let Ok(rows) = self.data.load_question_dashboard(&qid)
-                        && let Some((paper, _)) = rows.get(sel)
-                    {
-                        self.overlay = Some(Overlay::PaperDetail {
-                            paper_id: paper.id.as_str().to_string(),
-                            scroll: 0,
-                            annotation_focus: None,
-                            prompt: None,
-                            reader: false,
-                            highlight_focus: None,
-                        });
-                    }
-                }
-                _ => {}
-            },
+            Some(Overlay::QuestionDashboard { .. }) => {
+                self.handle_question_dashboard_key(code);
+            }
             None => {}
+        }
+    }
+
+    /// Routes a key inside the QuestionDashboard overlay. Layered just
+    /// like the PaperDetail handler so the active prompt (the `E`
+    /// export prompt) eats every keystroke before falling through to
+    /// the j/k/c/Enter list controls.
+    fn handle_question_dashboard_key(&mut self, code: KeyCode) {
+        let Some(Overlay::QuestionDashboard {
+            question_id,
+            selected,
+            export_prompt,
+        }) = self.overlay.as_mut()
+        else {
+            return;
+        };
+
+        // Layer 1: the path prompt is open — eat the keystroke here.
+        if export_prompt.is_some() {
+            self.handle_export_prompt_key(code);
+            return;
+        }
+
+        // Layer 2: plain dashboard list controls.
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
+            KeyCode::Char('j') | KeyCode::Down => {
+                let count = dashboard::row_count(&self.data, question_id);
+                if count > 0 {
+                    *selected = (*selected + 1).min(count - 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                *selected = selected.saturating_sub(1);
+            }
+            KeyCode::Char('c') => {
+                let qid = question_id.clone();
+                let sel = *selected;
+                if let Ok(rows) = self.data.load_question_dashboard(&qid)
+                    && let Some((paper, _)) = rows.get(sel)
+                {
+                    let pid = paper.id.as_str().to_string();
+                    let _ = self.data.toggle_shortlist(&qid, &pid, &self.reader);
+                }
+            }
+            // Open the export-path prompt. Uppercase `E` keeps the key
+            // out of the namespace of the lowercase `e` (annotation-edit)
+            // used inside PaperDetail and free of the global `c` we
+            // already use in tab mode (#135 sub-feature B).
+            KeyCode::Char('E') => {
+                let qid = question_id.clone();
+                let question_text = self
+                    .data
+                    .load_question(&qid)
+                    .ok()
+                    .flatten()
+                    .map(|q| q.text)
+                    .unwrap_or_default();
+                *export_prompt = Some(BibExportPrompt::from_question(
+                    &question_text,
+                    scitadel_export::SnapshotFormat::BibTeX,
+                ));
+            }
+            KeyCode::Enter => {
+                // Open the focused paper's detail overlay on top of
+                // the dashboard — same overlay mechanic as the
+                // SearchPapers flow. Esc returns to the dashboard.
+                let qid = question_id.clone();
+                let sel = *selected;
+                if let Ok(rows) = self.data.load_question_dashboard(&qid)
+                    && let Some((paper, _)) = rows.get(sel)
+                {
+                    self.overlay = Some(Overlay::PaperDetail {
+                        paper_id: paper.id.as_str().to_string(),
+                        scroll: 0,
+                        annotation_focus: None,
+                        prompt: None,
+                        reader: false,
+                        highlight_focus: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Drive the export-path prompt's text edits + Enter/Esc. Pulled
+    /// into its own method so the dispatch above stays readable.
+    fn handle_export_prompt_key(&mut self, code: KeyCode) {
+        let Some(Overlay::QuestionDashboard {
+            question_id,
+            export_prompt: Some(prompt),
+            ..
+        }) = self.overlay.as_mut()
+        else {
+            return;
+        };
+
+        match code {
+            KeyCode::Esc => {
+                if let Some(Overlay::QuestionDashboard { export_prompt, .. }) =
+                    self.overlay.as_mut()
+                {
+                    *export_prompt = None;
+                }
+            }
+            KeyCode::Char(c) => prompt.push_char(c),
+            KeyCode::Backspace => prompt.backspace(),
+            KeyCode::Enter => {
+                let path = prompt.submit();
+                let format = prompt.format;
+                let qid = question_id.clone();
+                // Drop the prompt before any DB / I/O so a long-running
+                // write doesn't keep the overlay borrow alive.
+                if let Some(Overlay::QuestionDashboard { export_prompt, .. }) =
+                    self.overlay.as_mut()
+                {
+                    *export_prompt = None;
+                }
+                if let Some(path_str) = path {
+                    self.run_bib_export(&qid, std::path::PathBuf::from(path_str), format);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Resolve the question's shortlist + tags and write the snapshot.
+    ///
+    /// Routes through the shared `scitadel_export::write_snapshot`
+    /// helper so the on-disk `.bib` + `.scitadel-bib.lock` artifacts
+    /// are byte-identical to what `bib snapshot` would write from the
+    /// CLI. Surfaces the outcome as a status-bar toast — never panics,
+    /// never bubbles I/O errors past the prompt.
+    fn run_bib_export(
+        &mut self,
+        question_id: &str,
+        output_path: std::path::PathBuf,
+        format: scitadel_export::SnapshotFormat,
+    ) {
+        let (paper_ids, papers, tags) =
+            match self.data.load_snapshot_inputs(question_id, &self.reader) {
+                Ok(t) => t,
+                Err(e) => {
+                    self.set_status_err(format!("export failed: {e}"));
+                    return;
+                }
+            };
+        if papers.is_empty() {
+            self.set_status_err("export failed: shortlist is empty");
+            return;
+        }
+        let result = scitadel_export::write_snapshot(
+            &output_path,
+            question_id,
+            &self.reader,
+            &papers,
+            &paper_ids,
+            |id| tags.get(id).cloned().unwrap_or_default(),
+            format,
+            true,
+        );
+        match result {
+            Ok(outcome) => {
+                let display = outcome.output_path.file_name().map_or_else(
+                    || outcome.output_path.display().to_string(),
+                    |n| n.to_string_lossy().to_string(),
+                );
+                self.set_status_ok(format!(
+                    "exported: {display} ({} entries)",
+                    outcome.entry_count
+                ));
+            }
+            Err(e) => self.set_status_err(format!("export failed: {e}")),
         }
     }
 
@@ -837,6 +1030,7 @@ impl App {
                             self.overlay = Some(Overlay::QuestionDashboard {
                                 question_id: q.id.as_str().to_string(),
                                 selected: 0,
+                                export_prompt: None,
                             });
                         }
                     }
@@ -1036,6 +1230,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         Some(Overlay::QuestionDashboard {
             question_id,
             selected,
+            export_prompt,
         }) => {
             dashboard::draw(
                 frame,
@@ -1045,6 +1240,9 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 &app.reader,
                 *selected,
             );
+            if let Some(prompt) = export_prompt {
+                bib_export_prompt::draw_overlay(frame, chunks[1], prompt);
+            }
         }
         None => match app.tab {
             Tab::Searches => searches::draw(frame, chunks[1], &app.data, app.search_selected),
@@ -1107,8 +1305,15 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         (Some(Overlay::SearchPapers { .. }), _) => {
             "Esc/q: back | j/k: navigate | Enter: open paper"
         }
+        (
+            Some(Overlay::QuestionDashboard {
+                export_prompt: Some(_),
+                ..
+            }),
+            _,
+        ) => "Enter: export | Backspace: delete char | Esc: cancel",
         (Some(Overlay::QuestionDashboard { .. }), _) => {
-            "Esc/q: back | j/k: navigate | Enter: open paper | c: toggle shortlist"
+            "Esc/q: back | j/k: navigate | Enter: open paper | c: toggle shortlist | E: export bib"
         }
         (None, Tab::Papers | Tab::Queue) => {
             "Tab: switch tabs | j/k: navigate | Enter: open | s: (un)star | c: clear tasks | q: quit"
@@ -1120,9 +1325,15 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     // Startup toast (#137) hijacks the status bar for its lifetime so
     // the user sees `theme: dalton-bright (auto)` right after launch
     // without us having to add a second status row. Falls back to the
-    // normal help_text once the toast expires.
+    // normal help_text once the toast expires. Action-driven toasts
+    // (#135 sub-feature B — "exported: paper.bib (12 entries)") share
+    // the same slot and take priority over the startup toast since
+    // they're always more recent than launch.
     let toast_text;
-    let bar_text: &str = if let Some(toast) = app.startup_toast.as_deref() {
+    let bar_text: &str = if let Some(status) = app.status_toast.as_ref() {
+        toast_text = status.message.clone();
+        &toast_text
+    } else if let Some(toast) = app.startup_toast.as_deref() {
         toast_text = toast.to_string();
         &toast_text
     } else {
@@ -1130,6 +1341,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     };
     status_bar::draw(frame, chunks[3], bar_text, app.offline);
     app.tick_startup_toast();
+    app.tick_status_toast();
 }
 
 /// Step the active annotation prompt by one keystroke. Mutates the
@@ -1202,4 +1414,171 @@ async fn probe_network() -> bool {
         .send()
         .await
         .is_ok_and(|r| r.status().is_success() || r.status().is_redirection())
+}
+
+#[cfg(test)]
+mod tests {
+    //! End-to-end-ish tests for the export keybind (#135 sub-feature B).
+    //!
+    //! These tests exercise the App-level keystroke dispatch path with
+    //! a real `DataStore` backed by a tempfile SQLite DB. We seed a
+    //! research question + a shortlisted paper, then drive `handle_key`
+    //! and inspect the overlay state + on-disk artifacts.
+
+    use super::*;
+    use scitadel_core::models::{Paper, PaperId, ResearchQuestion};
+    use scitadel_core::ports::{PaperRepository, QuestionRepository};
+    use std::path::PathBuf;
+
+    /// Build an `App` with a fresh on-disk SQLite DB and a single
+    /// shortlisted paper attached to one research question. Returns
+    /// `(app, question_id, papers_dir)`. `papers_dir` is rooted in a
+    /// `tempfile::TempDir` whose lifetime the caller must keep alive.
+    fn fixture(tmp: &tempfile::TempDir) -> (App, String, PathBuf) {
+        let db_path = tmp.path().join("scitadel.db");
+        let data = DataStore::open(&db_path).unwrap();
+
+        // Seed: a research question + one paper + shortlist row.
+        let q = ResearchQuestion::new("What is the role of attention?");
+        let qid = q.id.as_str().to_string();
+        let mut p = Paper::new("Attention Is All You Need");
+        p.id = PaperId::from("p-attn");
+        p.authors = vec!["Vaswani, A.".into()];
+        p.year = Some(2017);
+        // Use the underlying repos directly — DataStore's API is read-
+        // mostly so seeding goes through the lower-level handles.
+        let db = scitadel_db::sqlite::Database::open(&db_path).unwrap();
+        db.migrate().unwrap();
+        let (paper_repo, _, q_repo, _, _) = db.repositories();
+        q_repo.save_question(&q).unwrap();
+        paper_repo.save(&p).unwrap();
+        let shortlist = scitadel_db::sqlite::SqliteShortlistRepository::new(db);
+        shortlist.toggle(&qid, p.id.as_str(), "lars").unwrap();
+
+        let papers_dir = tmp.path().join("papers");
+        std::fs::create_dir_all(&papers_dir).unwrap();
+
+        let app = App::new(
+            data,
+            "demo@example.org".into(),
+            papers_dir.clone(),
+            false,
+            "lars".into(),
+        );
+        (app, qid, papers_dir)
+    }
+
+    /// Pressing `E` on the QuestionDashboard opens the path-prompt
+    /// overlay with the slugified default. The dashboard `selected`
+    /// cursor is left untouched.
+    #[tokio::test(flavor = "current_thread")]
+    async fn e_on_question_dashboard_opens_export_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, qid, _) = fixture(&tmp);
+        app.overlay = Some(Overlay::QuestionDashboard {
+            question_id: qid.clone(),
+            selected: 0,
+            export_prompt: None,
+        });
+
+        app.handle_key(KeyCode::Char('E'), KeyModifiers::NONE);
+
+        match app.overlay {
+            Some(Overlay::QuestionDashboard {
+                export_prompt: Some(ref p),
+                ..
+            }) => {
+                assert_eq!(p.path_buf, "what-is-the-role-of-attention.bib");
+            }
+            other => panic!("expected QuestionDashboard with prompt, got {other:?}"),
+        }
+    }
+
+    /// The `E` key must NOT be hijacked when no overlay is active —
+    /// that namespace belongs to the underlying tab. We assert that
+    /// pressing `E` on a plain tab leaves the overlay state alone (no
+    /// QuestionDashboard appears out of nowhere).
+    #[tokio::test(flavor = "current_thread")]
+    async fn e_on_searches_tab_is_not_hijacked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        // No overlay; default tab is Searches.
+        assert!(app.overlay.is_none());
+
+        app.handle_key(KeyCode::Char('E'), KeyModifiers::NONE);
+        assert!(
+            app.overlay.is_none(),
+            "E on Searches tab must not pop a dashboard overlay"
+        );
+    }
+
+    /// Drive the full happy path: open dashboard → press `E` → accept
+    /// the default path → assert the `.bib` + `.scitadel-bib.lock`
+    /// land on disk. The CWD is moved into the tempdir for the test
+    /// so the slug-derived default (`what-is-the-role-of-attention.bib`)
+    /// resolves to a sandboxed location.
+    #[tokio::test(flavor = "current_thread")]
+    async fn export_writes_bib_and_sidecar_on_default_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, qid, _) = fixture(&tmp);
+        let prev_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        app.overlay = Some(Overlay::QuestionDashboard {
+            question_id: qid,
+            selected: 0,
+            export_prompt: None,
+        });
+        app.handle_key(KeyCode::Char('E'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        let bib = tmp.path().join("what-is-the-role-of-attention.bib");
+        let lock = tmp
+            .path()
+            .join("what-is-the-role-of-attention.bib.scitadel-bib.lock");
+
+        // Restore CWD before any assertion so a panic doesn't pollute
+        // the rest of the test runner.
+        std::env::set_current_dir(prev_cwd).unwrap();
+
+        assert!(bib.exists(), "{} missing", bib.display());
+        assert!(lock.exists(), "{} missing", lock.display());
+        let bib_bytes = std::fs::read_to_string(&bib).unwrap();
+        assert!(
+            bib_bytes.contains("Attention Is All You Need"),
+            "bib didn't contain the seeded title; got:\n{bib_bytes}"
+        );
+        // Status toast confirms count + filename.
+        let toast = app.status_toast.as_ref().expect("status toast set");
+        assert!(
+            toast.message.starts_with("exported: ") && toast.message.contains("(1 entries)"),
+            "got toast: {}",
+            toast.message
+        );
+    }
+
+    /// Esc inside the prompt clears it without writing anything.
+    #[tokio::test(flavor = "current_thread")]
+    async fn esc_in_export_prompt_cancels() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, qid, _) = fixture(&tmp);
+        app.overlay = Some(Overlay::QuestionDashboard {
+            question_id: qid,
+            selected: 0,
+            export_prompt: Some(BibExportPrompt::from_question(
+                "x",
+                scitadel_export::SnapshotFormat::BibTeX,
+            )),
+        });
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+
+        match app.overlay {
+            Some(Overlay::QuestionDashboard {
+                export_prompt: None,
+                ..
+            }) => {}
+            other => panic!("expected dashboard with prompt cleared, got {other:?}"),
+        }
+        assert!(app.status_toast.is_none(), "no toast on cancel");
+    }
 }

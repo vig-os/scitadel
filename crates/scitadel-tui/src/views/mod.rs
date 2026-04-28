@@ -1,4 +1,5 @@
 pub mod annotation_prompt;
+pub mod bib_export_prompt;
 pub mod dashboard;
 pub mod detail;
 pub mod papers;

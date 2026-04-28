@@ -2498,6 +2498,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror",
  "uuid",
 ]
@@ -2555,6 +2556,8 @@ dependencies = [
  "scitadel-adapters",
  "scitadel-core",
  "scitadel-db",
+ "scitadel-export",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",

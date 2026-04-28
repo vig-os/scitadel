@@ -1108,15 +1108,8 @@ fn find_source_credentials(source: &str) -> Result<&'static credentials::SourceC
 
 // ---------- bib snapshot / verify (#178) ----------
 
-/// Sidecar suffix appended to the output `.bib` path. One sidecar per
-/// `.bib` keeps scope to a single (question, output_file) — see #178
-/// "Sidecar location collision" pitfall.
-pub const SIDECAR_SUFFIX: &str = ".scitadel-bib.lock";
-
 fn sidecar_path_for(bib: &std::path::Path) -> PathBuf {
-    let mut s = bib.as_os_str().to_owned();
-    s.push(SIDECAR_SUFFIX);
-    PathBuf::from(s)
+    scitadel_export::sidecar_path_for(bib)
 }
 
 fn current_reader() -> String {
@@ -1169,9 +1162,9 @@ fn load_shortlist(
     Ok((question, paper_ids, papers, tags))
 }
 
-/// Render the shortlist's `.bib`. Centralized so snapshot and verify
-/// produce byte-identical output for the same DB state — that's the
-/// whole determinism story.
+/// Render the shortlist's `.bib`. Kept as a thin wrapper around the
+/// reusable rendering helper so verify (which compares against a
+/// re-render) stays single-call-site.
 fn render_bibtex(
     papers: &[scitadel_core::models::Paper],
     tags: &std::collections::HashMap<String, Vec<String>>,
@@ -1179,9 +1172,8 @@ fn render_bibtex(
     scitadel_export::export_bibtex_with_tags(papers, |id| tags.get(id).cloned().unwrap_or_default())
 }
 
-/// Render the shortlist as canonical CSL-JSON 1.0.2 (#135 sub-feature
-/// A). Same determinism contract as [`render_bibtex`] — same DB state ⇒
-/// byte-identical output.
+/// CSL-JSON sibling of [`render_bibtex`]. Used by `bib verify` to
+/// re-render against the sidecar's recorded format.
 fn render_csl_json(
     papers: &[scitadel_core::models::Paper],
     tags: &std::collections::HashMap<String, Vec<String>>,
@@ -1191,13 +1183,14 @@ fn render_csl_json(
     })
 }
 
-/// Default output filename for a given snapshot format. Lets users skip
-/// `--output` entirely for the common case while keeping the extension
-/// honest (`.bib` for BibTeX, `.json` for CSL-JSON).
-fn default_output_for(format: &str) -> &'static std::path::Path {
+/// Parse the CLI's `--format` string into the typed enum the export
+/// helper accepts. Centralized so the error message stays consistent
+/// across snapshot + verify.
+fn parse_format(format: &str) -> Result<scitadel_export::SnapshotFormat> {
     match format {
-        "csl-json" => std::path::Path::new("paper.json"),
-        _ => std::path::Path::new("paper.bib"),
+        "csl-json" => Ok(scitadel_export::SnapshotFormat::CslJson),
+        "bibtex" | "" => Ok(scitadel_export::SnapshotFormat::BibTeX),
+        other => bail!("unknown --format: {other}; valid: bibtex, csl-json"),
     }
 }
 
@@ -1210,55 +1203,37 @@ pub fn bib_snapshot(
 ) -> Result<()> {
     let reader = reader_arg.map_or_else(current_reader, str::to_string);
     let (question, paper_ids, papers, tags) = load_shortlist(question_prefix, &reader)?;
+    let snapshot_format = parse_format(format)?;
 
-    let output_path = output.unwrap_or_else(|| default_output_for(format));
+    let output_path =
+        output.unwrap_or_else(|| scitadel_export::default_filename_for_format(snapshot_format));
 
-    let (content, lock) = match format {
-        "csl-json" => {
-            let c = render_csl_json(&papers, &tags);
-            let l = scitadel_export::BibLockfile::new_csl_json(
-                question.id.as_str(),
-                &reader,
-                &paper_ids,
-                &c,
-            );
-            (c, l)
-        }
-        "bibtex" | "" => {
-            let c = render_bibtex(&papers, &tags);
-            let l = scitadel_export::BibLockfile::new_bibtex(
-                question.id.as_str(),
-                &reader,
-                &paper_ids,
-                &c,
-            );
-            (c, l)
-        }
-        other => bail!("unknown --format: {other}; valid: bibtex, csl-json"),
-    };
+    let outcome = scitadel_export::write_snapshot(
+        output_path,
+        question.id.as_str(),
+        &reader,
+        &papers,
+        &paper_ids,
+        |id| tags.get(id).cloned().unwrap_or_default(),
+        snapshot_format,
+        !no_lock,
+    )
+    .with_context(|| format!("failed to write {}", output_path.display()))?;
 
-    std::fs::write(output_path, &content)
-        .with_context(|| format!("failed to write {}", output_path.display()))?;
-
-    if no_lock {
+    if let Some(sidecar) = outcome.sidecar_path {
+        println!(
+            "Wrote {} ({} papers) + {}",
+            outcome.output_path.display(),
+            outcome.entry_count,
+            sidecar.display()
+        );
+    } else {
         println!(
             "Wrote {} ({} papers) — sidecar skipped (--no-lock)",
-            output_path.display(),
-            papers.len()
+            outcome.output_path.display(),
+            outcome.entry_count
         );
-        return Ok(());
     }
-
-    let sidecar = sidecar_path_for(output_path);
-    std::fs::write(&sidecar, lock.to_json()?)
-        .with_context(|| format!("failed to write {}", sidecar.display()))?;
-
-    println!(
-        "Wrote {} ({} papers) + {}",
-        output_path.display(),
-        papers.len(),
-        sidecar.display()
-    );
     Ok(())
 }
 
