@@ -1106,6 +1106,339 @@ fn find_source_credentials(source: &str) -> Result<&'static credentials::SourceC
         })
 }
 
+// ---------- bib snapshot / verify (#178) ----------
+
+/// Sidecar suffix appended to the output `.bib` path. One sidecar per
+/// `.bib` keeps scope to a single (question, output_file) — see #178
+/// "Sidecar location collision" pitfall.
+pub const SIDECAR_SUFFIX: &str = ".scitadel-bib.lock";
+
+fn sidecar_path_for(bib: &std::path::Path) -> PathBuf {
+    let mut s = bib.as_os_str().to_owned();
+    s.push(SIDECAR_SUFFIX);
+    PathBuf::from(s)
+}
+
+fn current_reader() -> String {
+    std::env::var("USER").unwrap_or_else(|_| "unknown".into())
+}
+
+/// Load the question's shortlist once: returns the resolved question,
+/// the shortlist's paper IDs (in shortlist insertion order), the
+/// `Paper` records, and a paper_id → tags map. Snapshot and verify
+/// share this code path so they can never disagree about what the
+/// shortlist *is* at this moment in time.
+fn load_shortlist(
+    question_prefix: &str,
+    reader: &str,
+) -> Result<(
+    scitadel_core::models::ResearchQuestion,
+    Vec<String>,
+    Vec<scitadel_core::models::Paper>,
+    std::collections::HashMap<String, Vec<String>>,
+)> {
+    use scitadel_db::sqlite::{SqlitePaperTagRepository, SqliteShortlistRepository};
+
+    let db = open_db()?;
+    let (paper_repo, _, q_repo, _, _) = db.repositories();
+    let shortlist_repo = SqliteShortlistRepository::new(db.clone());
+    let tag_repo = SqlitePaperTagRepository::new(db);
+
+    let question = if let Some(q) = q_repo.get_question(question_prefix)? {
+        q
+    } else {
+        let questions = q_repo.list_questions()?;
+        resolve_prefix(&questions, question_prefix, |q| q.id.as_str())?.clone()
+    };
+
+    let paper_ids = shortlist_repo
+        .list(question.id.as_str(), reader)
+        .context("failed to read shortlist")?;
+    let papers: Vec<_> = paper_ids
+        .iter()
+        .filter_map(|id| paper_repo.get(id).ok().flatten())
+        .collect();
+
+    // Pre-load tags so the export closure isn't doing per-call I/O.
+    let mut tags = std::collections::HashMap::new();
+    for id in &paper_ids {
+        let t = tag_repo.tags_for(id).unwrap_or_default();
+        tags.insert(id.clone(), t);
+    }
+
+    Ok((question, paper_ids, papers, tags))
+}
+
+/// Render the shortlist's `.bib`. Centralized so snapshot and verify
+/// produce byte-identical output for the same DB state — that's the
+/// whole determinism story.
+fn render_bibtex(
+    papers: &[scitadel_core::models::Paper],
+    tags: &std::collections::HashMap<String, Vec<String>>,
+) -> String {
+    scitadel_export::export_bibtex_with_tags(papers, |id| tags.get(id).cloned().unwrap_or_default())
+}
+
+pub fn bib_snapshot(
+    question_prefix: &str,
+    output: &std::path::Path,
+    reader_arg: Option<&str>,
+    no_lock: bool,
+) -> Result<()> {
+    let reader = reader_arg.map_or_else(current_reader, str::to_string);
+    let (question, paper_ids, papers, tags) = load_shortlist(question_prefix, &reader)?;
+
+    let content = render_bibtex(&papers, &tags);
+    std::fs::write(output, &content)
+        .with_context(|| format!("failed to write {}", output.display()))?;
+
+    if no_lock {
+        println!(
+            "Wrote {} ({} papers) — sidecar skipped (--no-lock)",
+            output.display(),
+            papers.len()
+        );
+        return Ok(());
+    }
+
+    let lock = scitadel_export::BibLockfile::new_bibtex(
+        question.id.as_str(),
+        &reader,
+        &paper_ids,
+        &content,
+    );
+    let sidecar = sidecar_path_for(output);
+    std::fs::write(&sidecar, lock.to_json()?)
+        .with_context(|| format!("failed to write {}", sidecar.display()))?;
+
+    println!(
+        "Wrote {} ({} papers) + {}",
+        output.display(),
+        papers.len(),
+        sidecar.display()
+    );
+    Ok(())
+}
+
+/// Outcome of `bib verify`. Exit code follows `0/1/2` (ok/drift/stale).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifyOutcome {
+    /// `.bib` and sidecar both match a fresh re-snapshot.
+    Ok,
+    /// shortlist or content changed since the lockfile.
+    Drift {
+        shortlist_changed: bool,
+        content_changed: bool,
+        diff: String,
+    },
+    /// Lockfile fields don't match the current binary, OR sidecar absent.
+    Stale { reason: String },
+}
+
+impl VerifyOutcome {
+    fn exit_code(&self) -> i32 {
+        match self {
+            Self::Ok => 0,
+            Self::Drift { .. } => 1,
+            Self::Stale { .. } => 2,
+        }
+    }
+}
+
+/// Cap a unified-style diff to `max_lines` so verify output stays
+/// scannable. Anything longer is truncated with a sentinel line.
+fn cap_diff(s: &str, max_lines: usize) -> String {
+    use std::fmt::Write as _;
+    let lines: Vec<&str> = s.lines().collect();
+    if lines.len() <= max_lines {
+        return s.to_string();
+    }
+    let mut out = lines[..max_lines].join("\n");
+    let _ = write!(
+        out,
+        "\n... ({} more lines truncated)",
+        lines.len() - max_lines
+    );
+    out
+}
+
+/// Tiny line-level diff. Real `diff -u` is overkill here — verify only
+/// needs to *show* the user what moved, not produce a patch.
+fn line_diff(old: &str, new: &str) -> String {
+    use std::fmt::Write as _;
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+    let mut out = String::new();
+    out.push_str("--- committed\n+++ regenerated\n");
+    let max = old_lines.len().max(new_lines.len());
+    for i in 0..max {
+        match (old_lines.get(i), new_lines.get(i)) {
+            (Some(a), Some(b)) if a == b => {}
+            (Some(a), Some(b)) => {
+                let _ = writeln!(out, "-{a}");
+                let _ = writeln!(out, "+{b}");
+            }
+            (Some(a), None) => {
+                let _ = writeln!(out, "-{a}");
+            }
+            (None, Some(b)) => {
+                let _ = writeln!(out, "+{b}");
+            }
+            (None, None) => break,
+        }
+    }
+    out
+}
+
+/// Pure verify primitive — no I/O on shortlist, no DB. The CLI command
+/// pulls the shortlist + sidecar + bib bytes and hands them off here so
+/// tests can drive every exit-code branch from in-memory inputs.
+pub fn verify_against_lockfile(
+    bib_committed: &str,
+    bib_regenerated: &str,
+    paper_ids: &[String],
+    lock: &scitadel_export::BibLockfile,
+) -> VerifyOutcome {
+    // Stale (algorithm or binary moved) is the most fundamental
+    // failure: fail fast, the drift comparison would be nonsensical.
+    let current_algo = scitadel_export::sidecar::ALGO_HASH;
+    let current_version = env!("CARGO_PKG_VERSION");
+    if lock.algo_hash != current_algo {
+        return VerifyOutcome::Stale {
+            reason: format!(
+                "algo_hash mismatch: sidecar has {}, current binary has {} — \
+                 the citation-key algorithm has moved (ADR-006). Regenerate.",
+                short_hash(&lock.algo_hash),
+                short_hash(current_algo),
+            ),
+        };
+    }
+    if lock.scitadel_version != current_version {
+        return VerifyOutcome::Stale {
+            reason: format!(
+                "scitadel_version mismatch: sidecar has {}, current binary has {}. \
+                 Regenerate to refresh.",
+                lock.scitadel_version, current_version
+            ),
+        };
+    }
+
+    let shortlist_changed = scitadel_export::shortlist_hash(paper_ids) != lock.shortlist_hash;
+    let content_changed = scitadel_export::content_hash(bib_committed) != lock.content_hash
+        || bib_committed != bib_regenerated;
+    if shortlist_changed || content_changed {
+        let diff = cap_diff(&line_diff(bib_committed, bib_regenerated), 40);
+        return VerifyOutcome::Drift {
+            shortlist_changed,
+            content_changed,
+            diff,
+        };
+    }
+    VerifyOutcome::Ok
+}
+
+fn short_hash(h: &str) -> String {
+    // Strip optional `sha256:` prefix and keep first 12 chars for human
+    // legibility — full hashes are noise in error messages.
+    let bare = h.strip_prefix("sha256:").unwrap_or(h);
+    if bare.len() <= 12 {
+        bare.to_string()
+    } else {
+        format!("{}…", &bare[..12])
+    }
+}
+
+/// Returns the exit code (0/1/2). main.rs forwards via `process::exit`.
+pub fn bib_verify(
+    file: &std::path::Path,
+    question_override: Option<&str>,
+    format: &str,
+) -> Result<i32> {
+    let bib_bytes =
+        std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
+
+    let sidecar = sidecar_path_for(file);
+    if !sidecar.exists() {
+        let msg = format!(
+            "no lockfile at {} — run `scitadel bib snapshot <question_id> --output {}` first",
+            sidecar.display(),
+            file.display()
+        );
+        if format == "json" {
+            print_verify_json("stale", &msg, None);
+        } else {
+            eprintln!("STALE: {msg}");
+        }
+        return Ok(2);
+    }
+    let lock_bytes =
+        std::fs::read_to_string(&sidecar).with_context(|| format!("read {}", sidecar.display()))?;
+    let lock = scitadel_export::BibLockfile::from_json(&lock_bytes)
+        .with_context(|| format!("parse {}", sidecar.display()))?;
+
+    let question_id = question_override.unwrap_or(&lock.question_id);
+    let (_q, paper_ids, papers, tags) = load_shortlist(question_id, &lock.reader)?;
+    let regenerated = render_bibtex(&papers, &tags);
+
+    let outcome = verify_against_lockfile(&bib_bytes, &regenerated, &paper_ids, &lock);
+    let fix_line = format!(
+        "scitadel bib snapshot {} --output {}",
+        lock.question_id,
+        file.display()
+    );
+    match &outcome {
+        VerifyOutcome::Ok => {
+            if format == "json" {
+                print_verify_json("ok", "matches lockfile", None);
+            } else {
+                println!("OK: {} matches lockfile", file.display());
+            }
+        }
+        VerifyOutcome::Drift {
+            shortlist_changed,
+            content_changed,
+            diff,
+        } => {
+            let label = match (shortlist_changed, content_changed) {
+                (true, true) => "shortlist + content",
+                (true, false) => "shortlist",
+                (false, true) => "content",
+                (false, false) => "lockfile",
+            };
+            if format == "json" {
+                print_verify_json(
+                    "drift",
+                    &format!("{label} changed since lockfile"),
+                    Some(diff),
+                );
+            } else {
+                eprintln!("DRIFT: {label} changed since lockfile");
+                eprintln!("{diff}");
+                eprintln!("\nFix: {fix_line}");
+            }
+        }
+        VerifyOutcome::Stale { reason } => {
+            if format == "json" {
+                print_verify_json("stale", reason, None);
+            } else {
+                eprintln!("STALE: {reason}");
+                eprintln!("\nFix: {fix_line}");
+            }
+        }
+    }
+    Ok(outcome.exit_code())
+}
+
+fn print_verify_json(status: &str, message: &str, diff: Option<&str>) {
+    let mut obj = serde_json::Map::new();
+    obj.insert("status".into(), serde_json::Value::String(status.into()));
+    obj.insert("message".into(), serde_json::Value::String(message.into()));
+    if let Some(d) = diff {
+        obj.insert("diff".into(), serde_json::Value::String(d.into()));
+    }
+    println!("{}", serde_json::Value::Object(obj));
+}
+
 fn prompt_credential(label: &str, secret: bool) -> Result<String> {
     if secret {
         // Read without echo
@@ -1119,5 +1452,119 @@ fn prompt_credential(label: &str, secret: bool) -> Result<String> {
         let mut value = String::new();
         std::io::stdin().read_line(&mut value)?;
         Ok(value.trim().to_string())
+    }
+}
+
+#[cfg(test)]
+mod bib_verify_tests {
+    use super::{VerifyOutcome, cap_diff, verify_against_lockfile};
+    use scitadel_export::BibLockfile;
+    use std::fmt::Write as _;
+
+    fn fresh_lock(content: &str, paper_ids: &[String]) -> BibLockfile {
+        BibLockfile::new_bibtex("q-1", "lars", paper_ids, content)
+    }
+
+    #[test]
+    fn verify_returns_ok_when_committed_matches_lockfile() {
+        let bib = "@article{a,\n  title = {A},\n}\n";
+        let ids = vec!["p-1".to_string()];
+        let lock = fresh_lock(bib, &ids);
+        let outcome = verify_against_lockfile(bib, bib, &ids, &lock);
+        assert_eq!(outcome, VerifyOutcome::Ok);
+    }
+
+    #[test]
+    fn verify_returns_drift_when_content_differs() {
+        let original = "@article{a,\n  title = {A},\n}\n";
+        let modified = "@article{a,\n  title = {A — edited},\n}\n";
+        let ids = vec!["p-1".to_string()];
+        let lock = fresh_lock(original, &ids);
+        let outcome = verify_against_lockfile(modified, original, &ids, &lock);
+        match outcome {
+            VerifyOutcome::Drift {
+                content_changed,
+                shortlist_changed,
+                diff,
+            } => {
+                assert!(content_changed);
+                assert!(!shortlist_changed);
+                assert!(
+                    diff.contains("--- committed") && diff.contains("+++ regenerated"),
+                    "diff: {diff}"
+                );
+            }
+            other => panic!("expected Drift, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_returns_drift_when_shortlist_differs() {
+        let bib = "@article{a,\n  title = {A},\n}\n";
+        let lock = fresh_lock(bib, &["p-1".into(), "p-2".into()]);
+        let new_ids = vec!["p-1".to_string(), "p-2".into(), "p-3".into()];
+        let outcome = verify_against_lockfile(bib, bib, &new_ids, &lock);
+        match outcome {
+            VerifyOutcome::Drift {
+                shortlist_changed, ..
+            } => {
+                assert!(shortlist_changed);
+            }
+            other => panic!("expected Drift, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_returns_stale_when_algo_hash_flips() {
+        let bib = "@article{a,\n}\n";
+        let ids = vec!["p-1".to_string()];
+        let mut lock = fresh_lock(bib, &ids);
+        lock.algo_hash = "deadbeef".into();
+        let outcome = verify_against_lockfile(bib, bib, &ids, &lock);
+        match &outcome {
+            VerifyOutcome::Stale { reason } => {
+                assert!(reason.contains("algo_hash"), "reason: {reason}");
+            }
+            other => panic!("expected Stale, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_returns_stale_when_scitadel_version_flips() {
+        let bib = "@article{a,\n}\n";
+        let ids = vec!["p-1".to_string()];
+        let mut lock = fresh_lock(bib, &ids);
+        lock.scitadel_version = "0.0.0-time-traveler".into();
+        let outcome = verify_against_lockfile(bib, bib, &ids, &lock);
+        match outcome {
+            VerifyOutcome::Stale { reason } => {
+                assert!(reason.contains("scitadel_version"), "reason: {reason}");
+            }
+            other => panic!("expected Stale, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_stale_takes_precedence_over_drift() {
+        // If both algo_hash AND content disagree, we return stale —
+        // drift comparisons are meaningless when the algorithm itself moved.
+        let original = "@article{a,\n}\n";
+        let modified = "@article{a, modified}\n";
+        let ids = vec!["p-1".to_string()];
+        let mut lock = fresh_lock(original, &ids);
+        lock.algo_hash = "old-algo".into();
+        let outcome = verify_against_lockfile(modified, original, &ids, &lock);
+        assert!(matches!(outcome, VerifyOutcome::Stale { .. }));
+    }
+
+    #[test]
+    fn diff_capping_preserves_head_and_marks_truncation() {
+        let mut big = String::new();
+        for i in 0..200 {
+            let _ = writeln!(big, "line {i}");
+        }
+        let capped = cap_diff(&big, 40);
+        assert!(capped.lines().count() <= 41);
+        assert!(capped.contains("more lines truncated"));
     }
 }

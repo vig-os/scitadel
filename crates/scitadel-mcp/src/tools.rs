@@ -1723,6 +1723,193 @@ pub fn rekey_paper_tool(
     }
 }
 
+// ---------- bib snapshot / verify (#178) ----------
+
+/// Sidecar suffix; mirrors the CLI constant. Kept in lockstep so MCP
+/// snapshots and CLI verifies share the same lockfile path.
+const SIDECAR_SUFFIX: &str = ".scitadel-bib.lock";
+
+fn sidecar_path_for(bib: &std::path::Path) -> std::path::PathBuf {
+    let mut s = bib.as_os_str().to_owned();
+    s.push(SIDECAR_SUFFIX);
+    std::path::PathBuf::from(s)
+}
+
+fn resolve_question_id(
+    db: &Database,
+    question_prefix: &str,
+) -> Result<scitadel_core::models::ResearchQuestion, String> {
+    let (_, _, q_repo, _, _) = db.repositories();
+    if let Some(q) = q_repo
+        .get_question(question_prefix)
+        .map_err(|e| e.to_string())?
+    {
+        return Ok(q);
+    }
+    let questions = q_repo.list_questions().map_err(|e| e.to_string())?;
+    let matches: Vec<_> = questions
+        .iter()
+        .filter(|q| q.id.as_str().starts_with(question_prefix))
+        .collect();
+    match matches.len() {
+        0 => Err(format!("no question matching '{question_prefix}'")),
+        1 => Ok(matches[0].clone()),
+        n => Err(format!(
+            "ambiguous question prefix '{question_prefix}' — {n} matches"
+        )),
+    }
+}
+
+/// Render the shortlist's `.bib` reusing `export_bibtex_with_tags` so
+/// the CLI and MCP code paths produce byte-identical output for the
+/// same DB state — the determinism contract that makes verify possible.
+fn render_shortlist_bibtex(
+    db: &Database,
+    paper_ids: &[String],
+) -> Result<(Vec<Paper>, String), String> {
+    use scitadel_db::sqlite::SqlitePaperTagRepository;
+    let (paper_repo, _, _, _, _) = db.repositories();
+    let papers: Vec<Paper> = paper_ids
+        .iter()
+        .filter_map(|id| paper_repo.get(id).ok().flatten())
+        .collect();
+    let tag_repo = SqlitePaperTagRepository::new(db.clone());
+    let mut tags = std::collections::HashMap::new();
+    for id in paper_ids {
+        tags.insert(id.clone(), tag_repo.tags_for(id).unwrap_or_default());
+    }
+    let content = scitadel_export::export_bibtex_with_tags(&papers, |id| {
+        tags.get(id).cloned().unwrap_or_default()
+    });
+    Ok((papers, content))
+}
+
+pub fn bib_snapshot_tool(
+    question_prefix: &str,
+    output: &str,
+    reader: &str,
+    no_lock: bool,
+) -> Result<String, String> {
+    if reader.trim().is_empty() {
+        return Err("reader is required".into());
+    }
+    let db = open_db()?;
+    let shortlist_repo = scitadel_db::sqlite::SqliteShortlistRepository::new(db.clone());
+    let question = resolve_question_id(&db, question_prefix)?;
+
+    let paper_ids = shortlist_repo
+        .list(question.id.as_str(), reader)
+        .map_err(|e| e.to_string())?;
+    let (papers, content) = render_shortlist_bibtex(&db, &paper_ids)?;
+
+    let output_path = std::path::Path::new(output);
+    std::fs::write(output_path, &content).map_err(|e| e.to_string())?;
+
+    let sidecar = sidecar_path_for(output_path);
+    let mut response = serde_json::Map::new();
+    response.insert("output".into(), serde_json::Value::String(output.into()));
+    response.insert("papers".into(), serde_json::Value::from(papers.len()));
+
+    if no_lock {
+        response.insert("sidecar".into(), serde_json::Value::Null);
+    } else {
+        let lock = scitadel_export::BibLockfile::new_bibtex(
+            question.id.as_str(),
+            reader,
+            &paper_ids,
+            &content,
+        );
+        std::fs::write(&sidecar, lock.to_json().map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        response.insert(
+            "sidecar".into(),
+            serde_json::Value::String(sidecar.display().to_string()),
+        );
+        response.insert(
+            "shortlist_hash".into(),
+            serde_json::Value::String(lock.shortlist_hash),
+        );
+        response.insert(
+            "content_hash".into(),
+            serde_json::Value::String(lock.content_hash),
+        );
+    }
+    Ok(serde_json::Value::Object(response).to_string())
+}
+
+pub fn bib_verify_tool(file: &str, question_override: Option<&str>) -> Result<String, String> {
+    let bib_path = std::path::Path::new(file);
+    let bib_bytes = std::fs::read_to_string(bib_path).map_err(|e| e.to_string())?;
+
+    let sidecar = sidecar_path_for(bib_path);
+    if !sidecar.exists() {
+        return Ok(serde_json::json!({
+            "status": "stale",
+            "exit_code": 2,
+            "message": format!("no lockfile at {} — run bib_snapshot first", sidecar.display()),
+        })
+        .to_string());
+    }
+    let lock_bytes = std::fs::read_to_string(&sidecar).map_err(|e| e.to_string())?;
+    let lock = scitadel_export::BibLockfile::from_json(&lock_bytes).map_err(|e| e.to_string())?;
+
+    // Stale checks first — if the binary moved, drift comparisons mean nothing.
+    let current_algo = scitadel_export::sidecar::ALGO_HASH;
+    let current_version = env!("CARGO_PKG_VERSION");
+    if lock.algo_hash != current_algo {
+        return Ok(serde_json::json!({
+            "status": "stale",
+            "exit_code": 2,
+            "message": format!(
+                "algo_hash mismatch: sidecar={} current={}",
+                lock.algo_hash, current_algo,
+            ),
+        })
+        .to_string());
+    }
+    if lock.scitadel_version != current_version {
+        return Ok(serde_json::json!({
+            "status": "stale",
+            "exit_code": 2,
+            "message": format!(
+                "scitadel_version mismatch: sidecar={} current={}",
+                lock.scitadel_version, current_version,
+            ),
+        })
+        .to_string());
+    }
+
+    let db = open_db()?;
+    let shortlist_repo = scitadel_db::sqlite::SqliteShortlistRepository::new(db.clone());
+    let qid = question_override.unwrap_or(&lock.question_id);
+    let question = resolve_question_id(&db, qid)?;
+
+    let paper_ids = shortlist_repo
+        .list(question.id.as_str(), &lock.reader)
+        .map_err(|e| e.to_string())?;
+    let (_papers, regenerated) = render_shortlist_bibtex(&db, &paper_ids)?;
+
+    let shortlist_changed = scitadel_export::shortlist_hash(&paper_ids) != lock.shortlist_hash;
+    let content_changed =
+        scitadel_export::content_hash(&bib_bytes) != lock.content_hash || bib_bytes != regenerated;
+    if shortlist_changed || content_changed {
+        return Ok(serde_json::json!({
+            "status": "drift",
+            "exit_code": 1,
+            "shortlist_changed": shortlist_changed,
+            "content_changed": content_changed,
+            "fix": format!("scitadel bib snapshot {} --output {}", lock.question_id, file),
+        })
+        .to_string());
+    }
+    Ok(serde_json::json!({
+        "status": "ok",
+        "exit_code": 0,
+        "message": "matches lockfile",
+    })
+    .to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
