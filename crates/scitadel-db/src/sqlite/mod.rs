@@ -29,9 +29,27 @@ pub use tui_state::{SqliteTuiStateRepository, TuiState};
 
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::functions::FunctionFlags;
 use std::path::Path;
 
 use crate::error::DbError;
+
+/// Register `unicode_lower(text)` — a Unicode-aware lowercase scalar
+/// function for SQL queries. SQLite's built-in `LOWER()` is ASCII-only
+/// (`Ü` stays `Ü`), so case-insensitive title comparisons miss
+/// non-ASCII case variants. Registered on every connection at init
+/// time so any pooled handle can use it. (#159)
+fn register_unicode_lower(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.create_scalar_function(
+        "unicode_lower",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let s = ctx.get::<Option<String>>(0)?;
+            Ok(s.map(|v| v.to_lowercase()))
+        },
+    )
+}
 
 /// Parse an RFC3339 timestamp string, falling back to now on parse errors.
 pub(crate) fn parse_rfc3339_or_now(s: &str) -> chrono::DateTime<chrono::Utc> {
@@ -65,6 +83,7 @@ impl Database {
                      PRAGMA foreign_keys=ON;
                      PRAGMA busy_timeout=5000;",
             )?;
+            register_unicode_lower(conn)?;
             Ok(())
         });
 
@@ -80,6 +99,7 @@ impl Database {
                 "PRAGMA journal_mode=WAL;
                      PRAGMA foreign_keys=ON;",
             )?;
+            register_unicode_lower(conn)?;
             Ok(())
         });
 
