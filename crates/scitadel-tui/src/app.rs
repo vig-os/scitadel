@@ -155,6 +155,11 @@ pub struct App {
     /// the widget so a future event-driven refresh path can update the
     /// same field. (#185)
     pub unread_count: i64,
+    /// Cached set of paper IDs that have at least one unread
+    /// annotation for `reader`. Drives the per-row `●` glyph in the
+    /// Papers list. Refreshed on every draw alongside `unread_count`.
+    /// (#185)
+    pub papers_with_unread: std::collections::HashSet<String>,
 
     task_tx: mpsc::UnboundedSender<TaskUpdate>,
     task_rx: mpsc::UnboundedReceiver<TaskUpdate>,
@@ -223,18 +228,23 @@ impl App {
             startup_toast_frames: 0,
             status_toast: None,
             unread_count: 0,
+            papers_with_unread: std::collections::HashSet::new(),
             task_tx,
             task_rx,
             offline_rx,
         }
     }
 
-    /// Refresh `unread_count` from the DB. Cheap (`COUNT(*)` over the
-    /// annotations LEFT JOIN annotation_reads predicate), called on
-    /// every render tick. Failures are silently swallowed — a stale
-    /// badge is acceptable; an error toast every 100 ms is not. (#185)
-    fn refresh_unread_count(&mut self) {
+    /// Refresh `unread_count` and `papers_with_unread` from the DB.
+    /// Two cheap indexed queries per render tick; failures are silently
+    /// swallowed (a stale badge is acceptable, an error toast every
+    /// 100 ms is not). (#185)
+    fn refresh_unread(&mut self) {
         self.unread_count = self.data.load_unread_count(&self.reader).unwrap_or(0);
+        self.papers_with_unread = self
+            .data
+            .load_papers_with_unread(&self.reader)
+            .unwrap_or_default();
     }
 
     /// Advance the startup-toast lifetime by one draw (#137). Call once
@@ -1213,10 +1223,10 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App
 }
 
 fn draw(frame: &mut ratatui::Frame, app: &mut App) {
-    // Refresh the unread badge each tick so MCP-side annotation
-    // writes show up in the status bar within ~100ms (the event-poll
-    // cadence). (#185)
-    app.refresh_unread_count();
+    // Refresh unread state each tick so MCP-side annotation writes
+    // show up in the status bar + per-row glyphs within ~100ms (the
+    // event-poll cadence). (#185)
+    app.refresh_unread();
     let task_panel_height = tasks_view::panel_height(&app.tasks);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1262,7 +1272,14 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             highlight_focus,
         }) => {
             if *reader {
-                crate::views::reader::draw(frame, chunks[1], &app.data, paper_id, *highlight_focus);
+                crate::views::reader::draw(
+                    frame,
+                    chunks[1],
+                    &app.data,
+                    paper_id,
+                    *highlight_focus,
+                    &app.reader,
+                );
             } else {
                 detail::draw(
                     frame,
@@ -1289,6 +1306,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 *selected,
                 &app.starred,
                 &app.downloading_paper_ids(),
+                &app.papers_with_unread,
             );
         }
         Some(Overlay::QuestionDashboard {
@@ -1317,6 +1335,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 app.paper_selected,
                 &app.starred,
                 &app.downloading_paper_ids(),
+                &app.papers_with_unread,
             ),
             Tab::Questions => {
                 questions::draw(frame, chunks[1], &app.data, app.question_selected);

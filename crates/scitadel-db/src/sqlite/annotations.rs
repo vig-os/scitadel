@@ -246,6 +246,27 @@ impl SqliteAnnotationRepository {
         Ok(rows)
     }
 
+    /// Set of paper IDs that have at least one annotation `reader`
+    /// hasn't acknowledged. Drives the per-row `●` glyph on the
+    /// Papers list — one indexed query per draw tick. (#185)
+    pub fn papers_with_unread(
+        &self,
+        reader: &str,
+    ) -> Result<std::collections::HashSet<String>, DbError> {
+        let conn = self.db.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT a.paper_id FROM annotations a
+             LEFT JOIN annotation_reads r
+               ON r.annotation_id = a.id AND r.reader = ?1
+             WHERE a.deleted_at IS NULL
+               AND (r.seen_at IS NULL OR r.seen_at < a.updated_at)",
+        )?;
+        let rows = stmt
+            .query_map(params![reader], |row| row.get::<_, String>(0))?
+            .filter_map(Result::ok);
+        Ok(rows.collect())
+    }
+
     /// Same predicate as `list_unread` but returns just the count.
     /// Called on every TUI draw tick (~10 Hz) to drive the status-bar
     /// `[N new]` badge — `COUNT(*)` keeps the per-tick cost in
@@ -839,6 +860,41 @@ mod tests {
         repo.mark_thread_seen(root.id.as_str(), "lars").unwrap();
         let unread = repo.list_unread("lars", Some("p1")).unwrap();
         assert!(unread.is_empty());
+    }
+
+    #[test]
+    fn papers_with_unread_returns_distinct_paper_ids() {
+        let db = fresh_db_with_paper();
+        // Add a second paper.
+        db.conn()
+            .unwrap()
+            .execute(
+                "INSERT INTO papers (id, title, authors, abstract, created_at, updated_at)
+                 VALUES ('p2', 'Other', '[]', '', '2026-04-28T00:00:00Z', '2026-04-28T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        let repo = SqliteAnnotationRepository::new(db);
+        let on_p1 = sample_root();
+        let on_p2 = Annotation::new_root(
+            scitadel_core::models::PaperId::from("p2"),
+            "claude".into(),
+            "n".into(),
+            Anchor::default(),
+        );
+        repo.create(&on_p1).unwrap();
+        let p1_b = Annotation::new_reply(&on_p1, "claude".into(), "follow".into());
+        repo.create(&p1_b).unwrap();
+        repo.create(&on_p2).unwrap();
+
+        let set = repo.papers_with_unread("lars").unwrap();
+        assert_eq!(set.len(), 2, "two distinct paper_ids despite three rows");
+        assert!(set.contains("p1"));
+        assert!(set.contains("p2"));
+
+        repo.mark_thread_seen(on_p1.id.as_str(), "lars").unwrap();
+        let set = repo.papers_with_unread("lars").unwrap();
+        assert_eq!(set, std::iter::once("p2".to_string()).collect());
     }
 
     #[test]
