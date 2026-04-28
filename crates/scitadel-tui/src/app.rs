@@ -148,6 +148,13 @@ pub struct App {
     /// rendering branch — both feed the same status-bar slot. Lifetime
     /// is per-toast so a long error can linger longer than a quick OK.
     status_toast: Option<StatusToast>,
+    /// Cached count of annotations the current `reader` hasn't
+    /// acknowledged. Refreshed on every draw via `data.load_unread_count`
+    /// so the `[N new]` status-bar badge reflects MCP-side writes within
+    /// one tick (~100 ms). Kept on `App` rather than recomputing inside
+    /// the widget so a future event-driven refresh path can update the
+    /// same field. (#185)
+    pub unread_count: i64,
 
     task_tx: mpsc::UnboundedSender<TaskUpdate>,
     task_rx: mpsc::UnboundedReceiver<TaskUpdate>,
@@ -215,10 +222,19 @@ impl App {
             startup_toast: None,
             startup_toast_frames: 0,
             status_toast: None,
+            unread_count: 0,
             task_tx,
             task_rx,
             offline_rx,
         }
+    }
+
+    /// Refresh `unread_count` from the DB. Cheap (`COUNT(*)` over the
+    /// annotations LEFT JOIN annotation_reads predicate), called on
+    /// every render tick. Failures are silently swallowed — a stale
+    /// badge is acceptable; an error toast every 100 ms is not. (#185)
+    fn refresh_unread_count(&mut self) {
+        self.unread_count = self.data.load_unread_count(&self.reader).unwrap_or(0);
     }
 
     /// Advance the startup-toast lifetime by one draw (#137). Call once
@@ -1197,6 +1213,10 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App
 }
 
 fn draw(frame: &mut ratatui::Frame, app: &mut App) {
+    // Refresh the unread badge each tick so MCP-side annotation
+    // writes show up in the status bar within ~100ms (the event-poll
+    // cadence). (#185)
+    app.refresh_unread_count();
     let task_panel_height = tasks_view::panel_height(&app.tasks);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1383,7 +1403,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     } else {
         help_text
     };
-    status_bar::draw(frame, chunks[3], bar_text, app.offline);
+    status_bar::draw(frame, chunks[3], bar_text, app.offline, app.unread_count);
     app.tick_startup_toast();
     app.tick_status_toast();
 }
