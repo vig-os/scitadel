@@ -25,6 +25,14 @@ uuid = { workspace = true }
 reqwest = { workspace = true }
 chrono = { workspace = true }
 
+# OSC 11 background-color query (#176): unix `poll(2)` for a
+# nonblocking read on stdin with a millisecond-grained timeout.
+# `libc` is already a transitive dep via crossterm/tokio/mio, so
+# this is not a net-new dep in the lock graph — just a direct
+# declaration so the theme resolver can call `libc::poll`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = { workspace = true }
 

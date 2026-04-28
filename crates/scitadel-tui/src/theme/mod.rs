@@ -8,18 +8,22 @@
 //! for deuteranopia and protanopia. Source:
 //! <https://github.com/gerchowl/dalton-colorscheme>.
 //!
-//! ## Runtime resolution (#137)
+//! ## Runtime resolution (#137, #176)
 //!
 //! Theme is picked once at startup via [`init`] — call it before the
 //! first frame is drawn. Order, highest precedence first:
 //! 1. `--theme <name>` CLI flag (handled in caller)
 //! 2. `SCITADEL_THEME` env var
 //! 3. `[ui] theme = "..."` in `config.toml`
-//! 4. Default: `auto` (probe terminal background via `COLORFGBG`,
-//!    fall back to dark)
+//! 4. Default: `auto` — probe terminal background:
+//!    a. `COLORFGBG` env var (cheap, no I/O)
+//!    b. OSC 11 query against the controlling tty (#176; 100–200ms timeout, skipped on non-tty)
+//!    c. fall back to dark
 //!
 //! Mid-session theme change is intentionally not supported — if the
 //! terminal flips light/dark at sunset, restart the TUI.
+
+mod osc11;
 
 use std::sync::OnceLock;
 
@@ -242,16 +246,33 @@ pub enum TerminalBackground {
     Light,
 }
 
-/// Probe the terminal for its background luminance. Tries
-/// `COLORFGBG` (set by most mature terminals; format
-/// `"<fg>;<bg>"` where each is an ANSI 0–15 colour index) and
-/// returns `None` if the variable is missing or unparseable. OSC 11
-/// query is intentionally not implemented in this iter — it requires
-/// raw-mode tty access and a 100–200ms timeout dance, and the
-/// `--theme` override gives users a clean escape hatch when
-/// `COLORFGBG` is wrong or unset.
+/// Probe the terminal for its background luminance. Tries:
+///
+/// 1. `COLORFGBG` env var — cheap, no I/O. Format `"<fg>;<bg>"` where
+///    each is an ANSI 0–15 colour index. Set by VTE-family terminals
+///    and rxvt-unicode; widely respected.
+/// 2. OSC 11 query (#176) — emit `\x1b]11;?\x07` to the controlling
+///    tty, read back the RGB reply with a 150ms timeout, classify
+///    by luminance. Works on foot, kitty, alacritty, modern xterm.
+///    Skipped if stdin/stdout isn't a tty (test runner, redirected
+///    I/O) or on non-unix platforms.
+///
+/// Returns `None` if both probes fail; the caller then falls back to
+/// the dark default. Both probes run in priority order — COLORFGBG
+/// first because it's free, OSC 11 second because it's authoritative
+/// when it works.
 #[must_use]
 pub fn detect_terminal_background() -> Option<TerminalBackground> {
+    if let Some(bg) = detect_via_colorfgbg() {
+        return Some(bg);
+    }
+    detect_via_osc11()
+}
+
+/// Read `COLORFGBG` and classify the bg-index field. Pure env-var
+/// read; isolated so the resolver can call it without dragging in the
+/// OSC 11 fallback during tests that mutate env state.
+fn detect_via_colorfgbg() -> Option<TerminalBackground> {
     let raw = std::env::var("COLORFGBG").ok()?;
     let bg = raw.split(';').nth(1)?.trim();
     let idx: u8 = bg.parse().ok()?;
@@ -262,6 +283,16 @@ pub fn detect_terminal_background() -> Option<TerminalBackground> {
         Some(TerminalBackground::Light)
     } else {
         Some(TerminalBackground::Dark)
+    }
+}
+
+/// OSC 11 fallback. Returns `None` on any failure path (non-tty,
+/// timeout, malformed reply) so the resolver can fall through to the
+/// dark default. See `theme::osc11` for protocol detail.
+fn detect_via_osc11() -> Option<TerminalBackground> {
+    match osc11::detect()? {
+        osc11::Luminance::Light => Some(TerminalBackground::Light),
+        osc11::Luminance::Dark => Some(TerminalBackground::Dark),
     }
 }
 
@@ -402,6 +433,36 @@ mod tests {
             "explicit cli should not be tagged auto: {label:?}"
         );
         assert!(label.contains("dalton-dark"));
+    }
+
+    #[test]
+    fn osc11_skipped_when_stdin_not_a_tty() {
+        // Under cargo test stdin is a pipe, not a tty. The resolver
+        // must therefore short-circuit OSC 11 and fall through to the
+        // dark default rather than hanging on a terminal that will
+        // never reply. This test fences the contract: if the auto
+        // branch ever started spawning a real OSC 11 query in a
+        // non-tty context, it would either hang the suite (timeout)
+        // or print stray escape bytes — both unacceptable.
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            std::env::remove_var("SCITADEL_THEME");
+            std::env::remove_var("COLORFGBG");
+        }
+        let started = std::time::Instant::now();
+        let t = resolve(None, "auto");
+        // Resolver must return well under the OSC 11 timeout —
+        // anything in the multi-tens-of-ms range means we actually
+        // hit the polled read path.
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(50),
+            "auto resolution took {}ms — OSC 11 must not run on non-tty stdin",
+            started.elapsed().as_millis(),
+        );
+        // Final fallback is dark.
+        assert_eq!(t.emphasis, Theme::DALTON_DARK.emphasis);
     }
 
     #[test]
