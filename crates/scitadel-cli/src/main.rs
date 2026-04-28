@@ -190,33 +190,43 @@ enum BibCommands {
         reader: Option<String>,
     },
     /// One-shot deterministic snapshot of a question's shortlist to a
-    /// `.bib` plus `.scitadel-bib.lock` sidecar (#178). Same shortlist
-    /// twice ⇒ byte-identical output (sidecar `generated_at` excepted).
-    /// Pair with `bib verify` in CI to catch drift.
+    /// `.bib` (or `.json` with `--format csl-json`) plus
+    /// `.scitadel-bib.lock` sidecar (#178, #135). Same shortlist twice ⇒
+    /// byte-identical output (sidecar `generated_at` excepted). Pair
+    /// with `bib verify` in CI to catch drift.
     Snapshot {
         /// Research question id (full or unambiguous prefix).
         question_id: String,
-        /// Output `.bib` path (default: `paper.bib` in cwd).
-        #[arg(short, long, default_value = "paper.bib")]
-        output: PathBuf,
+        /// Output path. Defaults to `paper.bib` for `--format bibtex`
+        /// and `paper.json` for `--format csl-json`.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
         /// Reader scope for the shortlist. Defaults to $USER.
         #[arg(long)]
         reader: Option<String>,
-        /// Skip writing the sidecar (CI one-offs). The `.bib` is still
+        /// Skip writing the sidecar (CI one-offs). The export is still
         /// emitted but `bib verify` will exit 2 with "no lockfile".
         #[arg(long)]
         no_lock: bool,
+        /// Output flavor: `bibtex` (BibLaTeX, default) or `csl-json`
+        /// (CSL 1.0.2 canonical). Sidecar's `format` discriminant
+        /// records the choice so verify routes to the matching emitter.
+        #[arg(long, default_value = "bibtex", value_parser = ["bibtex", "csl-json"])]
+        format: String,
     },
-    /// Verify a committed `.bib` against its `.scitadel-bib.lock`
-    /// (#178). Exit codes: `0` ok, `1` drift (regenerate to fix),
+    /// Verify a committed export against its `.scitadel-bib.lock`
+    /// (#178). Routes to BibTeX or CSL-JSON based on the sidecar's
+    /// `format` field. Exit codes: `0` ok, `1` drift (regenerate to fix),
     /// `2` stale (binary moved or sidecar absent — regenerate required).
     Verify {
-        /// Path to the `.bib` to verify.
+        /// Path to the export to verify.
         file: PathBuf,
         /// Override the sidecar's question_id (rarely needed).
         #[arg(short, long)]
         question_id: Option<String>,
-        /// Output format: `text` (default) or `json` (CI-friendly).
+        /// Output format for the verify report: `text` (default) or
+        /// `json` (CI-friendly). Independent of the snapshot's flavor —
+        /// that's read from the sidecar.
         #[arg(long, default_value = "text", value_parser = ["text", "json"])]
         format: String,
     },
@@ -380,7 +390,14 @@ async fn main() -> Result<()> {
                 output,
                 reader,
                 no_lock,
-            } => commands::bib_snapshot(&question_id, &output, reader.as_deref(), no_lock),
+                format,
+            } => commands::bib_snapshot(
+                &question_id,
+                output.as_deref(),
+                reader.as_deref(),
+                no_lock,
+                &format,
+            ),
             BibCommands::Verify {
                 file,
                 question_id,

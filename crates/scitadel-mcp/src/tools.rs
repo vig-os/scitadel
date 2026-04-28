@@ -1767,6 +1767,31 @@ fn render_shortlist_bibtex(
     db: &Database,
     paper_ids: &[String],
 ) -> Result<(Vec<Paper>, String), String> {
+    let (papers, tags) = load_papers_and_tags(db, paper_ids);
+    let content = scitadel_export::export_bibtex_with_tags(&papers, |id| {
+        tags.get(id).cloned().unwrap_or_default()
+    });
+    Ok((papers, content))
+}
+
+/// CSL-JSON 1.0.2 sibling of [`render_shortlist_bibtex`] for #135.
+/// Same paper/tag lookup; different emitter. Determinism contract is
+/// identical.
+fn render_shortlist_csl_json(
+    db: &Database,
+    paper_ids: &[String],
+) -> Result<(Vec<Paper>, String), String> {
+    let (papers, tags) = load_papers_and_tags(db, paper_ids);
+    let content = scitadel_export::export_csl_json_with_tags(&papers, |id| {
+        tags.get(id).cloned().unwrap_or_default()
+    });
+    Ok((papers, content))
+}
+
+fn load_papers_and_tags(
+    db: &Database,
+    paper_ids: &[String],
+) -> (Vec<Paper>, std::collections::HashMap<String, Vec<String>>) {
     use scitadel_db::sqlite::SqlitePaperTagRepository;
     let (paper_repo, _, _, _, _) = db.repositories();
     let papers: Vec<Paper> = paper_ids
@@ -1778,10 +1803,7 @@ fn render_shortlist_bibtex(
     for id in paper_ids {
         tags.insert(id.clone(), tag_repo.tags_for(id).unwrap_or_default());
     }
-    let content = scitadel_export::export_bibtex_with_tags(&papers, |id| {
-        tags.get(id).cloned().unwrap_or_default()
-    });
-    Ok((papers, content))
+    (papers, tags)
 }
 
 pub fn bib_snapshot_tool(
@@ -1789,6 +1811,7 @@ pub fn bib_snapshot_tool(
     output: &str,
     reader: &str,
     no_lock: bool,
+    format: &str,
 ) -> Result<String, String> {
     if reader.trim().is_empty() {
         return Err("reader is required".into());
@@ -1800,7 +1823,16 @@ pub fn bib_snapshot_tool(
     let paper_ids = shortlist_repo
         .list(question.id.as_str(), reader)
         .map_err(|e| e.to_string())?;
-    let (papers, content) = render_shortlist_bibtex(&db, &paper_ids)?;
+    let is_csl = match format {
+        "csl-json" => true,
+        "" | "bibtex" => false,
+        other => return Err(format!("unknown format: {other}; valid: bibtex, csl-json")),
+    };
+    let (papers, content) = if is_csl {
+        render_shortlist_csl_json(&db, &paper_ids)?
+    } else {
+        render_shortlist_bibtex(&db, &paper_ids)?
+    };
 
     let output_path = std::path::Path::new(output);
     std::fs::write(output_path, &content).map_err(|e| e.to_string())?;
@@ -1813,12 +1845,21 @@ pub fn bib_snapshot_tool(
     if no_lock {
         response.insert("sidecar".into(), serde_json::Value::Null);
     } else {
-        let lock = scitadel_export::BibLockfile::new_bibtex(
-            question.id.as_str(),
-            reader,
-            &paper_ids,
-            &content,
-        );
+        let lock = if is_csl {
+            scitadel_export::BibLockfile::new_csl_json(
+                question.id.as_str(),
+                reader,
+                &paper_ids,
+                &content,
+            )
+        } else {
+            scitadel_export::BibLockfile::new_bibtex(
+                question.id.as_str(),
+                reader,
+                &paper_ids,
+                &content,
+            )
+        };
         std::fs::write(&sidecar, lock.to_json().map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
         response.insert(
@@ -1833,6 +1874,7 @@ pub fn bib_snapshot_tool(
             "content_hash".into(),
             serde_json::Value::String(lock.content_hash),
         );
+        response.insert("format".into(), serde_json::Value::String(lock.format));
     }
     Ok(serde_json::Value::Object(response).to_string())
 }
@@ -1887,7 +1929,13 @@ pub fn bib_verify_tool(file: &str, question_override: Option<&str>) -> Result<St
     let paper_ids = shortlist_repo
         .list(question.id.as_str(), &lock.reader)
         .map_err(|e| e.to_string())?;
-    let (_papers, regenerated) = render_shortlist_bibtex(&db, &paper_ids)?;
+    // Route to the matching emitter based on the sidecar's `format`
+    // discriminant (#135). Default to BibTeX so pre-#135 sidecars
+    // (which omit or carry "bibtex") keep working unchanged.
+    let (_papers, regenerated) = match lock.format.as_str() {
+        scitadel_export::sidecar::FORMAT_CSL_JSON => render_shortlist_csl_json(&db, &paper_ids)?,
+        _ => render_shortlist_bibtex(&db, &paper_ids)?,
+    };
 
     let shortlist_changed = scitadel_export::shortlist_hash(&paper_ids) != lock.shortlist_hash;
     let content_changed =

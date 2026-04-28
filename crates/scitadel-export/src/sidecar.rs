@@ -29,6 +29,11 @@ pub const FORMAT_VERSION: &str = "1";
 /// a string keeps the schema open without a serde enum migration.
 pub const FORMAT_BIBTEX: &str = "bibtex";
 
+/// `format` discriminant for CSL-JSON 1.0.2 snapshots (#135 sub-feature
+/// A). Routes verify to the JSON-aware emitter; sidecar schema is
+/// otherwise unchanged.
+pub const FORMAT_CSL_JSON: &str = "csl-json";
+
 /// Sidecar JSON written next to the exported `.bib` (path =
 /// `<output>.scitadel-bib.lock`). One sidecar per output file —
 /// per-question scope means several may live in one repo.
@@ -70,6 +75,30 @@ impl BibLockfile {
         paper_ids: &[String],
         content: &str,
     ) -> Self {
+        Self::new_with_format(question_id, reader, paper_ids, content, FORMAT_BIBTEX)
+    }
+
+    /// Construct a fresh lockfile for a CSL-JSON snapshot (#135). Same
+    /// invariants as [`Self::new_bibtex`] — ordering normalized, hashes
+    /// computed over the emitted bytes — only the `format` discriminant
+    /// differs so verify can route to the JSON-aware code path.
+    #[must_use]
+    pub fn new_csl_json(
+        question_id: impl Into<String>,
+        reader: impl Into<String>,
+        paper_ids: &[String],
+        content: &str,
+    ) -> Self {
+        Self::new_with_format(question_id, reader, paper_ids, content, FORMAT_CSL_JSON)
+    }
+
+    fn new_with_format(
+        question_id: impl Into<String>,
+        reader: impl Into<String>,
+        paper_ids: &[String],
+        content: &str,
+        format: &str,
+    ) -> Self {
         Self {
             question_id: question_id.into(),
             reader: reader.into(),
@@ -77,7 +106,7 @@ impl BibLockfile {
             content_hash: content_hash(content),
             scitadel_version: env!("CARGO_PKG_VERSION").to_string(),
             algo_hash: ALGO_HASH.to_string(),
-            format: FORMAT_BIBTEX.to_string(),
+            format: format.to_string(),
             format_version: FORMAT_VERSION.to_string(),
             generated_at: chrono::Utc::now().to_rfc3339(),
         }
