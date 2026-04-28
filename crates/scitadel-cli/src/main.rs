@@ -189,6 +189,37 @@ enum BibCommands {
         #[arg(long)]
         reader: Option<String>,
     },
+    /// One-shot deterministic snapshot of a question's shortlist to a
+    /// `.bib` plus `.scitadel-bib.lock` sidecar (#178). Same shortlist
+    /// twice ⇒ byte-identical output (sidecar `generated_at` excepted).
+    /// Pair with `bib verify` in CI to catch drift.
+    Snapshot {
+        /// Research question id (full or unambiguous prefix).
+        question_id: String,
+        /// Output `.bib` path (default: `paper.bib` in cwd).
+        #[arg(short, long, default_value = "paper.bib")]
+        output: PathBuf,
+        /// Reader scope for the shortlist. Defaults to $USER.
+        #[arg(long)]
+        reader: Option<String>,
+        /// Skip writing the sidecar (CI one-offs). The `.bib` is still
+        /// emitted but `bib verify` will exit 2 with "no lockfile".
+        #[arg(long)]
+        no_lock: bool,
+    },
+    /// Verify a committed `.bib` against its `.scitadel-bib.lock`
+    /// (#178). Exit codes: `0` ok, `1` drift (regenerate to fix),
+    /// `2` stale (binary moved or sidecar absent — regenerate required).
+    Verify {
+        /// Path to the `.bib` to verify.
+        file: PathBuf,
+        /// Override the sidecar's question_id (rarely needed).
+        #[arg(short, long)]
+        question_id: Option<String>,
+        /// Output format: `text` (default) or `json` (CI-friendly).
+        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+        format: String,
+    },
     /// Live `.bib` snapshot for a research question's shortlist.
     /// Polls SQLite at 1s, debounces bursts of edits, and skips
     /// the file write when the rendered content is byte-identical
@@ -344,6 +375,20 @@ async fn main() -> Result<()> {
                 key,
                 reader,
             } => commands::bib_rekey(&paper_id, key.as_deref(), reader),
+            BibCommands::Snapshot {
+                question_id,
+                output,
+                reader,
+                no_lock,
+            } => commands::bib_snapshot(&question_id, &output, reader.as_deref(), no_lock),
+            BibCommands::Verify {
+                file,
+                question_id,
+                format,
+            } => {
+                let code = commands::bib_verify(&file, question_id.as_deref(), &format)?;
+                std::process::exit(code);
+            }
             BibCommands::Watch {
                 question_id,
                 output,
