@@ -459,6 +459,35 @@ impl App {
         }
     }
 
+    /// True when the currently-active overlay is consuming character
+    /// keystrokes as text input — a per-paper annotation prompt or the
+    /// question-dashboard bib-export path prompt. Used by the global
+    /// theme-toggle hotkey (#175) to avoid hijacking `T` while the
+    /// user is typing into a field. Mirrors the same gating pattern
+    /// `handle_paper_detail_key` and `handle_question_dashboard_key`
+    /// already use to layer their own keybinds beneath an active prompt.
+    fn in_text_input_context(&self) -> bool {
+        match &self.overlay {
+            Some(Overlay::PaperDetail { prompt, .. }) => prompt.is_some(),
+            Some(Overlay::QuestionDashboard { export_prompt, .. }) => export_prompt.is_some(),
+            _ => false,
+        }
+    }
+
+    /// Swap to the next registered theme and flash the new name in the
+    /// status bar (#175). In-memory only — the user's `[ui] theme`
+    /// config isn't touched, so the next launch resolves the same way
+    /// it would have before the toggle. The `set_status_ok` slot reuses
+    /// the existing toast subsystem (#135-B / #137 P1) so this doesn't
+    /// add a second timing path.
+    fn cycle_theme(&mut self) {
+        let current = crate::theme::theme();
+        let next = crate::theme::Theme::cycle_next(current);
+        crate::theme::set(next);
+        let label = crate::theme::Theme::name(&next);
+        self.set_status_ok(format!("theme: {label}"));
+    }
+
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
         if code == KeyCode::Char('q') && self.overlay.is_none() {
             self.running = false;
@@ -466,6 +495,21 @@ impl App {
         }
         if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
             self.running = false;
+            return;
+        }
+
+        // #175 — runtime theme toggle. Uppercase `T` is unused
+        // elsewhere in the keymap (lowercase `t` is also free; we
+        // chose `T` so it parallels the other capital action keys
+        // — `D` (download), `R` (reader), `O` (open), `E` (export)).
+        // Gated to non-text-input contexts: text input is only active
+        // when an export prompt or annotation prompt is open inside
+        // an overlay (those layers consume `KeyCode::Char(_)`
+        // wholesale before reaching here, so a top-level dispatch is
+        // safe). If new top-level text inputs land later, gate them
+        // here explicitly.
+        if code == KeyCode::Char('T') && !self.in_text_input_context() {
+            self.cycle_theme();
             return;
         }
 
@@ -1316,10 +1360,10 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             "Esc/q: back | j/k: navigate | Enter: open paper | c: toggle shortlist | E: export bib"
         }
         (None, Tab::Papers | Tab::Queue) => {
-            "Tab: switch tabs | j/k: navigate | Enter: open | s: (un)star | c: clear tasks | q: quit"
+            "Tab: switch tabs | j/k: navigate | Enter: open | s: (un)star | c: clear tasks | T: theme | q: quit"
         }
         (None, _) => {
-            "Tab/Shift-Tab: switch tabs | j/k: navigate | Enter: select | c: clear tasks | q: quit"
+            "Tab/Shift-Tab: switch tabs | j/k: navigate | Enter: select | c: clear tasks | T: theme | q: quit"
         }
     };
     // Startup toast (#137) hijacks the status bar for its lifetime so
@@ -1555,6 +1599,92 @@ mod tests {
             "got toast: {}",
             toast.message
         );
+    }
+
+    /// Pressing `T` outside a text-input context cycles the active
+    /// theme and flashes a status-bar toast naming the new palette
+    /// (#175). We snapshot the toast slot rather than the global
+    /// theme to keep the assertion independent of test ordering —
+    /// other tests may mutate `crate::theme::ACTIVE` in parallel.
+    #[tokio::test(flavor = "current_thread")]
+    async fn t_cycles_theme_outside_input_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        // Reset the global theme to a known starting palette so the
+        // post-toggle name is deterministic regardless of which other
+        // test ran first.
+        crate::theme::set(crate::theme::Theme::DALTON_DARK);
+
+        app.handle_key(KeyCode::Char('T'), KeyModifiers::NONE);
+
+        let toast = app.status_toast.as_ref().expect("toast set after T");
+        assert_eq!(toast.message, "theme: dalton-bright");
+    }
+
+    /// `T` must NOT cycle the theme while the user is typing into a
+    /// prompt — the keystroke would otherwise be eaten before it reached
+    /// the export prompt's `push_char` handler. This guards the gating
+    /// added alongside the toggle (#175).
+    #[tokio::test(flavor = "current_thread")]
+    async fn t_in_export_prompt_does_not_cycle_theme() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, qid, _) = fixture(&tmp);
+        app.overlay = Some(Overlay::QuestionDashboard {
+            question_id: qid,
+            selected: 0,
+            export_prompt: Some(BibExportPrompt::from_question(
+                "x",
+                scitadel_export::SnapshotFormat::BibTeX,
+            )),
+        });
+
+        app.handle_key(KeyCode::Char('T'), KeyModifiers::NONE);
+
+        // The toast slot must NOT contain a "theme:" message. The
+        // prompt should also have absorbed the keystroke as a 'T'
+        // character (path edit), confirming it reached the prompt.
+        let toast_msg = app
+            .status_toast
+            .as_ref()
+            .map(|t| t.message.clone())
+            .unwrap_or_default();
+        assert!(
+            !toast_msg.starts_with("theme:"),
+            "theme toggle should not fire while a text-input prompt is open; got toast: {toast_msg}",
+        );
+        match &app.overlay {
+            Some(Overlay::QuestionDashboard {
+                export_prompt: Some(p),
+                ..
+            }) => assert!(
+                p.path_buf.contains('T'),
+                "T should have been pushed into prompt buffer, got {:?}",
+                p.path_buf,
+            ),
+            other => panic!("expected dashboard with prompt still open, got {other:?}"),
+        }
+    }
+
+    /// The toggle is session-only (#175) — it must not write back to
+    /// the on-disk config. Cycle the theme and assert the config file
+    /// the test fixture would have read is unchanged before/after.
+    /// Today the TUI doesn't write the config from anywhere, but this
+    /// test pins the contract so a future refactor can't quietly start
+    /// persisting toggle state.
+    #[tokio::test(flavor = "current_thread")]
+    async fn theme_toggle_does_not_persist_to_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let original = "[ui]\ntheme = \"dark\"\n";
+        std::fs::write(&cfg_path, original).unwrap();
+        let before = std::fs::read_to_string(&cfg_path).unwrap();
+
+        let (mut app, _, _) = fixture(&tmp);
+        crate::theme::set(crate::theme::Theme::DALTON_DARK);
+        app.handle_key(KeyCode::Char('T'), KeyModifiers::NONE);
+
+        let after = std::fs::read_to_string(&cfg_path).unwrap();
+        assert_eq!(before, after, "config.toml must not be rewritten by toggle");
     }
 
     /// Esc inside the prompt clears it without writing anything.
