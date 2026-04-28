@@ -20,23 +20,33 @@ jobs:
   tapes:
     name: Run tapes (${{ matrix.shard.name }})
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    # Per-shard budget. tui-reader gets 10m because its 4 tapes have
+    # historically been the flakiest (the distinctness retry loop can
+    # consume up to 3 extra renders per tape); the rest stay at 6m
+    # since they've never come close.
+    timeout-minutes: ${{ matrix.shard.timeout-minutes }}
     strategy:
       fail-fast: false
       matrix:
         shard:
           - name: cli
             tapes: "cli-bib-import.tape cli-bib-rekey.tape cli-question-workflow.tape cli-search.tape"
+            timeout-minutes: 6
           - name: tui-launch
             tapes: "tui-launch.tape init-wizard.tape"
+            timeout-minutes: 6
           - name: tui-papers
             tapes: "papers-download-state.tape queue-tab.tape reading-queue-star.tape question-dashboard.tape"
+            timeout-minutes: 6
           - name: tui-reader
             tapes: "tui-annotation-write.tape tui-annotations-reader.tape annotations-in-detail.tape tui-export-keybind.tape"
+            timeout-minutes: 10
           - name: theme
             tapes: "theme-dark.tape theme-light.tape theme-toggle.tape"
+            timeout-minutes: 6
           - name: connectivity
             tapes: "offline-indicator.tape open-externally.tape"
+            timeout-minutes: 6
     steps:
       - uses: actions/checkout@v4
 
@@ -192,19 +202,19 @@ jobs:
           )
           on_disk=$(find tests/vhs -maxdepth 1 -name '*.tape' -printf '%f\n' 2>/dev/null | sort)
 
-          missing=$(comm -23 <(echo "$on_disk") <(echo "$declared") || true)
-          extra=$(comm -13 <(echo "$on_disk") <(echo "$declared") || true)
+          unsharded=$(comm -23 <(echo "$on_disk") <(echo "$declared") || true)
+          stale=$(comm -13 <(echo "$on_disk") <(echo "$declared") || true)
           dupes=$(echo "$declared" | uniq -d || true)
 
           fail=0
-          if [ -n "$missing" ]; then
+          if [ -n "$unsharded" ]; then
             echo "::error::tape(s) on disk but not assigned to any shard in vhs.yml:"
-            echo "$missing" | sed 's/^/  /'
+            echo "$unsharded" | sed 's/^/  /'
             fail=1
           fi
-          if [ -n "$extra" ]; then
+          if [ -n "$stale" ]; then
             echo "::error::tape(s) declared in a shard but missing on disk:"
-            echo "$extra" | sed 's/^/  /'
+            echo "$stale" | sed 's/^/  /'
             fail=1
           fi
           if [ -n "$dupes" ]; then
@@ -218,23 +228,34 @@ jobs:
           echo "All $(echo "$on_disk" | wc -l | tr -d ' ') tape(s) covered by exactly one shard."
 
   # Roll-up gate so branch protection can require a single check name
-  # (`Tapes`) instead of every shard individually. Fails if any shard
-  # failed; passes only when all shards pass or the matrix is otherwise
-  # successful.
+  # (`Tapes`) instead of every shard + the coverage gate individually.
+  # Fails if any shard failed OR a tape on disk isn't claimed by a
+  # shard. Without `shard-coverage` in `needs`, a freshly added tape
+  # would pass `Tapes` (the existing 19 shards stay green) and only
+  # fail `Tape shard coverage` — which a single-check protection rule
+  # wouldn't see.
   tapes-rollup:
     name: Tapes
     runs-on: ubuntu-latest
-    needs: tapes
+    needs: [tapes, shard-coverage]
     if: always()
     steps:
-      - name: Aggregate shard results
+      - name: Aggregate shard + coverage results
         run: |
-          result="${{ needs.tapes.result }}"
-          echo "tapes matrix result: $result"
-          case "$result" in
-            success) echo "all shards green"; exit 0 ;;
-            *) echo "::error::one or more tape shards failed: $result"; exit 1 ;;
+          tapes="${{ needs.tapes.result }}"
+          coverage="${{ needs.shard-coverage.result }}"
+          echo "tapes matrix result: $tapes"
+          echo "shard-coverage result: $coverage"
+          fail=0
+          case "$tapes" in
+            success) ;;
+            *) echo "::error::one or more tape shards failed: $tapes"; fail=1 ;;
           esac
+          case "$coverage" in
+            success) ;;
+            *) echo "::error::tape shard coverage gate failed: $coverage"; fail=1 ;;
+          esac
+          exit $fail
 
   coverage:
     name: Tape coverage
