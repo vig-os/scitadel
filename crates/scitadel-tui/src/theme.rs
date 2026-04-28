@@ -233,6 +233,14 @@ pub fn detect_terminal_background() -> Option<TerminalBackground> {
 mod tests {
     use super::*;
 
+    /// Serialize tests that mutate `SCITADEL_THEME` / `COLORFGBG`.
+    /// Both vars are process-global; without this lock, the two
+    /// env-mutating tests below race and `resolve()` may observe
+    /// the other test's transient state mid-mutation. Surfaced as
+    /// the #165 flake (Rgb(122, 109, 0) vs Rgb(196, 196, 12) on CI).
+    /// Plain `Mutex<()>` beats `serial_test` for one isolated module.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn highlight_for_is_stable() {
         let t = Theme::DALTON_DARK;
@@ -259,11 +267,19 @@ mod tests {
 
     #[test]
     fn cli_flag_overrides_env_and_config() {
-        // SAFETY: serial test — env var mutation is process-global but
-        // these tests run single-threaded by default in `cargo test`.
-        // We don't restore because every assertion explicitly sets
-        // what it needs.
+        // Hold ENV_LOCK across the whole body. cargo test runs in
+        // parallel by default; without serialization the env mutations
+        // here race with `auto_with_colorfgbg_picks_correct_theme`.
+        // SAFETY: env var mutation is process-global; the lock ensures
+        // no other test in this module observes our transient state.
+        // Use `into_inner` on poison so a panicked sibling test doesn't
+        // permanently disable this one.
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Clear sibling-test state so we start from a known baseline.
         unsafe {
+            std::env::remove_var("COLORFGBG");
             std::env::set_var("SCITADEL_THEME", "light");
         }
         // CLI dark beats env light beats config bright.
@@ -285,6 +301,10 @@ mod tests {
 
     #[test]
     fn auto_with_colorfgbg_picks_correct_theme() {
+        // See ENV_LOCK rationale on `cli_flag_overrides_env_and_config`.
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe {
             std::env::remove_var("SCITADEL_THEME");
             std::env::set_var("COLORFGBG", "0;15"); // dark fg, white bg → light
