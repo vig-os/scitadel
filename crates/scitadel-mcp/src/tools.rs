@@ -1615,7 +1615,9 @@ pub fn import_bibtex_tool(
 
     let strategy = strategy.unwrap_or("merge");
     let strategy = MergeStrategy::parse(strategy).ok_or_else(|| {
-        format!("unknown strategy '{strategy}'; valid: reject, db-wins, bib-wins, merge")
+        format!(
+            "unknown strategy '{strategy}'; valid: reject, db-wins, bib-wins, merge, interactive"
+        )
     })?;
 
     let db = open_db()?;
@@ -1627,6 +1629,10 @@ pub fn import_bibtex_tool(
         strategy,
         reader: reader.to_string(),
         lenient: true,
+        // MCP-side prompt elicitation is a follow-up; without a
+        // resolver, `interactive` strategy degrades to the same
+        // per-row failure path as `merge` for ambiguous-alias rows.
+        prompt_resolver: None,
     };
     let report = import_bibtex_file(
         std::path::Path::new(path),

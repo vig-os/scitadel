@@ -747,7 +747,9 @@ pub fn bib_import(
     use scitadel_mcp::bib_import::{ImportOptions, import_bibtex_file};
 
     let strategy = MergeStrategy::parse(strategy).ok_or_else(|| {
-        anyhow::anyhow!("unknown --strategy: {strategy}; valid: reject, db-wins, bib-wins, merge")
+        anyhow::anyhow!(
+            "unknown --strategy: {strategy}; valid: reject, db-wins, bib-wins, merge, interactive"
+        )
     })?;
     let reader =
         reader.unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "import".into()));
@@ -761,6 +763,12 @@ pub fn bib_import(
         strategy,
         reader,
         lenient: true,
+        // CLI does not yet wire stdin prompts; #161's TUI/CLI
+        // prompt-surface is out of scope. Without a resolver,
+        // `--strategy interactive` degrades to the same per-row
+        // failure path as `--strategy merge` for ambiguous-alias
+        // rows. The trait is now in place for follow-ups.
+        prompt_resolver: None,
     };
     let report = import_bibtex_file(path, &options, &papers, &aliases, &annotations)
         .with_context(|| format!("import {}", path.display()))?;

@@ -16,8 +16,11 @@
 //!   `keywords=`, `file=`) are left to step-4 side-effect plumbing.
 //!   The Paper row itself stays unchanged under Merge — the value
 //!   the strategy adds is in the side effects, not the columns.
-//!
-//! Note: `interactive` mode is P1 polish per the issue — not in iter 2.
+//! - [`MergeStrategy::Interactive`] — same row-level semantics as
+//!   `Merge` (DB wins on owned fields). The strategy is a flag that
+//!   enables prompt-driven resolution at orchestrator-level steps the
+//!   pure resolver doesn't see (e.g. ambiguous-alias disambiguation
+//!   in `scitadel-mcp::bib_import`). See #161.
 
 use scitadel_core::models::Paper;
 
@@ -29,6 +32,10 @@ pub enum MergeStrategy {
     DbWins,
     BibWins,
     Merge,
+    /// Same row-level semantics as `Merge`, but signals to the
+    /// orchestrator that a `PromptResolver` may be consulted on
+    /// ambiguous decisions (e.g. ambiguous-alias). See #161.
+    Interactive,
 }
 
 impl MergeStrategy {
@@ -41,6 +48,7 @@ impl MergeStrategy {
             "db-wins" => Some(Self::DbWins),
             "bib-wins" => Some(Self::BibWins),
             "merge" => Some(Self::Merge),
+            "interactive" => Some(Self::Interactive),
             _ => None,
         }
     }
@@ -51,6 +59,7 @@ impl MergeStrategy {
             Self::DbWins => "db-wins",
             Self::BibWins => "bib-wins",
             Self::Merge => "merge",
+            Self::Interactive => "interactive",
         }
     }
 }
@@ -99,11 +108,13 @@ pub fn resolve(db_paper: Option<Paper>, bib: &BibEntry, strategy: MergeStrategy)
             from_bib: vec![],
             kept_from_db: vec![],
         },
-        // DbWins and Merge leave the Paper row identical — Merge
-        // adds value via side effects (annotations from `note=`,
-        // tags from `keywords=`) wired in step 4, not by mutating
-        // owned columns. Collapsed to one arm to keep clippy happy.
-        MergeStrategy::DbWins | MergeStrategy::Merge => MergeOutcome {
+        // DbWins, Merge, and Interactive leave the Paper row identical
+        // — Merge adds value via side effects (annotations from
+        // `note=`, tags from `keywords=`) wired in step 4, not by
+        // mutating owned columns. Interactive is just Merge with a
+        // prompt hook the orchestrator may consult upstream. Collapsed
+        // to one arm to keep clippy happy.
+        MergeStrategy::DbWins | MergeStrategy::Merge | MergeStrategy::Interactive => MergeOutcome {
             paper: Some(db),
             action: MergeAction::Unchanged,
             from_bib: vec![],
@@ -297,7 +308,7 @@ mod tests {
 
     #[test]
     fn parse_strategy_round_trip() {
-        for s in ["reject", "db-wins", "bib-wins", "merge"] {
+        for s in ["reject", "db-wins", "bib-wins", "merge", "interactive"] {
             let parsed = MergeStrategy::parse(s).unwrap();
             assert_eq!(parsed.as_str(), s);
         }

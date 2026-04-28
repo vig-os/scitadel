@@ -27,6 +27,7 @@
 //! entries.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use scitadel_core::bibtex_key::assign_keys;
 use scitadel_core::error::CoreError;
@@ -104,8 +105,34 @@ impl PaperLookup for SqliteBibLookup<'_> {
     }
 }
 
+/// Hook for orchestrator-level prompts during a bib import (#161).
+///
+/// The pure resolver in `scitadel-export` cannot prompt — it has no
+/// stdio, no UI, no async story. Instead, the import orchestrator
+/// calls a `PromptResolver` impl when it hits a decision the strategy
+/// alone can't settle (today: `MatchOutcome::AmbiguousAlias` under
+/// `MergeStrategy::Interactive`).
+///
+/// Returning `None` means "user declined / skip this row"; the
+/// orchestrator then falls back to the default failure path
+/// (`CoreError::Validation`, recorded in `report.failed`). This keeps
+/// the default-strategy regression in `ambiguous_alias_is_a_per_row_failure_not_a_silent_create`
+/// passing: a `None`-returning resolver and a non-Interactive
+/// strategy are observationally identical from the row's perspective.
+///
+/// TUI integration (paper-detail prompt overlay shape) is a follow-up;
+/// see the annotation-prompt plumbing in
+/// `crates/scitadel-tui/src/views/annotation_prompt.rs`.
+pub trait PromptResolver: Send + Sync {
+    /// Choose one paper id from the candidate set when an alias
+    /// resolves to multiple papers and title+year can't disambiguate.
+    /// Implementations may render the candidates however they like
+    /// (CLI numbered list, TUI overlay, MCP elicitation).
+    fn resolve_ambiguous_alias(&self, citekey: &str, candidate_ids: &[String]) -> Option<String>;
+}
+
 /// Configuration for one import run.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ImportOptions {
     pub strategy: MergeStrategy,
     /// Identity attached to created annotations (`Annotation.author`).
@@ -113,6 +140,28 @@ pub struct ImportOptions {
     /// Continue past per-row errors (logging them) rather than aborting.
     /// True is the default — see issue #134 P1 `--lenient` flag.
     pub lenient: bool,
+    /// Optional prompt hook consulted when `strategy` is
+    /// `Interactive`. `None` (the default) preserves the legacy
+    /// failure path: ambiguous-alias rows surface as `report.failed`
+    /// entries, which is the contract the #160 regression test pins.
+    pub prompt_resolver: Option<Arc<dyn PromptResolver>>,
+}
+
+impl std::fmt::Debug for ImportOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImportOptions")
+            .field("strategy", &self.strategy)
+            .field("reader", &self.reader)
+            .field("lenient", &self.lenient)
+            .field(
+                "prompt_resolver",
+                &self
+                    .prompt_resolver
+                    .as_ref()
+                    .map(|_| "<dyn PromptResolver>"),
+            )
+            .finish()
+    }
 }
 
 impl Default for ImportOptions {
@@ -121,6 +170,7 @@ impl Default for ImportOptions {
             strategy: MergeStrategy::Merge,
             reader: "import".to_string(),
             lenient: true,
+            prompt_resolver: None,
         }
     }
 }
@@ -215,25 +265,42 @@ fn import_one(
             // Equally, picking one of the candidates risks merging
             // the user's bib metadata into the wrong row.
             //
-            // Bubble up as a Validation error; the lenient-mode
-            // handler in `import_bibtex_str` records it in
-            // `report.failed` so the user sees exactly which entries
-            // need manual resolution (typically: `bib rekey` one
-            // of the candidates so its alias no longer collides).
-            // See #160. Interactive resolution lands with #161.
-            let preview: Vec<String> = ids.iter().take(3).cloned().collect();
-            let suffix = if ids.len() > preview.len() {
-                format!(" (+{} more)", ids.len() - preview.len())
+            // #161: under `--strategy interactive` AND a configured
+            // `PromptResolver`, ask the resolver which candidate the
+            // user wants. A `Some(id)` answer threads the row back
+            // onto the Matched path (the alias gets re-recorded as a
+            // side effect, but the user has explicitly endorsed the
+            // collision target). `None` (or no resolver, or a
+            // non-interactive strategy) preserves the #160 contract:
+            // bubble up as `Validation`, lenient-mode records it in
+            // `report.failed`, the default-strategy regression test
+            // keeps passing.
+            let resolver_pick = if matches!(options.strategy, MergeStrategy::Interactive) {
+                options
+                    .prompt_resolver
+                    .as_ref()
+                    .and_then(|r| r.resolve_ambiguous_alias(&entry.citekey, &ids))
             } else {
-                String::new()
+                None
             };
-            return Err(CoreError::Validation(format!(
-                "ambiguous alias '{}' matches {} papers [{}]{}; resolve via `scitadel bib rekey` on one of them, or use --strategy interactive once it lands (#161)",
-                entry.citekey,
-                ids.len(),
-                preview.join(", "),
-                suffix,
-            )));
+            match resolver_pick {
+                Some(picked) if ids.iter().any(|c| c == &picked) => Some(picked),
+                _ => {
+                    let preview: Vec<String> = ids.iter().take(3).cloned().collect();
+                    let suffix = if ids.len() > preview.len() {
+                        format!(" (+{} more)", ids.len() - preview.len())
+                    } else {
+                        String::new()
+                    };
+                    return Err(CoreError::Validation(format!(
+                        "ambiguous alias '{}' matches {} papers [{}]{}; resolve via `scitadel bib rekey` on one of them, or run with --strategy interactive and a prompt resolver (#161)",
+                        entry.citekey,
+                        ids.len(),
+                        preview.join(", "),
+                        suffix,
+                    )));
+                }
+            }
         }
     };
 
@@ -336,6 +403,7 @@ mod tests {
             strategy: MergeStrategy::Merge,
             reader: reader.into(),
             lenient: true,
+            prompt_resolver: None,
         }
     }
 
@@ -700,6 +768,111 @@ mod tests {
         );
         // And no alias was recorded either.
         assert!(aliases.lookup("ghostkey").unwrap().is_none());
+    }
+
+    /// #161: under `MergeStrategy::Interactive` with a `PromptResolver`
+    /// that returns one of the candidate ids, the row threads through
+    /// the Matched path. The picked paper's row stays unchanged
+    /// (Interactive == Merge semantics on owned columns), but the
+    /// citekey gets recorded as an alias on the chosen paper so the
+    /// next import resolves cleanly.
+    #[test]
+    fn interactive_strategy_with_resolver_picks_a_candidate() {
+        struct FixedPick {
+            picked: String,
+        }
+        impl PromptResolver for FixedPick {
+            fn resolve_ambiguous_alias(
+                &self,
+                _citekey: &str,
+                candidate_ids: &[String],
+            ) -> Option<String> {
+                // Sanity: resolver only ever sees the candidate set
+                // the matcher actually surfaced.
+                assert!(candidate_ids.contains(&self.picked));
+                Some(self.picked.clone())
+            }
+        }
+
+        let (papers, aliases, annotations) = fresh();
+        let mut p1 = Paper::new("First Paper");
+        p1.year = Some(2024);
+        let mut p2 = Paper::new("Second Paper");
+        p2.year = Some(2024);
+        papers.save(&p1).unwrap();
+        papers.save(&p2).unwrap();
+        aliases
+            .record(p1.id.as_str(), "smith2024", "bibtex-import")
+            .unwrap();
+        aliases
+            .record(p2.id.as_str(), "smith2024", "bibtex-import")
+            .unwrap();
+
+        let resolver = Arc::new(FixedPick {
+            picked: p2.id.as_str().to_string(),
+        });
+        let options = ImportOptions {
+            strategy: MergeStrategy::Interactive,
+            reader: "lars".into(),
+            lenient: true,
+            prompt_resolver: Some(resolver),
+        };
+
+        let src = r"
+@article{smith2024,
+    title = {Some Other Title Entirely},
+    year = {1999}
+}";
+        let report = import_bibtex_str(src, &options, &papers, &aliases, &annotations).unwrap();
+
+        assert!(
+            report.failed.is_empty(),
+            "interactive resolver chose a candidate; failure list should be empty: {:?}",
+            report.failed
+        );
+        assert_eq!(report.rows.len(), 1);
+        let row = &report.rows[0];
+        assert_eq!(row.citekey, "smith2024");
+        assert_eq!(row.action, MergeAction::Unchanged);
+        assert_eq!(row.paper_id.as_deref(), Some(p2.id.as_str()));
+    }
+
+    /// #161: `MergeStrategy::Interactive` without a resolver must
+    /// behave identically to the default failure path. Belt-and-braces
+    /// against accidentally enabling silent-create behavior just by
+    /// flipping the strategy.
+    #[test]
+    fn interactive_strategy_without_resolver_falls_back_to_validation_failure() {
+        let (papers, aliases, annotations) = fresh();
+        let mut p1 = Paper::new("First Paper");
+        p1.year = Some(2024);
+        let mut p2 = Paper::new("Second Paper");
+        p2.year = Some(2024);
+        papers.save(&p1).unwrap();
+        papers.save(&p2).unwrap();
+        aliases
+            .record(p1.id.as_str(), "smith2024", "bibtex-import")
+            .unwrap();
+        aliases
+            .record(p2.id.as_str(), "smith2024", "bibtex-import")
+            .unwrap();
+
+        let options = ImportOptions {
+            strategy: MergeStrategy::Interactive,
+            reader: "lars".into(),
+            lenient: true,
+            prompt_resolver: None,
+        };
+
+        let src = r"
+@article{smith2024,
+    title = {Some Other Title Entirely},
+    year = {1999}
+}";
+        let report = import_bibtex_str(src, &options, &papers, &aliases, &annotations).unwrap();
+        assert!(report.rows.is_empty());
+        assert_eq!(report.failed.len(), 1);
+        assert!(report.failed[0].1.contains("ambiguous alias"));
     }
 
     #[test]
