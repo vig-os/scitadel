@@ -331,21 +331,29 @@ pub struct RekeyPaperRequest {
 pub struct BibSnapshotRequest {
     /// Research question ID (or unique prefix) whose shortlist to snapshot
     pub question_id: String,
-    /// Output `.bib` path (e.g. `paper.bib`)
+    /// Output path (default `paper.bib` for bibtex, `paper.json` for csl-json)
     pub output: String,
     /// Reader identity (mirrors annotation/star scoping)
     pub reader: String,
     /// Skip writing the `.scitadel-bib.lock` sidecar
     #[serde(default)]
     pub no_lock: bool,
+    /// Output flavor: `bibtex` (default) or `csl-json` (canonical CSL 1.0.2).
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct BibVerifyRequest {
-    /// Path to the committed `.bib` to verify
+    /// Path to the committed export to verify
     pub file: String,
     /// Override the sidecar's question_id (rarely needed)
     pub question_id: Option<String>,
+    /// Reserved for future per-call overrides; today the sidecar's
+    /// `format` is authoritative so verify routes to the right emitter
+    /// regardless of this value.
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 // ---------- Server ----------
@@ -790,13 +798,14 @@ impl ScitadelServer {
     }
 
     #[tool(
-        description = "Snapshot a question's citation shortlist to a deterministic `.bib` file plus a `.scitadel-bib.lock` sidecar (drift/stale anchor; #178). Same content twice ⇒ byte-identical `.bib` (sidecar `generated_at` excepted). Pass `no_lock=true` to skip the sidecar (CI one-offs). Returns: JSON `{output, papers, sidecar?, shortlist_hash?, content_hash?}`."
+        description = "Snapshot a question's citation shortlist to a deterministic export file plus a `.scitadel-bib.lock` sidecar (drift/stale anchor; #178, #135). Default format is BibTeX (`.bib`); pass `format=\"csl-json\"` to emit canonical CSL-JSON 1.0.2 (`.json`). Same content twice ⇒ byte-identical output (sidecar `generated_at` excepted). Pass `no_lock=true` to skip the sidecar (CI one-offs). Returns: JSON `{output, papers, sidecar?, shortlist_hash?, content_hash?, format?}`."
     )]
     fn bib_snapshot(
         &self,
         Parameters(req): Parameters<BibSnapshotRequest>,
     ) -> Result<String, String> {
-        tools::bib_snapshot_tool(&req.question_id, &req.output, &req.reader, req.no_lock)
+        let fmt = req.format.as_deref().unwrap_or("bibtex");
+        tools::bib_snapshot_tool(&req.question_id, &req.output, &req.reader, req.no_lock, fmt)
     }
 
     #[tool(

@@ -1179,41 +1179,83 @@ fn render_bibtex(
     scitadel_export::export_bibtex_with_tags(papers, |id| tags.get(id).cloned().unwrap_or_default())
 }
 
+/// Render the shortlist as canonical CSL-JSON 1.0.2 (#135 sub-feature
+/// A). Same determinism contract as [`render_bibtex`] — same DB state ⇒
+/// byte-identical output.
+fn render_csl_json(
+    papers: &[scitadel_core::models::Paper],
+    tags: &std::collections::HashMap<String, Vec<String>>,
+) -> String {
+    scitadel_export::export_csl_json_with_tags(papers, |id| {
+        tags.get(id).cloned().unwrap_or_default()
+    })
+}
+
+/// Default output filename for a given snapshot format. Lets users skip
+/// `--output` entirely for the common case while keeping the extension
+/// honest (`.bib` for BibTeX, `.json` for CSL-JSON).
+fn default_output_for(format: &str) -> &'static std::path::Path {
+    match format {
+        "csl-json" => std::path::Path::new("paper.json"),
+        _ => std::path::Path::new("paper.bib"),
+    }
+}
+
 pub fn bib_snapshot(
     question_prefix: &str,
-    output: &std::path::Path,
+    output: Option<&std::path::Path>,
     reader_arg: Option<&str>,
     no_lock: bool,
+    format: &str,
 ) -> Result<()> {
     let reader = reader_arg.map_or_else(current_reader, str::to_string);
     let (question, paper_ids, papers, tags) = load_shortlist(question_prefix, &reader)?;
 
-    let content = render_bibtex(&papers, &tags);
-    std::fs::write(output, &content)
-        .with_context(|| format!("failed to write {}", output.display()))?;
+    let output_path = output.unwrap_or_else(|| default_output_for(format));
+
+    let (content, lock) = match format {
+        "csl-json" => {
+            let c = render_csl_json(&papers, &tags);
+            let l = scitadel_export::BibLockfile::new_csl_json(
+                question.id.as_str(),
+                &reader,
+                &paper_ids,
+                &c,
+            );
+            (c, l)
+        }
+        "bibtex" | "" => {
+            let c = render_bibtex(&papers, &tags);
+            let l = scitadel_export::BibLockfile::new_bibtex(
+                question.id.as_str(),
+                &reader,
+                &paper_ids,
+                &c,
+            );
+            (c, l)
+        }
+        other => bail!("unknown --format: {other}; valid: bibtex, csl-json"),
+    };
+
+    std::fs::write(output_path, &content)
+        .with_context(|| format!("failed to write {}", output_path.display()))?;
 
     if no_lock {
         println!(
             "Wrote {} ({} papers) — sidecar skipped (--no-lock)",
-            output.display(),
+            output_path.display(),
             papers.len()
         );
         return Ok(());
     }
 
-    let lock = scitadel_export::BibLockfile::new_bibtex(
-        question.id.as_str(),
-        &reader,
-        &paper_ids,
-        &content,
-    );
-    let sidecar = sidecar_path_for(output);
+    let sidecar = sidecar_path_for(output_path);
     std::fs::write(&sidecar, lock.to_json()?)
         .with_context(|| format!("failed to write {}", sidecar.display()))?;
 
     println!(
         "Wrote {} ({} papers) + {}",
-        output.display(),
+        output_path.display(),
         papers.len(),
         sidecar.display()
     );
@@ -1378,14 +1420,28 @@ pub fn bib_verify(
 
     let question_id = question_override.unwrap_or(&lock.question_id);
     let (_q, paper_ids, papers, tags) = load_shortlist(question_id, &lock.reader)?;
-    let regenerated = render_bibtex(&papers, &tags);
+    // Route to the matching emitter based on the sidecar's `format`
+    // discriminant — that's the whole point of the field. Default to
+    // BibTeX for backwards compat with sidecars written before #135.
+    let regenerated = match lock.format.as_str() {
+        scitadel_export::sidecar::FORMAT_CSL_JSON => render_csl_json(&papers, &tags),
+        _ => render_bibtex(&papers, &tags),
+    };
 
     let outcome = verify_against_lockfile(&bib_bytes, &regenerated, &paper_ids, &lock);
-    let fix_line = format!(
-        "scitadel bib snapshot {} --output {}",
-        lock.question_id,
-        file.display()
-    );
+    let fix_line = if lock.format == scitadel_export::sidecar::FORMAT_CSL_JSON {
+        format!(
+            "scitadel bib snapshot {} --output {} --format csl-json",
+            lock.question_id,
+            file.display()
+        )
+    } else {
+        format!(
+            "scitadel bib snapshot {} --output {}",
+            lock.question_id,
+            file.display()
+        )
+    };
     match &outcome {
         VerifyOutcome::Ok => {
             if format == "json" {
