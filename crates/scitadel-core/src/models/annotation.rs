@@ -128,6 +128,22 @@ pub fn paper_note_sentence_id(paper_id: &str) -> String {
     format!("{PAPER_NOTE_SENTENCE_ID_PREFIX}{paper_id}")
 }
 
+/// Build the synthetic `Anchor` that flags an annotation as a
+/// paper-level note. No quote, no char_range — only the
+/// `paper-note:<paper_id>` sentinel sentence_id and `AnchorStatus::Ok`
+/// so the resolver short-circuits without trying to match anything in
+/// the body text. Shared by every paper-note write path (MCP tool +
+/// TUI DataStore wrapper) so the two surfaces produce byte-identical
+/// anchors. (#185)
+#[must_use]
+pub fn paper_note_anchor(paper_id: &str) -> Anchor {
+    Anchor {
+        sentence_id: Some(paper_note_sentence_id(paper_id)),
+        status: AnchorStatus::Ok,
+        ..Anchor::default()
+    }
+}
+
 /// Build a synthetic `sentence_id` for an unanchored imported
 /// `note=`. Combines the source citekey with the SHA1 of the
 /// normalized note content so the same `(citekey, note)` pair
@@ -352,6 +368,23 @@ mod tests {
         assert!(pn.starts_with(PAPER_NOTE_SENTENCE_ID_PREFIX));
         assert!(!imp.starts_with(PAPER_NOTE_SENTENCE_ID_PREFIX));
         assert!(!pn.starts_with(IMPORTED_SENTENCE_ID_PREFIX));
+    }
+
+    #[test]
+    fn paper_note_anchor_is_recognised_by_predicate() {
+        // The shared helper must produce an anchor that
+        // `is_paper_note()` accepts; otherwise the two write paths
+        // (MCP tool + DataStore) drift from the resolver and the TUI
+        // rendering filter, and the round-trip silently breaks.
+        let a = paper_note_anchor("p-attn");
+        assert!(a.is_paper_note());
+        assert_eq!(a.status, AnchorStatus::Ok);
+        assert!(a.quote.is_none());
+        assert!(a.char_range.is_none());
+        assert_eq!(
+            a.sentence_id.as_deref(),
+            Some(&*paper_note_sentence_id("p-attn"))
+        );
     }
 
     #[test]

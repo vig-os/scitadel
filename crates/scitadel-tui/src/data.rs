@@ -176,18 +176,12 @@ impl DataStore {
     /// whole, with no quote / char_range. The anchor carries only the
     /// `paper-note:<paper_id>` sentinel and the resolver short-circuits
     /// it to Ok. (#185)
-    #[allow(dead_code)] // wired up in C3 (TUI Pp keybind)
     pub fn create_paper_note(&self, paper_id: &str, note: &str, author: &str) -> Result<String> {
-        let anchor = Anchor {
-            sentence_id: Some(scitadel_core::models::paper_note_sentence_id(paper_id)),
-            status: AnchorStatus::Ok,
-            ..Anchor::default()
-        };
         let ann = Annotation::new_root(
             PaperId::from(paper_id),
             author.to_string(),
             note.to_string(),
-            anchor,
+            scitadel_core::models::paper_note_anchor(paper_id),
         );
         SqliteAnnotationRepository::new(self.db.clone()).create(&ann)?;
         Ok(ann.id.as_str().to_string())

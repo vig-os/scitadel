@@ -8,7 +8,7 @@ mod search;
 
 pub use annotation::{
     Anchor, AnchorStatus, Annotation, AnnotationRead, IMPORTED_SENTENCE_ID_PREFIX,
-    PAPER_NOTE_SENTENCE_ID_PREFIX, imported_sentence_id, normalize_sentence,
+    PAPER_NOTE_SENTENCE_ID_PREFIX, imported_sentence_id, normalize_sentence, paper_note_anchor,
     paper_note_sentence_id, sentence_id,
 };
 pub use assessment::Assessment;

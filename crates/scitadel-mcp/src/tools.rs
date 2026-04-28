@@ -1192,16 +1192,11 @@ pub fn create_paper_note_tool(paper_id: &str, note: &str, author: &str) -> Resul
     }
     let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
 
-    let anchor = scitadel_core::models::Anchor {
-        sentence_id: Some(scitadel_core::models::paper_note_sentence_id(paper_id)),
-        status: scitadel_core::models::AnchorStatus::Ok,
-        ..Default::default()
-    };
     let ann = scitadel_core::models::Annotation::new_root(
         scitadel_core::models::PaperId::from(paper_id),
         author.to_string(),
         note.to_string(),
-        anchor,
+        scitadel_core::models::paper_note_anchor(paper_id),
     );
     repo.create(&ann).map_err(|e| e.to_string())?;
     tracing::info!(
