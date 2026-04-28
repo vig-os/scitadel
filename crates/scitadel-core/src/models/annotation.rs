@@ -70,6 +70,40 @@ impl Anchor {
     pub fn is_orphan(&self) -> bool {
         matches!(self.status, AnchorStatus::Orphan)
     }
+
+    /// True when the anchor's only "selector" is a synthetic
+    /// import-marker `sentence_id` (no quote, no char_range, no
+    /// real sentence hash) — i.e. a `note=` from a `.bib` import
+    /// that has nothing to anchor against in the paper text yet.
+    /// The resolver short-circuits these so they don't trip the
+    /// orphan-warning UI flow (#158).
+    #[must_use]
+    pub fn is_imported_synthetic(&self) -> bool {
+        self.char_range.is_none()
+            && self.quote.is_none()
+            && self
+                .sentence_id
+                .as_deref()
+                .is_some_and(|s| s.starts_with(IMPORTED_SENTENCE_ID_PREFIX))
+    }
+}
+
+/// Marker prefix on a synthetic `sentence_id` produced by the
+/// `.bib` import path for unanchored `note={...}` entries (#158).
+/// Picked to be unambiguous: SHA1 hex (the real `sentence_id`
+/// output) cannot start with `bibtex-import:`.
+pub const IMPORTED_SENTENCE_ID_PREFIX: &str = "bibtex-import:";
+
+/// Build a synthetic `sentence_id` for an unanchored imported
+/// `note=`. Combines the source citekey with the SHA1 of the
+/// normalized note content so the same `(citekey, note)` pair
+/// always hashes to the same id. The result is a stable handle
+/// that the resolver recognizes as "imported, not yet anchored
+/// to paper text" rather than as a broken anchor.
+#[must_use]
+pub fn imported_sentence_id(citekey: &str, note: &str) -> String {
+    let content_hash = sentence_id(note);
+    format!("{IMPORTED_SENTENCE_ID_PREFIX}{citekey}:{content_hash}")
 }
 
 /// One annotation. May be a root (with an anchor) or a reply (parent_id set,
@@ -244,6 +278,48 @@ mod tests {
         assert!(!a.is_orphan());
         a.status = AnchorStatus::Orphan;
         assert!(a.is_orphan());
+    }
+
+    #[test]
+    fn imported_synthetic_id_has_marker_prefix() {
+        let id = imported_sentence_id("smith2024", "some note");
+        assert!(id.starts_with(IMPORTED_SENTENCE_ID_PREFIX));
+        assert!(id.contains("smith2024"));
+    }
+
+    #[test]
+    fn is_imported_synthetic_recognises_marker_anchor() {
+        let a = Anchor {
+            sentence_id: Some(imported_sentence_id("k", "n")),
+            ..Anchor::default()
+        };
+        assert!(a.is_imported_synthetic());
+    }
+
+    #[test]
+    fn is_imported_synthetic_rejects_real_sentence_id() {
+        let a = Anchor {
+            sentence_id: Some(sentence_id("a real sentence.")),
+            ..Anchor::default()
+        };
+        assert!(!a.is_imported_synthetic());
+    }
+
+    #[test]
+    fn is_imported_synthetic_rejects_anchor_with_quote_or_range() {
+        let with_quote = Anchor {
+            sentence_id: Some(imported_sentence_id("k", "n")),
+            quote: Some("hi".into()),
+            ..Anchor::default()
+        };
+        assert!(!with_quote.is_imported_synthetic());
+
+        let with_range = Anchor {
+            sentence_id: Some(imported_sentence_id("k", "n")),
+            char_range: Some((0, 2)),
+            ..Anchor::default()
+        };
+        assert!(!with_range.is_imported_synthetic());
     }
 
     #[test]

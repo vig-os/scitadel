@@ -18,7 +18,7 @@
 //! (#134 step 1) so a future re-import resolves via the alias step
 //! of the match cascade.
 
-use scitadel_core::models::{Anchor, Annotation, PaperId};
+use scitadel_core::models::{Anchor, Annotation, PaperId, imported_sentence_id};
 
 use super::merge::MergeAction;
 use super::parse::BibEntry;
@@ -91,11 +91,20 @@ pub fn compute(paper_id: &str, reader: &str, bib: &BibEntry, action: MergeAction
 
     let (annotation, dropped_keywords) = match bib.note.as_deref() {
         Some(note) if !note.is_empty() => {
+            // Synthetic `sentence_id` so the resolver recognizes this
+            // as an unanchored import on first open instead of flipping
+            // it to `Orphan` (#158). Hash incorporates citekey + note
+            // content so the same `(citekey, note)` pair always
+            // produces the same id — re-import collapses to no-op.
+            let synthetic = Anchor {
+                sentence_id: Some(imported_sentence_id(&bib.citekey, note)),
+                ..Anchor::default()
+            };
             let mut a = Annotation::new_root(
                 PaperId::from(paper_id),
                 reader.to_string(),
                 note.to_string(),
-                Anchor::default(),
+                synthetic,
             );
             a.tags.clone_from(&bib.keywords);
             (Some(a), vec![])
@@ -169,11 +178,42 @@ mod tests {
         assert_eq!(a.note, "Read twice; methodology questionable");
         assert_eq!(a.paper_id.as_str(), "p-x");
         assert!(a.parent_id.is_none(), "root annotation");
-        assert_eq!(
-            a.anchor,
-            Anchor::default(),
-            "unanchored — no source text yet"
-        );
+        // No selectors against paper text — only the synthetic
+        // `sentence_id` marker the resolver uses to short-circuit (#158).
+        assert!(a.anchor.char_range.is_none());
+        assert!(a.anchor.quote.is_none());
+        assert!(a.anchor.prefix.is_none());
+        assert!(a.anchor.suffix.is_none());
+        assert!(a.anchor.is_imported_synthetic());
+    }
+
+    #[test]
+    fn imported_synthetic_sentence_id_is_stable_per_citekey_note() {
+        let mut b1 = bib("smith2024");
+        b1.note = Some("methodology questionable".into());
+        let mut b2 = bib("smith2024");
+        b2.note = Some("methodology questionable".into());
+        let mut b3 = bib("smith2024");
+        b3.note = Some("different note".into());
+        let mut b4 = bib("jones2024");
+        b4.note = Some("methodology questionable".into());
+
+        let a1 = compute("p", "lars", &b1, MergeAction::Updated)
+            .annotation
+            .unwrap();
+        let a2 = compute("p", "lars", &b2, MergeAction::Updated)
+            .annotation
+            .unwrap();
+        let a3 = compute("p", "lars", &b3, MergeAction::Updated)
+            .annotation
+            .unwrap();
+        let a4 = compute("p", "lars", &b4, MergeAction::Updated)
+            .annotation
+            .unwrap();
+
+        assert_eq!(a1.anchor.sentence_id, a2.anchor.sentence_id);
+        assert_ne!(a1.anchor.sentence_id, a3.anchor.sentence_id);
+        assert_ne!(a1.anchor.sentence_id, a4.anchor.sentence_id);
     }
 
     #[test]
