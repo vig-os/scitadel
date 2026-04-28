@@ -126,11 +126,27 @@ pub struct App {
     /// always work from SQLite; downloads still run (and can succeed via
     /// cache layers), but the status bar shows a visible OFFLINE badge.
     pub offline: bool,
+    /// Transient toast shown in the status bar for the first N draws
+    /// after launch (#137). `Some(label)` until cleared by
+    /// `tick_startup_toast`. Used to flash e.g.
+    /// `theme: dalton-dark (auto)` so users can verify which palette
+    /// resolved without digging through `--list-themes`.
+    startup_toast: Option<String>,
+    /// Draw-tick counter for `startup_toast`. The toast is dropped once
+    /// this exceeds `STARTUP_TOAST_FRAMES`. We count draws (~10 Hz on
+    /// the 100 ms event-poll cadence, ~30 frames ≈ 3 s) rather than
+    /// wall-clock so headless tape runs reproduce the same lifetime.
+    startup_toast_frames: u32,
 
     task_tx: mpsc::UnboundedSender<TaskUpdate>,
     task_rx: mpsc::UnboundedReceiver<TaskUpdate>,
     offline_rx: mpsc::UnboundedReceiver<bool>,
 }
+
+/// How many draws the startup toast lingers for (#137). At the
+/// 100 ms event-poll cadence this is ~3 seconds — long enough to read,
+/// short enough to clear before the user does anything substantial.
+const STARTUP_TOAST_FRAMES: u32 = 30;
 
 impl App {
     fn new(
@@ -168,9 +184,24 @@ impl App {
             reader,
             starred,
             offline: false,
+            startup_toast: None,
+            startup_toast_frames: 0,
             task_tx,
             task_rx,
             offline_rx,
+        }
+    }
+
+    /// Advance the startup-toast lifetime by one draw (#137). Call once
+    /// per frame from the render path; clears `startup_toast` once
+    /// `STARTUP_TOAST_FRAMES` have elapsed.
+    fn tick_startup_toast(&mut self) {
+        if self.startup_toast.is_none() {
+            return;
+        }
+        self.startup_toast_frames = self.startup_toast_frames.saturating_add(1);
+        if self.startup_toast_frames > STARTUP_TOAST_FRAMES {
+            self.startup_toast = None;
         }
     }
 
@@ -885,6 +916,7 @@ pub fn run(
     papers_dir: PathBuf,
     show_institutional_hint: bool,
     reader: String,
+    startup_toast: Option<String>,
 ) -> Result<()> {
     let data = DataStore::open(db_path)?;
     let mut app = App::new(
@@ -894,6 +926,7 @@ pub fn run(
         show_institutional_hint,
         reader,
     );
+    app.startup_toast = startup_toast;
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1084,7 +1117,19 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             "Tab/Shift-Tab: switch tabs | j/k: navigate | Enter: select | c: clear tasks | q: quit"
         }
     };
-    status_bar::draw(frame, chunks[3], help_text, app.offline);
+    // Startup toast (#137) hijacks the status bar for its lifetime so
+    // the user sees `theme: dalton-bright (auto)` right after launch
+    // without us having to add a second status row. Falls back to the
+    // normal help_text once the toast expires.
+    let toast_text;
+    let bar_text: &str = if let Some(toast) = app.startup_toast.as_deref() {
+        toast_text = toast.to_string();
+        &toast_text
+    } else {
+        help_text
+    };
+    status_bar::draw(frame, chunks[3], bar_text, app.offline);
+    app.tick_startup_toast();
 }
 
 /// Step the active annotation prompt by one keystroke. Mutates the
