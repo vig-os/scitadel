@@ -63,7 +63,7 @@ jobs:
           echo "checksum=${TAR}.sha256" >> "$GITHUB_OUTPUT"
 
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             ${{ steps.package.outputs.tarball }}
