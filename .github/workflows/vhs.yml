@@ -38,7 +38,7 @@ jobs:
           - name: tui-launch
             tapes: "tui-launch.tape init-wizard.tape"
           - name: tui-papers
-            tapes: "papers-download-state.tape queue-tab.tape reading-queue-star.tape question-dashboard.tape"
+            tapes: "papers-download-state.tape queue-tab.tape reading-queue-star.tape question-dashboard.tape tui-inbox.tape"
           - name: tui-reader
             tapes: "tui-annotation-write.tape tui-annotations-reader.tape annotations-in-detail.tape tui-export-keybind.tape"
           - name: theme
@@ -192,7 +192,7 @@ jobs:
           declared=$(cat <<'EOF' | tr ' ' '\n' | sed '/^$/d' | sort
           cli-bib-import.tape cli-bib-rekey.tape cli-question-workflow.tape cli-search.tape
           tui-launch.tape init-wizard.tape
-          papers-download-state.tape queue-tab.tape reading-queue-star.tape question-dashboard.tape
+          papers-download-state.tape queue-tab.tape reading-queue-star.tape question-dashboard.tape tui-inbox.tape
           tui-annotation-write.tape tui-annotations-reader.tape annotations-in-detail.tape tui-export-keybind.tape
           theme-dark.tape theme-light.tape theme-toggle.tape
           offline-indicator.tape open-externally.tape

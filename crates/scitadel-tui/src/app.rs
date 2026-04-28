@@ -104,6 +104,14 @@ pub enum Overlay {
         selected: usize,
         export_prompt: Option<BibExportPrompt>,
     },
+    /// Unread-annotations inbox (#185 P0). `items` is the rendered
+    /// flat list (mixed headers + rows); `selected` points at the
+    /// currently-highlighted row. Built once on overlay open and
+    /// rebuilt on every render so MCP-side writes show up live.
+    Inbox {
+        items: Vec<crate::views::inbox::InboxItem>,
+        selected: usize,
+    },
 }
 
 /// Main application state.
@@ -148,10 +156,95 @@ pub struct App {
     /// rendering branch — both feed the same status-bar slot. Lifetime
     /// is per-toast so a long error can linger longer than a quick OK.
     status_toast: Option<StatusToast>,
+    /// Cached count of annotations the current `reader` hasn't
+    /// acknowledged. Refreshed on every draw via `data.load_unread_count`
+    /// so the `[N new]` status-bar badge reflects MCP-side writes within
+    /// one tick (~100 ms). Kept on `App` rather than recomputing inside
+    /// the widget so a future event-driven refresh path can update the
+    /// same field. (#185)
+    pub unread_count: i64,
+    /// Cached set of paper IDs that have at least one unread
+    /// annotation for `reader`. Drives the per-row `●` glyph in the
+    /// Papers list. Refreshed on every draw alongside `unread_count`.
+    /// (#185)
+    pub papers_with_unread: std::collections::HashSet<String>,
+    /// The thread root ID the user most recently had in focus. Set
+    /// when annotation-focus / reader-highlight cursor moves onto a
+    /// thread; the *previous* value gets passed to `mark_thread_seen`
+    /// when focus moves to another thread (or away entirely). This is
+    /// the "focus-leave" semantics #185 calls for — a glance doesn't
+    /// mark seen, but moving past a thread does. (#185)
+    last_focused_root_id: Option<String>,
 
     task_tx: mpsc::UnboundedSender<TaskUpdate>,
     task_rx: mpsc::UnboundedReceiver<TaskUpdate>,
     offline_rx: mpsc::UnboundedReceiver<bool>,
+}
+
+/// Update the focus tracker and mark the *previous* thread seen if
+/// focus transitioned to a different thread (or to nothing). Free
+/// function rather than `&mut self` method so it can be called with
+/// disjoint borrows on `App` while `self.overlay.as_mut()` holds a
+/// mutable reference to the overlay slot. Failure of `mark_thread_seen`
+/// is silently swallowed — a stale badge is acceptable, an error
+/// toast every keystroke is not. (#185)
+fn set_focused_thread(
+    data: &DataStore,
+    reader: &str,
+    last_focused_root_id: &mut Option<String>,
+    new_root_id: Option<String>,
+) {
+    if *last_focused_root_id == new_root_id {
+        return;
+    }
+    if let Some(prev) = last_focused_root_id.take() {
+        let _ = data.mark_thread_seen(reader, &prev);
+    }
+    *last_focused_root_id = new_root_id;
+}
+
+/// Resolve the root at `root_idx` over the paper's live roots
+/// (oldest-first) and update the focus tracker. None clears focus
+/// without a DB hit. Used by reader-mode highlight navigation. (#185)
+fn focus_thread_by_root_idx(
+    data: &DataStore,
+    reader: &str,
+    last_focused_root_id: &mut Option<String>,
+    paper_id: &str,
+    root_idx: Option<usize>,
+) {
+    let new_root_id = root_idx.and_then(|idx| {
+        data.load_annotations_for_paper(paper_id)
+            .ok()?
+            .into_iter()
+            .filter(|a| !a.is_reply())
+            .nth(idx)
+            .map(|a| a.id.as_str().to_string())
+    });
+    set_focused_thread(data, reader, last_focused_root_id, new_root_id);
+}
+
+/// Resolve the thread root for the annotation at `annotation_idx`
+/// (mixed roots and replies, oldest-first) and update the focus
+/// tracker. Walks `parent_id` to the root so replies still mark their
+/// thread as the unit of "seen-ness". Used by annotation-focus
+/// navigation. (#185)
+fn focus_thread_by_annotation_idx(
+    data: &DataStore,
+    reader: &str,
+    last_focused_root_id: &mut Option<String>,
+    paper_id: &str,
+    annotation_idx: Option<usize>,
+) {
+    let new_root_id = annotation_idx.and_then(|idx| {
+        let annotations = data.load_annotations_for_paper(paper_id).ok()?;
+        let target = annotations.get(idx)?;
+        Some(target.parent_id.as_ref().map_or_else(
+            || target.id.as_str().to_string(),
+            |p| p.as_str().to_string(),
+        ))
+    });
+    set_focused_thread(data, reader, last_focused_root_id, new_root_id);
 }
 
 /// How many draws the startup toast lingers for (#137). At the
@@ -215,10 +308,25 @@ impl App {
             startup_toast: None,
             startup_toast_frames: 0,
             status_toast: None,
+            unread_count: 0,
+            papers_with_unread: std::collections::HashSet::new(),
+            last_focused_root_id: None,
             task_tx,
             task_rx,
             offline_rx,
         }
+    }
+
+    /// Refresh `unread_count` and `papers_with_unread` from the DB.
+    /// Two cheap indexed queries per render tick; failures are silently
+    /// swallowed (a stale badge is acceptable, an error toast every
+    /// 100 ms is not). (#185)
+    fn refresh_unread(&mut self) {
+        self.unread_count = self.data.load_unread_count(&self.reader).unwrap_or(0);
+        self.papers_with_unread = self
+            .data
+            .load_papers_with_unread(&self.reader)
+            .unwrap_or_default();
     }
 
     /// Advance the startup-toast lifetime by one draw (#137). Call once
@@ -335,7 +443,9 @@ impl App {
                 (Some(paper_id.clone()), None, ann_id)
             }
             Some(Overlay::SearchPapers { search_id, .. }) => (None, Some(search_id.clone()), None),
-            Some(Overlay::QuestionDashboard { .. }) | None => (None, None, None),
+            Some(Overlay::QuestionDashboard { .. } | Overlay::Inbox { .. }) | None => {
+                (None, None, None)
+            }
         };
         // Question id: from the overlay (dashboard open) or the
         // Questions-tab cursor. Dashboard wins since it's more specific.
@@ -513,6 +623,17 @@ impl App {
             return;
         }
 
+        // `U` toggles the unread inbox overlay (#185 P0). Same gating
+        // as `T`: skip when a text input is open. Pressing `U` again
+        // (or `Esc`/`q` inside the overlay) closes it. The toggle has
+        // to run BEFORE the generic overlay dispatch so it can close
+        // the inbox from on-top-of-itself; otherwise pressing `U`
+        // inside the inbox would just dispatch into the inbox view.
+        if code == KeyCode::Char('U') && !self.in_text_input_context() {
+            self.toggle_inbox();
+            return;
+        }
+
         if self.overlay.is_some() {
             self.handle_overlay_key(code);
             return;
@@ -526,6 +647,56 @@ impl App {
             KeyCode::Char('c') => self.clear_completed_tasks(),
             _ => self.handle_tab_key(code),
         }
+    }
+
+    /// Open the inbox overlay if no overlay is active, or close it if
+    /// the inbox is the current overlay. Cursor lands on the first
+    /// selectable row. (#185)
+    fn toggle_inbox(&mut self) {
+        if matches!(self.overlay, Some(Overlay::Inbox { .. })) {
+            self.overlay = None;
+            return;
+        }
+        let items = crate::views::inbox::load(&self.data, &self.reader);
+        // Cursor on first selectable row (skip the leading header).
+        let selected = items.iter().position(|i| i.is_selectable()).unwrap_or(0);
+        self.overlay = Some(Overlay::Inbox { items, selected });
+    }
+
+    /// Replace the overlay with a PaperDetail in two-pane reader mode
+    /// focused on the given thread. Caller has already resolved the
+    /// inbox cursor to `(paper_id, root_id)` so this method takes
+    /// concrete arguments rather than peeking at `self.overlay` —
+    /// keeps the borrow story straightforward in the inbox key
+    /// handler. (#185)
+    fn jump_to_thread(&mut self, paper_id: &str, root_id: &str) {
+        // Find the highlight_focus index of the target root over the
+        // paper's roots so reader mode opens with the cursor on it.
+        let highlight_focus = self
+            .data
+            .load_annotations_for_paper(paper_id)
+            .ok()
+            .and_then(|anns| {
+                anns.into_iter()
+                    .filter(|a| !a.is_reply())
+                    .position(|a| a.id.as_str() == root_id)
+            });
+        self.overlay = Some(Overlay::PaperDetail {
+            paper_id: paper_id.to_string(),
+            scroll: 0,
+            annotation_focus: None,
+            prompt: None,
+            reader: true,
+            highlight_focus,
+        });
+        // Track the focused root so leave-events mark it seen.
+        focus_thread_by_root_idx(
+            &self.data,
+            &self.reader,
+            &mut self.last_focused_root_id,
+            paper_id,
+            highlight_focus,
+        );
     }
 
     fn handle_overlay_key(&mut self, code: KeyCode) {
@@ -569,7 +740,46 @@ impl App {
             Some(Overlay::QuestionDashboard { .. }) => {
                 self.handle_question_dashboard_key(code);
             }
+            Some(Overlay::Inbox { .. }) => self.handle_inbox_key(code),
             None => {}
+        }
+    }
+
+    /// Routes a key inside the Inbox overlay. Esc/q close, j/k step
+    /// over selectable rows (skipping headers), Enter jumps to the
+    /// paper reader focused on the selected thread. (#185)
+    fn handle_inbox_key(&mut self, code: KeyCode) {
+        // Compute the action under the overlay borrow, then apply it
+        // after the borrow drops so the Enter path can call
+        // `&mut self` helpers without fighting the borrow checker.
+        enum InboxAction {
+            Close,
+            Jump(String, String),
+            None,
+        }
+        let action = {
+            let Some(Overlay::Inbox { items, selected }) = self.overlay.as_mut() else {
+                return;
+            };
+            match code {
+                KeyCode::Esc | KeyCode::Char('q') => InboxAction::Close,
+                KeyCode::Char('j') | KeyCode::Down => {
+                    *selected = crate::views::inbox::step_selection(items, *selected, 1);
+                    InboxAction::None
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    *selected = crate::views::inbox::step_selection(items, *selected, -1);
+                    InboxAction::None
+                }
+                KeyCode::Enter => crate::views::inbox::jump_target(items, *selected)
+                    .map_or(InboxAction::None, |(p, r)| InboxAction::Jump(p, r)),
+                _ => InboxAction::None,
+            }
+        };
+        match action {
+            InboxAction::Close => self.overlay = None,
+            InboxAction::Jump(paper_id, root_id) => self.jump_to_thread(&paper_id, &root_id),
+            InboxAction::None => {}
         }
     }
 
@@ -795,12 +1005,37 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('q' | 'R') => {
                     *reader = false;
                     *highlight_focus = None;
+                    // Focus left the reader entirely — mark whatever
+                    // thread was focused as seen. (#185)
+                    focus_thread_by_root_idx(
+                        &self.data,
+                        &self.reader,
+                        &mut self.last_focused_root_id,
+                        paper_id,
+                        None,
+                    );
                 }
                 KeyCode::Char('J') | KeyCode::Down if count > 0 => {
-                    *highlight_focus = Some(highlight_focus.map_or(0, |f| (f + 1).min(count - 1)));
+                    let next = Some(highlight_focus.map_or(0, |f| (f + 1).min(count - 1)));
+                    *highlight_focus = next;
+                    focus_thread_by_root_idx(
+                        &self.data,
+                        &self.reader,
+                        &mut self.last_focused_root_id,
+                        paper_id,
+                        next,
+                    );
                 }
                 KeyCode::Char('K') | KeyCode::Up if count > 0 => {
-                    *highlight_focus = Some(highlight_focus.map_or(0, |f| f.saturating_sub(1)));
+                    let next = Some(highlight_focus.map_or(0, |f| f.saturating_sub(1)));
+                    *highlight_focus = next;
+                    focus_thread_by_root_idx(
+                        &self.data,
+                        &self.reader,
+                        &mut self.last_focused_root_id,
+                        paper_id,
+                        next,
+                    );
                 }
                 KeyCode::Char('D') => {
                     let pid = paper_id.clone();
@@ -829,15 +1064,28 @@ impl App {
                 .unwrap_or_default();
             if annotations.is_empty() {
                 *annotation_focus = None;
+                focus_thread_by_annotation_idx(
+                    &self.data,
+                    &self.reader,
+                    &mut self.last_focused_root_id,
+                    &pid,
+                    None,
+                );
             } else {
                 let count = annotations.len();
+                let mut new_focus_idx: Option<usize> = Some(*focus);
                 match code {
-                    KeyCode::Esc => *annotation_focus = None,
+                    KeyCode::Esc => {
+                        *annotation_focus = None;
+                        new_focus_idx = None;
+                    }
                     KeyCode::Char('j') | KeyCode::Down => {
                         *focus = (*focus + 1).min(count - 1);
+                        new_focus_idx = Some(*focus);
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
                         *focus = focus.saturating_sub(1);
+                        new_focus_idx = Some(*focus);
                     }
                     KeyCode::Char('e') => {
                         let target = &annotations[*focus];
@@ -866,13 +1114,30 @@ impl App {
                     }
                     _ => {}
                 }
+                focus_thread_by_annotation_idx(
+                    &self.data,
+                    &self.reader,
+                    &mut self.last_focused_root_id,
+                    &pid,
+                    new_focus_idx,
+                );
                 return;
             }
         }
 
         // Layer 3: scroll mode.
         match code {
-            KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
+            KeyCode::Esc | KeyCode::Char('q') => {
+                // Closing the PaperDetail overlay leaves whatever
+                // thread was last focused — mark it seen. (#185)
+                set_focused_thread(
+                    &self.data,
+                    &self.reader,
+                    &mut self.last_focused_root_id,
+                    None,
+                );
+                self.overlay = None;
+            }
             KeyCode::Char('j') | KeyCode::Down => *scroll = scroll.saturating_add(1),
             KeyCode::Char('k') | KeyCode::Up => *scroll = scroll.saturating_sub(1),
             KeyCode::Char('d') => *scroll = scroll.saturating_add(10),
@@ -893,6 +1158,13 @@ impl App {
                     .map_or(0, |a| a.len());
                 if count > 0 {
                     *annotation_focus = Some(0);
+                    focus_thread_by_annotation_idx(
+                        &self.data,
+                        &self.reader,
+                        &mut self.last_focused_root_id,
+                        &pid,
+                        Some(0),
+                    );
                 }
             }
             KeyCode::Char('R') => {
@@ -902,6 +1174,13 @@ impl App {
                 let count = crate::views::reader::highlight_count(&self.data, &pid);
                 *reader = true;
                 *highlight_focus = if count > 0 { Some(0) } else { None };
+                focus_thread_by_root_idx(
+                    &self.data,
+                    &self.reader,
+                    &mut self.last_focused_root_id,
+                    &pid,
+                    *highlight_focus,
+                );
             }
             KeyCode::Char('O') => {
                 // #144: open the locally downloaded file in the OS
@@ -1197,6 +1476,23 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App
 }
 
 fn draw(frame: &mut ratatui::Frame, app: &mut App) {
+    // Refresh unread state each tick so MCP-side annotation writes
+    // show up in the status bar + per-row glyphs within ~100ms (the
+    // event-poll cadence). (#185)
+    app.refresh_unread();
+    // If the inbox overlay is open, rebuild its items each tick so a
+    // newly-arrived annotation shows up live without the user having
+    // to close + reopen. The cursor index is preserved (clamped to
+    // the new length).
+    if let Some(Overlay::Inbox { items, selected }) = app.overlay.as_mut() {
+        let fresh = crate::views::inbox::load(&app.data, &app.reader);
+        let max = fresh.len().saturating_sub(1);
+        *selected = (*selected).min(max);
+        // If the cursor lands on a header after the rebuild, snap it
+        // forward to the next selectable row.
+        *selected = crate::views::inbox::step_selection(&fresh, *selected, 0);
+        *items = fresh;
+    }
     let task_panel_height = tasks_view::panel_height(&app.tasks);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1242,7 +1538,14 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             highlight_focus,
         }) => {
             if *reader {
-                crate::views::reader::draw(frame, chunks[1], &app.data, paper_id, *highlight_focus);
+                crate::views::reader::draw(
+                    frame,
+                    chunks[1],
+                    &app.data,
+                    paper_id,
+                    *highlight_focus,
+                    &app.reader,
+                );
             } else {
                 detail::draw(
                     frame,
@@ -1269,6 +1572,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 *selected,
                 &app.starred,
                 &app.downloading_paper_ids(),
+                &app.papers_with_unread,
             );
         }
         Some(Overlay::QuestionDashboard {
@@ -1288,6 +1592,9 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 bib_export_prompt::draw_overlay(frame, chunks[1], prompt);
             }
         }
+        Some(Overlay::Inbox { items, selected }) => {
+            crate::views::inbox::draw(frame, chunks[1], items, *selected);
+        }
         None => match app.tab {
             Tab::Searches => searches::draw(frame, chunks[1], &app.data, app.search_selected),
             Tab::Papers => papers::draw(
@@ -1297,6 +1604,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 app.paper_selected,
                 &app.starred,
                 &app.downloading_paper_ids(),
+                &app.papers_with_unread,
             ),
             Tab::Questions => {
                 questions::draw(frame, chunks[1], &app.data, app.question_selected);
@@ -1359,11 +1667,14 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         (Some(Overlay::QuestionDashboard { .. }), _) => {
             "Esc/q: back | j/k: navigate | Enter: open paper | c: toggle shortlist | E: export bib"
         }
+        (Some(Overlay::Inbox { .. }), _) => {
+            "Esc/q/U: close inbox | j/k: navigate | Enter: jump to thread"
+        }
         (None, Tab::Papers | Tab::Queue) => {
-            "Tab: switch tabs | j/k: navigate | Enter: open | s: (un)star | c: clear tasks | T: theme | q: quit"
+            "Tab: switch tabs | j/k: navigate | Enter: open | s: (un)star | c: clear tasks | T: theme | U: inbox | q: quit"
         }
         (None, _) => {
-            "Tab/Shift-Tab: switch tabs | j/k: navigate | Enter: select | c: clear tasks | T: theme | q: quit"
+            "Tab/Shift-Tab: switch tabs | j/k: navigate | Enter: select | c: clear tasks | T: theme | U: inbox | q: quit"
         }
     };
     // Startup toast (#137) hijacks the status bar for its lifetime so
@@ -1383,7 +1694,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     } else {
         help_text
     };
-    status_bar::draw(frame, chunks[3], bar_text, app.offline);
+    status_bar::draw(frame, chunks[3], bar_text, app.offline, app.unread_count);
     app.tick_startup_toast();
     app.tick_status_toast();
 }
@@ -1710,5 +2021,219 @@ mod tests {
             other => panic!("expected dashboard with prompt cleared, got {other:?}"),
         }
         assert!(app.status_toast.is_none(), "no toast on cancel");
+    }
+
+    // ---- #185 focus-leave plumbing ----
+
+    /// Seed an annotation thread (root + reply) on `p-attn` so the
+    /// focus-leave tests can assert mark_thread_seen actually clears
+    /// unread state.
+    fn seed_thread(db_path: &std::path::Path) -> (String, String) {
+        use scitadel_core::models::{Anchor, Annotation};
+        let db = scitadel_db::sqlite::Database::open(db_path).unwrap();
+        let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+        let root = Annotation::new_root(
+            PaperId::from("p-attn"),
+            "claude".into(),
+            "claim".into(),
+            Anchor {
+                quote: Some("Attention".into()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&root).unwrap();
+        let reply = Annotation::new_reply(&root, "claude".into(), "follow-up".into());
+        repo.create(&reply).unwrap();
+        (root.id.as_str().to_string(), reply.id.as_str().to_string())
+    }
+
+    /// First focus arrives: nothing was previously focused, so no
+    /// mark_seen happens. The new root is just remembered.
+    #[tokio::test(flavor = "current_thread")]
+    async fn focus_arrive_does_not_mark_seen_when_none_was_focused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        let (root_id, _) = seed_thread(&tmp.path().join("scitadel.db"));
+        // Pre: 2 unread for lars.
+        assert_eq!(app.data.load_unread_count("lars").unwrap(), 2);
+
+        set_focused_thread(
+            &app.data,
+            &app.reader,
+            &mut app.last_focused_root_id,
+            Some(root_id.clone()),
+        );
+        // Tracker advanced...
+        assert_eq!(app.last_focused_root_id, Some(root_id));
+        // ...but nothing got marked seen yet (focus-leave semantics:
+        // mark only when leaving the previous thread, and there was
+        // no previous).
+        assert_eq!(app.data.load_unread_count("lars").unwrap(), 2);
+    }
+
+    /// Focus-leave path: A → None marks A's thread seen.
+    #[tokio::test(flavor = "current_thread")]
+    async fn focus_leave_to_none_marks_previous_thread_seen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        let (root_id, _) = seed_thread(&tmp.path().join("scitadel.db"));
+
+        set_focused_thread(
+            &app.data,
+            &app.reader,
+            &mut app.last_focused_root_id,
+            Some(root_id),
+        );
+        assert_eq!(app.data.load_unread_count("lars").unwrap(), 2);
+
+        set_focused_thread(&app.data, &app.reader, &mut app.last_focused_root_id, None);
+        assert_eq!(
+            app.data.load_unread_count("lars").unwrap(),
+            0,
+            "focus-leave to None must mark the previous thread (root + replies) seen"
+        );
+        assert_eq!(app.last_focused_root_id, None);
+    }
+
+    /// Re-focusing the same thread is a no-op — no double-write, no
+    /// toggle, no spurious mark_seen of an unrelated thread.
+    #[tokio::test(flavor = "current_thread")]
+    async fn focus_same_root_is_idempotent_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        let (root_id, _) = seed_thread(&tmp.path().join("scitadel.db"));
+
+        set_focused_thread(
+            &app.data,
+            &app.reader,
+            &mut app.last_focused_root_id,
+            Some(root_id.clone()),
+        );
+        // Calling again with the same root must NOT mark the focused
+        // thread seen on every call (would defeat focus-leave
+        // semantics) — it's a no-op.
+        set_focused_thread(
+            &app.data,
+            &app.reader,
+            &mut app.last_focused_root_id,
+            Some(root_id.clone()),
+        );
+        assert_eq!(app.data.load_unread_count("lars").unwrap(), 2);
+        assert_eq!(app.last_focused_root_id, Some(root_id));
+    }
+
+    /// Annotation-focus by reply index resolves to the reply's root,
+    /// so leaving the focus marks the whole thread seen.
+    #[tokio::test(flavor = "current_thread")]
+    async fn annotation_focus_on_reply_marks_root_thread_on_leave() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        let (root_id, _reply_id) = seed_thread(&tmp.path().join("scitadel.db"));
+        // Annotations are ordered by created_at ASC: [root, reply].
+        // Index 1 is the reply; its parent_id points at root.
+        focus_thread_by_annotation_idx(
+            &app.data,
+            &app.reader,
+            &mut app.last_focused_root_id,
+            "p-attn",
+            Some(1),
+        );
+        assert_eq!(app.last_focused_root_id, Some(root_id.clone()));
+
+        // Now leave focus. Both root and reply should clear.
+        focus_thread_by_annotation_idx(
+            &app.data,
+            &app.reader,
+            &mut app.last_focused_root_id,
+            "p-attn",
+            None,
+        );
+        assert_eq!(app.data.load_unread_count("lars").unwrap(), 0);
+    }
+
+    /// `U` opens the inbox overlay; pressing `U` again closes it.
+    /// Cursor lands on the first selectable row when there are unread
+    /// items.
+    #[tokio::test(flavor = "current_thread")]
+    async fn u_toggles_inbox_overlay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        let _ = seed_thread(&tmp.path().join("scitadel.db"));
+
+        // Open.
+        app.handle_key(KeyCode::Char('U'), KeyModifiers::NONE);
+        match &app.overlay {
+            Some(Overlay::Inbox { items, selected }) => {
+                assert!(items.iter().any(|i| i.is_selectable()));
+                assert!(items.get(*selected).is_some_and(|i| i.is_selectable()));
+            }
+            other => panic!("expected Inbox overlay, got {other:?}"),
+        }
+        // Close via U again.
+        app.handle_key(KeyCode::Char('U'), KeyModifiers::NONE);
+        assert!(app.overlay.is_none(), "U should toggle the inbox closed");
+    }
+
+    /// Enter on a selectable inbox row replaces the overlay with a
+    /// PaperDetail in two-pane reader mode focused on the chosen
+    /// thread.
+    #[tokio::test(flavor = "current_thread")]
+    async fn inbox_enter_jumps_to_paper_reader_focused_on_thread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        let (root_id, _) = seed_thread(&tmp.path().join("scitadel.db"));
+
+        app.handle_key(KeyCode::Char('U'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        match &app.overlay {
+            Some(Overlay::PaperDetail {
+                paper_id,
+                reader,
+                highlight_focus,
+                ..
+            }) => {
+                assert_eq!(paper_id, "p-attn");
+                assert!(*reader, "reader mode should be on after inbox jump");
+                assert_eq!(*highlight_focus, Some(0));
+            }
+            other => panic!("expected PaperDetail reader after Enter, got {other:?}"),
+        }
+        // The focus tracker should be set to the chosen root, so a
+        // subsequent leave-event will mark it seen.
+        assert_eq!(app.last_focused_root_id, Some(root_id));
+    }
+
+    /// Closing the PaperDetail overlay marks the focused thread seen,
+    /// driven through the real `handle_key` dispatch.
+    #[tokio::test(flavor = "current_thread")]
+    async fn closing_paper_detail_overlay_marks_focused_thread_seen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        let (_root_id, _) = seed_thread(&tmp.path().join("scitadel.db"));
+
+        // Open the PaperDetail overlay scrolled, then enter
+        // annotation-focus mode (`J`) to land focus on the root.
+        app.overlay = Some(Overlay::PaperDetail {
+            paper_id: "p-attn".into(),
+            scroll: 0,
+            annotation_focus: None,
+            prompt: None,
+            reader: false,
+            highlight_focus: None,
+        });
+        app.handle_key(KeyCode::Char('J'), KeyModifiers::NONE);
+        assert!(app.last_focused_root_id.is_some(), "J should focus root");
+
+        // Close the overlay. Esc out of annotation-focus first, then
+        // Esc closes the overlay.
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.overlay.is_none());
+        assert_eq!(
+            app.data.load_unread_count("lars").unwrap(),
+            0,
+            "overlay close must mark whatever thread was last focused as seen",
+        );
     }
 }
