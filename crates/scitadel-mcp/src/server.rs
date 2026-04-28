@@ -344,6 +344,23 @@ pub struct BibSnapshotRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct BibDiffRequest {
+    /// First bibliography file (BibTeX or CSL-JSON; auto-detected).
+    pub file_a: String,
+    /// Second bibliography file. Mutually exclusive with `question_id`.
+    #[serde(default)]
+    pub file_b: Option<String>,
+    /// Compare `file_a` against a fresh snapshot of this question's
+    /// shortlist. Mutually exclusive with `file_b`.
+    #[serde(default)]
+    pub question_id: Option<String>,
+    /// Reader scope when comparing against `question_id` (mirrors
+    /// annotation/star scoping). Required when `question_id` is set.
+    #[serde(default)]
+    pub reader: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct BibVerifyRequest {
     /// Path to the committed export to verify
     pub file: String,
@@ -813,6 +830,18 @@ impl ScitadelServer {
     )]
     fn bib_verify(&self, Parameters(req): Parameters<BibVerifyRequest>) -> Result<String, String> {
         tools::bib_verify_tool(&req.file, req.question_id.as_deref())
+    }
+
+    #[tool(
+        description = "Structural diff between two bibliographies — added/removed/changed entries with per-field changes — instead of the line-level diff `bib verify` prints. Auto-detects BibTeX vs CSL-JSON by content sniff (extension is cosmetic). Identity rule: citekey → DOI → arxiv_id → title+year (first match wins). Pass `file_b` for file-vs-file or `question_id` for file-vs-fresh-snapshot. Returns: JSON `{added: [...], removed: [...], changed: [{citekey, before_citekey?, field_changes: [...]}]}` — empty arrays mean no drift."
+    )]
+    fn bib_diff(&self, Parameters(req): Parameters<BibDiffRequest>) -> Result<String, String> {
+        tools::bib_diff_tool(
+            &req.file_a,
+            req.file_b.as_deref(),
+            req.question_id.as_deref(),
+            req.reader.as_deref(),
+        )
     }
 }
 

@@ -1958,6 +1958,50 @@ pub fn bib_verify_tool(file: &str, question_override: Option<&str>) -> Result<St
     .to_string())
 }
 
+/// Structural diff between two bibliography files (or one file +
+/// fresh DB snapshot of a question). Mirrors the CLI's `bib diff`.
+/// Returns: JSON `{added, removed, changed}` (empty arrays if zero
+/// drift). Exit-code semantics live in the CLI; the MCP tool returns
+/// the structure unconditionally so the caller can branch on it.
+pub fn bib_diff_tool(
+    file_a: &str,
+    file_b: Option<&str>,
+    question_id: Option<&str>,
+    reader: Option<&str>,
+) -> Result<String, String> {
+    let path_a = std::path::Path::new(file_a);
+    let (entries_a, fmt_a) = scitadel_export::load_entries_from_path(path_a)?;
+    let entries_b = match (file_b, question_id) {
+        (Some(_), Some(_)) => return Err("pass file_b OR question_id, not both".into()),
+        (None, None) => return Err("pass file_b or question_id".into()),
+        (Some(b), None) => {
+            let (e, _) = scitadel_export::load_entries_from_path(std::path::Path::new(b))?;
+            e
+        }
+        (None, Some(qid)) => {
+            let reader = reader
+                .map(str::to_string)
+                .ok_or_else(|| "reader is required when using question_id".to_string())?;
+            let db = open_db()?;
+            let shortlist_repo = scitadel_db::sqlite::SqliteShortlistRepository::new(db.clone());
+            let question = resolve_question_id(&db, qid)?;
+            let paper_ids = shortlist_repo
+                .list(question.id.as_str(), &reader)
+                .map_err(|e| e.to_string())?;
+            // Match the file's flavor so the comparison is apples-to-apples.
+            let (_papers, content) = match fmt_a {
+                scitadel_export::BibFormat::CslJson => render_shortlist_csl_json(&db, &paper_ids)?,
+                scitadel_export::BibFormat::Bibtex => render_shortlist_bibtex(&db, &paper_ids)?,
+            };
+            let (e, _) = scitadel_export::load_entries_from_str(&content)?;
+            e
+        }
+    };
+
+    let diff = scitadel_export::diff_entries(&entries_a, &entries_b);
+    serde_json::to_string(&diff).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
