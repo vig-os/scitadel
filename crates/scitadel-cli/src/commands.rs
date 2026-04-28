@@ -411,8 +411,11 @@ pub fn show(id: &str) -> Result<()> {
 }
 
 pub fn export(search_id: &str, format: &str, output: Option<PathBuf>) -> Result<()> {
+    use scitadel_db::sqlite::SqlitePaperTagRepository;
+
     let db = open_db()?;
     let (paper_repo, search_repo, _, _, _) = db.repositories();
+    let tag_repo = SqlitePaperTagRepository::new(db);
 
     let search = if let Some(s) = search_repo.get(search_id)? {
         s
@@ -432,7 +435,9 @@ pub fn export(search_id: &str, format: &str, output: Option<PathBuf>) -> Result<
     let content = match format {
         "json" => scitadel_export::export_json(&papers, 2),
         "csv" => scitadel_export::export_csv(&papers),
-        "bibtex" => scitadel_export::export_bibtex(&papers),
+        "bibtex" => scitadel_export::export_bibtex_with_tags(&papers, |id| {
+            tag_repo.tags_for(id).unwrap_or_default()
+        }),
         _ => bail!("unknown format: {format}"),
     };
 
@@ -742,6 +747,7 @@ pub fn bib_import(
 
     use scitadel_db::sqlite::{
         SqliteAnnotationRepository, SqlitePaperAliasRepository, SqlitePaperRepository,
+        SqlitePaperTagRepository,
     };
     use scitadel_export::import::{MergeAction, MergeStrategy};
     use scitadel_mcp::bib_import::{ImportOptions, import_bibtex_file};
@@ -757,7 +763,8 @@ pub fn bib_import(
     let db = open_db()?;
     let papers = SqlitePaperRepository::new(db.clone());
     let aliases = SqlitePaperAliasRepository::new(db.clone());
-    let annotations = SqliteAnnotationRepository::new(db);
+    let annotations = SqliteAnnotationRepository::new(db.clone());
+    let tags = SqlitePaperTagRepository::new(db);
 
     let options = ImportOptions {
         strategy,
@@ -770,7 +777,7 @@ pub fn bib_import(
         // rows. The trait is now in place for follow-ups.
         prompt_resolver: None,
     };
-    let report = import_bibtex_file(path, &options, &papers, &aliases, &annotations)
+    let report = import_bibtex_file(path, &options, &papers, &aliases, &annotations, &tags)
         .with_context(|| format!("import {}", path.display()))?;
 
     for row in &report.rows {
@@ -794,10 +801,13 @@ pub fn bib_import(
         if row.annotation_created {
             line.push_str(" + annotation");
         }
+        if !row.paper_tags_written.is_empty() {
+            let _ = write!(line, " + {} tag(s)", row.paper_tags_written.len());
+        }
         println!("{line}");
         if verbose {
-            if !row.dropped_keywords.is_empty() {
-                println!("    dropped keywords: {}", row.dropped_keywords.join(", "));
+            if !row.paper_tags_written.is_empty() {
+                println!("    paper tags: {}", row.paper_tags_written.join(", "));
             }
             if let Some(f) = &row.dropped_file {
                 println!("    dropped file: {f}");

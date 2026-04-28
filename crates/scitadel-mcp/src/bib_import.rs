@@ -16,6 +16,8 @@
 //!    the next import's match cascade.
 //! 2. Record the imported citekey on `paper_aliases`.
 //! 3. Save the unanchored annotation built from `note=` (if any).
+//! 4. Record paper-level tags from `keywords=` when there's no
+//!    `note=` to anchor them on (#162).
 //!
 //! All three writes are wrapped in a single per-row SQLite transaction
 //! (#157) so a mid-row failure can never strand an orphaned `papers`
@@ -35,7 +37,7 @@ use scitadel_core::ports::PaperRepository;
 use scitadel_db::error::DbError;
 use scitadel_db::sqlite::{
     SqliteAnnotationRepository, SqlitePaperAliasRepository, SqlitePaperRepository,
-    SqliteTransaction,
+    SqlitePaperTagRepository, SqliteTransaction,
 };
 use scitadel_export::import::{
     BibEntry, MatchOutcome, MergeAction, MergeStrategy, PaperLookup, SideEffects,
@@ -51,7 +53,10 @@ pub struct ImportRow {
     pub from_bib: Vec<&'static str>,
     pub kept_from_db: Vec<&'static str>,
     pub annotation_created: bool,
-    pub dropped_keywords: Vec<String>,
+    /// Paper-tag values written for this row (#162). Empty when
+    /// keywords rode along on an annotation, when there were none,
+    /// or when the action was `Rejected`.
+    pub paper_tags_written: Vec<String>,
     pub dropped_file: Option<String>,
 }
 
@@ -185,17 +190,21 @@ pub fn import_bibtex_str(
     papers: &SqlitePaperRepository,
     aliases: &SqlitePaperAliasRepository,
     annotations: &SqliteAnnotationRepository,
+    tags: &SqlitePaperTagRepository,
 ) -> Result<ImportReport, CoreError> {
     let entries =
         parse_bibtex(src).map_err(|e| CoreError::Adapter("bib-import".into(), e.to_string()))?;
     let lookup = SqliteBibLookup { papers, aliases };
     let mut report = ImportReport::default();
 
-    // `annotations` is unused below — the per-row tx grabs a connection
-    // from `papers.db()` and calls `SqliteAnnotationRepository::create_in_tx`
-    // statically. Kept on the outer signature so callers (CLI, MCP) don't
-    // need to change construction order (#157).
+    // `annotations` and `tags` are unused below — the per-row tx grabs
+    // a connection from `papers.db()` and calls
+    // `SqliteAnnotationRepository::create_in_tx` /
+    // `SqlitePaperTagRepository::record_in_tx` statically. Kept on the
+    // outer signature so callers (CLI, MCP) don't need to change
+    // construction order (#157, #162).
     let _ = annotations;
+    let _ = tags;
 
     for entry in entries {
         match import_one(&entry, options, &lookup, papers) {
@@ -217,9 +226,10 @@ pub fn import_bibtex_file(
     papers: &SqlitePaperRepository,
     aliases: &SqlitePaperAliasRepository,
     annotations: &SqliteAnnotationRepository,
+    tags: &SqlitePaperTagRepository,
 ) -> Result<ImportReport, CoreError> {
     let src = std::fs::read_to_string(path)?;
-    import_bibtex_str(&src, options, papers, aliases, annotations)
+    import_bibtex_str(&src, options, papers, aliases, annotations, tags)
 }
 
 /// Assign and persist a stable `bibtex_key` for a newly-saved paper
@@ -340,11 +350,13 @@ fn import_one(
         },
     };
 
-    let (annotation_created, dropped_keywords, dropped_file) = if let Some(pid) = &persisted_id {
+    // 4. Side effects (alias / annotation / paper-tags / verbose-log
+    //    items) — only when we have a paper to attach them to.
+    let (annotation_created, paper_tags_written, dropped_file) = if let Some(pid) = &persisted_id {
         let SideEffects {
             alias,
             annotation,
-            dropped_keywords,
+            paper_tags,
             dropped_file,
         } = compute_side_effects(pid, &options.reader, entry, merge.action);
         if let Some(a) = alias {
@@ -357,7 +369,13 @@ fn import_one(
         } else {
             false
         };
-        (created, dropped_keywords, dropped_file)
+        let mut written = Vec::with_capacity(paper_tags.len());
+        for t in &paper_tags {
+            SqlitePaperTagRepository::record_in_tx(&tx, &t.paper_id, &t.tag, t.source)
+                .map_err(CoreError::from)?;
+            written.push(t.tag.clone());
+        }
+        (created, written, dropped_file)
     } else {
         (false, vec![], None)
     };
@@ -373,7 +391,7 @@ fn import_one(
         from_bib: merge.from_bib,
         kept_from_db: merge.kept_from_db,
         annotation_created,
-        dropped_keywords,
+        paper_tags_written,
         dropped_file,
     })
 }
@@ -388,13 +406,15 @@ mod tests {
         SqlitePaperRepository,
         SqlitePaperAliasRepository,
         SqliteAnnotationRepository,
+        SqlitePaperTagRepository,
     ) {
         let db = Database::open_in_memory().unwrap();
         db.migrate().unwrap();
         (
             SqlitePaperRepository::new(db.clone()),
             SqlitePaperAliasRepository::new(db.clone()),
-            SqliteAnnotationRepository::new(db),
+            SqliteAnnotationRepository::new(db.clone()),
+            SqlitePaperTagRepository::new(db),
         )
     }
 
@@ -415,15 +435,22 @@ mod tests {
     /// for every Created paper.
     #[test]
     fn imported_new_paper_gets_persisted_bibtex_key() {
-        let (papers, aliases, annotations) = fresh();
+        let (papers, aliases, annotations, tags) = fresh();
         let src = r"
 @article{ignored2025x,
     title = {Bibtex Key Persistence Test},
     author = {Smith, John},
     year = {2025}
 }";
-        let report =
-            import_bibtex_str(src, &opts_merge("lars"), &papers, &aliases, &annotations).unwrap();
+        let report = import_bibtex_str(
+            src,
+            &opts_merge("lars"),
+            &papers,
+            &aliases,
+            &annotations,
+            &tags,
+        )
+        .unwrap();
         let pid = report.rows[0].paper_id.as_deref().unwrap();
         let p = papers.get(pid).unwrap().unwrap();
         assert!(
@@ -438,7 +465,7 @@ mod tests {
     /// title-year hit) must still resolve to the existing paper.
     #[test]
     fn round_trip_resolves_via_bibtex_key_step_when_other_ids_absent() {
-        let (papers, aliases, annotations) = fresh();
+        let (papers, aliases, annotations, tags) = fresh();
         // Seed a paper with a known bibtex_key and no external ids.
         let mut p = Paper::new("Cascade Anchor");
         p.authors = vec!["Anchor, A".into()];
@@ -459,8 +486,15 @@ mod tests {
     title = {Different Title For Cascade Probe},
     year = {1900}
 }";
-        let report =
-            import_bibtex_str(src, &opts_merge("lars"), &papers, &aliases, &annotations).unwrap();
+        let report = import_bibtex_str(
+            src,
+            &opts_merge("lars"),
+            &papers,
+            &aliases,
+            &annotations,
+            &tags,
+        )
+        .unwrap();
         let row = &report.rows[0];
         assert_eq!(
             row.action,
@@ -472,7 +506,7 @@ mod tests {
 
     #[test]
     fn unmatched_entry_creates_new_paper_with_alias() {
-        let (papers, aliases, annotations) = fresh();
+        let (papers, aliases, annotations, tags) = fresh();
         let src = r"
 @article{novel2025widget,
     title = {A Novel Widget},
@@ -480,8 +514,15 @@ mod tests {
     year = {2025},
     doi = {10.1/widget}
 }";
-        let report =
-            import_bibtex_str(src, &opts_merge("lars"), &papers, &aliases, &annotations).unwrap();
+        let report = import_bibtex_str(
+            src,
+            &opts_merge("lars"),
+            &papers,
+            &aliases,
+            &annotations,
+            &tags,
+        )
+        .unwrap();
         assert_eq!(report.rows.len(), 1);
         let row = &report.rows[0];
         assert_eq!(row.action, MergeAction::Created);
@@ -493,7 +534,7 @@ mod tests {
 
     #[test]
     fn doi_matched_entry_under_merge_leaves_db_paper_unchanged() {
-        let (papers, aliases, annotations) = fresh();
+        let (papers, aliases, annotations, tags) = fresh();
         let mut existing = Paper::new("Existing Title");
         existing.doi = Some("10.1/x".into());
         existing.year = Some(2020);
@@ -507,8 +548,15 @@ mod tests {
     year = {2024},
     doi = {10.1/X}
 }";
-        let report =
-            import_bibtex_str(src, &opts_merge("lars"), &papers, &aliases, &annotations).unwrap();
+        let report = import_bibtex_str(
+            src,
+            &opts_merge("lars"),
+            &papers,
+            &aliases,
+            &annotations,
+            &tags,
+        )
+        .unwrap();
         let row = &report.rows[0];
         assert_eq!(row.action, MergeAction::Unchanged);
 
@@ -522,7 +570,7 @@ mod tests {
 
     #[test]
     fn note_field_creates_annotation_under_reader_identity() {
-        let (papers, aliases, annotations) = fresh();
+        let (papers, aliases, annotations, tags) = fresh();
         let src = r"
 @article{withNote,
     title = {Some Paper},
@@ -530,8 +578,15 @@ mod tests {
     year = {2024},
     note = {Skim showed weak methods}
 }";
-        let report =
-            import_bibtex_str(src, &opts_merge("lars"), &papers, &aliases, &annotations).unwrap();
+        let report = import_bibtex_str(
+            src,
+            &opts_merge("lars"),
+            &papers,
+            &aliases,
+            &annotations,
+            &tags,
+        )
+        .unwrap();
         let row = &report.rows[0];
         assert!(row.annotation_created);
 
@@ -553,7 +608,7 @@ mod tests {
     fn round_trip_export_then_import_touches_zero_rows() {
         use scitadel_export::export_bibtex;
 
-        let (papers, aliases, annotations) = fresh();
+        let (papers, aliases, annotations, tags) = fresh();
         let mut p1 = Paper::new("Quantum Advantage");
         p1.authors = vec!["Smith, John".into()];
         p1.year = Some(2024);
@@ -584,9 +639,15 @@ mod tests {
         // aliases for the seeded papers' citekeys. Result must report
         // every row as Unchanged (the cascade resolves via DOI / arxiv
         // / title-year and the merge strategy is db-wins under Merge).
-        let report1 =
-            import_bibtex_str(&bib_a, &opts_merge("lars"), &papers, &aliases, &annotations)
-                .unwrap();
+        let report1 = import_bibtex_str(
+            &bib_a,
+            &opts_merge("lars"),
+            &papers,
+            &aliases,
+            &annotations,
+            &tags,
+        )
+        .unwrap();
         assert!(report1.failed.is_empty());
         for row in &report1.rows {
             assert_eq!(row.action, MergeAction::Unchanged);
@@ -611,9 +672,15 @@ mod tests {
         // Second import: the actual round-trip test. Must touch zero
         // rows in any table (paper_aliases is the canary against
         // accidental duplicate-row inflation).
-        let report2 =
-            import_bibtex_str(&bib_a, &opts_merge("lars"), &papers, &aliases, &annotations)
-                .unwrap();
+        let report2 = import_bibtex_str(
+            &bib_a,
+            &opts_merge("lars"),
+            &papers,
+            &aliases,
+            &annotations,
+            &tags,
+        )
+        .unwrap();
         assert!(report2.failed.is_empty());
         assert_eq!(report2.rows.len(), 3);
         for row in &report2.rows {
@@ -658,7 +725,7 @@ mod tests {
     /// `report.failed` with all candidate paper IDs.
     #[test]
     fn ambiguous_alias_is_a_per_row_failure_not_a_silent_create() {
-        let (papers, aliases, annotations) = fresh();
+        let (papers, aliases, annotations, tags) = fresh();
 
         // Two papers that legitimately share a citekey "smith2024"
         // (e.g. two distinct .bib files were both imported earlier
@@ -687,8 +754,15 @@ mod tests {
     title = {Some Other Title Entirely},
     year = {1999}
 }";
-        let report =
-            import_bibtex_str(src, &opts_merge("lars"), &papers, &aliases, &annotations).unwrap();
+        let report = import_bibtex_str(
+            src,
+            &opts_merge("lars"),
+            &papers,
+            &aliases,
+            &annotations,
+            &tags,
+        )
+        .unwrap();
 
         assert!(
             report.rows.is_empty(),
@@ -722,7 +796,7 @@ mod tests {
     /// zero after rollback.
     #[test]
     fn per_row_tx_rolls_back_when_alias_record_fails() {
-        let (papers, aliases, _annotations) = fresh();
+        let (papers, aliases, _annotations, _tags) = fresh();
         let mut p = Paper::new("Will Be Rolled Back");
         p.year = Some(2026);
 
@@ -794,7 +868,7 @@ mod tests {
             }
         }
 
-        let (papers, aliases, annotations) = fresh();
+        let (papers, aliases, annotations, tags) = fresh();
         let mut p1 = Paper::new("First Paper");
         p1.year = Some(2024);
         let mut p2 = Paper::new("Second Paper");
@@ -823,7 +897,8 @@ mod tests {
     title = {Some Other Title Entirely},
     year = {1999}
 }";
-        let report = import_bibtex_str(src, &options, &papers, &aliases, &annotations).unwrap();
+        let report =
+            import_bibtex_str(src, &options, &papers, &aliases, &annotations, &tags).unwrap();
 
         assert!(
             report.failed.is_empty(),
@@ -843,7 +918,7 @@ mod tests {
     /// flipping the strategy.
     #[test]
     fn interactive_strategy_without_resolver_falls_back_to_validation_failure() {
-        let (papers, aliases, annotations) = fresh();
+        let (papers, aliases, annotations, tags) = fresh();
         let mut p1 = Paper::new("First Paper");
         p1.year = Some(2024);
         let mut p2 = Paper::new("Second Paper");
@@ -869,7 +944,8 @@ mod tests {
     title = {Some Other Title Entirely},
     year = {1999}
 }";
-        let report = import_bibtex_str(src, &options, &papers, &aliases, &annotations).unwrap();
+        let report =
+            import_bibtex_str(src, &options, &papers, &aliases, &annotations, &tags).unwrap();
         assert!(report.rows.is_empty());
         assert_eq!(report.failed.len(), 1);
         assert!(report.failed[0].1.contains("ambiguous alias"));
@@ -877,7 +953,7 @@ mod tests {
 
     #[test]
     fn lenient_run_continues_past_a_malformed_row() {
-        let (papers, aliases, annotations) = fresh();
+        let (papers, aliases, annotations, tags) = fresh();
         // Second entry lacks closing brace — biblatex parse fails on
         // the whole document. We simulate per-row failure differently:
         // give the second entry a known shape but ensure import
@@ -891,9 +967,195 @@ mod tests {
 @article{b, title = {B}, year = {2002}}
 @article{c, title = {C}, year = {2003}}
 ";
-        let report =
-            import_bibtex_str(src, &opts_merge("lars"), &papers, &aliases, &annotations).unwrap();
+        let report = import_bibtex_str(
+            src,
+            &opts_merge("lars"),
+            &papers,
+            &aliases,
+            &annotations,
+            &tags,
+        )
+        .unwrap();
         assert_eq!(report.rows.len(), 3);
         assert!(report.failed.is_empty());
+    }
+
+    /// #162 acceptance #1: a Zotero `.bib` entry with `keywords=` but
+    /// no `note=` must land its keywords as `paper_tags` rows rather
+    /// than dropping them on the floor.
+    #[test]
+    fn keyword_only_zotero_entry_writes_paper_tags() {
+        let (papers, aliases, annotations, tags) = fresh();
+        let src = r"
+@article{tagged2025widget,
+    title = {Tagged But Unannotated},
+    author = {Smith, John},
+    year = {2025},
+    keywords = {machine-learning, robotics, to-read}
+}";
+        let report = import_bibtex_str(
+            src,
+            &opts_merge("lars"),
+            &papers,
+            &aliases,
+            &annotations,
+            &tags,
+        )
+        .unwrap();
+        assert_eq!(report.rows.len(), 1);
+        let row = &report.rows[0];
+        assert_eq!(row.action, MergeAction::Created);
+        assert!(
+            !row.annotation_created,
+            "no note → no annotation; keywords belong on paper_tags"
+        );
+        assert_eq!(
+            row.paper_tags_written,
+            vec![
+                "machine-learning".to_string(),
+                "robotics".to_string(),
+                "to-read".to_string(),
+            ],
+        );
+
+        // Read-back through the repo confirms persistence.
+        let pid = row.paper_id.as_deref().unwrap();
+        let stored = tags.tags_for(pid).unwrap();
+        assert_eq!(stored.len(), 3);
+        assert!(stored.contains(&"machine-learning".to_string()));
+        assert!(stored.contains(&"robotics".to_string()));
+        assert!(stored.contains(&"to-read".to_string()));
+    }
+
+    /// #162: keywords-with-note path is unchanged — annotation gets
+    /// the tags, paper_tags table stays empty for that row.
+    #[test]
+    fn keywords_with_note_still_ride_on_annotation_not_paper_tags() {
+        let (papers, aliases, annotations, tags) = fresh();
+        let src = r"
+@article{withBoth,
+    title = {Annotated And Tagged},
+    year = {2025},
+    note = {Re-read carefully},
+    keywords = {physics, follow-up}
+}";
+        let report = import_bibtex_str(
+            src,
+            &opts_merge("lars"),
+            &papers,
+            &aliases,
+            &annotations,
+            &tags,
+        )
+        .unwrap();
+        let row = &report.rows[0];
+        assert!(row.annotation_created);
+        assert!(
+            row.paper_tags_written.is_empty(),
+            "keywords ride on the annotation, not paper_tags"
+        );
+        let pid = row.paper_id.as_deref().unwrap();
+        assert!(tags.tags_for(pid).unwrap().is_empty());
+        let listed = annotations.list_by_paper(pid).unwrap();
+        assert_eq!(listed[0].tags, vec!["physics", "follow-up"]);
+    }
+
+    /// #162 acceptance #2: round-trip of a keyword-only entry must
+    /// re-emit the same `keywords=` field and a second import of the
+    /// already-normalized export must touch zero rows (idempotence on
+    /// `paper_tags`). Mirrors the existing
+    /// `round_trip_export_then_import_touches_zero_rows` test: the
+    /// FIRST import of `bib_a` is a legitimate normalization pass
+    /// (export rewrites the citekey to the stable bibtex_key, adding
+    /// one alias); the SECOND import is the actual no-op assertion.
+    #[test]
+    fn keyword_only_round_trip_is_byte_stable_and_idempotent() {
+        use scitadel_export::export_bibtex_with_tags;
+
+        let (papers, aliases, annotations, tags) = fresh();
+        let src = r"
+@article{tagged2025widget,
+    title = {Round Trip Tags},
+    author = {Smith, John},
+    year = {2025},
+    keywords = {alpha, beta, gamma}
+}";
+        let report0 = import_bibtex_str(
+            src,
+            &opts_merge("lars"),
+            &papers,
+            &aliases,
+            &annotations,
+            &tags,
+        )
+        .unwrap();
+        let pid = report0.rows[0].paper_id.as_deref().unwrap().to_string();
+
+        // Export with the tags lookup — keywords must round-trip.
+        let saved = vec![papers.get(&pid).unwrap().unwrap()];
+        let bib_a = export_bibtex_with_tags(&saved, |id| tags.tags_for(id).unwrap_or_default());
+        assert!(
+            bib_a.contains("keywords = {alpha, beta, gamma}"),
+            "exported bib must round-trip keywords; got:\n{bib_a}"
+        );
+
+        // First import of the exported bib: legitimate normalization
+        // — adds one alias for the rewritten (stable) citekey.
+        let report1 = import_bibtex_str(
+            &bib_a,
+            &opts_merge("lars"),
+            &papers,
+            &aliases,
+            &annotations,
+            &tags,
+        )
+        .unwrap();
+        assert!(report1.failed.is_empty());
+        for row in &report1.rows {
+            assert_eq!(row.action, MergeAction::Unchanged);
+        }
+
+        // Snapshot row counts after the first re-import: this is the
+        // "zero diff" baseline.
+        let papers_baseline = papers.list_all(100, 0).unwrap().len();
+        let tags_baseline = tags.tags_for(&pid).unwrap().len();
+        let aliases_baseline = aliases.list_for(&pid).unwrap().len();
+
+        // Second re-import: must touch zero rows in any table.
+        let report2 = import_bibtex_str(
+            &bib_a,
+            &opts_merge("lars"),
+            &papers,
+            &aliases,
+            &annotations,
+            &tags,
+        )
+        .unwrap();
+        assert!(report2.failed.is_empty());
+        for row in &report2.rows {
+            assert_eq!(
+                row.action,
+                MergeAction::Unchanged,
+                "round-trip row {} must be Unchanged on second import",
+                row.citekey,
+            );
+        }
+        assert_eq!(papers.list_all(100, 0).unwrap().len(), papers_baseline);
+        assert_eq!(
+            tags.tags_for(&pid).unwrap().len(),
+            tags_baseline,
+            "no duplicate paper_tags",
+        );
+        assert_eq!(
+            aliases.list_for(&pid).unwrap().len(),
+            aliases_baseline,
+            "no duplicate aliases",
+        );
+
+        // Re-export must be byte-identical (paper_tags ordering is
+        // stable, deterministic by the repo contract).
+        let saved2 = vec![papers.get(&pid).unwrap().unwrap()];
+        let bib_b = export_bibtex_with_tags(&saved2, |id| tags.tags_for(id).unwrap_or_default());
+        assert_eq!(bib_a, bib_b, "round-trip must be byte-identical");
     }
 }

@@ -1,14 +1,15 @@
 //! Zotero compat — non-row work that follows a successful import
-//! resolution (#134 step 4):
+//! resolution (#134 step 4 + #162):
 //!
 //! - `note={...}` → an unanchored [`Annotation`] (paper-level), with
 //!   the bib's `keywords={a,b,c}` carried as the annotation's tags.
 //!   Author is the import-time `reader`, matching the convention used
 //!   for TUI / MCP annotation writes.
-//! - `keywords=` *without* a `note=` are surfaced for `--verbose`
-//!   logging — paper-level tags don't exist as first-class data yet
-//!   (a tracked gap; a follow-up issue would add a `paper_tags`
-//!   table). Dropping silently would lose user data without warning.
+//! - `keywords=` *without* a `note=` → paper-level tag rows on
+//!   `paper_tags` (#162). Earlier behavior surfaced these as
+//!   `dropped_keywords` under `--verbose` because paper-tags didn't
+//!   exist as first-class data — they do now, so the data is no
+//!   longer dropped on the floor.
 //! - `file={...}` is always surfaced for `--verbose` logging — the
 //!   issue spec deliberately drops these, since paths in someone
 //!   else's Zotero export are meaningless on the importer's machine.
@@ -29,10 +30,23 @@ use super::parse::BibEntry;
 /// `scitadel-db` dependency.
 pub const ALIAS_SOURCE: &str = "bibtex-import";
 
+/// `source` value recorded on `paper_tags` rows that originate here —
+/// mirrors `scitadel_db::sqlite::TAG_SOURCE_BIBTEX_IMPORT` for the
+/// same dep-cycle reason as [`ALIAS_SOURCE`]. Same string value: the
+/// audit columns are deliberately uniform across the two tables.
+pub const TAG_SOURCE: &str = "bibtex-import";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AliasRecord {
     pub paper_id: String,
     pub alias: String,
+    pub source: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagRecord {
+    pub paper_id: String,
+    pub tag: String,
     pub source: &'static str,
 }
 
@@ -44,10 +58,11 @@ pub struct SideEffects {
     /// `note=` carrying user's reading context. Built unanchored
     /// (paper-level), with `bib.keywords` attached as tags.
     pub annotation: Option<Annotation>,
-    /// `keywords=` we couldn't attach to anything because there was
-    /// no `note=` to anchor them on. Surface in `--verbose` so the
-    /// user knows their tags didn't make it.
-    pub dropped_keywords: Vec<String>,
+    /// `keywords=` from a note-less entry — written to `paper_tags`
+    /// rather than dropped (#162). Empty when keywords rode along on
+    /// an annotation, when there were none, or when the action was
+    /// `Rejected`.
+    pub paper_tags: Vec<TagRecord>,
     /// `file=` paths — never imported (paths from a foreign machine
     /// are meaningless), but surfaced in `--verbose`.
     pub dropped_file: Option<String>,
@@ -60,7 +75,7 @@ impl SideEffects {
         Self {
             alias: None,
             annotation: None,
-            dropped_keywords: vec![],
+            paper_tags: vec![],
             dropped_file: None,
         }
     }
@@ -70,7 +85,7 @@ impl SideEffects {
     pub fn is_empty(&self) -> bool {
         self.alias.is_none()
             && self.annotation.is_none()
-            && self.dropped_keywords.is_empty()
+            && self.paper_tags.is_empty()
             && self.dropped_file.is_none()
     }
 }
@@ -89,7 +104,9 @@ pub fn compute(paper_id: &str, reader: &str, bib: &BibEntry, action: MergeAction
         source: ALIAS_SOURCE,
     });
 
-    let (annotation, dropped_keywords) = match bib.note.as_deref() {
+    // keywords-with-note → annotation tags (existing behavior).
+    // keywords-without-note → paper_tags rows (#162 — the fix).
+    let (annotation, paper_tags) = match bib.note.as_deref() {
         Some(note) if !note.is_empty() => {
             // Synthetic `sentence_id` so the resolver recognizes this
             // as an unanchored import on first open instead of flipping
@@ -109,13 +126,24 @@ pub fn compute(paper_id: &str, reader: &str, bib: &BibEntry, action: MergeAction
             a.tags.clone_from(&bib.keywords);
             (Some(a), vec![])
         }
-        _ => (None, bib.keywords.clone()),
+        _ => {
+            let tags = bib
+                .keywords
+                .iter()
+                .map(|k| TagRecord {
+                    paper_id: paper_id.to_string(),
+                    tag: k.clone(),
+                    source: TAG_SOURCE,
+                })
+                .collect();
+            (None, tags)
+        }
     };
 
     SideEffects {
         alias,
         annotation,
-        dropped_keywords,
+        paper_tags,
         dropped_file: bib.file.clone(),
     }
 }
@@ -224,16 +252,24 @@ mod tests {
         let se = compute("p1", "lars", &b, MergeAction::Updated);
         let a = se.annotation.unwrap();
         assert_eq!(a.tags, vec!["alpha", "beta"]);
-        assert!(se.dropped_keywords.is_empty());
+        assert!(
+            se.paper_tags.is_empty(),
+            "keywords riding on annotation must not also write paper-tag rows"
+        );
     }
 
     #[test]
-    fn keywords_without_note_are_dropped_for_verbose_log() {
+    fn keywords_without_note_become_paper_tags() {
         let mut b = bib("k");
         b.keywords = vec!["alpha".into(), "beta".into()];
         let se = compute("p1", "lars", &b, MergeAction::Updated);
         assert!(se.annotation.is_none());
-        assert_eq!(se.dropped_keywords, vec!["alpha", "beta"]);
+        let tags: Vec<&str> = se.paper_tags.iter().map(|t| t.tag.as_str()).collect();
+        assert_eq!(tags, vec!["alpha", "beta"]);
+        for t in &se.paper_tags {
+            assert_eq!(t.paper_id, "p1");
+            assert_eq!(t.source, TAG_SOURCE);
+        }
     }
 
     #[test]
@@ -246,7 +282,8 @@ mod tests {
             se.annotation.is_none(),
             "empty note string must not produce an empty-content annotation"
         );
-        assert_eq!(se.dropped_keywords, vec!["x"]);
+        let tags: Vec<&str> = se.paper_tags.iter().map(|t| t.tag.as_str()).collect();
+        assert_eq!(tags, vec!["x"]);
     }
 
     #[test]
@@ -262,7 +299,16 @@ mod tests {
         let se = compute("p1", "lars", &bib("k"), MergeAction::Updated);
         assert!(se.alias.is_some());
         assert!(se.annotation.is_none());
-        assert!(se.dropped_keywords.is_empty());
+        assert!(se.paper_tags.is_empty());
         assert!(se.dropped_file.is_none());
+    }
+
+    #[test]
+    fn rejected_action_skips_paper_tags_too() {
+        let mut b = bib("k");
+        b.keywords = vec!["should-not-land".into()];
+        let se = compute("p1", "lars", &b, MergeAction::Rejected);
+        assert!(se.is_empty());
+        assert!(se.paper_tags.is_empty());
     }
 }

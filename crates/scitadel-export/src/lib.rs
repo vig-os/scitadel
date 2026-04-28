@@ -3,7 +3,7 @@ pub mod csv_export;
 pub mod import;
 pub mod json_export;
 
-pub use bibtex::export_bibtex;
+pub use bibtex::{export_bibtex, export_bibtex_with_tags};
 pub use csv_export::export_csv;
 pub use import::{
     ALIAS_SOURCE, AliasRecord, BibEntry, MatchOutcome, MatchStrategy, MergeAction, MergeOutcome,

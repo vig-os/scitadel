@@ -31,8 +31,26 @@ pub const KEY_ALGO_HASH: &str = "1a7e0b9c2f8d6a4b3e5c9d8f7b6a5c4d3e2f1a0b9c8d7e6
 /// citation key (uses the paper's persisted `bibtex_key` when present,
 /// else regenerates it — but the caller is expected to have backfilled
 /// before calling this).
+///
+/// Emits no `keywords=` field. Use [`export_bibtex_with_tags`] when
+/// you have access to the `paper_tags` repo and want round-trip
+/// preservation of Zotero keyword-only entries (#162).
 #[must_use]
 pub fn export_bibtex(papers: &[Paper]) -> String {
+    export_bibtex_with_tags(papers, |_| Vec::new())
+}
+
+/// Same as [`export_bibtex`] but emits a `keywords = {a, b, c}` field
+/// per paper using `tags_for(paper_id)`. Tags are written in the
+/// order returned by the lookup; the export remains deterministic
+/// when the lookup is deterministic (the SQLite repo orders by
+/// `created_at ASC, tag ASC`). Empty tag lists emit no field, so the
+/// output is byte-identical to [`export_bibtex`] when no paper has
+/// tags — preserving the round-trip invariant for non-#162 callers.
+pub fn export_bibtex_with_tags<F>(papers: &[Paper], mut tags_for: F) -> String
+where
+    F: FnMut(&str) -> Vec<String>,
+{
     let mut owned: Vec<(String, &Paper)> = papers
         .iter()
         .map(|p| {
@@ -54,7 +72,8 @@ pub fn export_bibtex(papers: &[Paper]) -> String {
         if i > 0 {
             out.push('\n');
         }
-        out.push_str(&paper_to_entry(key, paper));
+        let tags = tags_for(paper.id.as_str());
+        out.push_str(&paper_to_entry(key, paper, &tags));
     }
     out
 }
@@ -87,7 +106,7 @@ pub fn backfill_keys<S: std::hash::BuildHasher>(
     out
 }
 
-fn paper_to_entry(key: &str, paper: &Paper) -> String {
+fn paper_to_entry(key: &str, paper: &Paper, tags: &[String]) -> String {
     let mut fields: Vec<String> = Vec::new();
     fields.push(fmt_field("title", &paper.title));
     if !paper.authors.is_empty() {
@@ -111,6 +130,13 @@ fn paper_to_entry(key: &str, paper: &Paper) -> String {
     }
     if !paper.r#abstract.is_empty() {
         fields.push(fmt_field("abstract", &paper.r#abstract));
+    }
+    if !tags.is_empty() {
+        // Comma-separated, preserving caller-supplied order.
+        // The SQLite repo (`SqlitePaperTagRepository::tags_for`)
+        // returns deterministic order, so the export stays
+        // byte-stable across runs.
+        fields.push(fmt_field("keywords", &tags.join(", ")));
     }
     format!("@article{{{key},\n{}\n}}\n", fields.join(",\n"))
 }
@@ -193,6 +219,26 @@ mod tests {
         assert!(out.starts_with("% scitadel"));
         assert!(out.contains("algo_hash="));
         assert!(!out.contains("generated at"));
+    }
+
+    #[test]
+    fn export_with_tags_emits_keywords_field() {
+        let mut p = paper("Test", &["Anon"], Some(2024));
+        p.bibtex_key = Some("anon2024test".into());
+        let out = export_bibtex_with_tags(&[p], |_| vec!["alpha".to_string(), "beta".to_string()]);
+        assert!(out.contains("keywords = {alpha, beta}"), "got: {out}");
+    }
+
+    #[test]
+    fn export_with_empty_tags_is_byte_identical_to_plain_export() {
+        let mut p = paper("Same", &["Anon"], Some(2024));
+        p.bibtex_key = Some("anon2024same".into());
+        let plain = export_bibtex(std::slice::from_ref(&p));
+        let with_empty = export_bibtex_with_tags(&[p], |_| Vec::new());
+        assert_eq!(
+            plain, with_empty,
+            "no-tags lookup must preserve the round-trip invariant"
+        );
     }
 
     #[test]
