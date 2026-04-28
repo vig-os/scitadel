@@ -288,11 +288,6 @@ impl DataStore {
         Ok(scitadel_db::sqlite::SqliteTuiStateRepository::new(self.db.clone()).set(state)?)
     }
 
-    /// Load the inputs needed by `scitadel_export::write_snapshot` for a
-    /// question + reader (#135 sub-feature B). Returns the shortlist's
-    /// paper IDs in DB order, the hydrated `Paper` rows, and a
-    /// `paper_id → tags` map. Mirrors `load_shortlist` in `scitadel-cli`
-    /// so the CLI and TUI surfaces produce byte-identical snapshots.
     /// Test-only: construct a `DataStore` around an in-memory DB so
     /// unread/mark-seen plumbing can be exercised without a temp dir.
     #[cfg(test)]
@@ -302,6 +297,11 @@ impl DataStore {
         Self { db }
     }
 
+    /// Load the inputs needed by `scitadel_export::write_snapshot` for a
+    /// question + reader (#135 sub-feature B). Returns the shortlist's
+    /// paper IDs in DB order, the hydrated `Paper` rows, and a
+    /// `paper_id → tags` map. Mirrors `load_shortlist` in `scitadel-cli`
+    /// so the CLI and TUI surfaces produce byte-identical snapshots.
     pub fn load_snapshot_inputs(
         &self,
         question_id: &str,

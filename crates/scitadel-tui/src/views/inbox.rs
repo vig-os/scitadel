@@ -424,6 +424,40 @@ mod tests {
     }
 
     #[test]
+    fn step_selection_with_zero_delta_snaps_off_header_to_first_row() {
+        // Mirrors the per-tick-rebuild clamp path in app::draw: when an
+        // item is removed mid-tick (e.g. the row the cursor was on
+        // gets marked seen by another reader), `selected.min(max)` may
+        // land the cursor on a header. `step_selection(items, sel, 0)`
+        // is the snap that pushes it forward to the next selectable
+        // row without moving the user any further than necessary.
+        let r1 = root_at("p-a", "ann-1", "x");
+        let r2 = root_at("p-b", "ann-2", "y");
+        let unread = vec![r1, r2];
+        let papers = [paper("p-a", "A"), paper("p-b", "B")].into_iter().collect();
+        let items = build_items(&unread, &papers);
+        // Layout: H, R, H, R. Cursor on idx 0 (header) → snap to 1.
+        assert_eq!(step_selection(&items, 0, 0), 1);
+        // Cursor on idx 2 (header) → snap forward in the same direction
+        // would land on 3, but step_selection's snap goes to the FIRST
+        // selectable, which is 1. That's an acceptable behaviour: a
+        // cursor that ended up on a header gets normalised to a known
+        // good position rather than jumping unpredictably.
+        assert_eq!(step_selection(&items, 2, 0), 1);
+        // Cursor on a row (idx 1) is already selectable — no-op.
+        assert_eq!(step_selection(&items, 1, 0), 1);
+    }
+
+    #[test]
+    fn step_selection_on_empty_returns_input() {
+        let items: Vec<InboxItem> = Vec::new();
+        // Pre-rebuild cursor of 5 stays put when items is empty —
+        // nothing to clamp against. Caller is responsible for the
+        // `min(max)` clamp before calling step_selection.
+        assert_eq!(step_selection(&items, 5, 0), 5);
+    }
+
+    #[test]
     fn preview_replaces_newlines() {
         assert_eq!(preview("line one\nline two", 100), "line one line two");
     }
