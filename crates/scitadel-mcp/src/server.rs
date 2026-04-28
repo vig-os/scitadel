@@ -177,6 +177,18 @@ pub struct ListUnreadRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct SubscribeAnnotationsRequest {
+    /// Optional paper ID to scope the subscription. When set, only
+    /// events on annotations anchored to this paper are delivered.
+    /// When absent, all annotation lifecycle events are delivered.
+    pub paper_id: Option<String>,
+    /// Subscriber identity. Recorded in the spawned task's tracing
+    /// span so audit logs can attribute notifications to a specific
+    /// agent. Not currently used to filter events. (#185)
+    pub reader: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct FindSimilarSearchesRequest {
     /// Free-text query — FTS5 operators are stripped automatically
     pub query: String,
@@ -386,6 +398,26 @@ pub struct BibVerifyRequest {
 
 use crate::events::{AnnotationEvent, AnnotationEventKind};
 use tokio::sync::broadcast;
+
+/// Build the resource URI advertised to a `subscribe_annotations`
+/// caller. Pure function so the URI-shape contract can be tested
+/// without spawning the broadcast task. (#185)
+#[must_use]
+pub fn subscription_uri(paper_id: Option<&str>) -> String {
+    paper_id.map_or_else(
+        || "scitadel://annotations/all".to_string(),
+        |p| format!("scitadel://annotations/{p}"),
+    )
+}
+
+/// Whether a subscriber scoped to `scope_paper` should be notified
+/// about an event on `event_paper`. None scope = subscribed to all
+/// papers. Pure function so the routing logic is testable without
+/// spawning the subscription task. (#185)
+#[must_use]
+pub fn event_matches_scope(scope_paper: Option<&str>, event_paper: &str) -> bool {
+    scope_paper.is_none_or(|p| p == event_paper)
+}
 
 #[derive(Debug, Clone)]
 pub struct ScitadelServer {
@@ -675,6 +707,78 @@ impl ScitadelServer {
         Parameters(req): Parameters<ListUnreadRequest>,
     ) -> Result<String, String> {
         tools::list_unread_tool(&req.reader, req.paper_id.as_deref())
+    }
+
+    #[tool(
+        description = "Subscribe to annotation lifecycle events on this paper (or all papers if `paper_id` is omitted). Spawns a server-side task that translates each create/reply/update/delete/mark_seen event into an MCP-spec `notifications/resources/updated` for the calling peer. The notification carries only the resource URI — call `list_annotations` (or `list_unread`) to inspect what changed. Lagged subscribers see one suppressed notification then resume; re-fetch via `list_annotations` to recover. Returns: text (the resource URI, e.g. `scitadel://annotations/{paper_id_or_all}`). (#185)"
+    )]
+    async fn subscribe_annotations(
+        &self,
+        Parameters(req): Parameters<SubscribeAnnotationsRequest>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<String, String> {
+        let uri = subscription_uri(req.paper_id.as_deref());
+        let mut rx = self.event_tx.subscribe();
+        let peer = ctx.peer.clone();
+        let scope_paper = req.paper_id.clone();
+        let reader = req.reader.clone();
+        let uri_for_task = uri.clone();
+        // Spawn one task per subscribe call. The task lives until
+        // either the broadcast Sender drops (server shutdown) or the
+        // peer's notify call fails (client disconnect). No explicit
+        // unsubscribe RPC is needed; closing the connection is the
+        // unsubscribe signal.
+        tokio::spawn(async move {
+            tracing::debug!(reader, uri = uri_for_task, "annotation subscriber active");
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        if !event_matches_scope(scope_paper.as_deref(), &event.paper_id) {
+                            continue;
+                        }
+                        let result = peer
+                            .notify_resource_updated(
+                                rmcp::model::ResourceUpdatedNotificationParam {
+                                    uri: uri_for_task.clone(),
+                                },
+                            )
+                            .await;
+                        if let Err(e) = result {
+                            // Peer disconnected (or transport error).
+                            // Drop the subscription — the receiver
+                            // would otherwise leak the task forever.
+                            tracing::debug!(reader, uri = uri_for_task, error = %e, "annotation peer notify failed; ending subscription");
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // We dropped `n` events. The notification
+                        // payload only carries the URI anyway, so
+                        // emit one update — the agent should re-fetch
+                        // via list_annotations to catch up.
+                        tracing::warn!(
+                            reader,
+                            uri = uri_for_task,
+                            dropped = n,
+                            "annotation subscriber lagged; emitting one resync update"
+                        );
+                        let _ = peer
+                            .notify_resource_updated(
+                                rmcp::model::ResourceUpdatedNotificationParam {
+                                    uri: uri_for_task.clone(),
+                                },
+                            )
+                            .await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // Sender dropped — server is shutting down.
+                        break;
+                    }
+                }
+            }
+            tracing::debug!(reader, uri = uri_for_task, "annotation subscriber ended");
+        });
+        Ok(uri)
     }
 
     #[tool(
@@ -1000,6 +1104,38 @@ impl ServerHandler for ScitadelServer {
 #[cfg(test)]
 mod tests {
     use rmcp::ServerHandler;
+
+    /// Scope filter: a subscriber with `paper_id=None` sees every
+    /// event; a paper-scoped subscriber sees only events on that
+    /// paper. (#185)
+    #[test]
+    fn event_matches_scope_filter() {
+        assert!(super::event_matches_scope(None, "p-a"));
+        assert!(super::event_matches_scope(None, "p-b"));
+        assert!(super::event_matches_scope(Some("p-a"), "p-a"));
+        assert!(!super::event_matches_scope(Some("p-a"), "p-b"));
+        // Empty-string scope only matches empty-string event paper_id
+        // — defensive (the public call rejects empty paper_id at the
+        // tool boundary or just produces a never-matching URI).
+        assert!(super::event_matches_scope(Some(""), ""));
+        assert!(!super::event_matches_scope(Some(""), "p-a"));
+    }
+
+    /// URI shape contract: scope-all when `paper_id` is None,
+    /// `scitadel://annotations/{paper_id}` otherwise. (#185)
+    #[test]
+    fn subscription_uri_shape() {
+        assert_eq!(super::subscription_uri(None), "scitadel://annotations/all");
+        assert_eq!(
+            super::subscription_uri(Some("p-attn")),
+            "scitadel://annotations/p-attn"
+        );
+        // Empty paper_id is not a valid scope but the URI builder
+        // should not panic — caller-side validation is the
+        // appropriate place to reject this if it ever becomes a
+        // concern. Pin the no-panic behaviour.
+        assert_eq!(super::subscription_uri(Some("")), "scitadel://annotations/");
+    }
 
     /// `subscribe_events` must hand out a receiver that observes
     /// every event emitted on the server's broadcast channel —
