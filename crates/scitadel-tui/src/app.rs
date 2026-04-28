@@ -1149,6 +1149,13 @@ impl App {
             KeyCode::Char('n') => {
                 *prompt = Some(AnnotationPrompt::create());
             }
+            KeyCode::Char('P') => {
+                // Paper-level note (#185): quote-less commentary on
+                // the publication as a whole. Capital `P` so the
+                // namespace stays parallel to `D` (download), `O`
+                // (open externally), `R` (reader), `E` (export).
+                *prompt = Some(AnnotationPrompt::paper_note());
+            }
             KeyCode::Char('J') => {
                 // Enter annotation focus mode if the paper has any.
                 let pid = paper_id.clone();
@@ -1275,6 +1282,9 @@ impl App {
                         *focus = new_count - 1;
                     }
                 }
+            }
+            PromptSubmission::PaperNote { note } => {
+                let _ = self.data.create_paper_note(&pid, &note, &reader);
             }
         }
     }
@@ -1649,7 +1659,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                         "Esc: leave focus | j/k: navigate | n: new | e: edit | r: reply | d: delete"
                     }
                     (None, None) => {
-                        "Esc/q: back | j/k: scroll | d/u: page | D: download | O: open externally | R: reader | n: new | J: focus"
+                        "Esc/q: back | j/k: scroll | d/u: page | D: download | O: open externally | R: reader | n: new | P: paper-note | J: focus"
                     }
                 }
             }

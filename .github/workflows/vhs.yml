@@ -40,7 +40,7 @@ jobs:
           - name: tui-papers
             tapes: "papers-download-state.tape queue-tab.tape reading-queue-star.tape question-dashboard.tape tui-inbox.tape"
           - name: tui-reader
-            tapes: "tui-annotation-write.tape tui-annotations-reader.tape annotations-in-detail.tape tui-export-keybind.tape"
+            tapes: "tui-annotation-write.tape tui-annotations-reader.tape annotations-in-detail.tape tui-export-keybind.tape tui-paper-note.tape"
           - name: theme
             tapes: "theme-dark.tape theme-light.tape theme-toggle.tape"
           - name: connectivity
@@ -193,7 +193,7 @@ jobs:
           cli-bib-import.tape cli-bib-rekey.tape cli-question-workflow.tape cli-search.tape
           tui-launch.tape init-wizard.tape
           papers-download-state.tape queue-tab.tape reading-queue-star.tape question-dashboard.tape tui-inbox.tape
-          tui-annotation-write.tape tui-annotations-reader.tape annotations-in-detail.tape tui-export-keybind.tape
+          tui-annotation-write.tape tui-annotations-reader.tape annotations-in-detail.tape tui-export-keybind.tape tui-paper-note.tape
           theme-dark.tape theme-light.tape theme-toggle.tape
           offline-indicator.tape open-externally.tape
           EOF

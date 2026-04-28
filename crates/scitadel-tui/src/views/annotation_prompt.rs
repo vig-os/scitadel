@@ -40,6 +40,12 @@ pub enum AnnotationPrompt {
     DeleteConfirm {
         annotation_id: String,
     },
+    /// Quote-less paper-level note (#185). Single-buffer state — the
+    /// anchor is synthetic so there's nothing to type other than the
+    /// note body. Submitted as `PromptSubmission::PaperNote`.
+    PaperNote {
+        note_buf: String,
+    },
 }
 
 /// What happens when the user submits the prompt. The app translates
@@ -56,10 +62,26 @@ pub enum PromptCommit {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptSubmission {
-    Create { quote: String, note: String },
-    Edit { annotation_id: String, note: String },
-    Reply { parent_id: String, note: String },
-    Delete { annotation_id: String },
+    Create {
+        quote: String,
+        note: String,
+    },
+    Edit {
+        annotation_id: String,
+        note: String,
+    },
+    Reply {
+        parent_id: String,
+        note: String,
+    },
+    Delete {
+        annotation_id: String,
+    },
+    /// Quote-less paper-level commentary (#185). The app dispatches
+    /// to `data.create_paper_note(paper_id, note, reader)`.
+    PaperNote {
+        note: String,
+    },
 }
 
 impl AnnotationPrompt {
@@ -99,6 +121,15 @@ impl AnnotationPrompt {
         }
     }
 
+    /// Start a paper-level note prompt (#185). Single-buffer; no
+    /// quote stage.
+    #[must_use]
+    pub fn paper_note() -> Self {
+        Self::PaperNote {
+            note_buf: String::new(),
+        }
+    }
+
     /// Append a character to the active buffer (whichever the prompt
     /// is currently editing). Confirm prompts ignore character input
     /// other than y/n/Esc; the app handles those at the key layer.
@@ -109,7 +140,8 @@ impl AnnotationPrompt {
             } if *stage == CreateStage::Quote => quote_buf.push(ch),
             Self::Create { note_buf, .. }
             | Self::Edit { note_buf, .. }
-            | Self::Reply { note_buf, .. } => {
+            | Self::Reply { note_buf, .. }
+            | Self::PaperNote { note_buf } => {
                 note_buf.push(ch);
             }
             Self::DeleteConfirm { .. } => {}
@@ -126,7 +158,8 @@ impl AnnotationPrompt {
             }
             Self::Create { note_buf, .. }
             | Self::Edit { note_buf, .. }
-            | Self::Reply { note_buf, .. } => {
+            | Self::Reply { note_buf, .. }
+            | Self::PaperNote { note_buf } => {
                 note_buf.pop();
             }
             Self::DeleteConfirm { .. } => {}
@@ -173,6 +206,11 @@ impl AnnotationPrompt {
                 parent_id: parent_id.clone(),
                 note: note_buf.clone(),
             }),
+            Self::PaperNote { note_buf } if !note_buf.trim().is_empty() => {
+                PromptCommit::Submit(PromptSubmission::PaperNote {
+                    note: note_buf.clone(),
+                })
+            }
             // Empty buffer (or DeleteConfirm) — Enter is a no-op cancel.
             _ => PromptCommit::Cancel,
         }
@@ -210,6 +248,7 @@ impl AnnotationPrompt {
             Self::Edit { .. } => " Edit Annotation ",
             Self::Reply { .. } => " Reply ",
             Self::DeleteConfirm { .. } => " Delete annotation? ",
+            Self::PaperNote { .. } => " Paper-level note ",
         }
     }
 
@@ -229,7 +268,8 @@ impl AnnotationPrompt {
                 ..
             }
             | Self::Edit { note_buf, .. }
-            | Self::Reply { note_buf, .. } => note_buf,
+            | Self::Reply { note_buf, .. }
+            | Self::PaperNote { note_buf } => note_buf,
             Self::DeleteConfirm { .. } => "press y to delete, n/Esc to cancel",
         }
     }
@@ -301,6 +341,7 @@ pub fn draw_overlay(frame: &mut Frame, area: Rect, prompt: &AnnotationPrompt) {
             | AnnotationPrompt::Edit { .. } => "note body",
             AnnotationPrompt::Reply { .. } => "reply",
             AnnotationPrompt::DeleteConfirm { .. } => "",
+            AnnotationPrompt::PaperNote { .. } => "paper-level note",
         };
         lines.push(Line::from(vec![
             Span::styled(
@@ -451,5 +492,39 @@ mod tests {
         p.push_char(' ');
         p.push_char(' ');
         assert_eq!(p.submit(), PromptCommit::Cancel);
+    }
+
+    #[test]
+    fn paper_note_submits_single_buffer_no_quote() {
+        let mut p = AnnotationPrompt::paper_note();
+        for c in "overall: methodology weak".chars() {
+            p.push_char(c);
+        }
+        assert_eq!(
+            p.submit(),
+            PromptCommit::Submit(PromptSubmission::PaperNote {
+                note: "overall: methodology weak".into()
+            })
+        );
+    }
+
+    #[test]
+    fn paper_note_empty_buffer_cancels() {
+        let p = AnnotationPrompt::paper_note();
+        assert_eq!(p.submit(), PromptCommit::Cancel);
+        let mut p = AnnotationPrompt::paper_note();
+        p.push_char(' ');
+        p.push_char(' ');
+        assert_eq!(p.submit(), PromptCommit::Cancel);
+    }
+
+    #[test]
+    fn paper_note_supports_backspace() {
+        let mut p = AnnotationPrompt::paper_note();
+        for c in "abc".chars() {
+            p.push_char(c);
+        }
+        p.backspace();
+        assert_eq!(p.body(), "ab");
     }
 }
