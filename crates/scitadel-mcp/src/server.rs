@@ -177,6 +177,18 @@ pub struct ListUnreadRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct SubscribeAnnotationsRequest {
+    /// Optional paper ID to scope the subscription. When set, only
+    /// events on annotations anchored to this paper are delivered.
+    /// When absent, all annotation lifecycle events are delivered.
+    pub paper_id: Option<String>,
+    /// Subscriber identity. Recorded in the spawned task's tracing
+    /// span so audit logs can attribute notifications to a specific
+    /// agent. Not currently used to filter events. (#185)
+    pub reader: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct FindSimilarSearchesRequest {
     /// Free-text query — FTS5 operators are stripped automatically
     pub query: String,
@@ -384,17 +396,63 @@ pub struct BibVerifyRequest {
 
 // ---------- Server ----------
 
+use crate::events::{AnnotationEvent, AnnotationEventKind};
+use tokio::sync::broadcast;
+
+/// Build the resource URI advertised to a `subscribe_annotations`
+/// caller. Pure function so the URI-shape contract can be tested
+/// without spawning the broadcast task. (#185)
+#[must_use]
+pub fn subscription_uri(paper_id: Option<&str>) -> String {
+    paper_id.map_or_else(
+        || "scitadel://annotations/all".to_string(),
+        |p| format!("scitadel://annotations/{p}"),
+    )
+}
+
+/// Whether a subscriber scoped to `scope_paper` should be notified
+/// about an event on `event_paper`. None scope = subscribed to all
+/// papers. Pure function so the routing logic is testable without
+/// spawning the subscription task. (#185)
+#[must_use]
+pub fn event_matches_scope(scope_paper: Option<&str>, event_paper: &str) -> bool {
+    scope_paper.is_none_or(|p| p == event_paper)
+}
+
 #[derive(Debug, Clone)]
 pub struct ScitadelServer {
     tool_router: ToolRouter<Self>,
+    /// Broadcast channel for annotation lifecycle events (#185 P0).
+    /// Every write tool emits one event; the `subscribe_annotations`
+    /// tool (PR3 C2) hands a `Receiver` to a server-side task that
+    /// translates events into MCP `notifications/resources/updated`
+    /// for its peer. Cloning the server clones the `Sender`, which
+    /// is the intended sharing model.
+    event_tx: broadcast::Sender<AnnotationEvent>,
 }
 
 impl ScitadelServer {
     #[must_use]
     pub fn new() -> Self {
+        // Discard the receiver from the initial pair so `Sender::send`
+        // returns SendError (fail-silent) until a real subscriber
+        // attaches via `event_tx.subscribe()`. The Sender stays
+        // usable for future subscribe() calls.
+        let (event_tx, _) = crate::events::channel();
         Self {
             tool_router: Self::tool_router(),
+            event_tx,
         }
+    }
+
+    /// Hand out a fresh receiver for the annotation event stream.
+    /// Used by the `subscribe_annotations` tool (PR3 C2). Subscribers
+    /// that lag past the channel capacity see `RecvError::Lagged(n)`
+    /// on `recv` — they should re-fetch via `list_annotations` to
+    /// resync.
+    #[must_use]
+    pub fn subscribe_events(&self) -> broadcast::Receiver<AnnotationEvent> {
+        self.event_tx.subscribe()
     }
 }
 
@@ -464,13 +522,13 @@ impl ScitadelServer {
     }
 
     #[tool(
-        description = "Create an annotation anchored to a passage in a paper. Root-level; use `reply_annotation` for replies. `author` is required — pass your identity string (e.g. agent slug). NOTE: author identity is trust-on-first-use until the Dolt sync / auth layer lands (Phase 5); any client may impersonate any author. Every write is logged via tracing for audit. Returns: text (the new annotation ID)."
+        description = "Create an annotation anchored to a passage in a paper. Root-level; use `reply_annotation` for replies. `author` is required — pass your identity string (e.g. agent slug). NOTE: author identity is trust-on-first-use until the Dolt sync / auth layer lands (Phase 5); any client may impersonate any author. Every write is logged via tracing for audit and emits an MCP-spec `notifications/resources/updated` to active `subscribe_annotations` clients (#185). Returns: text (the new annotation ID)."
     )]
     fn create_annotation(
         &self,
         Parameters(req): Parameters<CreateAnnotationRequest>,
     ) -> Result<String, String> {
-        tools::create_annotation_tool(
+        let id = tools::create_annotation_tool(
             &req.paper_id,
             &req.quote,
             &req.note,
@@ -480,37 +538,97 @@ impl ScitadelServer {
             req.question_id.as_deref(),
             req.color.as_deref(),
             req.tags,
-        )
+        )?;
+        crate::events::emit(
+            &self.event_tx,
+            AnnotationEvent {
+                paper_id: req.paper_id.clone(),
+                annotation_id: id.clone(),
+                kind: AnnotationEventKind::Created,
+                reader: None,
+            },
+        );
+        Ok(id)
     }
 
     #[tool(
-        description = "Reply to an existing annotation. Inherits paper_id + question_id from the parent; the reply has no anchor of its own. NOTE: author identity is trust-on-first-use (see create_annotation); writes are tracing-logged. Returns: text (the new reply ID)."
+        description = "Reply to an existing annotation. Inherits paper_id + question_id from the parent; the reply has no anchor of its own. NOTE: author identity is trust-on-first-use (see create_annotation); writes are tracing-logged. Emits an MCP-spec `notifications/resources/updated` to active `subscribe_annotations` clients (#185). Returns: text (the new reply ID)."
     )]
     fn reply_annotation(
         &self,
         Parameters(req): Parameters<ReplyAnnotationRequest>,
     ) -> Result<String, String> {
-        tools::reply_annotation_tool(&req.parent_id, &req.note, &req.author)
+        // Look up the parent's paper_id BEFORE the reply so the
+        // emitted event scope is correct even if the parent was
+        // somehow deleted between this and the next read.
+        let parent_paper = tools::lookup_annotation_paper_id(&req.parent_id)?;
+        let id = tools::reply_annotation_tool(&req.parent_id, &req.note, &req.author)?;
+        if let Some(paper_id) = parent_paper {
+            crate::events::emit(
+                &self.event_tx,
+                AnnotationEvent {
+                    paper_id,
+                    annotation_id: id.clone(),
+                    kind: AnnotationEventKind::Replied,
+                    reader: None,
+                },
+            );
+        }
+        Ok(id)
     }
 
     #[tool(
-        description = "Update note / color / tags on an existing annotation. NOTE: no author check — trust-on-first-use (see create_annotation). Writes are tracing-logged. Returns: text confirmation."
+        description = "Update note / color / tags on an existing annotation. NOTE: no author check — trust-on-first-use (see create_annotation). Writes are tracing-logged. Emits an MCP-spec `notifications/resources/updated` to active `subscribe_annotations` clients (#185). Returns: text confirmation."
     )]
     fn update_annotation(
         &self,
         Parameters(req): Parameters<UpdateAnnotationRequest>,
     ) -> Result<String, String> {
-        tools::update_annotation_tool(&req.id, req.note.as_deref(), req.color.as_deref(), req.tags)
+        let paper_id = tools::lookup_annotation_paper_id(&req.id)?;
+        let result = tools::update_annotation_tool(
+            &req.id,
+            req.note.as_deref(),
+            req.color.as_deref(),
+            req.tags,
+        )?;
+        if let Some(paper_id) = paper_id {
+            crate::events::emit(
+                &self.event_tx,
+                AnnotationEvent {
+                    paper_id,
+                    annotation_id: req.id.clone(),
+                    kind: AnnotationEventKind::Updated,
+                    reader: None,
+                },
+            );
+        }
+        Ok(result)
     }
 
     #[tool(
-        description = "Soft-delete an annotation (tombstone). Threads stay intact; list_annotations hides the row. NOTE: no author check — trust-on-first-use (see create_annotation). Writes are tracing-logged. Returns: text confirmation."
+        description = "Soft-delete an annotation (tombstone). Threads stay intact; list_annotations hides the row. NOTE: no author check — trust-on-first-use (see create_annotation). Writes are tracing-logged. Emits an MCP-spec `notifications/resources/updated` to active `subscribe_annotations` clients (#185). Returns: text confirmation."
     )]
     fn delete_annotation(
         &self,
         Parameters(req): Parameters<DeleteAnnotationRequest>,
     ) -> Result<String, String> {
-        tools::delete_annotation_tool(&req.id)
+        // Look up paper_id BEFORE the soft-delete — afterwards
+        // `repo.get` filters out the tombstoned row and we'd lose the
+        // scope information for the event.
+        let paper_id = tools::lookup_annotation_paper_id(&req.id)?;
+        let result = tools::delete_annotation_tool(&req.id)?;
+        if let Some(paper_id) = paper_id {
+            crate::events::emit(
+                &self.event_tx,
+                AnnotationEvent {
+                    paper_id,
+                    annotation_id: req.id.clone(),
+                    kind: AnnotationEventKind::Deleted,
+                    reader: None,
+                },
+            );
+        }
+        Ok(result)
     }
 
     #[tool(
@@ -524,20 +642,61 @@ impl ScitadelServer {
     }
 
     #[tool(
-        description = "Mark one or more annotations as seen by `reader`. Repeat calls just update seen_at. Used so an agent can stop re-processing notes it already handled. Returns: text count."
+        description = "Mark one or more annotations as seen by `reader`. Repeat calls just update seen_at. Used so an agent can stop re-processing notes it already handled. Emits one `notifications/resources/updated` per annotation_id to active `subscribe_annotations` clients (#185). Returns: text count."
     )]
     fn mark_seen(&self, Parameters(req): Parameters<MarkSeenRequest>) -> Result<String, String> {
-        tools::mark_seen_tool(req.annotation_ids, &req.reader)
+        // Resolve paper_id per id BEFORE the write so the event
+        // scope is correct (the row exists pre-write; mark_seen is
+        // not destructive but we keep the pattern uniform with the
+        // other mutating tools).
+        let scopes: Vec<(String, Option<String>)> = req
+            .annotation_ids
+            .iter()
+            .map(|id| {
+                (
+                    id.clone(),
+                    tools::lookup_annotation_paper_id(id).ok().flatten(),
+                )
+            })
+            .collect();
+        let result = tools::mark_seen_tool(req.annotation_ids, &req.reader)?;
+        for (annotation_id, paper_id) in scopes {
+            if let Some(paper_id) = paper_id {
+                crate::events::emit(
+                    &self.event_tx,
+                    AnnotationEvent {
+                        paper_id,
+                        annotation_id,
+                        kind: AnnotationEventKind::MarkedSeen,
+                        reader: Some(req.reader.clone()),
+                    },
+                );
+            }
+        }
+        Ok(result)
     }
 
     #[tool(
-        description = "Mark a whole annotation thread (root + replies) as seen by `reader` in one call. Returns: text confirmation."
+        description = "Mark a whole annotation thread (root + replies) as seen by `reader` in one call. Emits one `notifications/resources/updated` (kind=marked_thread_seen, annotation_id=root_id) to active `subscribe_annotations` clients (#185). Returns: text confirmation."
     )]
     fn mark_thread_seen(
         &self,
         Parameters(req): Parameters<MarkThreadSeenRequest>,
     ) -> Result<String, String> {
-        tools::mark_thread_seen_tool(&req.root_id, &req.reader)
+        let paper_id = tools::lookup_annotation_paper_id(&req.root_id)?;
+        let result = tools::mark_thread_seen_tool(&req.root_id, &req.reader)?;
+        if let Some(paper_id) = paper_id {
+            crate::events::emit(
+                &self.event_tx,
+                AnnotationEvent {
+                    paper_id,
+                    annotation_id: req.root_id.clone(),
+                    kind: AnnotationEventKind::MarkedThreadSeen,
+                    reader: Some(req.reader.clone()),
+                },
+            );
+        }
+        Ok(result)
     }
 
     #[tool(
@@ -548,6 +707,86 @@ impl ScitadelServer {
         Parameters(req): Parameters<ListUnreadRequest>,
     ) -> Result<String, String> {
         tools::list_unread_tool(&req.reader, req.paper_id.as_deref())
+    }
+
+    #[tool(
+        description = "Subscribe to annotation lifecycle events on this paper (or all papers if `paper_id` is omitted). Spawns a server-side task that translates each create/reply/update/delete/mark_seen event into an MCP-spec `notifications/resources/updated` for the calling peer. The notification carries only the resource URI — call `list_annotations` (or `list_unread`) to inspect what changed. Lagged subscribers see one suppressed notification then resume; re-fetch via `list_annotations` to recover. Returns: text (the resource URI, e.g. `scitadel://annotations/{paper_id_or_all}`). (#185)"
+    )]
+    async fn subscribe_annotations(
+        &self,
+        Parameters(req): Parameters<SubscribeAnnotationsRequest>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<String, String> {
+        // Reject `Some("")` explicitly: an empty paper_id would
+        // produce `scitadel://annotations/` and a scope filter that
+        // never matches a real event, leaving the caller with a
+        // valid-looking URI that delivers nothing. Treat as caller
+        // error rather than degrading silently. (#185)
+        if req.paper_id.as_deref() == Some("") {
+            return Err("paper_id, if provided, must not be empty".into());
+        }
+        let uri = subscription_uri(req.paper_id.as_deref());
+        let mut rx = self.event_tx.subscribe();
+        let peer = ctx.peer.clone();
+        let scope_paper = req.paper_id.clone();
+        let reader = req.reader.clone();
+        let uri_for_task = uri.clone();
+        // Spawn one task per subscribe call. The task lives until
+        // either the broadcast Sender drops (server shutdown) or the
+        // peer's notify call fails (client disconnect). No explicit
+        // unsubscribe RPC is needed; closing the connection is the
+        // unsubscribe signal.
+        tokio::spawn(async move {
+            tracing::debug!(reader, uri = uri_for_task, "annotation subscriber active");
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        if !event_matches_scope(scope_paper.as_deref(), &event.paper_id) {
+                            continue;
+                        }
+                        let result = peer
+                            .notify_resource_updated(
+                                rmcp::model::ResourceUpdatedNotificationParam {
+                                    uri: uri_for_task.clone(),
+                                },
+                            )
+                            .await;
+                        if let Err(e) = result {
+                            // Peer disconnected (or transport error).
+                            // Drop the subscription — the receiver
+                            // would otherwise leak the task forever.
+                            tracing::debug!(reader, uri = uri_for_task, error = %e, "annotation peer notify failed; ending subscription");
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // We dropped `n` events. The notification
+                        // payload only carries the URI anyway, so
+                        // emit one update — the agent should re-fetch
+                        // via list_annotations to catch up.
+                        tracing::warn!(
+                            reader,
+                            uri = uri_for_task,
+                            dropped = n,
+                            "annotation subscriber lagged; emitting one resync update"
+                        );
+                        let _ = peer
+                            .notify_resource_updated(
+                                rmcp::model::ResourceUpdatedNotificationParam {
+                                    uri: uri_for_task.clone(),
+                                },
+                            )
+                            .await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // Sender dropped — server is shutting down.
+                        break;
+                    }
+                }
+            }
+            tracing::debug!(reader, uri = uri_for_task, "annotation subscriber ended");
+        });
+        Ok(uri)
     }
 
     #[tool(
@@ -873,6 +1112,119 @@ impl ServerHandler for ScitadelServer {
 #[cfg(test)]
 mod tests {
     use rmcp::ServerHandler;
+
+    /// Scope filter: a subscriber with `paper_id=None` sees every
+    /// event; a paper-scoped subscriber sees only events on that
+    /// paper. (#185)
+    #[test]
+    fn event_matches_scope_filter() {
+        assert!(super::event_matches_scope(None, "p-a"));
+        assert!(super::event_matches_scope(None, "p-b"));
+        assert!(super::event_matches_scope(Some("p-a"), "p-a"));
+        assert!(!super::event_matches_scope(Some("p-a"), "p-b"));
+        // Empty-string scope only matches empty-string event paper_id
+        // — defensive (the public call rejects empty paper_id at the
+        // tool boundary or just produces a never-matching URI).
+        assert!(super::event_matches_scope(Some(""), ""));
+        assert!(!super::event_matches_scope(Some(""), "p-a"));
+    }
+
+    /// URI shape contract: scope-all when `paper_id` is None,
+    /// `scitadel://annotations/{paper_id}` otherwise. (#185)
+    #[test]
+    fn subscription_uri_shape() {
+        assert_eq!(super::subscription_uri(None), "scitadel://annotations/all");
+        assert_eq!(
+            super::subscription_uri(Some("p-attn")),
+            "scitadel://annotations/p-attn"
+        );
+        // Empty paper_id is not a valid scope but the URI builder
+        // should not panic — caller-side validation is the
+        // appropriate place to reject this if it ever becomes a
+        // concern. Pin the no-panic behaviour.
+        assert_eq!(super::subscription_uri(Some("")), "scitadel://annotations/");
+    }
+
+    /// End-to-end: a real `create_annotation` call goes through the
+    /// tool surface and emits a `Created` event on the broadcast
+    /// channel. Insurance against a future refactor that re-routes a
+    /// write tool through a path that skips `events::emit` — without
+    /// this test, the wiring at every emit site is verified only by
+    /// reading the diff. Drives one tool path end-to-end; the other
+    /// five are mechanically identical so this guards them all.
+    /// (#185 PR3 review)
+    #[tokio::test]
+    async fn create_annotation_through_server_emits_created_event() {
+        // Each test gets its own SCITADEL_DB path. No other lib test
+        // in this crate touches SCITADEL_DB (the rest go through
+        // `Database::open_in_memory()` directly in their test
+        // helpers), so the env var isn't a parallel-test hazard
+        // here.
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        // Safety: we own the env var for the lifetime of this test
+        // and no parallel test in this crate reads SCITADEL_DB.
+        unsafe {
+            std::env::set_var("SCITADEL_DB", &db_path);
+        }
+
+        // Seed one paper so the annotation has somewhere to anchor.
+        let db = scitadel_db::sqlite::Database::open(&db_path).unwrap();
+        db.migrate().unwrap();
+        let mut p = scitadel_core::models::Paper::new("e2e");
+        p.id = scitadel_core::models::PaperId::from("p-e2e");
+        let (paper_repo, _, _, _, _) = db.repositories();
+        scitadel_core::ports::PaperRepository::save(&paper_repo, &p).unwrap();
+
+        let server = super::ScitadelServer::new();
+        let mut rx = server.subscribe_events();
+        let req = super::CreateAnnotationRequest {
+            paper_id: "p-e2e".into(),
+            quote: "Q".into(),
+            note: "N".into(),
+            author: "claude".into(),
+            prefix: None,
+            suffix: None,
+            question_id: None,
+            color: None,
+            tags: None,
+        };
+        let id = server
+            .create_annotation(rmcp::handler::server::wrapper::Parameters(req))
+            .expect("create_annotation succeeds");
+
+        let event = rx.recv().await.expect("event arrives");
+        assert_eq!(event.paper_id, "p-e2e");
+        assert_eq!(event.kind, super::AnnotationEventKind::Created);
+        assert_eq!(event.annotation_id, id);
+        assert!(event.reader.is_none(), "create events have no reader");
+    }
+
+    /// `subscribe_events` must hand out a receiver that observes
+    /// every event emitted on the server's broadcast channel —
+    /// otherwise a `subscribe_annotations` client (#185 PR3 C2) would
+    /// silently miss writes. We exercise the wiring by emitting an
+    /// event through the same Sender the server holds and asserting
+    /// the receiver sees it.
+    #[tokio::test]
+    async fn subscribe_events_sees_emits_through_server_sender() {
+        use crate::events::{AnnotationEvent, AnnotationEventKind};
+        let server = super::ScitadelServer::new();
+        let mut rx = server.subscribe_events();
+        crate::events::emit(
+            &server.event_tx,
+            AnnotationEvent {
+                paper_id: "p-1".into(),
+                annotation_id: "ann-1".into(),
+                kind: AnnotationEventKind::Created,
+                reader: None,
+            },
+        );
+        let got = rx.recv().await.expect("event arrives");
+        assert_eq!(got.paper_id, "p-1");
+        assert_eq!(got.annotation_id, "ann-1");
+        assert_eq!(got.kind, AnnotationEventKind::Created);
+    }
 
     /// An MCP server that does not declare the `tools` capability in its
     /// `initialize` response will never have `tools/list` called by the

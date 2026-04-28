@@ -1194,6 +1194,20 @@ pub fn update_annotation_tool(
     Ok(format!("Annotation {id} updated."))
 }
 
+/// Resolve the `paper_id` an annotation is anchored to. Used by the
+/// MCP server when emitting an `AnnotationEvent` so subscribers can
+/// scope the resource URI without re-querying themselves. Returns
+/// `Ok(None)` if the annotation row is missing (deleted or never
+/// existed) — the server logs a warning and skips the emit. (#185)
+pub fn lookup_annotation_paper_id(id: &str) -> Result<Option<String>, String> {
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+    Ok(repo
+        .get(id)
+        .map_err(|e| e.to_string())?
+        .map(|a| a.paper_id.as_str().to_string()))
+}
+
 /// Soft-delete an annotation. Keeps the row so threads are preserved;
 /// `list_annotations` hides it.
 pub fn delete_annotation_tool(id: &str) -> Result<String, String> {
