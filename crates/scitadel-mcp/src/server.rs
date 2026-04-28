@@ -717,6 +717,14 @@ impl ScitadelServer {
         Parameters(req): Parameters<SubscribeAnnotationsRequest>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<String, String> {
+        // Reject `Some("")` explicitly: an empty paper_id would
+        // produce `scitadel://annotations/` and a scope filter that
+        // never matches a real event, leaving the caller with a
+        // valid-looking URI that delivers nothing. Treat as caller
+        // error rather than degrading silently. (#185)
+        if req.paper_id.as_deref() == Some("") {
+            return Err("paper_id, if provided, must not be empty".into());
+        }
         let uri = subscription_uri(req.paper_id.as_deref());
         let mut rx = self.event_tx.subscribe();
         let peer = ctx.peer.clone();
@@ -1135,6 +1143,61 @@ mod tests {
         // appropriate place to reject this if it ever becomes a
         // concern. Pin the no-panic behaviour.
         assert_eq!(super::subscription_uri(Some("")), "scitadel://annotations/");
+    }
+
+    /// End-to-end: a real `create_annotation` call goes through the
+    /// tool surface and emits a `Created` event on the broadcast
+    /// channel. Insurance against a future refactor that re-routes a
+    /// write tool through a path that skips `events::emit` — without
+    /// this test, the wiring at every emit site is verified only by
+    /// reading the diff. Drives one tool path end-to-end; the other
+    /// five are mechanically identical so this guards them all.
+    /// (#185 PR3 review)
+    #[tokio::test]
+    async fn create_annotation_through_server_emits_created_event() {
+        // Each test gets its own SCITADEL_DB path. No other lib test
+        // in this crate touches SCITADEL_DB (the rest go through
+        // `Database::open_in_memory()` directly in their test
+        // helpers), so the env var isn't a parallel-test hazard
+        // here.
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        // Safety: we own the env var for the lifetime of this test
+        // and no parallel test in this crate reads SCITADEL_DB.
+        unsafe {
+            std::env::set_var("SCITADEL_DB", &db_path);
+        }
+
+        // Seed one paper so the annotation has somewhere to anchor.
+        let db = scitadel_db::sqlite::Database::open(&db_path).unwrap();
+        db.migrate().unwrap();
+        let mut p = scitadel_core::models::Paper::new("e2e");
+        p.id = scitadel_core::models::PaperId::from("p-e2e");
+        let (paper_repo, _, _, _, _) = db.repositories();
+        scitadel_core::ports::PaperRepository::save(&paper_repo, &p).unwrap();
+
+        let server = super::ScitadelServer::new();
+        let mut rx = server.subscribe_events();
+        let req = super::CreateAnnotationRequest {
+            paper_id: "p-e2e".into(),
+            quote: "Q".into(),
+            note: "N".into(),
+            author: "claude".into(),
+            prefix: None,
+            suffix: None,
+            question_id: None,
+            color: None,
+            tags: None,
+        };
+        let id = server
+            .create_annotation(rmcp::handler::server::wrapper::Parameters(req))
+            .expect("create_annotation succeeds");
+
+        let event = rx.recv().await.expect("event arrives");
+        assert_eq!(event.paper_id, "p-e2e");
+        assert_eq!(event.kind, super::AnnotationEventKind::Created);
+        assert_eq!(event.annotation_id, id);
+        assert!(event.reader.is_none(), "create events have no reader");
     }
 
     /// `subscribe_events` must hand out a receiver that observes
