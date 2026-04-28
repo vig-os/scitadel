@@ -43,7 +43,7 @@ reqwest = { version = "0.12", features = ["json"] }
 quick-xml = { version = "0.37", features = ["serialize"] }
 
 # SQLite
-rusqlite = { version = "0.32", features = ["bundled", "serde_json"] }
+rusqlite = { version = "0.32", features = ["bundled", "functions", "serde_json"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.25"
 

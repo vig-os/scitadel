@@ -181,28 +181,32 @@ impl SqlitePaperRepository {
     }
 
     /// Case-insensitive title match, optionally constrained by year.
-    /// Year `None` means "any year". Title comparison uses `LOWER()`
-    /// like `find_by_title`; whitespace normalization is the caller's
-    /// responsibility (the matcher passes title verbatim today —
-    /// good enough for the issue's stated "exact match only" intent).
+    /// Year `None` means "any year". Title comparison uses
+    /// `unicode_lower()` (a Rust-side `to_lowercase` registered as a
+    /// SQL scalar function in `Database::open` — see #159) so case
+    /// folds work for non-ASCII characters like `Ü/ü`. Whitespace
+    /// normalization is the caller's responsibility (the matcher
+    /// passes title verbatim today — good enough for the issue's
+    /// stated "exact match only" intent).
     pub fn find_id_by_title_and_year(
         &self,
         title: &str,
         year: Option<i32>,
     ) -> Result<Option<String>, CoreError> {
         let conn = self.db.conn()?;
+        let lowered = title.to_lowercase();
         let id: Option<String> = match year {
             Some(y) => conn
                 .query_row(
-                    "SELECT id FROM papers WHERE LOWER(title) = LOWER(?1) AND year = ?2",
-                    params![title, y],
+                    "SELECT id FROM papers WHERE unicode_lower(title) = ?1 AND year = ?2",
+                    params![lowered, y],
                     |r| r.get(0),
                 )
                 .optional(),
             None => conn
                 .query_row(
-                    "SELECT id FROM papers WHERE LOWER(title) = LOWER(?1)",
-                    params![title],
+                    "SELECT id FROM papers WHERE unicode_lower(title) = ?1",
+                    params![lowered],
                     |r| r.get(0),
                 )
                 .optional(),
@@ -367,10 +371,10 @@ impl PaperRepository for SqlitePaperRepository {
     fn find_by_title(&self, title: &str) -> Result<Option<Paper>, CoreError> {
         let conn = self.db.conn()?;
         let mut stmt = conn
-            .prepare("SELECT * FROM papers WHERE LOWER(title) = LOWER(?1)")
+            .prepare("SELECT * FROM papers WHERE unicode_lower(title) = ?1")
             .map_err(DbError::Sqlite)?;
         let result = stmt
-            .query_row(params![title], row_to_paper)
+            .query_row(params![title.to_lowercase()], row_to_paper)
             .optional()
             .map_err(DbError::Sqlite)?;
         Ok(result)
@@ -659,5 +663,46 @@ mod tests {
         let failed = repo.get(paper.id.as_str()).unwrap().unwrap();
         assert!(failed.local_path.is_none());
         assert_eq!(failed.download_status, Some(DownloadStatus::Failed));
+    }
+
+    /// Regression for #159: SQLite's built-in `LOWER()` is ASCII-only,
+    /// so a re-import of a `.bib` whose title differs only by case on
+    /// a non-ASCII letter (`Ü` vs `ü`, `Ñ` vs `ñ`, `Ï` vs `ï`) used to
+    /// miss the title+year fallback and create a duplicate paper. The
+    /// `unicode_lower` SQL function registered at connection init lifts
+    /// this — both query and stored title are folded with Rust's
+    /// Unicode-aware `to_lowercase`.
+    #[test]
+    fn find_id_by_title_and_year_unicode_case_insensitive() {
+        let (_, repo) = setup();
+        let mut paper = Paper::new("Über die naïve Quantenfeldtheorie");
+        paper.year = Some(1925);
+        repo.save(&paper).unwrap();
+
+        // Same title, different case on the non-ASCII letters: must
+        // resolve to the existing paper, not miss.
+        let found = repo
+            .find_id_by_title_and_year("ÜBER DIE NAÏVE QUANTENFELDTHEORIE", Some(1925))
+            .unwrap();
+        assert_eq!(found.as_deref(), Some(paper.id.as_str()));
+
+        // Lowercased query against title-cased stored row also matches.
+        let found_lower = repo
+            .find_id_by_title_and_year("über die naïve quantenfeldtheorie", Some(1925))
+            .unwrap();
+        assert_eq!(found_lower.as_deref(), Some(paper.id.as_str()));
+
+        // Year mismatch still misses.
+        let none = repo
+            .find_id_by_title_and_year("über die naïve quantenfeldtheorie", Some(1926))
+            .unwrap();
+        assert!(none.is_none());
+
+        // `find_by_title` (no year) follows the same unicode-aware path.
+        let by_title = repo
+            .find_by_title("ÜBER DIE NAÏVE QUANTENFELDTHEORIE")
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_title.id, paper.id);
     }
 }
