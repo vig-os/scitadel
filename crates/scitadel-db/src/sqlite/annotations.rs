@@ -31,6 +31,20 @@ impl SqliteAnnotationRepository {
     /// `Annotation` (see `Annotation::new_root` / `new_reply`).
     pub fn create(&self, annotation: &Annotation) -> Result<(), DbError> {
         let conn = self.db.conn()?;
+        Self::insert_via(&conn, annotation)
+    }
+
+    /// Transactional sibling of [`Self::create`] (#157). Used by the
+    /// bib-import orchestrator so paper-save + alias-record + annotation-
+    /// create commit (or roll back) as a single unit per row.
+    pub fn create_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        annotation: &Annotation,
+    ) -> Result<(), DbError> {
+        Self::insert_via(tx, annotation)
+    }
+
+    fn insert_via(conn: &rusqlite::Connection, annotation: &Annotation) -> Result<(), DbError> {
         conn.execute(
             "INSERT INTO annotations
                 (id, parent_id, paper_id, question_id,
