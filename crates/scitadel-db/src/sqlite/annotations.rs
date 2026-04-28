@@ -316,6 +316,18 @@ pub fn resolve_anchor_with_threshold(
     text: &str,
     fuzzy_threshold: f64,
 ) -> AnchorStatus {
+    // Short-circuit: `.bib`-imported `note=` annotations carry only
+    // a synthetic marker `sentence_id` (no quote / range), since they
+    // have nothing to anchor against in the paper text yet. Treat them
+    // as `Ok` instead of falling through to `Orphan`, so they don't
+    // trip the orphan-warning UI flow (#158). Real Orphan semantics
+    // still apply to anchors whose selectors *should* match paper text
+    // but failed to.
+    if anchor.is_imported_synthetic() {
+        anchor.status = AnchorStatus::Ok;
+        return AnchorStatus::Ok;
+    }
+
     // Step 1: position selector — bounds-checked.
     if let (Some((start, end)), Some(quote)) = (anchor.char_range, anchor.quote.as_ref())
         && let Some(slice) = char_slice(text, start, end)
@@ -695,6 +707,41 @@ mod tests {
             resolve_anchor(&mut a, "nothing to see"),
             AnchorStatus::Orphan
         );
+    }
+
+    /// #158: an unanchored `.bib` `note=` import carries only a
+    /// synthetic marker `sentence_id`. The resolver must short-circuit
+    /// to `Ok` rather than falling through to `Orphan` (which would
+    /// trip the orphan-warning UI flow).
+    #[test]
+    fn resolver_short_circuits_imported_synthetic_anchor_to_ok() {
+        let mut a = Anchor {
+            sentence_id: Some(scitadel_core::models::imported_sentence_id(
+                "smith2024",
+                "Reading note about methodology.",
+            )),
+            ..Anchor::default()
+        };
+        // Paper text deliberately contains nothing matching the
+        // synthetic id — the short-circuit must fire regardless.
+        let status = resolve_anchor(&mut a, "the body of the paper says many things.");
+        assert_eq!(status, AnchorStatus::Ok);
+        assert_eq!(a.status, AnchorStatus::Ok);
+        assert!(!a.is_orphan());
+    }
+
+    /// #158: an anchor with a `quote` that fails to resolve must still
+    /// flip to `Orphan` — the synthetic short-circuit only applies to
+    /// import-only anchors with no real selectors.
+    #[test]
+    fn resolver_still_orphans_real_anchors_that_fail() {
+        let mut a = Anchor {
+            quote: Some("missing quote".into()),
+            sentence_id: Some(scitadel_core::models::sentence_id("a real sentence.")),
+            ..Anchor::default()
+        };
+        let status = resolve_anchor(&mut a, "different text without the quote.");
+        assert_eq!(status, AnchorStatus::Orphan);
     }
 
     // ---- Read-receipt tests ----

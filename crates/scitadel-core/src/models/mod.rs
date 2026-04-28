@@ -7,7 +7,8 @@ mod question;
 mod search;
 
 pub use annotation::{
-    Anchor, AnchorStatus, Annotation, AnnotationRead, normalize_sentence, sentence_id,
+    Anchor, AnchorStatus, Annotation, AnnotationRead, IMPORTED_SENTENCE_ID_PREFIX,
+    imported_sentence_id, normalize_sentence, sentence_id,
 };
 pub use assessment::Assessment;
 pub use citation::{Citation, CitationDirection, SnowballRun};
