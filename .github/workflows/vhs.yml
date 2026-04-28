@@ -20,15 +20,17 @@ jobs:
   tapes:
     name: Run tapes (${{ matrix.shard.name }})
     runs-on: ubuntu-latest
-    # Per-shard budget — uniform 10m. Empirically the cargo build +
-    # ttyd/ffmpeg install eats ~3m of fixed overhead before a single
-    # tape renders, and TUI tapes can take 60-90s each. With 4 tapes
-    # in the largest shards, 6m was too tight even on the happy path
-    # (tui-papers blew it on the first sharded run); 10m gives every
-    # shard headroom to absorb the build cost plus the per-tape retry
-    # logic in the distinctness assertion. Total wall-clock stays
-    # <10m because shards run in parallel.
-    timeout-minutes: 10
+    # Per-shard budget — per-shard timeout via matrix entry. The
+    # cargo build + ttyd/ffmpeg install eats ~3m of fixed overhead
+    # before a single tape renders, and TUI tapes can take 60-90s
+    # each. tui-reader carries the historically flaky
+    # `tui-export-keybind.tape` which fires the distinctness retry
+    # loop on roughly half of CI runs (3 extra renders × 60-90s
+    # each), so it needs 14m to absorb that on top of 5 tapes; the
+    # rest stay at 10m where they have ~3m of headroom over their
+    # observed wall-clock. Total wall-clock stays under 14m because
+    # shards run in parallel.
+    timeout-minutes: ${{ matrix.shard.timeout-minutes || 10 }}
     strategy:
       fail-fast: false
       matrix:
@@ -40,7 +42,8 @@ jobs:
           - name: tui-papers
             tapes: "papers-download-state.tape queue-tab.tape reading-queue-star.tape question-dashboard.tape tui-inbox.tape"
           - name: tui-reader
-            tapes: "tui-annotation-write.tape tui-annotations-reader.tape annotations-in-detail.tape tui-export-keybind.tape"
+            tapes: "tui-annotation-write.tape tui-annotations-reader.tape annotations-in-detail.tape tui-export-keybind.tape tui-paper-note.tape"
+            timeout-minutes: 14
           - name: theme
             tapes: "theme-dark.tape theme-light.tape theme-toggle.tape"
           - name: connectivity
@@ -193,7 +196,7 @@ jobs:
           cli-bib-import.tape cli-bib-rekey.tape cli-question-workflow.tape cli-search.tape
           tui-launch.tape init-wizard.tape
           papers-download-state.tape queue-tab.tape reading-queue-star.tape question-dashboard.tape tui-inbox.tape
-          tui-annotation-write.tape tui-annotations-reader.tape annotations-in-detail.tape tui-export-keybind.tape
+          tui-annotation-write.tape tui-annotations-reader.tape annotations-in-detail.tape tui-export-keybind.tape tui-paper-note.tape
           theme-dark.tape theme-light.tape theme-toggle.tape
           offline-indicator.tape open-externally.tape
           EOF

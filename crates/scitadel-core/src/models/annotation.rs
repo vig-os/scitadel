@@ -86,6 +86,23 @@ impl Anchor {
                 .as_deref()
                 .is_some_and(|s| s.starts_with(IMPORTED_SENTENCE_ID_PREFIX))
     }
+
+    /// True when this anchor represents a paper-level note: a
+    /// commentary on the publication as a whole rather than a
+    /// passage in it. Built by `paper_note_sentence_id(paper_id)`
+    /// and recognised by the resolver as `AnchorStatus::Ok` without
+    /// needing a quote / char_range / fuzzy match. The TUI renders
+    /// these in a separate "paper-level notes" section above the
+    /// thread list. (#185)
+    #[must_use]
+    pub fn is_paper_note(&self) -> bool {
+        self.char_range.is_none()
+            && self.quote.is_none()
+            && self
+                .sentence_id
+                .as_deref()
+                .is_some_and(|s| s.starts_with(PAPER_NOTE_SENTENCE_ID_PREFIX))
+    }
 }
 
 /// Marker prefix on a synthetic `sentence_id` produced by the
@@ -93,6 +110,39 @@ impl Anchor {
 /// Picked to be unambiguous: SHA1 hex (the real `sentence_id`
 /// output) cannot start with `bibtex-import:`.
 pub const IMPORTED_SENTENCE_ID_PREFIX: &str = "bibtex-import:";
+
+/// Marker prefix on a synthetic `sentence_id` for paper-level
+/// commentary (no quote, no anchor — the user is commenting on the
+/// publication as a whole). Lives in a different namespace from
+/// [`IMPORTED_SENTENCE_ID_PREFIX`] so a single resolver pass can
+/// route each kind to its own short-circuit path. SHA1 hex output
+/// cannot start with `paper-note:`, and `bibtex-import:` /
+/// `paper-note:` are disjoint by construction. (#185)
+pub const PAPER_NOTE_SENTENCE_ID_PREFIX: &str = "paper-note:";
+
+/// Build the synthetic `sentence_id` that identifies a paper-level
+/// note. Stable per `paper_id` so future calls (e.g. for de-dup)
+/// can re-derive the same handle. (#185)
+#[must_use]
+pub fn paper_note_sentence_id(paper_id: &str) -> String {
+    format!("{PAPER_NOTE_SENTENCE_ID_PREFIX}{paper_id}")
+}
+
+/// Build the synthetic `Anchor` that flags an annotation as a
+/// paper-level note. No quote, no char_range — only the
+/// `paper-note:<paper_id>` sentinel sentence_id and `AnchorStatus::Ok`
+/// so the resolver short-circuits without trying to match anything in
+/// the body text. Shared by every paper-note write path (MCP tool +
+/// TUI DataStore wrapper) so the two surfaces produce byte-identical
+/// anchors. (#185)
+#[must_use]
+pub fn paper_note_anchor(paper_id: &str) -> Anchor {
+    Anchor {
+        sentence_id: Some(paper_note_sentence_id(paper_id)),
+        status: AnchorStatus::Ok,
+        ..Anchor::default()
+    }
+}
 
 /// Build a synthetic `sentence_id` for an unanchored imported
 /// `note=`. Combines the source citekey with the SHA1 of the
@@ -303,6 +353,76 @@ mod tests {
             ..Anchor::default()
         };
         assert!(!a.is_imported_synthetic());
+    }
+
+    #[test]
+    fn paper_note_sentinel_is_disjoint_from_imported() {
+        // The two sentinel namespaces must not collide — a single
+        // resolver pass needs to route each kind to its own
+        // short-circuit. Pin the disjointness here so a future
+        // rename can't quietly break it. (#185)
+        assert_ne!(IMPORTED_SENTENCE_ID_PREFIX, PAPER_NOTE_SENTENCE_ID_PREFIX);
+        let imp = imported_sentence_id("k", "n");
+        let pn = paper_note_sentence_id("p-attn");
+        assert!(imp.starts_with(IMPORTED_SENTENCE_ID_PREFIX));
+        assert!(pn.starts_with(PAPER_NOTE_SENTENCE_ID_PREFIX));
+        assert!(!imp.starts_with(PAPER_NOTE_SENTENCE_ID_PREFIX));
+        assert!(!pn.starts_with(IMPORTED_SENTENCE_ID_PREFIX));
+    }
+
+    #[test]
+    fn paper_note_anchor_is_recognised_by_predicate() {
+        // The shared helper must produce an anchor that
+        // `is_paper_note()` accepts; otherwise the two write paths
+        // (MCP tool + DataStore) drift from the resolver and the TUI
+        // rendering filter, and the round-trip silently breaks.
+        let a = paper_note_anchor("p-attn");
+        assert!(a.is_paper_note());
+        assert_eq!(a.status, AnchorStatus::Ok);
+        assert!(a.quote.is_none());
+        assert!(a.char_range.is_none());
+        assert_eq!(
+            a.sentence_id.as_deref(),
+            Some(&*paper_note_sentence_id("p-attn"))
+        );
+    }
+
+    #[test]
+    fn paper_note_id_is_stable_per_paper() {
+        // Same paper_id ⇒ same id; different paper_id ⇒ different id.
+        // Used by future de-dup logic if "comment on the paper as a
+        // whole" ever needs uniqueness per paper+author.
+        assert_eq!(paper_note_sentence_id("p-1"), paper_note_sentence_id("p-1"));
+        assert_ne!(paper_note_sentence_id("p-1"), paper_note_sentence_id("p-2"));
+    }
+
+    #[test]
+    fn is_paper_note_recognises_marker_anchor() {
+        let a = Anchor {
+            sentence_id: Some(paper_note_sentence_id("p-1")),
+            ..Anchor::default()
+        };
+        assert!(a.is_paper_note());
+        // …and is_imported_synthetic must NOT also be true; the two
+        // predicates are mutually exclusive on a well-formed anchor.
+        assert!(!a.is_imported_synthetic());
+    }
+
+    #[test]
+    fn is_paper_note_rejects_quote_or_range() {
+        let with_quote = Anchor {
+            sentence_id: Some(paper_note_sentence_id("p-1")),
+            quote: Some("hi".into()),
+            ..Anchor::default()
+        };
+        assert!(!with_quote.is_paper_note());
+
+        let with_range = Anchor {
+            sentence_id: Some(paper_note_sentence_id("p-1")),
+            char_range: Some((0, 2)),
+            ..Anchor::default()
+        };
+        assert!(!with_range.is_paper_note());
     }
 
     #[test]
