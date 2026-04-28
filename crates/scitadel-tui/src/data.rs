@@ -129,7 +129,6 @@ impl DataStore {
     /// Mark a thread (root + replies) as seen by `reader`. Called from
     /// the TUI on focus-leave / overlay-close so the badge and
     /// `[unread]` markers clear without a manual action. (#185)
-    #[allow(dead_code)] // wired up in commit C4 of this branch
     pub fn mark_thread_seen(&self, reader: &str, root_id: &str) -> Result<()> {
         SqliteAnnotationRepository::new(self.db.clone()).mark_thread_seen(root_id, reader)?;
         Ok(())

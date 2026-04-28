@@ -160,10 +160,83 @@ pub struct App {
     /// Papers list. Refreshed on every draw alongside `unread_count`.
     /// (#185)
     pub papers_with_unread: std::collections::HashSet<String>,
+    /// The thread root ID the user most recently had in focus. Set
+    /// when annotation-focus / reader-highlight cursor moves onto a
+    /// thread; the *previous* value gets passed to `mark_thread_seen`
+    /// when focus moves to another thread (or away entirely). This is
+    /// the "focus-leave" semantics #185 calls for — a glance doesn't
+    /// mark seen, but moving past a thread does. (#185)
+    last_focused_root_id: Option<String>,
 
     task_tx: mpsc::UnboundedSender<TaskUpdate>,
     task_rx: mpsc::UnboundedReceiver<TaskUpdate>,
     offline_rx: mpsc::UnboundedReceiver<bool>,
+}
+
+/// Update the focus tracker and mark the *previous* thread seen if
+/// focus transitioned to a different thread (or to nothing). Free
+/// function rather than `&mut self` method so it can be called with
+/// disjoint borrows on `App` while `self.overlay.as_mut()` holds a
+/// mutable reference to the overlay slot. Failure of `mark_thread_seen`
+/// is silently swallowed — a stale badge is acceptable, an error
+/// toast every keystroke is not. (#185)
+fn set_focused_thread(
+    data: &DataStore,
+    reader: &str,
+    last_focused_root_id: &mut Option<String>,
+    new_root_id: Option<String>,
+) {
+    if *last_focused_root_id == new_root_id {
+        return;
+    }
+    if let Some(prev) = last_focused_root_id.take() {
+        let _ = data.mark_thread_seen(reader, &prev);
+    }
+    *last_focused_root_id = new_root_id;
+}
+
+/// Resolve the root at `root_idx` over the paper's live roots
+/// (oldest-first) and update the focus tracker. None clears focus
+/// without a DB hit. Used by reader-mode highlight navigation. (#185)
+fn focus_thread_by_root_idx(
+    data: &DataStore,
+    reader: &str,
+    last_focused_root_id: &mut Option<String>,
+    paper_id: &str,
+    root_idx: Option<usize>,
+) {
+    let new_root_id = root_idx.and_then(|idx| {
+        data.load_annotations_for_paper(paper_id)
+            .ok()?
+            .into_iter()
+            .filter(|a| !a.is_reply())
+            .nth(idx)
+            .map(|a| a.id.as_str().to_string())
+    });
+    set_focused_thread(data, reader, last_focused_root_id, new_root_id);
+}
+
+/// Resolve the thread root for the annotation at `annotation_idx`
+/// (mixed roots and replies, oldest-first) and update the focus
+/// tracker. Walks `parent_id` to the root so replies still mark their
+/// thread as the unit of "seen-ness". Used by annotation-focus
+/// navigation. (#185)
+fn focus_thread_by_annotation_idx(
+    data: &DataStore,
+    reader: &str,
+    last_focused_root_id: &mut Option<String>,
+    paper_id: &str,
+    annotation_idx: Option<usize>,
+) {
+    let new_root_id = annotation_idx.and_then(|idx| {
+        let annotations = data.load_annotations_for_paper(paper_id).ok()?;
+        let target = annotations.get(idx)?;
+        Some(target.parent_id.as_ref().map_or_else(
+            || target.id.as_str().to_string(),
+            |p| p.as_str().to_string(),
+        ))
+    });
+    set_focused_thread(data, reader, last_focused_root_id, new_root_id);
 }
 
 /// How many draws the startup toast lingers for (#137). At the
@@ -229,6 +302,7 @@ impl App {
             status_toast: None,
             unread_count: 0,
             papers_with_unread: std::collections::HashSet::new(),
+            last_focused_root_id: None,
             task_tx,
             task_rx,
             offline_rx,
@@ -821,12 +895,37 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('q' | 'R') => {
                     *reader = false;
                     *highlight_focus = None;
+                    // Focus left the reader entirely — mark whatever
+                    // thread was focused as seen. (#185)
+                    focus_thread_by_root_idx(
+                        &self.data,
+                        &self.reader,
+                        &mut self.last_focused_root_id,
+                        paper_id,
+                        None,
+                    );
                 }
                 KeyCode::Char('J') | KeyCode::Down if count > 0 => {
-                    *highlight_focus = Some(highlight_focus.map_or(0, |f| (f + 1).min(count - 1)));
+                    let next = Some(highlight_focus.map_or(0, |f| (f + 1).min(count - 1)));
+                    *highlight_focus = next;
+                    focus_thread_by_root_idx(
+                        &self.data,
+                        &self.reader,
+                        &mut self.last_focused_root_id,
+                        paper_id,
+                        next,
+                    );
                 }
                 KeyCode::Char('K') | KeyCode::Up if count > 0 => {
-                    *highlight_focus = Some(highlight_focus.map_or(0, |f| f.saturating_sub(1)));
+                    let next = Some(highlight_focus.map_or(0, |f| f.saturating_sub(1)));
+                    *highlight_focus = next;
+                    focus_thread_by_root_idx(
+                        &self.data,
+                        &self.reader,
+                        &mut self.last_focused_root_id,
+                        paper_id,
+                        next,
+                    );
                 }
                 KeyCode::Char('D') => {
                     let pid = paper_id.clone();
@@ -855,15 +954,28 @@ impl App {
                 .unwrap_or_default();
             if annotations.is_empty() {
                 *annotation_focus = None;
+                focus_thread_by_annotation_idx(
+                    &self.data,
+                    &self.reader,
+                    &mut self.last_focused_root_id,
+                    &pid,
+                    None,
+                );
             } else {
                 let count = annotations.len();
+                let mut new_focus_idx: Option<usize> = Some(*focus);
                 match code {
-                    KeyCode::Esc => *annotation_focus = None,
+                    KeyCode::Esc => {
+                        *annotation_focus = None;
+                        new_focus_idx = None;
+                    }
                     KeyCode::Char('j') | KeyCode::Down => {
                         *focus = (*focus + 1).min(count - 1);
+                        new_focus_idx = Some(*focus);
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
                         *focus = focus.saturating_sub(1);
+                        new_focus_idx = Some(*focus);
                     }
                     KeyCode::Char('e') => {
                         let target = &annotations[*focus];
@@ -892,13 +1004,30 @@ impl App {
                     }
                     _ => {}
                 }
+                focus_thread_by_annotation_idx(
+                    &self.data,
+                    &self.reader,
+                    &mut self.last_focused_root_id,
+                    &pid,
+                    new_focus_idx,
+                );
                 return;
             }
         }
 
         // Layer 3: scroll mode.
         match code {
-            KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
+            KeyCode::Esc | KeyCode::Char('q') => {
+                // Closing the PaperDetail overlay leaves whatever
+                // thread was last focused — mark it seen. (#185)
+                set_focused_thread(
+                    &self.data,
+                    &self.reader,
+                    &mut self.last_focused_root_id,
+                    None,
+                );
+                self.overlay = None;
+            }
             KeyCode::Char('j') | KeyCode::Down => *scroll = scroll.saturating_add(1),
             KeyCode::Char('k') | KeyCode::Up => *scroll = scroll.saturating_sub(1),
             KeyCode::Char('d') => *scroll = scroll.saturating_add(10),
@@ -919,6 +1048,13 @@ impl App {
                     .map_or(0, |a| a.len());
                 if count > 0 {
                     *annotation_focus = Some(0);
+                    focus_thread_by_annotation_idx(
+                        &self.data,
+                        &self.reader,
+                        &mut self.last_focused_root_id,
+                        &pid,
+                        Some(0),
+                    );
                 }
             }
             KeyCode::Char('R') => {
@@ -928,6 +1064,13 @@ impl App {
                 let count = crate::views::reader::highlight_count(&self.data, &pid);
                 *reader = true;
                 *highlight_focus = if count > 0 { Some(0) } else { None };
+                focus_thread_by_root_idx(
+                    &self.data,
+                    &self.reader,
+                    &mut self.last_focused_root_id,
+                    &pid,
+                    *highlight_focus,
+                );
             }
             KeyCode::Char('O') => {
                 // #144: open the locally downloaded file in the OS
@@ -1749,5 +1892,166 @@ mod tests {
             other => panic!("expected dashboard with prompt cleared, got {other:?}"),
         }
         assert!(app.status_toast.is_none(), "no toast on cancel");
+    }
+
+    // ---- #185 focus-leave plumbing ----
+
+    /// Seed an annotation thread (root + reply) on `p-attn` so the
+    /// focus-leave tests can assert mark_thread_seen actually clears
+    /// unread state.
+    fn seed_thread(db_path: &std::path::Path) -> (String, String) {
+        use scitadel_core::models::{Anchor, Annotation};
+        let db = scitadel_db::sqlite::Database::open(db_path).unwrap();
+        let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+        let root = Annotation::new_root(
+            PaperId::from("p-attn"),
+            "claude".into(),
+            "claim".into(),
+            Anchor {
+                quote: Some("Attention".into()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&root).unwrap();
+        let reply = Annotation::new_reply(&root, "claude".into(), "follow-up".into());
+        repo.create(&reply).unwrap();
+        (root.id.as_str().to_string(), reply.id.as_str().to_string())
+    }
+
+    /// First focus arrives: nothing was previously focused, so no
+    /// mark_seen happens. The new root is just remembered.
+    #[tokio::test(flavor = "current_thread")]
+    async fn focus_arrive_does_not_mark_seen_when_none_was_focused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        let (root_id, _) = seed_thread(&tmp.path().join("scitadel.db"));
+        // Pre: 2 unread for lars.
+        assert_eq!(app.data.load_unread_count("lars").unwrap(), 2);
+
+        set_focused_thread(
+            &app.data,
+            &app.reader,
+            &mut app.last_focused_root_id,
+            Some(root_id.clone()),
+        );
+        // Tracker advanced...
+        assert_eq!(app.last_focused_root_id, Some(root_id));
+        // ...but nothing got marked seen yet (focus-leave semantics:
+        // mark only when leaving the previous thread, and there was
+        // no previous).
+        assert_eq!(app.data.load_unread_count("lars").unwrap(), 2);
+    }
+
+    /// Focus-leave path: A → None marks A's thread seen.
+    #[tokio::test(flavor = "current_thread")]
+    async fn focus_leave_to_none_marks_previous_thread_seen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        let (root_id, _) = seed_thread(&tmp.path().join("scitadel.db"));
+
+        set_focused_thread(
+            &app.data,
+            &app.reader,
+            &mut app.last_focused_root_id,
+            Some(root_id),
+        );
+        assert_eq!(app.data.load_unread_count("lars").unwrap(), 2);
+
+        set_focused_thread(&app.data, &app.reader, &mut app.last_focused_root_id, None);
+        assert_eq!(
+            app.data.load_unread_count("lars").unwrap(),
+            0,
+            "focus-leave to None must mark the previous thread (root + replies) seen"
+        );
+        assert_eq!(app.last_focused_root_id, None);
+    }
+
+    /// Re-focusing the same thread is a no-op — no double-write, no
+    /// toggle, no spurious mark_seen of an unrelated thread.
+    #[tokio::test(flavor = "current_thread")]
+    async fn focus_same_root_is_idempotent_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        let (root_id, _) = seed_thread(&tmp.path().join("scitadel.db"));
+
+        set_focused_thread(
+            &app.data,
+            &app.reader,
+            &mut app.last_focused_root_id,
+            Some(root_id.clone()),
+        );
+        // Calling again with the same root must NOT mark the focused
+        // thread seen on every call (would defeat focus-leave
+        // semantics) — it's a no-op.
+        set_focused_thread(
+            &app.data,
+            &app.reader,
+            &mut app.last_focused_root_id,
+            Some(root_id.clone()),
+        );
+        assert_eq!(app.data.load_unread_count("lars").unwrap(), 2);
+        assert_eq!(app.last_focused_root_id, Some(root_id));
+    }
+
+    /// Annotation-focus by reply index resolves to the reply's root,
+    /// so leaving the focus marks the whole thread seen.
+    #[tokio::test(flavor = "current_thread")]
+    async fn annotation_focus_on_reply_marks_root_thread_on_leave() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        let (root_id, _reply_id) = seed_thread(&tmp.path().join("scitadel.db"));
+        // Annotations are ordered by created_at ASC: [root, reply].
+        // Index 1 is the reply; its parent_id points at root.
+        focus_thread_by_annotation_idx(
+            &app.data,
+            &app.reader,
+            &mut app.last_focused_root_id,
+            "p-attn",
+            Some(1),
+        );
+        assert_eq!(app.last_focused_root_id, Some(root_id.clone()));
+
+        // Now leave focus. Both root and reply should clear.
+        focus_thread_by_annotation_idx(
+            &app.data,
+            &app.reader,
+            &mut app.last_focused_root_id,
+            "p-attn",
+            None,
+        );
+        assert_eq!(app.data.load_unread_count("lars").unwrap(), 0);
+    }
+
+    /// Closing the PaperDetail overlay marks the focused thread seen,
+    /// driven through the real `handle_key` dispatch.
+    #[tokio::test(flavor = "current_thread")]
+    async fn closing_paper_detail_overlay_marks_focused_thread_seen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        let (_root_id, _) = seed_thread(&tmp.path().join("scitadel.db"));
+
+        // Open the PaperDetail overlay scrolled, then enter
+        // annotation-focus mode (`J`) to land focus on the root.
+        app.overlay = Some(Overlay::PaperDetail {
+            paper_id: "p-attn".into(),
+            scroll: 0,
+            annotation_focus: None,
+            prompt: None,
+            reader: false,
+            highlight_focus: None,
+        });
+        app.handle_key(KeyCode::Char('J'), KeyModifiers::NONE);
+        assert!(app.last_focused_root_id.is_some(), "J should focus root");
+
+        // Close the overlay. Esc out of annotation-focus first, then
+        // Esc closes the overlay.
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.overlay.is_none());
+        assert_eq!(
+            app.data.load_unread_count("lars").unwrap(),
+            0,
+            "overlay close must mark whatever thread was last focused as seen",
+        );
     }
 }
