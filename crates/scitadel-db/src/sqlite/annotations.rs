@@ -394,6 +394,17 @@ pub fn resolve_anchor_with_threshold(
         return AnchorStatus::Ok;
     }
 
+    // Short-circuit: paper-level notes — commentary on the
+    // publication as a whole — carry a synthetic `paper-note:<id>`
+    // sentence_id with no quote / range. They have nothing to
+    // re-anchor against in the body text by design, so the only
+    // sensible status is Ok. The TUI renders them in a separate
+    // section above the thread list. (#185)
+    if anchor.is_paper_note() {
+        anchor.status = AnchorStatus::Ok;
+        return AnchorStatus::Ok;
+    }
+
     // Step 1: position selector — bounds-checked.
     if let (Some((start, end)), Some(quote)) = (anchor.char_range, anchor.quote.as_ref())
         && let Some(slice) = char_slice(text, start, end)
@@ -791,6 +802,22 @@ mod tests {
         // Paper text deliberately contains nothing matching the
         // synthetic id — the short-circuit must fire regardless.
         let status = resolve_anchor(&mut a, "the body of the paper says many things.");
+        assert_eq!(status, AnchorStatus::Ok);
+        assert_eq!(a.status, AnchorStatus::Ok);
+        assert!(!a.is_orphan());
+    }
+
+    /// #185: paper-level notes carry a `paper-note:<paper_id>`
+    /// sentence_id with no quote / range. Same short-circuit story
+    /// as the import case but in its own namespace so the two
+    /// kinds can render distinctly in the TUI.
+    #[test]
+    fn resolver_short_circuits_paper_note_anchor_to_ok() {
+        let mut a = Anchor {
+            sentence_id: Some(scitadel_core::models::paper_note_sentence_id("p-attn")),
+            ..Anchor::default()
+        };
+        let status = resolve_anchor(&mut a, "irrelevant body text.");
         assert_eq!(status, AnchorStatus::Ok);
         assert_eq!(a.status, AnchorStatus::Ok);
         assert!(!a.is_orphan());
