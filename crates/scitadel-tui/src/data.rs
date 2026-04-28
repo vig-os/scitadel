@@ -126,6 +126,14 @@ impl DataStore {
         Ok(SqliteAnnotationRepository::new(self.db.clone()).papers_with_unread(reader)?)
     }
 
+    /// Every unread annotation across all papers for `reader`,
+    /// oldest-first per the underlying `list_unread` query. Used by
+    /// the inbox overlay (#185 P0) which then groups by paper for
+    /// display.
+    pub fn load_all_unread(&self, reader: &str) -> Result<Vec<Annotation>> {
+        Ok(SqliteAnnotationRepository::new(self.db.clone()).list_unread(reader, None)?)
+    }
+
     /// Mark a thread (root + replies) as seen by `reader`. Called from
     /// the TUI on focus-leave / overlay-close so the badge and
     /// `[unread]` markers clear without a manual action. (#185)
