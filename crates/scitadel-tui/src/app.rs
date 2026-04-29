@@ -428,18 +428,46 @@ impl App {
             Some(Overlay::PaperDetail {
                 paper_id,
                 annotation_focus,
+                reader,
+                highlight_focus,
                 ..
             }) => {
-                // Resolve the focused annotation's id only when the
-                // user is actively in focus mode — otherwise leave None
-                // so agents don't think the user is "on" an annotation
-                // they happen to be scrolling past.
-                let ann_id = annotation_focus.and_then(|i| {
-                    self.data
-                        .load_annotations_for_paper(paper_id)
-                        .ok()
-                        .and_then(|anns| anns.get(i).map(|a| a.id.as_str().to_string()))
-                });
+                // Resolve the focused annotation's id when the user
+                // has anything in focus, in either mode:
+                //
+                // - Single-pane annotation focus (`J` enters): index
+                //   over the full annotation list (mixed roots +
+                //   replies).
+                // - Two-pane reader (`R` enters): index over the
+                //   ROOTS-only list, since `highlight_focus` walks
+                //   highlight cursors and replies don't carry their
+                //   own anchor.
+                //
+                // Pre-#185 PR5 only the annotation_focus path was
+                // wired, so an agent calling get_current_selection
+                // while the human was browsing highlights in reader
+                // mode would see annotation_id=None — the human
+                // *was* on something, the agent just couldn't tell.
+                let ann_id = if *reader {
+                    highlight_focus.and_then(|i| {
+                        self.data
+                            .load_annotations_for_paper(paper_id)
+                            .ok()
+                            .and_then(|anns| {
+                                anns.into_iter()
+                                    .filter(|a| !a.is_reply() && !a.anchor.is_paper_note())
+                                    .nth(i)
+                                    .map(|a| a.id.as_str().to_string())
+                            })
+                    })
+                } else {
+                    annotation_focus.and_then(|i| {
+                        self.data
+                            .load_annotations_for_paper(paper_id)
+                            .ok()
+                            .and_then(|anns| anns.get(i).map(|a| a.id.as_str().to_string()))
+                    })
+                };
                 (Some(paper_id.clone()), None, ann_id)
             }
             Some(Overlay::SearchPapers { search_id, .. }) => (None, Some(search_id.clone()), None),
@@ -2244,6 +2272,191 @@ mod tests {
             app.data.load_unread_count("lars").unwrap(),
             0,
             "overlay close must mark whatever thread was last focused as seen",
+        );
+    }
+
+    // ---- #185 PR5 selection fidelity ----
+
+    /// Two-pane reader mode + `highlight_focus` set → annotation_id
+    /// surfaces. Pre-#185 PR5 this returned None even though the
+    /// human's cursor was sitting on a highlight; agents calling
+    /// `get_current_selection` would think the user wasn't on
+    /// anything.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reader_highlight_focus_surfaces_annotation_id() {
+        use scitadel_core::models::{Anchor, Annotation};
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        // Seed two anchored roots so highlight_focus indices map
+        // unambiguously over the roots-only list.
+        let db = scitadel_db::sqlite::Database::open(&tmp.path().join("scitadel.db")).unwrap();
+        let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+        let r0 = Annotation::new_root(
+            PaperId::from("p-attn"),
+            "claude".into(),
+            "first".into(),
+            Anchor {
+                quote: Some("Q1".into()),
+                ..Anchor::default()
+            },
+        );
+        let r1 = Annotation::new_root(
+            PaperId::from("p-attn"),
+            "claude".into(),
+            "second".into(),
+            Anchor {
+                quote: Some("Q2".into()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&r0).unwrap();
+        repo.create(&r1).unwrap();
+
+        app.overlay = Some(Overlay::PaperDetail {
+            paper_id: "p-attn".into(),
+            scroll: 0,
+            annotation_focus: None,
+            prompt: None,
+            reader: true,
+            highlight_focus: Some(1),
+        });
+
+        let snapshot = app.current_tui_state();
+        assert_eq!(snapshot.paper_id.as_deref(), Some("p-attn"));
+        assert_eq!(
+            snapshot.annotation_id.as_deref(),
+            Some(r1.id.as_str()),
+            "highlight_focus index 1 must map to the second root annotation"
+        );
+    }
+
+    /// Two-pane reader with no highlight focused (cursor not yet on
+    /// a highlight) → annotation_id is None; the agent must not see
+    /// a stale or first-by-default selection.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reader_with_no_highlight_focus_surfaces_no_annotation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        app.overlay = Some(Overlay::PaperDetail {
+            paper_id: "p-attn".into(),
+            scroll: 0,
+            annotation_focus: None,
+            prompt: None,
+            reader: true,
+            highlight_focus: None,
+        });
+
+        let snapshot = app.current_tui_state();
+        assert_eq!(snapshot.paper_id.as_deref(), Some("p-attn"));
+        assert!(
+            snapshot.annotation_id.is_none(),
+            "no highlight focused → no annotation surfaced; got {:?}",
+            snapshot.annotation_id
+        );
+    }
+
+    /// `highlight_focus` indices walk over roots-only; paper-level
+    /// notes (#185 PR4) and replies must NOT shift the mapping. Pin
+    /// this so a regression doesn't quietly hand agents the wrong
+    /// annotation_id.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reader_highlight_focus_skips_paper_notes_and_replies() {
+        use scitadel_core::models::{Anchor, Annotation};
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        let db = scitadel_db::sqlite::Database::open(&tmp.path().join("scitadel.db")).unwrap();
+        let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+
+        // Layout in created_at order: paper-note, root_a, reply_a, root_b.
+        // The roots-only list (excluding paper-note + replies) is
+        // [root_a, root_b] — same as the highlight indices.
+        let pn = Annotation::new_root(
+            PaperId::from("p-attn"),
+            "claude".into(),
+            "global".into(),
+            scitadel_core::models::paper_note_anchor("p-attn"),
+        );
+        let root_a = Annotation::new_root(
+            PaperId::from("p-attn"),
+            "claude".into(),
+            "passage A".into(),
+            Anchor {
+                quote: Some("A".into()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&pn).unwrap();
+        repo.create(&root_a).unwrap();
+        let reply = Annotation::new_reply(&root_a, "claude".into(), "follow-up".into());
+        repo.create(&reply).unwrap();
+        let root_b = Annotation::new_root(
+            PaperId::from("p-attn"),
+            "claude".into(),
+            "passage B".into(),
+            Anchor {
+                quote: Some("B".into()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&root_b).unwrap();
+
+        for (idx, expected) in [(0, root_a.id.as_str()), (1, root_b.id.as_str())] {
+            app.overlay = Some(Overlay::PaperDetail {
+                paper_id: "p-attn".into(),
+                scroll: 0,
+                annotation_focus: None,
+                prompt: None,
+                reader: true,
+                highlight_focus: Some(idx),
+            });
+            let snapshot = app.current_tui_state();
+            assert_eq!(
+                snapshot.annotation_id.as_deref(),
+                Some(expected),
+                "highlight_focus {idx} must map to {expected}, got {:?}",
+                snapshot.annotation_id
+            );
+        }
+    }
+
+    /// Annotation-focus mode (single-pane, `J`) keeps its existing
+    /// mapping over the FULL annotation list (roots + replies). PR5
+    /// only adds the reader path; this regression-pins that the
+    /// pre-existing behaviour didn't drift.
+    #[tokio::test(flavor = "current_thread")]
+    async fn annotation_focus_mode_unchanged_indexes_full_list() {
+        use scitadel_core::models::{Anchor, Annotation};
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        let db = scitadel_db::sqlite::Database::open(&tmp.path().join("scitadel.db")).unwrap();
+        let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+        let root = Annotation::new_root(
+            PaperId::from("p-attn"),
+            "claude".into(),
+            "root".into(),
+            Anchor {
+                quote: Some("Q".into()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&root).unwrap();
+        let reply = Annotation::new_reply(&root, "claude".into(), "reply".into());
+        repo.create(&reply).unwrap();
+
+        // annotation_focus indices over FULL list: 0 = root, 1 = reply.
+        app.overlay = Some(Overlay::PaperDetail {
+            paper_id: "p-attn".into(),
+            scroll: 0,
+            annotation_focus: Some(1),
+            prompt: None,
+            reader: false,
+            highlight_focus: None,
+        });
+        let snapshot = app.current_tui_state();
+        assert_eq!(
+            snapshot.annotation_id.as_deref(),
+            Some(reply.id.as_str()),
+            "annotation_focus=1 must map to the reply (index over full list, not roots-only)"
         );
     }
 }
