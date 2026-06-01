@@ -1,0 +1,4 @@
+# Release binaries fetched on first launch are cached here (versioned, e.g.
+# scitadel-0.6.0). Never commit them — only the wrapper and VERSION are tracked.
+scitadel-[0-9]*
+*.tmp
