@@ -1,0 +1,14 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "release-type": "rust",
+  "include-v-in-tag": false,
+  "include-component-in-tag": false,
+  "packages": {
+    ".": {
+      "component": "scitadel"
+    }
+  },
+  "plugins": [
+    "cargo-workspace"
+  ]
+}
