@@ -1,14 +1,21 @@
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
-  "release-type": "rust",
+  "release-type": "simple",
   "include-v-in-tag": false,
   "include-component-in-tag": false,
   "packages": {
     ".": {
-      "component": "scitadel"
+      "component": "scitadel",
+      "extra-files": [
+        { "type": "generic", "path": "crates/scitadel-core/Cargo.toml" },
+        { "type": "generic", "path": "crates/scitadel-db/Cargo.toml" },
+        { "type": "generic", "path": "crates/scitadel-adapters/Cargo.toml" },
+        { "type": "generic", "path": "crates/scitadel-scoring/Cargo.toml" },
+        { "type": "generic", "path": "crates/scitadel-export/Cargo.toml" },
+        { "type": "generic", "path": "crates/scitadel-mcp/Cargo.toml" },
+        { "type": "generic", "path": "crates/scitadel-tui/Cargo.toml" },
+        { "type": "generic", "path": "crates/scitadel-cli/Cargo.toml" }
+      ]
     }
-  },
-  "plugins": [
-    "cargo-workspace"
-  ]
+  }
 }
