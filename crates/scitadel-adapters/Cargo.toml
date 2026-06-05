@@ -1,6 +1,6 @@
 [package]
 name = "scitadel-adapters"
-version = "0.6.0"
+version = "0.6.0" # x-release-please-version
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -16,7 +16,7 @@ default = []
 contract-tests = []
 
 [dependencies]
-scitadel-core = { path = "../scitadel-core", version = "0.6.0" }
+scitadel-core = { path = "../scitadel-core", version = "0.6.0" } # x-release-please-version
 reqwest = { workspace = true }
 quick-xml = { workspace = true }
 serde = { workspace = true }

@@ -1,6 +1,6 @@
 [package]
 name = "scitadel-export"
-version = "0.6.0"
+version = "0.6.0" # x-release-please-version
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,7 +12,7 @@ description = "BibTeX, JSON, and CSV exporters for scitadel search results."
 readme = "../../README.md"
 
 [dependencies]
-scitadel-core = { path = "../scitadel-core", version = "0.6.0" }
+scitadel-core = { path = "../scitadel-core", version = "0.6.0" } # x-release-please-version
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
