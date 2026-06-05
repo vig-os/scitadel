@@ -12,6 +12,17 @@ on:
     tags:
       - '[0-9]+.[0-9]+.[0-9]+'
       - '[0-9]+.[0-9]+.[0-9]+-*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and upload assets for (e.g. 0.7.0)"
+        required: true
+
+# Needed to upload assets to the GitHub Release. Without this the default
+# GITHUB_TOKEN is read-only under restrictive org defaults and the upload
+# fails with "Resource not accessible by integration".
+permissions:
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -34,6 +45,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -49,7 +62,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME}"
+          VERSION="${{ inputs.tag || github.ref_name }}"
           DIST_NAME="${BINARY_NAME}-${VERSION}-${{ matrix.target }}"
           STAGE=$(mktemp -d)
           mkdir -p "${STAGE}/${DIST_NAME}"
@@ -65,6 +78,7 @@ jobs:
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
             ${{ steps.package.outputs.tarball }}
             ${{ steps.package.outputs.checksum }}
