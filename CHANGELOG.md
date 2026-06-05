@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- **Light mode + auto-detect** (#137, theme iter 2). Adds
+  `Theme::DALTON_BRIGHT` (Dalton Bright palette ported from upstream)
+  and runtime theme resolution: `--theme <name>` CLI flag on
+  `scitadel tui` (highest precedence) → `SCITADEL_THEME` env var →
+  `[ui] theme = "..."` in config → `auto`. `auto` probes `COLORFGBG`
+  to pick light vs dark and falls back to dark when unset/unparseable.
+  OSC 11 fallback intentionally deferred (raw-tty + timeout dance);
+  `--theme` is the documented escape hatch when `COLORFGBG` is wrong.
+  Theme is locked once at startup — restart the TUI if the terminal
+  flips light/dark mid-session.
+
 ## [0.6.0] - 2026-04-24
 
 The "actually read what you found" release. Closes the workflow gap
@@ -66,25 +79,6 @@ on 2-column scientific PDFs via `pdftotext -layout` when available.
   Dark](https://github.com/gerchowl/dalton-colorscheme), a
   colourblind-friendly scheme tuned for deuteranopia and protanopia.
   Light mode and auto-detection ship in #137.
-- **Cross-search Queue tab** (#48 reduced, #140). Fourth tab in the
-  TUI aggregates every starred paper across searches into one ranked
-  view, sorted most-recently-starred first. Reuses the Papers-tab
-  rendering, so `s` (un)stars from the Queue and `Enter` opens the
-  detail overlay just like the per-search view. Closes the
-  "everything I've flagged" workflow that previously required jumping
-  between searches.
-
-### Changed
-
-- **CI tape suite retries up to 3 times on flake** (#143). Replaces
-  the prior retry-once policy after the `annotations-in-detail.tape`
-  kept tripping the distinct-snapshot gate intermittently; sleeps
-  bumped 3500/2500/3500ms → 5s/3500ms/5s on that tape too. Combined,
-  these turn the tape gate from "occasionally red on green PRs" into
-  reliably gating real regressions.
-- **CI dependencies refreshed**: `actions/checkout` v4 → v6 (#37);
-  `github/codeql-action`, `actions/create-github-app-token`,
-  `actions/cache` minor bumps (#63).
 
 ## [0.5.0] - 2026-04-21
 

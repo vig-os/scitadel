@@ -1,0 +1,22 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "scitadel",
+  "description": "Scitadel — local-first literature management with an MCP server for annotating papers and exposing your reading to an adjacent agent.",
+  "owner": {
+    "name": "scitadel contributors",
+    "url": "https://github.com/vig-os/scitadel"
+  },
+  "plugins": [
+    {
+      "name": "scitadel",
+      "description": "Registers the scitadel MCP server (stdio). On first launch it fetches the pinned scitadel release binary for your platform from GitHub Releases, verifies its checksum, caches it, and runs `scitadel mcp`. No manual PATH setup.",
+      "source": "./plugins/scitadel",
+      "author": {
+        "name": "scitadel contributors",
+        "url": "https://github.com/vig-os/scitadel"
+      },
+      "category": "productivity",
+      "homepage": "https://github.com/vig-os/scitadel"
+    }
+  ]
+}

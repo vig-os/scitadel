@@ -1,6 +1,6 @@
 [package]
 name = "scitadel-tui"
-version.workspace = true
+version = "0.6.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -15,6 +15,7 @@ readme = "../../README.md"
 scitadel-core = { path = "../scitadel-core", version = "0.6.0" }
 scitadel-db = { path = "../scitadel-db", version = "0.6.0" }
 scitadel-adapters = { path = "../scitadel-adapters", version = "0.6.0" }
+scitadel-export = { path = "../scitadel-export", version = "0.6.0" }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 anyhow = { workspace = true }
@@ -23,6 +24,17 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 reqwest = { workspace = true }
 chrono = { workspace = true }
+
+# OSC 11 background-color query (#176): unix `poll(2)` for a
+# nonblocking read on stdin with a millisecond-grained timeout.
+# `libc` is already a transitive dep via crossterm/tokio/mio, so
+# this is not a net-new dep in the lock graph — just a direct
+# declaration so the theme resolver can call `libc::poll`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

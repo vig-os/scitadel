@@ -26,7 +26,14 @@ use scitadel_core::models::Annotation;
 // annotation-background tints swappable alongside the rest of the UI
 // when light-mode / auto-detect ships in #137.
 
-pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, paper_id: &str, focus: Option<usize>) {
+pub fn draw(
+    frame: &mut Frame,
+    area: Rect,
+    data: &DataStore,
+    paper_id: &str,
+    focus: Option<usize>,
+    reader: &str,
+) {
     let Ok(Some(paper)) = data.load_paper(paper_id) else {
         let block = Block::default().title(" Reader ").borders(Borders::ALL);
         let msg = Paragraph::new("Paper not found.").block(block);
@@ -37,8 +44,26 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, paper_id: &str, foc
     let annotations = data
         .load_annotations_for_paper(paper_id)
         .unwrap_or_default();
-    // Roots only on the left pane — replies don't carry their own anchor.
-    let roots: Vec<&Annotation> = annotations.iter().filter(|a| !a.is_reply()).collect();
+    // Roots only on the left pane — replies don't carry their own
+    // anchor. Paper-level notes (#185) are also excluded from the
+    // anchored-roots set: they have no quote / char_range and don't
+    // produce a body highlight; they render in their own section.
+    let roots: Vec<&Annotation> = annotations
+        .iter()
+        .filter(|a| !a.is_reply() && !a.anchor.is_paper_note())
+        .collect();
+    let paper_notes: Vec<&Annotation> = annotations
+        .iter()
+        .filter(|a| !a.is_reply() && a.anchor.is_paper_note())
+        .collect();
+    // Set of annotation IDs `reader` hasn't acknowledged yet, used by
+    // the right-pane to render `[unread]` markers per row. (#185)
+    let unread: std::collections::HashSet<String> = data
+        .load_unread_for_paper(reader, paper_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| a.id.as_str().to_string())
+        .collect();
 
     let body = paper
         .full_text
@@ -66,7 +91,15 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &DataStore, paper_id: &str, foc
         .split(area);
 
     draw_text_pane(frame, chunks[0], &paper.title, body, &roots, focus);
-    draw_notes_pane(frame, chunks[1], &annotations, &roots, focus);
+    draw_notes_pane(
+        frame,
+        chunks[1],
+        &annotations,
+        &roots,
+        &paper_notes,
+        focus,
+        &unread,
+    );
 }
 
 fn draw_text_pane(
@@ -89,14 +122,77 @@ fn draw_text_pane(
     frame.render_widget(para, area);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_notes_pane(
     frame: &mut Frame,
     area: Rect,
     annotations: &[Annotation],
     roots: &[&Annotation],
+    paper_notes: &[&Annotation],
     focus: Option<usize>,
+    unread: &std::collections::HashSet<String>,
 ) {
     let mut lines: Vec<Line<'_>> = Vec::new();
+    let unread_span = || {
+        Span::styled(
+            "  [unread]",
+            Style::default()
+                .fg(crate::theme::theme().emphasis)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+
+    // Paper-level notes section first — quote-less commentary on the
+    // publication as a whole. Drawn above the threaded annotations
+    // so the human sees overall reactions before passage-anchored
+    // ones. Replies to a paper-level note are still rendered as
+    // children, since the data model permits replying to anything. (#185)
+    if !paper_notes.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            "── Paper-level notes ──",
+            Style::default()
+                .fg(crate::theme::theme().muted)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        for note in paper_notes {
+            let mut head = vec![Span::raw(format!(
+                "  ¶ {} ({}): {}",
+                note.author,
+                note.created_at.format("%Y-%m-%d"),
+                note.note,
+            ))];
+            if unread.contains(note.id.as_str()) {
+                head.push(unread_span());
+            }
+            lines.push(Line::from(head));
+            for ann in annotations.iter().filter(|a| {
+                a.parent_id
+                    .as_ref()
+                    .is_some_and(|p| p.as_str() == note.id.as_str())
+            }) {
+                let mut spans = vec![
+                    Span::raw("    └ "),
+                    Span::styled(
+                        format!("{}: ", ann.author),
+                        Style::default().fg(crate::theme::theme().emphasis),
+                    ),
+                    Span::raw(ann.note.clone()),
+                ];
+                if unread.contains(ann.id.as_str()) {
+                    spans.push(unread_span());
+                }
+                lines.push(Line::from(spans));
+            }
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            "── Threaded annotations ──",
+            Style::default()
+                .fg(crate::theme::theme().muted)
+                .add_modifier(Modifier::BOLD),
+        )]));
+    }
+
     for (idx, root) in roots.iter().enumerate() {
         let color = color_for(root.id.as_str());
         let is_focused = focus == Some(idx);
@@ -129,26 +225,34 @@ fn draw_notes_pane(
                 ),
             ]));
         }
-        lines.push(Line::from(format!(
+        let mut root_meta = vec![Span::raw(format!(
             "    {} ({}): {}",
             root.author,
             root.created_at.format("%Y-%m-%d"),
             root.note
-        )));
+        ))];
+        if unread.contains(root.id.as_str()) {
+            root_meta.push(unread_span());
+        }
+        lines.push(Line::from(root_meta));
         // Replies threaded under the root.
         for ann in annotations.iter().filter(|a| {
             a.parent_id
                 .as_ref()
                 .is_some_and(|p| p.as_str() == root.id.as_str())
         }) {
-            lines.push(Line::from(vec![
+            let mut spans = vec![
                 Span::raw("    └ "),
                 Span::styled(
                     format!("{}: ", ann.author),
                     Style::default().fg(crate::theme::theme().emphasis),
                 ),
                 Span::raw(ann.note.clone()),
-            ]));
+            ];
+            if unread.contains(ann.id.as_str()) {
+                spans.push(unread_span());
+            }
+            lines.push(Line::from(spans));
         }
         lines.push(Line::from(""));
     }

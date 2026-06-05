@@ -1,7 +1,7 @@
 mod app;
 mod data;
 mod tasks;
-mod theme;
+pub mod theme;
 mod views;
 mod widgets;
 

@@ -267,7 +267,16 @@ pub fn export_search_tool(search_id: &str, format: &str) -> Result<String, Strin
 
     match format {
         "csv" => Ok(scitadel_export::export_csv(&papers)),
-        "bibtex" => Ok(scitadel_export::export_bibtex(&papers)),
+        "bibtex" => {
+            // #162: surface paper-level tags as `keywords={…}` so a
+            // Zotero round-trip preserves keyword-only entries.
+            use scitadel_db::sqlite::SqlitePaperTagRepository;
+            let db = open_db()?;
+            let tags = SqlitePaperTagRepository::new(db);
+            Ok(scitadel_export::export_bibtex_with_tags(&papers, |id| {
+                tags.tags_for(id).unwrap_or_default()
+            }))
+        }
         // Default to JSON for unknown formats
         _ => Ok(scitadel_export::export_json(&papers, 2)),
     }
@@ -549,9 +558,19 @@ pub async fn download_paper_tool(
 /// Extract text from a paper's downloaded file (PDF or HTML).
 ///
 /// Looks up the paper in the DB, locates its cached file under `papers_dir()`,
-/// and returns the extracted text. Truncated to `max_chars` (default 20_000) to
-/// keep responses manageable for the host LLM.
-pub async fn read_paper_tool(paper_id: &str, max_chars: Option<usize>) -> Result<String, String> {
+/// and returns the extracted text. Truncated to `max_chars` (default 20_000)
+/// to keep responses manageable for the host LLM.
+///
+/// When `with_annotations` is `None` or `Some(true)` (the default), the
+/// response is a JSON envelope that folds in live annotations alongside the
+/// extracted text — closes the silent-miss bug where an agent calling
+/// `read_paper` would never observe a human comment (#185). Pass
+/// `Some(false)` for the legacy text shape.
+pub async fn read_paper_tool(
+    paper_id: &str,
+    max_chars: Option<usize>,
+    with_annotations: Option<bool>,
+) -> Result<String, String> {
     let config = load_config();
     let db = open_db()?;
     let (paper_repo, _, _, _, _) = db.repositories();
@@ -601,21 +620,67 @@ pub async fn read_paper_tool(paper_id: &str, max_chars: Option<usize>) -> Result
     let text = text.expect("text populated above");
 
     let limit = max_chars.unwrap_or(20_000);
-    let truncated = if text.chars().count() > limit {
-        let head: String = text.chars().take(limit).collect();
-        format!(
-            "{head}\n\n[... truncated, {} of {} chars shown ...]",
-            limit,
-            text.chars().count()
-        )
+    assemble_read_paper_response(
+        &db,
+        &paper,
+        text,
+        extractor,
+        &path_display,
+        limit,
+        with_annotations.unwrap_or(true),
+    )
+}
+
+/// Format the extracted text + (optionally) annotations into the
+/// `read_paper` response. Factored out of `read_paper_tool` so the
+/// JSON-shape contract can be exercised with an in-memory DB without
+/// wiring a real PDF fixture.
+#[allow(clippy::too_many_arguments)]
+fn assemble_read_paper_response(
+    db: &Database,
+    paper: &Paper,
+    extracted_text: String,
+    extractor: Option<&str>,
+    path_display: &str,
+    max_chars: usize,
+    with_annotations: bool,
+) -> Result<String, String> {
+    let total_chars = extracted_text.chars().count();
+    let was_truncated = total_chars > max_chars;
+    let body: String = if was_truncated {
+        extracted_text.chars().take(max_chars).collect()
     } else {
-        text
+        extracted_text
     };
 
+    if with_annotations {
+        let (annotations, source_version) = build_annotations_json(db, paper.id.as_str())?;
+        let response = serde_json::json!({
+            "paper": {
+                "id": paper.id.as_str(),
+                "title": paper.title,
+                "abstract": paper.r#abstract,
+                "full_text": body,
+            },
+            "annotations": annotations,
+            "source_version": source_version,
+            "extractor": extractor,
+            "path": path_display,
+            "truncated": was_truncated,
+            "total_chars": total_chars,
+        });
+        return serde_json::to_string_pretty(&response).map_err(|e| e.to_string());
+    }
+
+    let body_with_marker = if was_truncated {
+        format!("{body}\n\n[... truncated, {max_chars} of {total_chars} chars shown ...]")
+    } else {
+        body
+    };
     let extractor_line = extractor.map_or_else(String::new, |e| format!("Extractor: {e}\n"));
     Ok(format!(
-        "Paper: {}\nPath: {}\n{extractor_line}\n{}",
-        paper.title, path_display, truncated
+        "Paper: {}\nPath: {path_display}\n{extractor_line}\n{body_with_marker}",
+        paper.title
     ))
 }
 
@@ -1101,6 +1166,49 @@ pub fn reply_annotation_tool(parent_id: &str, note: &str, author: &str) -> Resul
     Ok(reply.id.as_str().to_string())
 }
 
+/// Create a paper-level note: commentary on the publication as a
+/// whole, with no quote / char_range / fuzzy match. The anchor
+/// carries only a synthetic `paper-note:<paper_id>` sentence_id and
+/// the resolver short-circuits it to Ok. (#185)
+pub fn create_paper_note_tool(paper_id: &str, note: &str, author: &str) -> Result<String, String> {
+    if author.trim().is_empty() {
+        return Err("author is required (pass an identity string)".into());
+    }
+    if note.trim().is_empty() {
+        return Err("note is required".into());
+    }
+    let db = open_db()?;
+    // Verify the paper exists. Without this, a typo in `paper_id`
+    // would create a dangling note with no UI surface to find it
+    // again — a bigger footfun than a clean error here.
+    {
+        let (paper_repo, _, _, _, _) = db.repositories();
+        if scitadel_core::ports::PaperRepository::get(&paper_repo, paper_id)
+            .map_err(|e| e.to_string())?
+            .is_none()
+        {
+            return Err(format!("Paper '{paper_id}' not found."));
+        }
+    }
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+
+    let ann = scitadel_core::models::Annotation::new_root(
+        scitadel_core::models::PaperId::from(paper_id),
+        author.to_string(),
+        note.to_string(),
+        scitadel_core::models::paper_note_anchor(paper_id),
+    );
+    repo.create(&ann).map_err(|e| e.to_string())?;
+    tracing::info!(
+        op = "create_paper_note",
+        annotation_id = ann.id.as_str(),
+        paper_id = paper_id,
+        author = author,
+        "annotation write (trust-on-first-use)"
+    );
+    Ok(ann.id.as_str().to_string())
+}
+
 /// Update mutable fields on an existing annotation.
 pub fn update_annotation_tool(
     id: &str,
@@ -1127,6 +1235,20 @@ pub fn update_annotation_tool(
         "annotation write (trust-on-first-use)"
     );
     Ok(format!("Annotation {id} updated."))
+}
+
+/// Resolve the `paper_id` an annotation is anchored to. Used by the
+/// MCP server when emitting an `AnnotationEvent` so subscribers can
+/// scope the resource URI without re-querying themselves. Returns
+/// `Ok(None)` if the annotation row is missing (deleted or never
+/// existed) — the server logs a warning and skips the emit. (#185)
+pub fn lookup_annotation_paper_id(id: &str) -> Result<Option<String>, String> {
+    let db = open_db()?;
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+    Ok(repo
+        .get(id)
+        .map_err(|e| e.to_string())?
+        .map(|a| a.paper_id.as_str().to_string()))
 }
 
 /// Soft-delete an annotation. Keeps the row so threads are preserved;
@@ -1201,14 +1323,14 @@ pub fn get_annotated_paper_tool(paper_id: &str) -> Result<String, String> {
     build_annotated_paper(&db, paper_id)
 }
 
-fn build_annotated_paper(db: &Database, paper_id: &str) -> Result<String, String> {
+/// Build the annotation array + source_version block shared by
+/// `read_paper` (when `with_annotations=true`) and `get_annotated_paper`.
+/// Soft-deleted annotations are excluded by `list_by_paper`.
+fn build_annotations_json(
+    db: &Database,
+    paper_id: &str,
+) -> Result<(Vec<serde_json::Value>, Option<String>), String> {
     use std::collections::HashMap;
-
-    let (paper_repo, _, _, _, _) = db.repositories();
-    let paper = paper_repo
-        .get(paper_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Paper '{paper_id}' not found."))?;
 
     let ann_repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db.clone());
     let annotations = ann_repo
@@ -1263,6 +1385,18 @@ fn build_annotated_paper(db: &Database, paper_id: &str) -> Result<String, String
             })
         })
         .collect();
+
+    Ok((entries, source_version))
+}
+
+fn build_annotated_paper(db: &Database, paper_id: &str) -> Result<String, String> {
+    let (paper_repo, _, _, _, _) = db.repositories();
+    let paper = paper_repo
+        .get(paper_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Paper '{paper_id}' not found."))?;
+
+    let (entries, source_version) = build_annotations_json(db, paper_id)?;
 
     let response = serde_json::json!({
         "paper": {
@@ -1598,11 +1732,406 @@ pub fn list_starred_tool(reader: &str) -> Result<String, String> {
     serde_json::to_string(&sorted).map_err(|e| e.to_string())
 }
 
+/// `import_bibtex` MCP tool — parse a `.bib` file at `path` and apply
+/// the import pipeline. Returns a JSON summary mirroring what the CLI
+/// prints, so downstream agents can decide whether to follow up
+/// (resolve ambiguous aliases, retry rejected entries, etc).
+pub fn import_bibtex_tool(
+    path: &str,
+    strategy: Option<&str>,
+    reader: &str,
+) -> Result<String, String> {
+    use crate::bib_import::{ImportOptions, import_bibtex_file};
+    use scitadel_db::sqlite::{
+        SqliteAnnotationRepository, SqlitePaperAliasRepository, SqlitePaperRepository,
+        SqlitePaperTagRepository,
+    };
+    use scitadel_export::import::MergeStrategy;
+
+    let strategy = strategy.unwrap_or("merge");
+    let strategy = MergeStrategy::parse(strategy).ok_or_else(|| {
+        format!(
+            "unknown strategy '{strategy}'; valid: reject, db-wins, bib-wins, merge, interactive"
+        )
+    })?;
+
+    let db = open_db()?;
+    let papers = SqlitePaperRepository::new(db.clone());
+    let aliases = SqlitePaperAliasRepository::new(db.clone());
+    let annotations = SqliteAnnotationRepository::new(db.clone());
+    let tags = SqlitePaperTagRepository::new(db);
+
+    let options = ImportOptions {
+        strategy,
+        reader: reader.to_string(),
+        lenient: true,
+        // MCP-side prompt elicitation is a follow-up; without a
+        // resolver, `interactive` strategy degrades to the same
+        // per-row failure path as `merge` for ambiguous-alias rows.
+        prompt_resolver: None,
+    };
+    let report = import_bibtex_file(
+        std::path::Path::new(path),
+        &options,
+        &papers,
+        &aliases,
+        &annotations,
+        &tags,
+    )
+    .map_err(|e| e.to_string())?;
+
+    let rows: Vec<serde_json::Value> = report
+        .rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "citekey": r.citekey,
+                "paper_id": r.paper_id,
+                "action": match r.action {
+                    scitadel_export::import::MergeAction::Created => "created",
+                    scitadel_export::import::MergeAction::Updated => "updated",
+                    scitadel_export::import::MergeAction::Unchanged => "unchanged",
+                    scitadel_export::import::MergeAction::Rejected => "rejected",
+                },
+                "from_bib": r.from_bib,
+                "kept_from_db": r.kept_from_db,
+                "annotation_created": r.annotation_created,
+                "paper_tags_written": r.paper_tags_written,
+                "dropped_file": r.dropped_file,
+            })
+        })
+        .collect();
+    let summary = serde_json::json!({
+        "rows": rows,
+        "failed": report.failed.iter().map(|(k, e)| serde_json::json!({"citekey": k, "error": e})).collect::<Vec<_>>(),
+        "totals": {
+            "total":     report.rows.len(),
+            "created":   report.count(scitadel_export::import::MergeAction::Created),
+            "updated":   report.count(scitadel_export::import::MergeAction::Updated),
+            "unchanged": report.count(scitadel_export::import::MergeAction::Unchanged),
+            "rejected":  report.count(scitadel_export::import::MergeAction::Rejected),
+            "failed":    report.failed.len(),
+        }
+    });
+    serde_json::to_string_pretty(&summary).map_err(|e| e.to_string())
+}
+
+/// `rekey_paper` MCP tool — reassign a paper's citation key. Returns
+/// JSON `{paper_id, old_key, new_key, changed}` so downstream agents
+/// can update referenced manuscripts.
+pub fn rekey_paper_tool(
+    paper_id: &str,
+    explicit_key: Option<&str>,
+    reader: &str,
+) -> Result<String, String> {
+    use crate::bib_rekey::{RekeyError, rekey_paper};
+    use scitadel_db::sqlite::{SqlitePaperAliasRepository, SqlitePaperRepository};
+
+    let db = open_db()?;
+    let papers = SqlitePaperRepository::new(db.clone());
+    let aliases = SqlitePaperAliasRepository::new(db);
+
+    match rekey_paper(&papers, &aliases, paper_id, explicit_key, reader) {
+        Ok(out) => serde_json::to_string_pretty(&serde_json::json!({
+            "paper_id": out.paper_id,
+            "old_key": out.old_key,
+            "new_key": out.new_key,
+            "changed": out.changed,
+        }))
+        .map_err(|e| e.to_string()),
+        Err(RekeyError::PaperNotFound(id)) => Err(format!("paper '{id}' not found")),
+        Err(RekeyError::KeyCollision { key, owner }) => Err(format!(
+            "citation key '{key}' already used by paper '{owner}'"
+        )),
+        Err(RekeyError::InvalidKey(k)) => Err(format!("invalid citation key '{k}'")),
+        Err(RekeyError::Core(e)) => Err(e.to_string()),
+    }
+}
+
+// ---------- bib snapshot / verify (#178) ----------
+
+/// Sidecar suffix; mirrors the CLI constant. Kept in lockstep so MCP
+/// snapshots and CLI verifies share the same lockfile path.
+const SIDECAR_SUFFIX: &str = ".scitadel-bib.lock";
+
+fn sidecar_path_for(bib: &std::path::Path) -> std::path::PathBuf {
+    let mut s = bib.as_os_str().to_owned();
+    s.push(SIDECAR_SUFFIX);
+    std::path::PathBuf::from(s)
+}
+
+fn resolve_question_id(
+    db: &Database,
+    question_prefix: &str,
+) -> Result<scitadel_core::models::ResearchQuestion, String> {
+    let (_, _, q_repo, _, _) = db.repositories();
+    if let Some(q) = q_repo
+        .get_question(question_prefix)
+        .map_err(|e| e.to_string())?
+    {
+        return Ok(q);
+    }
+    let questions = q_repo.list_questions().map_err(|e| e.to_string())?;
+    let matches: Vec<_> = questions
+        .iter()
+        .filter(|q| q.id.as_str().starts_with(question_prefix))
+        .collect();
+    match matches.len() {
+        0 => Err(format!("no question matching '{question_prefix}'")),
+        1 => Ok(matches[0].clone()),
+        n => Err(format!(
+            "ambiguous question prefix '{question_prefix}' — {n} matches"
+        )),
+    }
+}
+
+/// Render the shortlist's `.bib` reusing `export_bibtex_with_tags` so
+/// the CLI and MCP code paths produce byte-identical output for the
+/// same DB state — the determinism contract that makes verify possible.
+fn render_shortlist_bibtex(
+    db: &Database,
+    paper_ids: &[String],
+) -> Result<(Vec<Paper>, String), String> {
+    let (papers, tags) = load_papers_and_tags(db, paper_ids);
+    let content = scitadel_export::export_bibtex_with_tags(&papers, |id| {
+        tags.get(id).cloned().unwrap_or_default()
+    });
+    Ok((papers, content))
+}
+
+/// CSL-JSON 1.0.2 sibling of [`render_shortlist_bibtex`] for #135.
+/// Same paper/tag lookup; different emitter. Determinism contract is
+/// identical.
+fn render_shortlist_csl_json(
+    db: &Database,
+    paper_ids: &[String],
+) -> Result<(Vec<Paper>, String), String> {
+    let (papers, tags) = load_papers_and_tags(db, paper_ids);
+    let content = scitadel_export::export_csl_json_with_tags(&papers, |id| {
+        tags.get(id).cloned().unwrap_or_default()
+    });
+    Ok((papers, content))
+}
+
+fn load_papers_and_tags(
+    db: &Database,
+    paper_ids: &[String],
+) -> (Vec<Paper>, std::collections::HashMap<String, Vec<String>>) {
+    use scitadel_db::sqlite::SqlitePaperTagRepository;
+    let (paper_repo, _, _, _, _) = db.repositories();
+    let papers: Vec<Paper> = paper_ids
+        .iter()
+        .filter_map(|id| paper_repo.get(id).ok().flatten())
+        .collect();
+    let tag_repo = SqlitePaperTagRepository::new(db.clone());
+    let mut tags = std::collections::HashMap::new();
+    for id in paper_ids {
+        tags.insert(id.clone(), tag_repo.tags_for(id).unwrap_or_default());
+    }
+    (papers, tags)
+}
+
+pub fn bib_snapshot_tool(
+    question_prefix: &str,
+    output: &str,
+    reader: &str,
+    no_lock: bool,
+    format: &str,
+) -> Result<String, String> {
+    if reader.trim().is_empty() {
+        return Err("reader is required".into());
+    }
+    let db = open_db()?;
+    let shortlist_repo = scitadel_db::sqlite::SqliteShortlistRepository::new(db.clone());
+    let question = resolve_question_id(&db, question_prefix)?;
+
+    let paper_ids = shortlist_repo
+        .list(question.id.as_str(), reader)
+        .map_err(|e| e.to_string())?;
+    let is_csl = match format {
+        "csl-json" => true,
+        "" | "bibtex" => false,
+        other => return Err(format!("unknown format: {other}; valid: bibtex, csl-json")),
+    };
+    let (papers, content) = if is_csl {
+        render_shortlist_csl_json(&db, &paper_ids)?
+    } else {
+        render_shortlist_bibtex(&db, &paper_ids)?
+    };
+
+    let output_path = std::path::Path::new(output);
+    std::fs::write(output_path, &content).map_err(|e| e.to_string())?;
+
+    let sidecar = sidecar_path_for(output_path);
+    let mut response = serde_json::Map::new();
+    response.insert("output".into(), serde_json::Value::String(output.into()));
+    response.insert("papers".into(), serde_json::Value::from(papers.len()));
+
+    if no_lock {
+        response.insert("sidecar".into(), serde_json::Value::Null);
+    } else {
+        let lock = if is_csl {
+            scitadel_export::BibLockfile::new_csl_json(
+                question.id.as_str(),
+                reader,
+                &paper_ids,
+                &content,
+            )
+        } else {
+            scitadel_export::BibLockfile::new_bibtex(
+                question.id.as_str(),
+                reader,
+                &paper_ids,
+                &content,
+            )
+        };
+        std::fs::write(&sidecar, lock.to_json().map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        response.insert(
+            "sidecar".into(),
+            serde_json::Value::String(sidecar.display().to_string()),
+        );
+        response.insert(
+            "shortlist_hash".into(),
+            serde_json::Value::String(lock.shortlist_hash),
+        );
+        response.insert(
+            "content_hash".into(),
+            serde_json::Value::String(lock.content_hash),
+        );
+        response.insert("format".into(), serde_json::Value::String(lock.format));
+    }
+    Ok(serde_json::Value::Object(response).to_string())
+}
+
+pub fn bib_verify_tool(file: &str, question_override: Option<&str>) -> Result<String, String> {
+    let bib_path = std::path::Path::new(file);
+    let bib_bytes = std::fs::read_to_string(bib_path).map_err(|e| e.to_string())?;
+
+    let sidecar = sidecar_path_for(bib_path);
+    if !sidecar.exists() {
+        return Ok(serde_json::json!({
+            "status": "stale",
+            "exit_code": 2,
+            "message": format!("no lockfile at {} — run bib_snapshot first", sidecar.display()),
+        })
+        .to_string());
+    }
+    let lock_bytes = std::fs::read_to_string(&sidecar).map_err(|e| e.to_string())?;
+    let lock = scitadel_export::BibLockfile::from_json(&lock_bytes).map_err(|e| e.to_string())?;
+
+    // Stale checks first — if the binary moved, drift comparisons mean nothing.
+    let current_algo = scitadel_export::sidecar::ALGO_HASH;
+    let current_version = env!("CARGO_PKG_VERSION");
+    if lock.algo_hash != current_algo {
+        return Ok(serde_json::json!({
+            "status": "stale",
+            "exit_code": 2,
+            "message": format!(
+                "algo_hash mismatch: sidecar={} current={}",
+                lock.algo_hash, current_algo,
+            ),
+        })
+        .to_string());
+    }
+    if lock.scitadel_version != current_version {
+        return Ok(serde_json::json!({
+            "status": "stale",
+            "exit_code": 2,
+            "message": format!(
+                "scitadel_version mismatch: sidecar={} current={}",
+                lock.scitadel_version, current_version,
+            ),
+        })
+        .to_string());
+    }
+
+    let db = open_db()?;
+    let shortlist_repo = scitadel_db::sqlite::SqliteShortlistRepository::new(db.clone());
+    let qid = question_override.unwrap_or(&lock.question_id);
+    let question = resolve_question_id(&db, qid)?;
+
+    let paper_ids = shortlist_repo
+        .list(question.id.as_str(), &lock.reader)
+        .map_err(|e| e.to_string())?;
+    // Route to the matching emitter based on the sidecar's `format`
+    // discriminant (#135). Default to BibTeX so pre-#135 sidecars
+    // (which omit or carry "bibtex") keep working unchanged.
+    let (_papers, regenerated) = match lock.format.as_str() {
+        scitadel_export::sidecar::FORMAT_CSL_JSON => render_shortlist_csl_json(&db, &paper_ids)?,
+        _ => render_shortlist_bibtex(&db, &paper_ids)?,
+    };
+
+    let shortlist_changed = scitadel_export::shortlist_hash(&paper_ids) != lock.shortlist_hash;
+    let content_changed =
+        scitadel_export::content_hash(&bib_bytes) != lock.content_hash || bib_bytes != regenerated;
+    if shortlist_changed || content_changed {
+        return Ok(serde_json::json!({
+            "status": "drift",
+            "exit_code": 1,
+            "shortlist_changed": shortlist_changed,
+            "content_changed": content_changed,
+            "fix": format!("scitadel bib snapshot {} --output {}", lock.question_id, file),
+        })
+        .to_string());
+    }
+    Ok(serde_json::json!({
+        "status": "ok",
+        "exit_code": 0,
+        "message": "matches lockfile",
+    })
+    .to_string())
+}
+
+/// Structural diff between two bibliography files (or one file +
+/// fresh DB snapshot of a question). Mirrors the CLI's `bib diff`.
+/// Returns: JSON `{added, removed, changed}` (empty arrays if zero
+/// drift). Exit-code semantics live in the CLI; the MCP tool returns
+/// the structure unconditionally so the caller can branch on it.
+pub fn bib_diff_tool(
+    file_a: &str,
+    file_b: Option<&str>,
+    question_id: Option<&str>,
+    reader: Option<&str>,
+) -> Result<String, String> {
+    let path_a = std::path::Path::new(file_a);
+    let (entries_a, fmt_a) = scitadel_export::load_entries_from_path(path_a)?;
+    let entries_b = match (file_b, question_id) {
+        (Some(_), Some(_)) => return Err("pass file_b OR question_id, not both".into()),
+        (None, None) => return Err("pass file_b or question_id".into()),
+        (Some(b), None) => {
+            let (e, _) = scitadel_export::load_entries_from_path(std::path::Path::new(b))?;
+            e
+        }
+        (None, Some(qid)) => {
+            let reader = reader
+                .map(str::to_string)
+                .ok_or_else(|| "reader is required when using question_id".to_string())?;
+            let db = open_db()?;
+            let shortlist_repo = scitadel_db::sqlite::SqliteShortlistRepository::new(db.clone());
+            let question = resolve_question_id(&db, qid)?;
+            let paper_ids = shortlist_repo
+                .list(question.id.as_str(), &reader)
+                .map_err(|e| e.to_string())?;
+            // Match the file's flavor so the comparison is apples-to-apples.
+            let (_papers, content) = match fmt_a {
+                scitadel_export::BibFormat::CslJson => render_shortlist_csl_json(&db, &paper_ids)?,
+                scitadel_export::BibFormat::Bibtex => render_shortlist_bibtex(&db, &paper_ids)?,
+            };
+            let (e, _) = scitadel_export::load_entries_from_str(&content)?;
+            e
+        }
+    };
+
+    let diff = scitadel_export::diff_entries(&entries_a, &entries_b);
+    serde_json::to_string(&diff).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        SOURCE_REGISTRY, build_annotated_paper, html_to_text, is_source_configured,
-        truncate_abstract,
+        SOURCE_REGISTRY, assemble_read_paper_response, build_annotated_paper, html_to_text,
+        is_source_configured, truncate_abstract,
     };
     use scitadel_core::config::Config;
     use scitadel_core::models::{Anchor, Annotation, Paper, PaperId};
@@ -1623,6 +2152,11 @@ mod tests {
         p.full_text = full_text.map(str::to_string);
         paper_repo.save(&p).expect("save paper");
         p.id
+    }
+
+    fn load_paper(db: &Database, id: &str) -> Paper {
+        let (paper_repo, _, _, _, _) = db.repositories();
+        paper_repo.get(id).unwrap().expect("paper present")
     }
 
     #[test]
@@ -1741,6 +2275,184 @@ mod tests {
         let db = fresh_db();
         let err = build_annotated_paper(&db, "nope").unwrap_err();
         assert!(err.contains("not found"));
+    }
+
+    // -- read_paper #185: with_annotations folds the annotation array
+    //    into the response so an agent never silently misses comments.
+
+    #[test]
+    fn read_paper_with_annotations_default_true_returns_json_envelope() {
+        let db = fresh_db();
+        let pid = save_paper(&db, "p-rp1", "Cosmic rays", Some("body text"));
+        let repo = SqliteAnnotationRepository::new(db.clone());
+        let ann = Annotation::new_root(
+            pid,
+            "lars".into(),
+            "interesting".into(),
+            Anchor {
+                quote: Some("body".into()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&ann).unwrap();
+
+        let paper = load_paper(&db, "p-rp1");
+        let out = assemble_read_paper_response(
+            &db,
+            &paper,
+            "body text".into(),
+            Some("pdftotext"),
+            "/tmp/p-rp1.pdf",
+            100,
+            true,
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(v["paper"]["id"], "p-rp1");
+        assert_eq!(v["paper"]["full_text"], "body text");
+        assert_eq!(v["extractor"], "pdftotext");
+        assert_eq!(v["path"], "/tmp/p-rp1.pdf");
+        assert_eq!(v["truncated"], false);
+        assert_eq!(v["total_chars"], 9);
+        assert_eq!(v["annotations"].as_array().unwrap().len(), 1);
+        assert_eq!(v["annotations"][0]["note"], "interesting");
+    }
+
+    #[test]
+    fn read_paper_with_annotations_false_returns_text_shape() {
+        let db = fresh_db();
+        save_paper(&db, "p-rp2", "Old format", Some("hello"));
+        let paper = load_paper(&db, "p-rp2");
+        let out = assemble_read_paper_response(
+            &db,
+            &paper,
+            "hello".into(),
+            Some("pdftotext"),
+            "/tmp/p-rp2.pdf",
+            100,
+            false,
+        )
+        .unwrap();
+        // Legacy text shape: must NOT be JSON, must include the title
+        // and extractor lines exactly as before #185.
+        assert!(serde_json::from_str::<serde_json::Value>(&out).is_err());
+        assert!(out.starts_with("Paper: Old format\n"));
+        assert!(out.contains("Path: /tmp/p-rp2.pdf"));
+        assert!(out.contains("Extractor: pdftotext"));
+        assert!(out.contains("hello"));
+    }
+
+    #[test]
+    fn read_paper_with_annotations_truncates_full_text_and_flags_it() {
+        let db = fresh_db();
+        save_paper(&db, "p-rp3", "Long", Some(""));
+        let long: String = "a".repeat(50);
+        let paper = load_paper(&db, "p-rp3");
+        let out =
+            assemble_read_paper_response(&db, &paper, long, None, "(cached)", 10, true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["total_chars"], 50);
+        assert_eq!(
+            v["paper"]["full_text"].as_str().unwrap().chars().count(),
+            10
+        );
+    }
+
+    #[test]
+    fn read_paper_text_shape_appends_truncation_marker() {
+        let db = fresh_db();
+        save_paper(&db, "p-rp4", "Long", Some(""));
+        let long: String = "a".repeat(50);
+        let paper = load_paper(&db, "p-rp4");
+        let out =
+            assemble_read_paper_response(&db, &paper, long, None, "(cached)", 10, false).unwrap();
+        assert!(out.contains("[... truncated, 10 of 50 chars shown ...]"));
+    }
+
+    #[test]
+    fn read_paper_with_annotations_excludes_soft_deleted() {
+        let db = fresh_db();
+        let pid = save_paper(&db, "p-rp5", "T", Some(""));
+        let repo = SqliteAnnotationRepository::new(db.clone());
+        let live = Annotation::new_root(
+            pid.clone(),
+            "lars".into(),
+            "live".into(),
+            Anchor {
+                quote: Some("q1".into()),
+                ..Anchor::default()
+            },
+        );
+        let doomed = Annotation::new_root(
+            pid,
+            "lars".into(),
+            "gone".into(),
+            Anchor {
+                quote: Some("q2".into()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&live).unwrap();
+        repo.create(&doomed).unwrap();
+        repo.soft_delete(doomed.id.as_str()).unwrap();
+
+        let paper = load_paper(&db, "p-rp5");
+        let out =
+            assemble_read_paper_response(&db, &paper, "body".into(), None, "(cached)", 100, true)
+                .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let arr = v["annotations"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["note"], "live");
+    }
+
+    #[test]
+    fn read_paper_with_annotations_zero_annotations_returns_empty_array() {
+        let db = fresh_db();
+        save_paper(&db, "p-rp6", "Empty", Some(""));
+        let paper = load_paper(&db, "p-rp6");
+        let out =
+            assemble_read_paper_response(&db, &paper, "body".into(), None, "(cached)", 100, true)
+                .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["annotations"].as_array().unwrap().len(), 0);
+        assert!(v["source_version"].is_null());
+    }
+
+    #[test]
+    fn read_paper_with_annotations_replies_carry_root_id() {
+        // Insurance against future refactors of build_annotations_json:
+        // confirm parent_id/root_id propagate through the read_paper
+        // envelope (mirrors get_annotated_paper_replies_carry_root_id).
+        let db = fresh_db();
+        let pid = save_paper(&db, "p-rp7", "T", Some(""));
+        let repo = SqliteAnnotationRepository::new(db.clone());
+        let root = Annotation::new_root(
+            pid,
+            "lars".into(),
+            "root note".into(),
+            Anchor {
+                quote: Some("q".into()),
+                ..Anchor::default()
+            },
+        );
+        let reply = Annotation::new_reply(&root, "claude".into(), "agreed".into());
+        repo.create(&root).unwrap();
+        repo.create(&reply).unwrap();
+
+        let paper = load_paper(&db, "p-rp7");
+        let out =
+            assemble_read_paper_response(&db, &paper, "body".into(), None, "(cached)", 100, true)
+                .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let arr = v["annotations"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        let reply_entry = arr
+            .iter()
+            .find(|a| a["parent_id"].is_string())
+            .expect("has reply");
+        assert_eq!(reply_entry["root_id"], root.id.as_str());
     }
 
     #[test]

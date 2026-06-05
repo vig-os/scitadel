@@ -18,8 +18,10 @@ use tokio::sync::mpsc;
 use crate::data::DataStore;
 use crate::tasks::{Task, TaskKind, TaskStatus, TaskUpdate, spawn_download_paper};
 use crate::views::annotation_prompt::{AnnotationPrompt, PromptCommit, PromptSubmission};
+use crate::views::bib_export_prompt::BibExportPrompt;
 use crate::views::{
-    annotation_prompt, dashboard, detail, papers, questions, queue, searches, tasks as tasks_view,
+    annotation_prompt, bib_export_prompt, dashboard, detail, papers, questions, queue, searches,
+    tasks as tasks_view,
 };
 use crate::widgets::status_bar;
 
@@ -94,9 +96,20 @@ pub enum Overlay {
     },
     /// Question Dashboard (#133). Split-pane ranked-by-score view of
     /// papers assessed against the question, with a citation shortlist
-    /// curated via `c`.
+    /// curated via `c`. The optional `export_prompt` field carries the
+    /// state of the `E` path-prompt overlay (#135 sub-feature B); when
+    /// `Some`, the prompt eats every keystroke until Enter / Esc.
     QuestionDashboard {
         question_id: String,
+        selected: usize,
+        export_prompt: Option<BibExportPrompt>,
+    },
+    /// Unread-annotations inbox (#185 P0). `items` is the rendered
+    /// flat list (mixed headers + rows); `selected` points at the
+    /// currently-highlighted row. Built once on overlay open and
+    /// rebuilt on every render so MCP-side writes show up live.
+    Inbox {
+        items: Vec<crate::views::inbox::InboxItem>,
         selected: usize,
     },
 }
@@ -126,10 +139,134 @@ pub struct App {
     /// always work from SQLite; downloads still run (and can succeed via
     /// cache layers), but the status bar shows a visible OFFLINE badge.
     pub offline: bool,
+    /// Transient toast shown in the status bar for the first N draws
+    /// after launch (#137). `Some(label)` until cleared by
+    /// `tick_startup_toast`. Used to flash e.g.
+    /// `theme: dalton-dark (auto)` so users can verify which palette
+    /// resolved without digging through `--list-themes`.
+    startup_toast: Option<String>,
+    /// Draw-tick counter for `startup_toast`. The toast is dropped once
+    /// this exceeds `STARTUP_TOAST_FRAMES`. We count draws (~10 Hz on
+    /// the 100 ms event-poll cadence, ~30 frames ≈ 3 s) rather than
+    /// wall-clock so headless tape runs reproduce the same lifetime.
+    startup_toast_frames: u32,
+    /// Transient status-bar toast set by user-facing actions
+    /// (currently: bib export success/failure, #135 sub-feature B).
+    /// Shape mirrors the startup toast so we don't need a second
+    /// rendering branch — both feed the same status-bar slot. Lifetime
+    /// is per-toast so a long error can linger longer than a quick OK.
+    status_toast: Option<StatusToast>,
+    /// Cached count of annotations the current `reader` hasn't
+    /// acknowledged. Refreshed on every draw via `data.load_unread_count`
+    /// so the `[N new]` status-bar badge reflects MCP-side writes within
+    /// one tick (~100 ms). Kept on `App` rather than recomputing inside
+    /// the widget so a future event-driven refresh path can update the
+    /// same field. (#185)
+    pub unread_count: i64,
+    /// Cached set of paper IDs that have at least one unread
+    /// annotation for `reader`. Drives the per-row `●` glyph in the
+    /// Papers list. Refreshed on every draw alongside `unread_count`.
+    /// (#185)
+    pub papers_with_unread: std::collections::HashSet<String>,
+    /// The thread root ID the user most recently had in focus. Set
+    /// when annotation-focus / reader-highlight cursor moves onto a
+    /// thread; the *previous* value gets passed to `mark_thread_seen`
+    /// when focus moves to another thread (or away entirely). This is
+    /// the "focus-leave" semantics #185 calls for — a glance doesn't
+    /// mark seen, but moving past a thread does. (#185)
+    last_focused_root_id: Option<String>,
 
     task_tx: mpsc::UnboundedSender<TaskUpdate>,
     task_rx: mpsc::UnboundedReceiver<TaskUpdate>,
     offline_rx: mpsc::UnboundedReceiver<bool>,
+}
+
+/// Update the focus tracker and mark the *previous* thread seen if
+/// focus transitioned to a different thread (or to nothing). Free
+/// function rather than `&mut self` method so it can be called with
+/// disjoint borrows on `App` while `self.overlay.as_mut()` holds a
+/// mutable reference to the overlay slot. Failure of `mark_thread_seen`
+/// is silently swallowed — a stale badge is acceptable, an error
+/// toast every keystroke is not. (#185)
+fn set_focused_thread(
+    data: &DataStore,
+    reader: &str,
+    last_focused_root_id: &mut Option<String>,
+    new_root_id: Option<String>,
+) {
+    if *last_focused_root_id == new_root_id {
+        return;
+    }
+    if let Some(prev) = last_focused_root_id.take() {
+        let _ = data.mark_thread_seen(reader, &prev);
+    }
+    *last_focused_root_id = new_root_id;
+}
+
+/// Resolve the root at `root_idx` over the paper's live roots
+/// (oldest-first) and update the focus tracker. None clears focus
+/// without a DB hit. Used by reader-mode highlight navigation. (#185)
+fn focus_thread_by_root_idx(
+    data: &DataStore,
+    reader: &str,
+    last_focused_root_id: &mut Option<String>,
+    paper_id: &str,
+    root_idx: Option<usize>,
+) {
+    let new_root_id = root_idx.and_then(|idx| {
+        data.load_annotations_for_paper(paper_id)
+            .ok()?
+            .into_iter()
+            .filter(|a| !a.is_reply())
+            .nth(idx)
+            .map(|a| a.id.as_str().to_string())
+    });
+    set_focused_thread(data, reader, last_focused_root_id, new_root_id);
+}
+
+/// Resolve the thread root for the annotation at `annotation_idx`
+/// (mixed roots and replies, oldest-first) and update the focus
+/// tracker. Walks `parent_id` to the root so replies still mark their
+/// thread as the unit of "seen-ness". Used by annotation-focus
+/// navigation. (#185)
+fn focus_thread_by_annotation_idx(
+    data: &DataStore,
+    reader: &str,
+    last_focused_root_id: &mut Option<String>,
+    paper_id: &str,
+    annotation_idx: Option<usize>,
+) {
+    let new_root_id = annotation_idx.and_then(|idx| {
+        let annotations = data.load_annotations_for_paper(paper_id).ok()?;
+        let target = annotations.get(idx)?;
+        Some(target.parent_id.as_ref().map_or_else(
+            || target.id.as_str().to_string(),
+            |p| p.as_str().to_string(),
+        ))
+    });
+    set_focused_thread(data, reader, last_focused_root_id, new_root_id);
+}
+
+/// How many draws the startup toast lingers for (#137). At the
+/// 100 ms event-poll cadence this is ~3 seconds — long enough to read,
+/// short enough to clear before the user does anything substantial.
+const STARTUP_TOAST_FRAMES: u32 = 30;
+
+/// Lifetime budget (in draws) for action-success toasts. ~30 frames at
+/// the 100 ms poll cadence ≈ 3 s.
+const STATUS_TOAST_OK_FRAMES: u32 = 30;
+
+/// Lifetime budget (in draws) for action-failure toasts. Doubled so the
+/// user has time to read a longer error message before it clears.
+const STATUS_TOAST_ERR_FRAMES: u32 = 60;
+
+/// Action-driven status toast (success or failure). Mirrors the shape
+/// of `startup_toast` + `startup_toast_frames` but ships them in a
+/// single struct so per-toast lifetime is configurable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StatusToast {
+    pub message: String,
+    pub frames_remaining: u32,
 }
 
 impl App {
@@ -168,10 +305,73 @@ impl App {
             reader,
             starred,
             offline: false,
+            startup_toast: None,
+            startup_toast_frames: 0,
+            status_toast: None,
+            unread_count: 0,
+            papers_with_unread: std::collections::HashSet::new(),
+            last_focused_root_id: None,
             task_tx,
             task_rx,
             offline_rx,
         }
+    }
+
+    /// Refresh `unread_count` and `papers_with_unread` from the DB.
+    /// Two cheap indexed queries per render tick; failures are silently
+    /// swallowed (a stale badge is acceptable, an error toast every
+    /// 100 ms is not). (#185)
+    fn refresh_unread(&mut self) {
+        self.unread_count = self.data.load_unread_count(&self.reader).unwrap_or(0);
+        self.papers_with_unread = self
+            .data
+            .load_papers_with_unread(&self.reader)
+            .unwrap_or_default();
+    }
+
+    /// Advance the startup-toast lifetime by one draw (#137). Call once
+    /// per frame from the render path; clears `startup_toast` once
+    /// `STARTUP_TOAST_FRAMES` have elapsed.
+    fn tick_startup_toast(&mut self) {
+        if self.startup_toast.is_none() {
+            return;
+        }
+        self.startup_toast_frames = self.startup_toast_frames.saturating_add(1);
+        if self.startup_toast_frames > STARTUP_TOAST_FRAMES {
+            self.startup_toast = None;
+        }
+    }
+
+    /// Decrement the action-toast lifetime by one draw. Mirrors
+    /// `tick_startup_toast` so both toast slots share the same
+    /// per-frame counter cadence — there is no second timing
+    /// subsystem (#135 sub-feature B keeps the existing primitive).
+    fn tick_status_toast(&mut self) {
+        let Some(toast) = self.status_toast.as_mut() else {
+            return;
+        };
+        if toast.frames_remaining == 0 {
+            self.status_toast = None;
+        } else {
+            toast.frames_remaining -= 1;
+        }
+    }
+
+    /// Show a success/info status-bar toast for ~30 frames.
+    pub(crate) fn set_status_ok(&mut self, message: impl Into<String>) {
+        self.status_toast = Some(StatusToast {
+            message: message.into(),
+            frames_remaining: STATUS_TOAST_OK_FRAMES,
+        });
+    }
+
+    /// Show an error status-bar toast for ~60 frames (longer so the
+    /// user has time to read it).
+    pub(crate) fn set_status_err(&mut self, message: impl Into<String>) {
+        self.status_toast = Some(StatusToast {
+            message: message.into(),
+            frames_remaining: STATUS_TOAST_ERR_FRAMES,
+        });
     }
 
     fn drain_offline(&mut self) {
@@ -228,22 +428,52 @@ impl App {
             Some(Overlay::PaperDetail {
                 paper_id,
                 annotation_focus,
+                reader,
+                highlight_focus,
                 ..
             }) => {
-                // Resolve the focused annotation's id only when the
-                // user is actively in focus mode — otherwise leave None
-                // so agents don't think the user is "on" an annotation
-                // they happen to be scrolling past.
-                let ann_id = annotation_focus.and_then(|i| {
-                    self.data
-                        .load_annotations_for_paper(paper_id)
-                        .ok()
-                        .and_then(|anns| anns.get(i).map(|a| a.id.as_str().to_string()))
-                });
+                // Resolve the focused annotation's id when the user
+                // has anything in focus, in either mode:
+                //
+                // - Single-pane annotation focus (`J` enters): index
+                //   over the full annotation list (mixed roots +
+                //   replies).
+                // - Two-pane reader (`R` enters): index over the
+                //   ROOTS-only list, since `highlight_focus` walks
+                //   highlight cursors and replies don't carry their
+                //   own anchor.
+                //
+                // Pre-#185 PR5 only the annotation_focus path was
+                // wired, so an agent calling get_current_selection
+                // while the human was browsing highlights in reader
+                // mode would see annotation_id=None — the human
+                // *was* on something, the agent just couldn't tell.
+                let ann_id = if *reader {
+                    highlight_focus.and_then(|i| {
+                        self.data
+                            .load_annotations_for_paper(paper_id)
+                            .ok()
+                            .and_then(|anns| {
+                                anns.into_iter()
+                                    .filter(|a| !a.is_reply() && !a.anchor.is_paper_note())
+                                    .nth(i)
+                                    .map(|a| a.id.as_str().to_string())
+                            })
+                    })
+                } else {
+                    annotation_focus.and_then(|i| {
+                        self.data
+                            .load_annotations_for_paper(paper_id)
+                            .ok()
+                            .and_then(|anns| anns.get(i).map(|a| a.id.as_str().to_string()))
+                    })
+                };
                 (Some(paper_id.clone()), None, ann_id)
             }
             Some(Overlay::SearchPapers { search_id, .. }) => (None, Some(search_id.clone()), None),
-            Some(Overlay::QuestionDashboard { .. }) | None => (None, None, None),
+            Some(Overlay::QuestionDashboard { .. } | Overlay::Inbox { .. }) | None => {
+                (None, None, None)
+            }
         };
         // Question id: from the overlay (dashboard open) or the
         // Questions-tab cursor. Dashboard wins since it's more specific.
@@ -367,6 +597,35 @@ impl App {
         }
     }
 
+    /// True when the currently-active overlay is consuming character
+    /// keystrokes as text input — a per-paper annotation prompt or the
+    /// question-dashboard bib-export path prompt. Used by the global
+    /// theme-toggle hotkey (#175) to avoid hijacking `T` while the
+    /// user is typing into a field. Mirrors the same gating pattern
+    /// `handle_paper_detail_key` and `handle_question_dashboard_key`
+    /// already use to layer their own keybinds beneath an active prompt.
+    fn in_text_input_context(&self) -> bool {
+        match &self.overlay {
+            Some(Overlay::PaperDetail { prompt, .. }) => prompt.is_some(),
+            Some(Overlay::QuestionDashboard { export_prompt, .. }) => export_prompt.is_some(),
+            _ => false,
+        }
+    }
+
+    /// Swap to the next registered theme and flash the new name in the
+    /// status bar (#175). In-memory only — the user's `[ui] theme`
+    /// config isn't touched, so the next launch resolves the same way
+    /// it would have before the toggle. The `set_status_ok` slot reuses
+    /// the existing toast subsystem (#135-B / #137 P1) so this doesn't
+    /// add a second timing path.
+    fn cycle_theme(&mut self) {
+        let current = crate::theme::theme();
+        let next = crate::theme::Theme::cycle_next(current);
+        crate::theme::set(next);
+        let label = crate::theme::Theme::name(&next);
+        self.set_status_ok(format!("theme: {label}"));
+    }
+
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
         if code == KeyCode::Char('q') && self.overlay.is_none() {
             self.running = false;
@@ -374,6 +633,32 @@ impl App {
         }
         if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
             self.running = false;
+            return;
+        }
+
+        // #175 — runtime theme toggle. Uppercase `T` is unused
+        // elsewhere in the keymap (lowercase `t` is also free; we
+        // chose `T` so it parallels the other capital action keys
+        // — `D` (download), `R` (reader), `O` (open), `E` (export)).
+        // Gated to non-text-input contexts: text input is only active
+        // when an export prompt or annotation prompt is open inside
+        // an overlay (those layers consume `KeyCode::Char(_)`
+        // wholesale before reaching here, so a top-level dispatch is
+        // safe). If new top-level text inputs land later, gate them
+        // here explicitly.
+        if code == KeyCode::Char('T') && !self.in_text_input_context() {
+            self.cycle_theme();
+            return;
+        }
+
+        // `U` toggles the unread inbox overlay (#185 P0). Same gating
+        // as `T`: skip when a text input is open. Pressing `U` again
+        // (or `Esc`/`q` inside the overlay) closes it. The toggle has
+        // to run BEFORE the generic overlay dispatch so it can close
+        // the inbox from on-top-of-itself; otherwise pressing `U`
+        // inside the inbox would just dispatch into the inbox view.
+        if code == KeyCode::Char('U') && !self.in_text_input_context() {
+            self.toggle_inbox();
             return;
         }
 
@@ -390,6 +675,56 @@ impl App {
             KeyCode::Char('c') => self.clear_completed_tasks(),
             _ => self.handle_tab_key(code),
         }
+    }
+
+    /// Open the inbox overlay if no overlay is active, or close it if
+    /// the inbox is the current overlay. Cursor lands on the first
+    /// selectable row. (#185)
+    fn toggle_inbox(&mut self) {
+        if matches!(self.overlay, Some(Overlay::Inbox { .. })) {
+            self.overlay = None;
+            return;
+        }
+        let items = crate::views::inbox::load(&self.data, &self.reader);
+        // Cursor on first selectable row (skip the leading header).
+        let selected = items.iter().position(|i| i.is_selectable()).unwrap_or(0);
+        self.overlay = Some(Overlay::Inbox { items, selected });
+    }
+
+    /// Replace the overlay with a PaperDetail in two-pane reader mode
+    /// focused on the given thread. Caller has already resolved the
+    /// inbox cursor to `(paper_id, root_id)` so this method takes
+    /// concrete arguments rather than peeking at `self.overlay` —
+    /// keeps the borrow story straightforward in the inbox key
+    /// handler. (#185)
+    fn jump_to_thread(&mut self, paper_id: &str, root_id: &str) {
+        // Find the highlight_focus index of the target root over the
+        // paper's roots so reader mode opens with the cursor on it.
+        let highlight_focus = self
+            .data
+            .load_annotations_for_paper(paper_id)
+            .ok()
+            .and_then(|anns| {
+                anns.into_iter()
+                    .filter(|a| !a.is_reply())
+                    .position(|a| a.id.as_str() == root_id)
+            });
+        self.overlay = Some(Overlay::PaperDetail {
+            paper_id: paper_id.to_string(),
+            scroll: 0,
+            annotation_focus: None,
+            prompt: None,
+            reader: true,
+            highlight_focus,
+        });
+        // Track the focused root so leave-events mark it seen.
+        focus_thread_by_root_idx(
+            &self.data,
+            &self.reader,
+            &mut self.last_focused_root_id,
+            paper_id,
+            highlight_focus,
+        );
     }
 
     fn handle_overlay_key(&mut self, code: KeyCode) {
@@ -430,52 +765,223 @@ impl App {
                 }
                 _ => {}
             },
-            Some(Overlay::QuestionDashboard {
-                ref question_id,
-                ref mut selected,
-            }) => match code {
-                KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
+            Some(Overlay::QuestionDashboard { .. }) => {
+                self.handle_question_dashboard_key(code);
+            }
+            Some(Overlay::Inbox { .. }) => self.handle_inbox_key(code),
+            None => {}
+        }
+    }
+
+    /// Routes a key inside the Inbox overlay. Esc/q close, j/k step
+    /// over selectable rows (skipping headers), Enter jumps to the
+    /// paper reader focused on the selected thread. (#185)
+    fn handle_inbox_key(&mut self, code: KeyCode) {
+        // Compute the action under the overlay borrow, then apply it
+        // after the borrow drops so the Enter path can call
+        // `&mut self` helpers without fighting the borrow checker.
+        enum InboxAction {
+            Close,
+            Jump(String, String),
+            None,
+        }
+        let action = {
+            let Some(Overlay::Inbox { items, selected }) = self.overlay.as_mut() else {
+                return;
+            };
+            match code {
+                KeyCode::Esc | KeyCode::Char('q') => InboxAction::Close,
                 KeyCode::Char('j') | KeyCode::Down => {
-                    let count = dashboard::row_count(&self.data, question_id);
-                    if count > 0 {
-                        *selected = (*selected + 1).min(count - 1);
-                    }
+                    *selected = crate::views::inbox::step_selection(items, *selected, 1);
+                    InboxAction::None
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    *selected = selected.saturating_sub(1);
+                    *selected = crate::views::inbox::step_selection(items, *selected, -1);
+                    InboxAction::None
                 }
-                KeyCode::Char('c') => {
-                    let qid = question_id.clone();
-                    let sel = *selected;
-                    if let Ok(rows) = self.data.load_question_dashboard(&qid)
-                        && let Some((paper, _)) = rows.get(sel)
-                    {
-                        let pid = paper.id.as_str().to_string();
-                        let _ = self.data.toggle_shortlist(&qid, &pid, &self.reader);
-                    }
+                KeyCode::Enter => crate::views::inbox::jump_target(items, *selected)
+                    .map_or(InboxAction::None, |(p, r)| InboxAction::Jump(p, r)),
+                _ => InboxAction::None,
+            }
+        };
+        match action {
+            InboxAction::Close => self.overlay = None,
+            InboxAction::Jump(paper_id, root_id) => self.jump_to_thread(&paper_id, &root_id),
+            InboxAction::None => {}
+        }
+    }
+
+    /// Routes a key inside the QuestionDashboard overlay. Layered just
+    /// like the PaperDetail handler so the active prompt (the `E`
+    /// export prompt) eats every keystroke before falling through to
+    /// the j/k/c/Enter list controls.
+    fn handle_question_dashboard_key(&mut self, code: KeyCode) {
+        let Some(Overlay::QuestionDashboard {
+            question_id,
+            selected,
+            export_prompt,
+        }) = self.overlay.as_mut()
+        else {
+            return;
+        };
+
+        // Layer 1: the path prompt is open — eat the keystroke here.
+        if export_prompt.is_some() {
+            self.handle_export_prompt_key(code);
+            return;
+        }
+
+        // Layer 2: plain dashboard list controls.
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
+            KeyCode::Char('j') | KeyCode::Down => {
+                let count = dashboard::row_count(&self.data, question_id);
+                if count > 0 {
+                    *selected = (*selected + 1).min(count - 1);
                 }
-                KeyCode::Enter => {
-                    // Open the focused paper's detail overlay on top of
-                    // the dashboard — same overlay mechanic as the
-                    // SearchPapers flow. Esc returns to the dashboard.
-                    let qid = question_id.clone();
-                    let sel = *selected;
-                    if let Ok(rows) = self.data.load_question_dashboard(&qid)
-                        && let Some((paper, _)) = rows.get(sel)
-                    {
-                        self.overlay = Some(Overlay::PaperDetail {
-                            paper_id: paper.id.as_str().to_string(),
-                            scroll: 0,
-                            annotation_focus: None,
-                            prompt: None,
-                            reader: false,
-                            highlight_focus: None,
-                        });
-                    }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                *selected = selected.saturating_sub(1);
+            }
+            KeyCode::Char('c') => {
+                let qid = question_id.clone();
+                let sel = *selected;
+                if let Ok(rows) = self.data.load_question_dashboard(&qid)
+                    && let Some((paper, _)) = rows.get(sel)
+                {
+                    let pid = paper.id.as_str().to_string();
+                    let _ = self.data.toggle_shortlist(&qid, &pid, &self.reader);
                 }
-                _ => {}
-            },
-            None => {}
+            }
+            // Open the export-path prompt. Uppercase `E` keeps the key
+            // out of the namespace of the lowercase `e` (annotation-edit)
+            // used inside PaperDetail and free of the global `c` we
+            // already use in tab mode (#135 sub-feature B).
+            KeyCode::Char('E') => {
+                let qid = question_id.clone();
+                let question_text = self
+                    .data
+                    .load_question(&qid)
+                    .ok()
+                    .flatten()
+                    .map(|q| q.text)
+                    .unwrap_or_default();
+                *export_prompt = Some(BibExportPrompt::from_question(
+                    &question_text,
+                    scitadel_export::SnapshotFormat::BibTeX,
+                ));
+            }
+            KeyCode::Enter => {
+                // Open the focused paper's detail overlay on top of
+                // the dashboard — same overlay mechanic as the
+                // SearchPapers flow. Esc returns to the dashboard.
+                let qid = question_id.clone();
+                let sel = *selected;
+                if let Ok(rows) = self.data.load_question_dashboard(&qid)
+                    && let Some((paper, _)) = rows.get(sel)
+                {
+                    self.overlay = Some(Overlay::PaperDetail {
+                        paper_id: paper.id.as_str().to_string(),
+                        scroll: 0,
+                        annotation_focus: None,
+                        prompt: None,
+                        reader: false,
+                        highlight_focus: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Drive the export-path prompt's text edits + Enter/Esc. Pulled
+    /// into its own method so the dispatch above stays readable.
+    fn handle_export_prompt_key(&mut self, code: KeyCode) {
+        let Some(Overlay::QuestionDashboard {
+            question_id,
+            export_prompt: Some(prompt),
+            ..
+        }) = self.overlay.as_mut()
+        else {
+            return;
+        };
+
+        match code {
+            KeyCode::Esc => {
+                if let Some(Overlay::QuestionDashboard { export_prompt, .. }) =
+                    self.overlay.as_mut()
+                {
+                    *export_prompt = None;
+                }
+            }
+            KeyCode::Char(c) => prompt.push_char(c),
+            KeyCode::Backspace => prompt.backspace(),
+            KeyCode::Enter => {
+                let path = prompt.submit();
+                let format = prompt.format;
+                let qid = question_id.clone();
+                // Drop the prompt before any DB / I/O so a long-running
+                // write doesn't keep the overlay borrow alive.
+                if let Some(Overlay::QuestionDashboard { export_prompt, .. }) =
+                    self.overlay.as_mut()
+                {
+                    *export_prompt = None;
+                }
+                if let Some(path_str) = path {
+                    self.run_bib_export(&qid, std::path::PathBuf::from(path_str), format);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Resolve the question's shortlist + tags and write the snapshot.
+    ///
+    /// Routes through the shared `scitadel_export::write_snapshot`
+    /// helper so the on-disk `.bib` + `.scitadel-bib.lock` artifacts
+    /// are byte-identical to what `bib snapshot` would write from the
+    /// CLI. Surfaces the outcome as a status-bar toast — never panics,
+    /// never bubbles I/O errors past the prompt.
+    fn run_bib_export(
+        &mut self,
+        question_id: &str,
+        output_path: std::path::PathBuf,
+        format: scitadel_export::SnapshotFormat,
+    ) {
+        let (paper_ids, papers, tags) =
+            match self.data.load_snapshot_inputs(question_id, &self.reader) {
+                Ok(t) => t,
+                Err(e) => {
+                    self.set_status_err(format!("export failed: {e}"));
+                    return;
+                }
+            };
+        if papers.is_empty() {
+            self.set_status_err("export failed: shortlist is empty");
+            return;
+        }
+        let result = scitadel_export::write_snapshot(
+            &output_path,
+            question_id,
+            &self.reader,
+            &papers,
+            &paper_ids,
+            |id| tags.get(id).cloned().unwrap_or_default(),
+            format,
+            true,
+        );
+        match result {
+            Ok(outcome) => {
+                let display = outcome.output_path.file_name().map_or_else(
+                    || outcome.output_path.display().to_string(),
+                    |n| n.to_string_lossy().to_string(),
+                );
+                self.set_status_ok(format!(
+                    "exported: {display} ({} entries)",
+                    outcome.entry_count
+                ));
+            }
+            Err(e) => self.set_status_err(format!("export failed: {e}")),
         }
     }
 
@@ -527,12 +1033,37 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('q' | 'R') => {
                     *reader = false;
                     *highlight_focus = None;
+                    // Focus left the reader entirely — mark whatever
+                    // thread was focused as seen. (#185)
+                    focus_thread_by_root_idx(
+                        &self.data,
+                        &self.reader,
+                        &mut self.last_focused_root_id,
+                        paper_id,
+                        None,
+                    );
                 }
                 KeyCode::Char('J') | KeyCode::Down if count > 0 => {
-                    *highlight_focus = Some(highlight_focus.map_or(0, |f| (f + 1).min(count - 1)));
+                    let next = Some(highlight_focus.map_or(0, |f| (f + 1).min(count - 1)));
+                    *highlight_focus = next;
+                    focus_thread_by_root_idx(
+                        &self.data,
+                        &self.reader,
+                        &mut self.last_focused_root_id,
+                        paper_id,
+                        next,
+                    );
                 }
                 KeyCode::Char('K') | KeyCode::Up if count > 0 => {
-                    *highlight_focus = Some(highlight_focus.map_or(0, |f| f.saturating_sub(1)));
+                    let next = Some(highlight_focus.map_or(0, |f| f.saturating_sub(1)));
+                    *highlight_focus = next;
+                    focus_thread_by_root_idx(
+                        &self.data,
+                        &self.reader,
+                        &mut self.last_focused_root_id,
+                        paper_id,
+                        next,
+                    );
                 }
                 KeyCode::Char('D') => {
                     let pid = paper_id.clone();
@@ -561,15 +1092,28 @@ impl App {
                 .unwrap_or_default();
             if annotations.is_empty() {
                 *annotation_focus = None;
+                focus_thread_by_annotation_idx(
+                    &self.data,
+                    &self.reader,
+                    &mut self.last_focused_root_id,
+                    &pid,
+                    None,
+                );
             } else {
                 let count = annotations.len();
+                let mut new_focus_idx: Option<usize> = Some(*focus);
                 match code {
-                    KeyCode::Esc => *annotation_focus = None,
+                    KeyCode::Esc => {
+                        *annotation_focus = None;
+                        new_focus_idx = None;
+                    }
                     KeyCode::Char('j') | KeyCode::Down => {
                         *focus = (*focus + 1).min(count - 1);
+                        new_focus_idx = Some(*focus);
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
                         *focus = focus.saturating_sub(1);
+                        new_focus_idx = Some(*focus);
                     }
                     KeyCode::Char('e') => {
                         let target = &annotations[*focus];
@@ -598,13 +1142,30 @@ impl App {
                     }
                     _ => {}
                 }
+                focus_thread_by_annotation_idx(
+                    &self.data,
+                    &self.reader,
+                    &mut self.last_focused_root_id,
+                    &pid,
+                    new_focus_idx,
+                );
                 return;
             }
         }
 
         // Layer 3: scroll mode.
         match code {
-            KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
+            KeyCode::Esc | KeyCode::Char('q') => {
+                // Closing the PaperDetail overlay leaves whatever
+                // thread was last focused — mark it seen. (#185)
+                set_focused_thread(
+                    &self.data,
+                    &self.reader,
+                    &mut self.last_focused_root_id,
+                    None,
+                );
+                self.overlay = None;
+            }
             KeyCode::Char('j') | KeyCode::Down => *scroll = scroll.saturating_add(1),
             KeyCode::Char('k') | KeyCode::Up => *scroll = scroll.saturating_sub(1),
             KeyCode::Char('d') => *scroll = scroll.saturating_add(10),
@@ -616,6 +1177,13 @@ impl App {
             KeyCode::Char('n') => {
                 *prompt = Some(AnnotationPrompt::create());
             }
+            KeyCode::Char('P') => {
+                // Paper-level note (#185): quote-less commentary on
+                // the publication as a whole. Capital `P` so the
+                // namespace stays parallel to `D` (download), `O`
+                // (open externally), `R` (reader), `E` (export).
+                *prompt = Some(AnnotationPrompt::paper_note());
+            }
             KeyCode::Char('J') => {
                 // Enter annotation focus mode if the paper has any.
                 let pid = paper_id.clone();
@@ -625,6 +1193,13 @@ impl App {
                     .map_or(0, |a| a.len());
                 if count > 0 {
                     *annotation_focus = Some(0);
+                    focus_thread_by_annotation_idx(
+                        &self.data,
+                        &self.reader,
+                        &mut self.last_focused_root_id,
+                        &pid,
+                        Some(0),
+                    );
                 }
             }
             KeyCode::Char('R') => {
@@ -634,6 +1209,13 @@ impl App {
                 let count = crate::views::reader::highlight_count(&self.data, &pid);
                 *reader = true;
                 *highlight_focus = if count > 0 { Some(0) } else { None };
+                focus_thread_by_root_idx(
+                    &self.data,
+                    &self.reader,
+                    &mut self.last_focused_root_id,
+                    &pid,
+                    *highlight_focus,
+                );
             }
             KeyCode::Char('O') => {
                 // #144: open the locally downloaded file in the OS
@@ -729,6 +1311,9 @@ impl App {
                     }
                 }
             }
+            PromptSubmission::PaperNote { note } => {
+                let _ = self.data.create_paper_note(&pid, &note, &reader);
+            }
         }
     }
 
@@ -806,6 +1391,7 @@ impl App {
                             self.overlay = Some(Overlay::QuestionDashboard {
                                 question_id: q.id.as_str().to_string(),
                                 selected: 0,
+                                export_prompt: None,
                             });
                         }
                     }
@@ -885,6 +1471,7 @@ pub fn run(
     papers_dir: PathBuf,
     show_institutional_hint: bool,
     reader: String,
+    startup_toast: Option<String>,
 ) -> Result<()> {
     let data = DataStore::open(db_path)?;
     let mut app = App::new(
@@ -894,6 +1481,7 @@ pub fn run(
         show_institutional_hint,
         reader,
     );
+    app.startup_toast = startup_toast;
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -926,6 +1514,23 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App
 }
 
 fn draw(frame: &mut ratatui::Frame, app: &mut App) {
+    // Refresh unread state each tick so MCP-side annotation writes
+    // show up in the status bar + per-row glyphs within ~100ms (the
+    // event-poll cadence). (#185)
+    app.refresh_unread();
+    // If the inbox overlay is open, rebuild its items each tick so a
+    // newly-arrived annotation shows up live without the user having
+    // to close + reopen. The cursor index is preserved (clamped to
+    // the new length).
+    if let Some(Overlay::Inbox { items, selected }) = app.overlay.as_mut() {
+        let fresh = crate::views::inbox::load(&app.data, &app.reader);
+        let max = fresh.len().saturating_sub(1);
+        *selected = (*selected).min(max);
+        // If the cursor lands on a header after the rebuild, snap it
+        // forward to the next selectable row.
+        *selected = crate::views::inbox::step_selection(&fresh, *selected, 0);
+        *items = fresh;
+    }
     let task_panel_height = tasks_view::panel_height(&app.tasks);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -971,7 +1576,14 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             highlight_focus,
         }) => {
             if *reader {
-                crate::views::reader::draw(frame, chunks[1], &app.data, paper_id, *highlight_focus);
+                crate::views::reader::draw(
+                    frame,
+                    chunks[1],
+                    &app.data,
+                    paper_id,
+                    *highlight_focus,
+                    &app.reader,
+                );
             } else {
                 detail::draw(
                     frame,
@@ -998,11 +1610,13 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 *selected,
                 &app.starred,
                 &app.downloading_paper_ids(),
+                &app.papers_with_unread,
             );
         }
         Some(Overlay::QuestionDashboard {
             question_id,
             selected,
+            export_prompt,
         }) => {
             dashboard::draw(
                 frame,
@@ -1012,6 +1626,12 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 &app.reader,
                 *selected,
             );
+            if let Some(prompt) = export_prompt {
+                bib_export_prompt::draw_overlay(frame, chunks[1], prompt);
+            }
+        }
+        Some(Overlay::Inbox { items, selected }) => {
+            crate::views::inbox::draw(frame, chunks[1], items, *selected);
         }
         None => match app.tab {
             Tab::Searches => searches::draw(frame, chunks[1], &app.data, app.search_selected),
@@ -1022,6 +1642,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 app.paper_selected,
                 &app.starred,
                 &app.downloading_paper_ids(),
+                &app.papers_with_unread,
             ),
             Tab::Questions => {
                 questions::draw(frame, chunks[1], &app.data, app.question_selected);
@@ -1066,7 +1687,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                         "Esc: leave focus | j/k: navigate | n: new | e: edit | r: reply | d: delete"
                     }
                     (None, None) => {
-                        "Esc/q: back | j/k: scroll | d/u: page | D: download | O: open externally | R: reader | n: new | J: focus"
+                        "Esc/q: back | j/k: scroll | d/u: page | D: download | O: open externally | R: reader | n: new | P: paper-note | J: focus"
                     }
                 }
             }
@@ -1074,17 +1695,46 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         (Some(Overlay::SearchPapers { .. }), _) => {
             "Esc/q: back | j/k: navigate | Enter: open paper"
         }
+        (
+            Some(Overlay::QuestionDashboard {
+                export_prompt: Some(_),
+                ..
+            }),
+            _,
+        ) => "Enter: export | Backspace: delete char | Esc: cancel",
         (Some(Overlay::QuestionDashboard { .. }), _) => {
-            "Esc/q: back | j/k: navigate | Enter: open paper | c: toggle shortlist"
+            "Esc/q: back | j/k: navigate | Enter: open paper | c: toggle shortlist | E: export bib"
+        }
+        (Some(Overlay::Inbox { .. }), _) => {
+            "Esc/q/U: close inbox | j/k: navigate | Enter: jump to thread"
         }
         (None, Tab::Papers | Tab::Queue) => {
-            "Tab: switch tabs | j/k: navigate | Enter: open | s: (un)star | c: clear tasks | q: quit"
+            "Tab: switch tabs | j/k: navigate | Enter: open | s: (un)star | c: clear tasks | T: theme | U: inbox | q: quit"
         }
         (None, _) => {
-            "Tab/Shift-Tab: switch tabs | j/k: navigate | Enter: select | c: clear tasks | q: quit"
+            "Tab/Shift-Tab: switch tabs | j/k: navigate | Enter: select | c: clear tasks | T: theme | U: inbox | q: quit"
         }
     };
-    status_bar::draw(frame, chunks[3], help_text, app.offline);
+    // Startup toast (#137) hijacks the status bar for its lifetime so
+    // the user sees `theme: dalton-bright (auto)` right after launch
+    // without us having to add a second status row. Falls back to the
+    // normal help_text once the toast expires. Action-driven toasts
+    // (#135 sub-feature B — "exported: paper.bib (12 entries)") share
+    // the same slot and take priority over the startup toast since
+    // they're always more recent than launch.
+    let toast_text;
+    let bar_text: &str = if let Some(status) = app.status_toast.as_ref() {
+        toast_text = status.message.clone();
+        &toast_text
+    } else if let Some(toast) = app.startup_toast.as_deref() {
+        toast_text = toast.to_string();
+        &toast_text
+    } else {
+        help_text
+    };
+    status_bar::draw(frame, chunks[3], bar_text, app.offline, app.unread_count);
+    app.tick_startup_toast();
+    app.tick_status_toast();
 }
 
 /// Step the active annotation prompt by one keystroke. Mutates the
@@ -1157,4 +1807,656 @@ async fn probe_network() -> bool {
         .send()
         .await
         .is_ok_and(|r| r.status().is_success() || r.status().is_redirection())
+}
+
+#[cfg(test)]
+mod tests {
+    //! End-to-end-ish tests for the export keybind (#135 sub-feature B).
+    //!
+    //! These tests exercise the App-level keystroke dispatch path with
+    //! a real `DataStore` backed by a tempfile SQLite DB. We seed a
+    //! research question + a shortlisted paper, then drive `handle_key`
+    //! and inspect the overlay state + on-disk artifacts.
+
+    use super::*;
+    use scitadel_core::models::{Paper, PaperId, ResearchQuestion};
+    use scitadel_core::ports::{PaperRepository, QuestionRepository};
+    use std::path::PathBuf;
+
+    /// Build an `App` with a fresh on-disk SQLite DB and a single
+    /// shortlisted paper attached to one research question. Returns
+    /// `(app, question_id, papers_dir)`. `papers_dir` is rooted in a
+    /// `tempfile::TempDir` whose lifetime the caller must keep alive.
+    fn fixture(tmp: &tempfile::TempDir) -> (App, String, PathBuf) {
+        let db_path = tmp.path().join("scitadel.db");
+        let data = DataStore::open(&db_path).unwrap();
+
+        // Seed: a research question + one paper + shortlist row.
+        let q = ResearchQuestion::new("What is the role of attention?");
+        let qid = q.id.as_str().to_string();
+        let mut p = Paper::new("Attention Is All You Need");
+        p.id = PaperId::from("p-attn");
+        p.authors = vec!["Vaswani, A.".into()];
+        p.year = Some(2017);
+        // Use the underlying repos directly — DataStore's API is read-
+        // mostly so seeding goes through the lower-level handles.
+        let db = scitadel_db::sqlite::Database::open(&db_path).unwrap();
+        db.migrate().unwrap();
+        let (paper_repo, _, q_repo, _, _) = db.repositories();
+        q_repo.save_question(&q).unwrap();
+        paper_repo.save(&p).unwrap();
+        let shortlist = scitadel_db::sqlite::SqliteShortlistRepository::new(db);
+        shortlist.toggle(&qid, p.id.as_str(), "lars").unwrap();
+
+        let papers_dir = tmp.path().join("papers");
+        std::fs::create_dir_all(&papers_dir).unwrap();
+
+        let app = App::new(
+            data,
+            "demo@example.org".into(),
+            papers_dir.clone(),
+            false,
+            "lars".into(),
+        );
+        (app, qid, papers_dir)
+    }
+
+    /// Pressing `E` on the QuestionDashboard opens the path-prompt
+    /// overlay with the slugified default. The dashboard `selected`
+    /// cursor is left untouched.
+    #[tokio::test(flavor = "current_thread")]
+    async fn e_on_question_dashboard_opens_export_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, qid, _) = fixture(&tmp);
+        app.overlay = Some(Overlay::QuestionDashboard {
+            question_id: qid.clone(),
+            selected: 0,
+            export_prompt: None,
+        });
+
+        app.handle_key(KeyCode::Char('E'), KeyModifiers::NONE);
+
+        match app.overlay {
+            Some(Overlay::QuestionDashboard {
+                export_prompt: Some(ref p),
+                ..
+            }) => {
+                assert_eq!(p.path_buf, "what-is-the-role-of-attention.bib");
+            }
+            other => panic!("expected QuestionDashboard with prompt, got {other:?}"),
+        }
+    }
+
+    /// The `E` key must NOT be hijacked when no overlay is active —
+    /// that namespace belongs to the underlying tab. We assert that
+    /// pressing `E` on a plain tab leaves the overlay state alone (no
+    /// QuestionDashboard appears out of nowhere).
+    #[tokio::test(flavor = "current_thread")]
+    async fn e_on_searches_tab_is_not_hijacked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        // No overlay; default tab is Searches.
+        assert!(app.overlay.is_none());
+
+        app.handle_key(KeyCode::Char('E'), KeyModifiers::NONE);
+        assert!(
+            app.overlay.is_none(),
+            "E on Searches tab must not pop a dashboard overlay"
+        );
+    }
+
+    /// Drive the full happy path: open dashboard → press `E` → accept
+    /// the default path → assert the `.bib` + `.scitadel-bib.lock`
+    /// land on disk. The CWD is moved into the tempdir for the test
+    /// so the slug-derived default (`what-is-the-role-of-attention.bib`)
+    /// resolves to a sandboxed location.
+    #[tokio::test(flavor = "current_thread")]
+    async fn export_writes_bib_and_sidecar_on_default_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, qid, _) = fixture(&tmp);
+        let prev_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        app.overlay = Some(Overlay::QuestionDashboard {
+            question_id: qid,
+            selected: 0,
+            export_prompt: None,
+        });
+        app.handle_key(KeyCode::Char('E'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        let bib = tmp.path().join("what-is-the-role-of-attention.bib");
+        let lock = tmp
+            .path()
+            .join("what-is-the-role-of-attention.bib.scitadel-bib.lock");
+
+        // Restore CWD before any assertion so a panic doesn't pollute
+        // the rest of the test runner.
+        std::env::set_current_dir(prev_cwd).unwrap();
+
+        assert!(bib.exists(), "{} missing", bib.display());
+        assert!(lock.exists(), "{} missing", lock.display());
+        let bib_bytes = std::fs::read_to_string(&bib).unwrap();
+        assert!(
+            bib_bytes.contains("Attention Is All You Need"),
+            "bib didn't contain the seeded title; got:\n{bib_bytes}"
+        );
+        // Status toast confirms count + filename.
+        let toast = app.status_toast.as_ref().expect("status toast set");
+        assert!(
+            toast.message.starts_with("exported: ") && toast.message.contains("(1 entries)"),
+            "got toast: {}",
+            toast.message
+        );
+    }
+
+    /// Pressing `T` outside a text-input context cycles the active
+    /// theme and flashes a status-bar toast naming the new palette
+    /// (#175). We snapshot the toast slot rather than the global
+    /// theme to keep the assertion independent of test ordering —
+    /// other tests may mutate `crate::theme::ACTIVE` in parallel.
+    #[tokio::test(flavor = "current_thread")]
+    async fn t_cycles_theme_outside_input_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        // Reset the global theme to a known starting palette so the
+        // post-toggle name is deterministic regardless of which other
+        // test ran first.
+        crate::theme::set(crate::theme::Theme::DALTON_DARK);
+
+        app.handle_key(KeyCode::Char('T'), KeyModifiers::NONE);
+
+        let toast = app.status_toast.as_ref().expect("toast set after T");
+        assert_eq!(toast.message, "theme: dalton-bright");
+    }
+
+    /// `T` must NOT cycle the theme while the user is typing into a
+    /// prompt — the keystroke would otherwise be eaten before it reached
+    /// the export prompt's `push_char` handler. This guards the gating
+    /// added alongside the toggle (#175).
+    #[tokio::test(flavor = "current_thread")]
+    async fn t_in_export_prompt_does_not_cycle_theme() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, qid, _) = fixture(&tmp);
+        app.overlay = Some(Overlay::QuestionDashboard {
+            question_id: qid,
+            selected: 0,
+            export_prompt: Some(BibExportPrompt::from_question(
+                "x",
+                scitadel_export::SnapshotFormat::BibTeX,
+            )),
+        });
+
+        app.handle_key(KeyCode::Char('T'), KeyModifiers::NONE);
+
+        // The toast slot must NOT contain a "theme:" message. The
+        // prompt should also have absorbed the keystroke as a 'T'
+        // character (path edit), confirming it reached the prompt.
+        let toast_msg = app
+            .status_toast
+            .as_ref()
+            .map(|t| t.message.clone())
+            .unwrap_or_default();
+        assert!(
+            !toast_msg.starts_with("theme:"),
+            "theme toggle should not fire while a text-input prompt is open; got toast: {toast_msg}",
+        );
+        match &app.overlay {
+            Some(Overlay::QuestionDashboard {
+                export_prompt: Some(p),
+                ..
+            }) => assert!(
+                p.path_buf.contains('T'),
+                "T should have been pushed into prompt buffer, got {:?}",
+                p.path_buf,
+            ),
+            other => panic!("expected dashboard with prompt still open, got {other:?}"),
+        }
+    }
+
+    /// The toggle is session-only (#175) — it must not write back to
+    /// the on-disk config. Cycle the theme and assert the config file
+    /// the test fixture would have read is unchanged before/after.
+    /// Today the TUI doesn't write the config from anywhere, but this
+    /// test pins the contract so a future refactor can't quietly start
+    /// persisting toggle state.
+    #[tokio::test(flavor = "current_thread")]
+    async fn theme_toggle_does_not_persist_to_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let original = "[ui]\ntheme = \"dark\"\n";
+        std::fs::write(&cfg_path, original).unwrap();
+        let before = std::fs::read_to_string(&cfg_path).unwrap();
+
+        let (mut app, _, _) = fixture(&tmp);
+        crate::theme::set(crate::theme::Theme::DALTON_DARK);
+        app.handle_key(KeyCode::Char('T'), KeyModifiers::NONE);
+
+        let after = std::fs::read_to_string(&cfg_path).unwrap();
+        assert_eq!(before, after, "config.toml must not be rewritten by toggle");
+    }
+
+    /// Esc inside the prompt clears it without writing anything.
+    #[tokio::test(flavor = "current_thread")]
+    async fn esc_in_export_prompt_cancels() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, qid, _) = fixture(&tmp);
+        app.overlay = Some(Overlay::QuestionDashboard {
+            question_id: qid,
+            selected: 0,
+            export_prompt: Some(BibExportPrompt::from_question(
+                "x",
+                scitadel_export::SnapshotFormat::BibTeX,
+            )),
+        });
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+
+        match app.overlay {
+            Some(Overlay::QuestionDashboard {
+                export_prompt: None,
+                ..
+            }) => {}
+            other => panic!("expected dashboard with prompt cleared, got {other:?}"),
+        }
+        assert!(app.status_toast.is_none(), "no toast on cancel");
+    }
+
+    // ---- #185 focus-leave plumbing ----
+
+    /// Seed an annotation thread (root + reply) on `p-attn` so the
+    /// focus-leave tests can assert mark_thread_seen actually clears
+    /// unread state.
+    fn seed_thread(db_path: &std::path::Path) -> (String, String) {
+        use scitadel_core::models::{Anchor, Annotation};
+        let db = scitadel_db::sqlite::Database::open(db_path).unwrap();
+        let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+        let root = Annotation::new_root(
+            PaperId::from("p-attn"),
+            "claude".into(),
+            "claim".into(),
+            Anchor {
+                quote: Some("Attention".into()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&root).unwrap();
+        let reply = Annotation::new_reply(&root, "claude".into(), "follow-up".into());
+        repo.create(&reply).unwrap();
+        (root.id.as_str().to_string(), reply.id.as_str().to_string())
+    }
+
+    /// First focus arrives: nothing was previously focused, so no
+    /// mark_seen happens. The new root is just remembered.
+    #[tokio::test(flavor = "current_thread")]
+    async fn focus_arrive_does_not_mark_seen_when_none_was_focused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        let (root_id, _) = seed_thread(&tmp.path().join("scitadel.db"));
+        // Pre: 2 unread for lars.
+        assert_eq!(app.data.load_unread_count("lars").unwrap(), 2);
+
+        set_focused_thread(
+            &app.data,
+            &app.reader,
+            &mut app.last_focused_root_id,
+            Some(root_id.clone()),
+        );
+        // Tracker advanced...
+        assert_eq!(app.last_focused_root_id, Some(root_id));
+        // ...but nothing got marked seen yet (focus-leave semantics:
+        // mark only when leaving the previous thread, and there was
+        // no previous).
+        assert_eq!(app.data.load_unread_count("lars").unwrap(), 2);
+    }
+
+    /// Focus-leave path: A → None marks A's thread seen.
+    #[tokio::test(flavor = "current_thread")]
+    async fn focus_leave_to_none_marks_previous_thread_seen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        let (root_id, _) = seed_thread(&tmp.path().join("scitadel.db"));
+
+        set_focused_thread(
+            &app.data,
+            &app.reader,
+            &mut app.last_focused_root_id,
+            Some(root_id),
+        );
+        assert_eq!(app.data.load_unread_count("lars").unwrap(), 2);
+
+        set_focused_thread(&app.data, &app.reader, &mut app.last_focused_root_id, None);
+        assert_eq!(
+            app.data.load_unread_count("lars").unwrap(),
+            0,
+            "focus-leave to None must mark the previous thread (root + replies) seen"
+        );
+        assert_eq!(app.last_focused_root_id, None);
+    }
+
+    /// Re-focusing the same thread is a no-op — no double-write, no
+    /// toggle, no spurious mark_seen of an unrelated thread.
+    #[tokio::test(flavor = "current_thread")]
+    async fn focus_same_root_is_idempotent_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        let (root_id, _) = seed_thread(&tmp.path().join("scitadel.db"));
+
+        set_focused_thread(
+            &app.data,
+            &app.reader,
+            &mut app.last_focused_root_id,
+            Some(root_id.clone()),
+        );
+        // Calling again with the same root must NOT mark the focused
+        // thread seen on every call (would defeat focus-leave
+        // semantics) — it's a no-op.
+        set_focused_thread(
+            &app.data,
+            &app.reader,
+            &mut app.last_focused_root_id,
+            Some(root_id.clone()),
+        );
+        assert_eq!(app.data.load_unread_count("lars").unwrap(), 2);
+        assert_eq!(app.last_focused_root_id, Some(root_id));
+    }
+
+    /// Annotation-focus by reply index resolves to the reply's root,
+    /// so leaving the focus marks the whole thread seen.
+    #[tokio::test(flavor = "current_thread")]
+    async fn annotation_focus_on_reply_marks_root_thread_on_leave() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        let (root_id, _reply_id) = seed_thread(&tmp.path().join("scitadel.db"));
+        // Annotations are ordered by created_at ASC: [root, reply].
+        // Index 1 is the reply; its parent_id points at root.
+        focus_thread_by_annotation_idx(
+            &app.data,
+            &app.reader,
+            &mut app.last_focused_root_id,
+            "p-attn",
+            Some(1),
+        );
+        assert_eq!(app.last_focused_root_id, Some(root_id.clone()));
+
+        // Now leave focus. Both root and reply should clear.
+        focus_thread_by_annotation_idx(
+            &app.data,
+            &app.reader,
+            &mut app.last_focused_root_id,
+            "p-attn",
+            None,
+        );
+        assert_eq!(app.data.load_unread_count("lars").unwrap(), 0);
+    }
+
+    /// `U` opens the inbox overlay; pressing `U` again closes it.
+    /// Cursor lands on the first selectable row when there are unread
+    /// items.
+    #[tokio::test(flavor = "current_thread")]
+    async fn u_toggles_inbox_overlay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        let _ = seed_thread(&tmp.path().join("scitadel.db"));
+
+        // Open.
+        app.handle_key(KeyCode::Char('U'), KeyModifiers::NONE);
+        match &app.overlay {
+            Some(Overlay::Inbox { items, selected }) => {
+                assert!(items.iter().any(|i| i.is_selectable()));
+                assert!(items.get(*selected).is_some_and(|i| i.is_selectable()));
+            }
+            other => panic!("expected Inbox overlay, got {other:?}"),
+        }
+        // Close via U again.
+        app.handle_key(KeyCode::Char('U'), KeyModifiers::NONE);
+        assert!(app.overlay.is_none(), "U should toggle the inbox closed");
+    }
+
+    /// Enter on a selectable inbox row replaces the overlay with a
+    /// PaperDetail in two-pane reader mode focused on the chosen
+    /// thread.
+    #[tokio::test(flavor = "current_thread")]
+    async fn inbox_enter_jumps_to_paper_reader_focused_on_thread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        let (root_id, _) = seed_thread(&tmp.path().join("scitadel.db"));
+
+        app.handle_key(KeyCode::Char('U'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        match &app.overlay {
+            Some(Overlay::PaperDetail {
+                paper_id,
+                reader,
+                highlight_focus,
+                ..
+            }) => {
+                assert_eq!(paper_id, "p-attn");
+                assert!(*reader, "reader mode should be on after inbox jump");
+                assert_eq!(*highlight_focus, Some(0));
+            }
+            other => panic!("expected PaperDetail reader after Enter, got {other:?}"),
+        }
+        // The focus tracker should be set to the chosen root, so a
+        // subsequent leave-event will mark it seen.
+        assert_eq!(app.last_focused_root_id, Some(root_id));
+    }
+
+    /// Closing the PaperDetail overlay marks the focused thread seen,
+    /// driven through the real `handle_key` dispatch.
+    #[tokio::test(flavor = "current_thread")]
+    async fn closing_paper_detail_overlay_marks_focused_thread_seen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        let (_root_id, _) = seed_thread(&tmp.path().join("scitadel.db"));
+
+        // Open the PaperDetail overlay scrolled, then enter
+        // annotation-focus mode (`J`) to land focus on the root.
+        app.overlay = Some(Overlay::PaperDetail {
+            paper_id: "p-attn".into(),
+            scroll: 0,
+            annotation_focus: None,
+            prompt: None,
+            reader: false,
+            highlight_focus: None,
+        });
+        app.handle_key(KeyCode::Char('J'), KeyModifiers::NONE);
+        assert!(app.last_focused_root_id.is_some(), "J should focus root");
+
+        // Close the overlay. Esc out of annotation-focus first, then
+        // Esc closes the overlay.
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.overlay.is_none());
+        assert_eq!(
+            app.data.load_unread_count("lars").unwrap(),
+            0,
+            "overlay close must mark whatever thread was last focused as seen",
+        );
+    }
+
+    // ---- #185 PR5 selection fidelity ----
+
+    /// Two-pane reader mode + `highlight_focus` set → annotation_id
+    /// surfaces. Pre-#185 PR5 this returned None even though the
+    /// human's cursor was sitting on a highlight; agents calling
+    /// `get_current_selection` would think the user wasn't on
+    /// anything.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reader_highlight_focus_surfaces_annotation_id() {
+        use scitadel_core::models::{Anchor, Annotation};
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        // Seed two anchored roots so highlight_focus indices map
+        // unambiguously over the roots-only list.
+        let db = scitadel_db::sqlite::Database::open(&tmp.path().join("scitadel.db")).unwrap();
+        let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+        let r0 = Annotation::new_root(
+            PaperId::from("p-attn"),
+            "claude".into(),
+            "first".into(),
+            Anchor {
+                quote: Some("Q1".into()),
+                ..Anchor::default()
+            },
+        );
+        let r1 = Annotation::new_root(
+            PaperId::from("p-attn"),
+            "claude".into(),
+            "second".into(),
+            Anchor {
+                quote: Some("Q2".into()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&r0).unwrap();
+        repo.create(&r1).unwrap();
+
+        app.overlay = Some(Overlay::PaperDetail {
+            paper_id: "p-attn".into(),
+            scroll: 0,
+            annotation_focus: None,
+            prompt: None,
+            reader: true,
+            highlight_focus: Some(1),
+        });
+
+        let snapshot = app.current_tui_state();
+        assert_eq!(snapshot.paper_id.as_deref(), Some("p-attn"));
+        assert_eq!(
+            snapshot.annotation_id.as_deref(),
+            Some(r1.id.as_str()),
+            "highlight_focus index 1 must map to the second root annotation"
+        );
+    }
+
+    /// Two-pane reader with no highlight focused (cursor not yet on
+    /// a highlight) → annotation_id is None; the agent must not see
+    /// a stale or first-by-default selection.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reader_with_no_highlight_focus_surfaces_no_annotation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        app.overlay = Some(Overlay::PaperDetail {
+            paper_id: "p-attn".into(),
+            scroll: 0,
+            annotation_focus: None,
+            prompt: None,
+            reader: true,
+            highlight_focus: None,
+        });
+
+        let snapshot = app.current_tui_state();
+        assert_eq!(snapshot.paper_id.as_deref(), Some("p-attn"));
+        assert!(
+            snapshot.annotation_id.is_none(),
+            "no highlight focused → no annotation surfaced; got {:?}",
+            snapshot.annotation_id
+        );
+    }
+
+    /// `highlight_focus` indices walk over roots-only; paper-level
+    /// notes (#185 PR4) and replies must NOT shift the mapping. Pin
+    /// this so a regression doesn't quietly hand agents the wrong
+    /// annotation_id.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reader_highlight_focus_skips_paper_notes_and_replies() {
+        use scitadel_core::models::{Anchor, Annotation};
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        let db = scitadel_db::sqlite::Database::open(&tmp.path().join("scitadel.db")).unwrap();
+        let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+
+        // Layout in created_at order: paper-note, root_a, reply_a, root_b.
+        // The roots-only list (excluding paper-note + replies) is
+        // [root_a, root_b] — same as the highlight indices.
+        let pn = Annotation::new_root(
+            PaperId::from("p-attn"),
+            "claude".into(),
+            "global".into(),
+            scitadel_core::models::paper_note_anchor("p-attn"),
+        );
+        let root_a = Annotation::new_root(
+            PaperId::from("p-attn"),
+            "claude".into(),
+            "passage A".into(),
+            Anchor {
+                quote: Some("A".into()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&pn).unwrap();
+        repo.create(&root_a).unwrap();
+        let reply = Annotation::new_reply(&root_a, "claude".into(), "follow-up".into());
+        repo.create(&reply).unwrap();
+        let root_b = Annotation::new_root(
+            PaperId::from("p-attn"),
+            "claude".into(),
+            "passage B".into(),
+            Anchor {
+                quote: Some("B".into()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&root_b).unwrap();
+
+        for (idx, expected) in [(0, root_a.id.as_str()), (1, root_b.id.as_str())] {
+            app.overlay = Some(Overlay::PaperDetail {
+                paper_id: "p-attn".into(),
+                scroll: 0,
+                annotation_focus: None,
+                prompt: None,
+                reader: true,
+                highlight_focus: Some(idx),
+            });
+            let snapshot = app.current_tui_state();
+            assert_eq!(
+                snapshot.annotation_id.as_deref(),
+                Some(expected),
+                "highlight_focus {idx} must map to {expected}, got {:?}",
+                snapshot.annotation_id
+            );
+        }
+    }
+
+    /// Annotation-focus mode (single-pane, `J`) keeps its existing
+    /// mapping over the FULL annotation list (roots + replies). PR5
+    /// only adds the reader path; this regression-pins that the
+    /// pre-existing behaviour didn't drift.
+    #[tokio::test(flavor = "current_thread")]
+    async fn annotation_focus_mode_unchanged_indexes_full_list() {
+        use scitadel_core::models::{Anchor, Annotation};
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        let db = scitadel_db::sqlite::Database::open(&tmp.path().join("scitadel.db")).unwrap();
+        let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+        let root = Annotation::new_root(
+            PaperId::from("p-attn"),
+            "claude".into(),
+            "root".into(),
+            Anchor {
+                quote: Some("Q".into()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&root).unwrap();
+        let reply = Annotation::new_reply(&root, "claude".into(), "reply".into());
+        repo.create(&reply).unwrap();
+
+        // annotation_focus indices over FULL list: 0 = root, 1 = reply.
+        app.overlay = Some(Overlay::PaperDetail {
+            paper_id: "p-attn".into(),
+            scroll: 0,
+            annotation_focus: Some(1),
+            prompt: None,
+            reader: false,
+            highlight_focus: None,
+        });
+        let snapshot = app.current_tui_state();
+        assert_eq!(
+            snapshot.annotation_id.as_deref(),
+            Some(reply.id.as_str()),
+            "annotation_focus=1 must map to the reply (index over full list, not roots-only)"
+        );
+    }
 }

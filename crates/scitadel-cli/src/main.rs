@@ -116,7 +116,22 @@ enum Commands {
     /// Launch MCP server on stdio
     Mcp,
     /// Launch interactive TUI dashboard
-    Tui,
+    Tui {
+        /// Override the active theme for this session (#137).
+        /// Accepts: `auto` | `dark` | `light` | `dalton-dark` | `dalton-bright`.
+        /// Precedence: this flag > `SCITADEL_THEME` env > config > auto.
+        #[arg(long)]
+        theme: Option<String>,
+        /// Print the registered themes (with one-line descriptions) and
+        /// exit without launching the TUI (#137).
+        #[arg(long, conflicts_with = "theme")]
+        list_themes: bool,
+    },
+    /// Bibliographic operations: import / export / rekey / watch (#134)
+    Bib {
+        #[command(subcommand)]
+        command: BibCommands,
+    },
     /// Run citation chaining (snowballing)
     Snowball {
         /// Search ID
@@ -136,6 +151,140 @@ enum Commands {
         /// Model for scoring
         #[arg(short, long, default_value = "claude-sonnet-4-6")]
         model: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum BibCommands {
+    /// Import a `.bib` file (BibTeX or BibLaTeX), matching entries
+    /// against existing papers via DOI/arXiv/PubMed/OpenAlex/citekey/
+    /// title+year. Imported citekeys are recorded as aliases so
+    /// re-importing is a no-op.
+    Import {
+        /// Path to the .bib file (Zotero / Mendeley export)
+        path: PathBuf,
+        /// Merge strategy: reject | db-wins | bib-wins | merge | interactive
+        #[arg(long, default_value = "merge")]
+        strategy: String,
+        /// Identity attached to imported annotations (`note=` field).
+        /// Defaults to $USER.
+        #[arg(long)]
+        reader: Option<String>,
+        /// Show per-row trace output (dropped files, dropped keywords).
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    /// Reassign a paper's citation key. Without `--key`, re-runs the
+    /// #132 algorithm against current paper metadata; with `--key`,
+    /// sets an explicit key. Old key is preserved as an alias so
+    /// manuscripts that still cite by the old key keep resolving.
+    /// Fails loudly on collision with another paper's existing key.
+    Rekey {
+        /// Paper id to rekey (full id or unambiguous prefix).
+        paper_id: String,
+        /// Explicit citation key. If omitted, the algorithm picks one.
+        #[arg(long)]
+        key: Option<String>,
+        /// Identity recorded in the audit log. Defaults to $USER.
+        #[arg(long)]
+        reader: Option<String>,
+    },
+    /// One-shot deterministic snapshot of a question's shortlist to a
+    /// `.bib` (or `.json` with `--format csl-json`) plus
+    /// `.scitadel-bib.lock` sidecar (#178, #135). Same shortlist twice ⇒
+    /// byte-identical output (sidecar `generated_at` excepted). Pair
+    /// with `bib verify` in CI to catch drift.
+    Snapshot {
+        /// Research question id (full or unambiguous prefix).
+        question_id: String,
+        /// Output path. Defaults to `paper.bib` for `--format bibtex`
+        /// and `paper.json` for `--format csl-json`.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Reader scope for the shortlist. Defaults to $USER.
+        #[arg(long)]
+        reader: Option<String>,
+        /// Skip writing the sidecar (CI one-offs). The export is still
+        /// emitted but `bib verify` will exit 2 with "no lockfile".
+        #[arg(long)]
+        no_lock: bool,
+        /// Output flavor: `bibtex` (BibLaTeX, default) or `csl-json`
+        /// (CSL 1.0.2 canonical). Sidecar's `format` discriminant
+        /// records the choice so verify routes to the matching emitter.
+        #[arg(long, default_value = "bibtex", value_parser = ["bibtex", "csl-json"])]
+        format: String,
+    },
+    /// Verify a committed export against its `.scitadel-bib.lock`
+    /// (#178). Routes to BibTeX or CSL-JSON based on the sidecar's
+    /// `format` field. Exit codes: `0` ok, `1` drift (regenerate to fix),
+    /// `2` stale (binary moved or sidecar absent — regenerate required).
+    Verify {
+        /// Path to the export to verify.
+        file: PathBuf,
+        /// Override the sidecar's question_id (rarely needed).
+        #[arg(short, long)]
+        question_id: Option<String>,
+        /// Output format for the verify report: `text` (default) or
+        /// `json` (CI-friendly). Independent of the snapshot's flavor —
+        /// that's read from the sidecar.
+        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+        format: String,
+    },
+    /// Structural diff between two bibliography exports — entry-level
+    /// (added / removed / changed) rather than line-level. Mirrors the
+    /// human-readable "what actually moved" report `bib verify` only
+    /// hints at via its line diff. Auto-detects BibTeX vs CSL-JSON by
+    /// content sniff; the two flavors are interchangeable. Exit codes:
+    /// `0` no diff, `1` diff (mirrors `git diff`).
+    Diff {
+        /// First file (BibTeX or CSL-JSON).
+        file_a: PathBuf,
+        /// Second file. Mutually exclusive with `--question-id`.
+        file_b: Option<PathBuf>,
+        /// Compare `file_a` against a fresh snapshot of this question's
+        /// shortlist from the DB. Mutually exclusive with `<file_b>`.
+        #[arg(long)]
+        question_id: Option<String>,
+        /// Output format: `text` (default, hand-rolled ANSI when
+        /// stdout is a TTY) or `json` (structured, CI-friendly).
+        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+        format: String,
+        /// Force ANSI color off (useful for piping into `less` without
+        /// `-R`). Color is also auto-disabled when stdout is not a TTY.
+        #[arg(long)]
+        no_color: bool,
+        /// Reader scope when comparing against `--question-id`. Defaults
+        /// to $USER. Ignored when `<file_b>` is provided.
+        #[arg(long)]
+        reader: Option<String>,
+    },
+    /// Live `.bib` snapshot for a research question's shortlist.
+    /// Polls SQLite at 1s, debounces bursts of edits, and skips
+    /// the file write when the rendered content is byte-identical
+    /// (hash-and-skip) so unrelated DB churn doesn't thrash the
+    /// output. SIGINT/SIGTERM flushes any pending change before exit.
+    Watch {
+        /// Research question id (full or unambiguous prefix).
+        question_id: String,
+        /// Output `.bib` path. Will be (re)written each time the
+        /// shortlist's content changes.
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Reader scope for the shortlist. Defaults to $USER.
+        #[arg(long)]
+        reader: Option<String>,
+        /// Drop papers whose max assessment score for this question
+        /// is below this threshold. Default: include everything.
+        #[arg(long)]
+        min_score: Option<f64>,
+        /// Debounce window in milliseconds — bursts of edits within
+        /// this window coalesce into a single write.
+        #[arg(long, default_value = "300")]
+        debounce_ms: u64,
+        /// Polling interval in milliseconds. Lower = lower latency
+        /// but more SQLite reads.
+        #[arg(long, default_value = "1000")]
+        poll_ms: u64,
     },
 }
 
@@ -238,7 +387,13 @@ async fn main() -> Result<()> {
         },
         Commands::Download { doi, output_dir } => commands::download(&doi, output_dir).await,
         Commands::Mcp => commands::mcp().await,
-        Commands::Tui => commands::tui(),
+        Commands::Tui { theme, list_themes } => {
+            if list_themes {
+                commands::list_themes()
+            } else {
+                commands::tui(theme.as_deref())
+            }
+        }
         Commands::Assess {
             search_id,
             question,
@@ -246,6 +401,76 @@ async fn main() -> Result<()> {
             temperature,
             scorer,
         } => commands::assess(&search_id, &question, &model, temperature, &scorer).await,
+        Commands::Bib { command } => match command {
+            BibCommands::Import {
+                path,
+                strategy,
+                reader,
+                verbose,
+            } => commands::bib_import(&path, &strategy, reader, verbose),
+            BibCommands::Rekey {
+                paper_id,
+                key,
+                reader,
+            } => commands::bib_rekey(&paper_id, key.as_deref(), reader),
+            BibCommands::Snapshot {
+                question_id,
+                output,
+                reader,
+                no_lock,
+                format,
+            } => commands::bib_snapshot(
+                &question_id,
+                output.as_deref(),
+                reader.as_deref(),
+                no_lock,
+                &format,
+            ),
+            BibCommands::Verify {
+                file,
+                question_id,
+                format,
+            } => {
+                let code = commands::bib_verify(&file, question_id.as_deref(), &format)?;
+                std::process::exit(code);
+            }
+            BibCommands::Diff {
+                file_a,
+                file_b,
+                question_id,
+                format,
+                no_color,
+                reader,
+            } => {
+                let code = commands::bib_diff(
+                    &file_a,
+                    file_b.as_deref(),
+                    question_id.as_deref(),
+                    &format,
+                    no_color,
+                    reader.as_deref(),
+                )?;
+                std::process::exit(code);
+            }
+            BibCommands::Watch {
+                question_id,
+                output,
+                reader,
+                min_score,
+                debounce_ms,
+                poll_ms,
+            } => {
+                commands::bib_watch(
+                    &question_id,
+                    &output,
+                    reader,
+                    min_score,
+                    debounce_ms,
+                    poll_ms,
+                )
+                .await
+            }
+        },
         Commands::Snowball {
             search_id,
             question,

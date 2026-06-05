@@ -1,0 +1,148 @@
+% Synthetic Zotero-shaped export covering the real-world shapes the
+% scitadel `bib import` parser needs to handle. Each block is a
+% deliberate variant — keep them; trimming this file weakens the
+% test coverage for #134.
+
+@article{vaswani2017attention,
+  title = {Attention Is All You Need},
+  author = {Vaswani, Ashish and Shazeer, Noam and Parmar, Niki},
+  year = {2017},
+  journal = {NeurIPS},
+  doi = {10.5555/3295222.3295349},
+}
+
+@article{he2015deep,
+  title = {Deep Residual Learning for Image Recognition},
+  author = {He, Kaiming and Zhang, Xiangyu and Ren, Shaoqing and Sun, Jian},
+  year = {2015},
+  eprint = {1512.03385},
+  archivePrefix = {arXiv},
+}
+
+@article{biblatex_eprinttype_arxiv,
+  title = {Diffusion Models Beat GANs on Image Synthesis},
+  author = {Dhariwal, Prafulla and Nichol, Alex},
+  year = {2021},
+  eprint = {2105.05233},
+  eprinttype = {arxiv},
+}
+
+@article{biblatex_date_form,
+  title = {Reasoning Gaps in Large Language Models},
+  author = {Author, Some},
+  date = {2024-03-15},
+}
+
+@article{doi_with_https_prefix,
+  title = {A Note on DOI Normalization},
+  author = {Smith, John},
+  year = {2023},
+  doi = {https://doi.org/10.1145/3586183.3606763},
+}
+
+@article{doi_with_doi_prefix,
+  title = {Another Note on DOI Normalization},
+  author = {Doe, Jane},
+  year = {2023},
+  doi = {doi:10.1145/3586183.3606764},
+}
+
+@article{pubmed_only,
+  title = {Genomic Patterns in Cohort Studies},
+  author = {Müller, Hans},
+  year = {2022},
+  pmid = {12345678},
+}
+
+@article{openalex_only,
+  title = {Network Effects in Citation Graphs},
+  author = {Liu, Wei and García, María},
+  year = {2024},
+  openalex = {W3000123456},
+}
+
+@article{zotero_note_keywords,
+  title = {Quantum Error Correction Survey},
+  author = {Preskill, John},
+  year = {2018},
+  doi = {10.1146/annurev-conmatphys-031115-014622},
+  note = {Read carefully; figures 4-6 motivate the surface-code path.},
+  keywords = {quantum, error-correction, survey},
+}
+
+@article{zotero_file_dropped,
+  title = {Statistical Methods in Particle Physics},
+  author = {Cowan, Glen},
+  year = {2011},
+  doi = {10.1142/9789814449052_0009},
+  file = {/Users/somebody/Zotero/storage/ABC123/Cowan_2011.pdf},
+}
+
+@article{extended_name_format,
+  title = {On Names With Extended Format},
+  author = {family=Neumann, given=John, prefix=von},
+  year = {1945},
+}
+
+@article{multiple_authors_and,
+  title = {Federated Search for Scientific Literature},
+  author = {Lastly, First and Otra, Persona and Tres, María Elena},
+  year = {2024},
+  journal = {SIGIR},
+}
+
+@article{title_special_chars,
+  title = {Cats {\&} Dogs: a 100{\%} {\#}1 Study},
+  author = {Anon, Anon},
+  year = {1999},
+}
+
+@article{title_unicode,
+  title = {Über das Problem der Künstlichen Intelligenz},
+  author = {Müller, Karl},
+  year = {2003},
+  journal = {Naturwissenschaften},
+}
+
+@article{title_only_year_only,
+  title = {Bare Minimum Entry},
+  year = {2000},
+}
+
+@article{month_field_unused,
+  title = {Paper With a Month Field},
+  author = {Author, Some},
+  year = {2020},
+  month = {may},
+  journal = {Some Journal},
+}
+
+@article{both_arxiv_and_doi,
+  title = {Cross-Identified Paper},
+  author = {Cross, Identified},
+  year = {2022},
+  doi = {10.1234/cross.2022},
+  eprint = {2204.00001},
+  archivePrefix = {arXiv},
+}
+
+@article{empty_note_field,
+  title = {Empty Note Should Not Create Annotation},
+  author = {Author, Some},
+  year = {2024},
+  note = {},
+}
+
+@article{keywords_no_note,
+  title = {Keywords Without a Note},
+  author = {Author, Some},
+  year = {2024},
+  keywords = {alpha, beta, gamma},
+}
+
+@article{round_trip_anchor,
+  title = {Anchor for Round-Trip Test},
+  author = {RoundTrip, Author},
+  year = {2025},
+  doi = {10.99999/round.trip.test},
+}

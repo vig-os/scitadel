@@ -31,6 +31,20 @@ impl SqliteAnnotationRepository {
     /// `Annotation` (see `Annotation::new_root` / `new_reply`).
     pub fn create(&self, annotation: &Annotation) -> Result<(), DbError> {
         let conn = self.db.conn()?;
+        Self::insert_via(&conn, annotation)
+    }
+
+    /// Transactional sibling of [`Self::create`] (#157). Used by the
+    /// bib-import orchestrator so paper-save + alias-record + annotation-
+    /// create commit (or roll back) as a single unit per row.
+    pub fn create_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        annotation: &Annotation,
+    ) -> Result<(), DbError> {
+        Self::insert_via(tx, annotation)
+    }
+
+    fn insert_via(conn: &rusqlite::Connection, annotation: &Annotation) -> Result<(), DbError> {
         conn.execute(
             "INSERT INTO annotations
                 (id, parent_id, paper_id, question_id,
@@ -231,6 +245,58 @@ impl SqliteAnnotationRepository {
         let _ = sql; // kept for potential future logging
         Ok(rows)
     }
+
+    /// Set of paper IDs that have at least one annotation `reader`
+    /// hasn't acknowledged. Drives the per-row `●` glyph on the
+    /// Papers list — one indexed query per draw tick. (#185)
+    pub fn papers_with_unread(
+        &self,
+        reader: &str,
+    ) -> Result<std::collections::HashSet<String>, DbError> {
+        let conn = self.db.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT a.paper_id FROM annotations a
+             LEFT JOIN annotation_reads r
+               ON r.annotation_id = a.id AND r.reader = ?1
+             WHERE a.deleted_at IS NULL
+               AND (r.seen_at IS NULL OR r.seen_at < a.updated_at)",
+        )?;
+        let rows = stmt
+            .query_map(params![reader], |row| row.get::<_, String>(0))?
+            .filter_map(Result::ok);
+        Ok(rows.collect())
+    }
+
+    /// Same predicate as `list_unread` but returns just the count.
+    /// Called on every TUI draw tick (~10 Hz) to drive the status-bar
+    /// `[N new]` badge — `COUNT(*)` keeps the per-tick cost in
+    /// microseconds even when there are many annotations. (#185)
+    pub fn count_unread(&self, reader: &str, paper_id: Option<&str>) -> Result<i64, DbError> {
+        let conn = self.db.conn()?;
+        let n: i64 = if let Some(pid) = paper_id {
+            conn.query_row(
+                "SELECT COUNT(*) FROM annotations a
+                 LEFT JOIN annotation_reads r
+                   ON r.annotation_id = a.id AND r.reader = ?1
+                 WHERE a.paper_id = ?2
+                   AND a.deleted_at IS NULL
+                   AND (r.seen_at IS NULL OR r.seen_at < a.updated_at)",
+                params![reader, pid],
+                |row| row.get(0),
+            )?
+        } else {
+            conn.query_row(
+                "SELECT COUNT(*) FROM annotations a
+                 LEFT JOIN annotation_reads r
+                   ON r.annotation_id = a.id AND r.reader = ?1
+                 WHERE a.deleted_at IS NULL
+                   AND (r.seen_at IS NULL OR r.seen_at < a.updated_at)",
+                params![reader],
+                |row| row.get(0),
+            )?
+        };
+        Ok(n)
+    }
 }
 
 fn row_to_annotation(row: &rusqlite::Row) -> rusqlite::Result<Annotation> {
@@ -316,6 +382,29 @@ pub fn resolve_anchor_with_threshold(
     text: &str,
     fuzzy_threshold: f64,
 ) -> AnchorStatus {
+    // Short-circuit: `.bib`-imported `note=` annotations carry only
+    // a synthetic marker `sentence_id` (no quote / range), since they
+    // have nothing to anchor against in the paper text yet. Treat them
+    // as `Ok` instead of falling through to `Orphan`, so they don't
+    // trip the orphan-warning UI flow (#158). Real Orphan semantics
+    // still apply to anchors whose selectors *should* match paper text
+    // but failed to.
+    if anchor.is_imported_synthetic() {
+        anchor.status = AnchorStatus::Ok;
+        return AnchorStatus::Ok;
+    }
+
+    // Short-circuit: paper-level notes — commentary on the
+    // publication as a whole — carry a synthetic `paper-note:<id>`
+    // sentence_id with no quote / range. They have nothing to
+    // re-anchor against in the body text by design, so the only
+    // sensible status is Ok. The TUI renders them in a separate
+    // section above the thread list. (#185)
+    if anchor.is_paper_note() {
+        anchor.status = AnchorStatus::Ok;
+        return AnchorStatus::Ok;
+    }
+
     // Step 1: position selector — bounds-checked.
     if let (Some((start, end)), Some(quote)) = (anchor.char_range, anchor.quote.as_ref())
         && let Some(slice) = char_slice(text, start, end)
@@ -697,6 +786,57 @@ mod tests {
         );
     }
 
+    /// #158: an unanchored `.bib` `note=` import carries only a
+    /// synthetic marker `sentence_id`. The resolver must short-circuit
+    /// to `Ok` rather than falling through to `Orphan` (which would
+    /// trip the orphan-warning UI flow).
+    #[test]
+    fn resolver_short_circuits_imported_synthetic_anchor_to_ok() {
+        let mut a = Anchor {
+            sentence_id: Some(scitadel_core::models::imported_sentence_id(
+                "smith2024",
+                "Reading note about methodology.",
+            )),
+            ..Anchor::default()
+        };
+        // Paper text deliberately contains nothing matching the
+        // synthetic id — the short-circuit must fire regardless.
+        let status = resolve_anchor(&mut a, "the body of the paper says many things.");
+        assert_eq!(status, AnchorStatus::Ok);
+        assert_eq!(a.status, AnchorStatus::Ok);
+        assert!(!a.is_orphan());
+    }
+
+    /// #185: paper-level notes carry a `paper-note:<paper_id>`
+    /// sentence_id with no quote / range. Same short-circuit story
+    /// as the import case but in its own namespace so the two
+    /// kinds can render distinctly in the TUI.
+    #[test]
+    fn resolver_short_circuits_paper_note_anchor_to_ok() {
+        let mut a = Anchor {
+            sentence_id: Some(scitadel_core::models::paper_note_sentence_id("p-attn")),
+            ..Anchor::default()
+        };
+        let status = resolve_anchor(&mut a, "irrelevant body text.");
+        assert_eq!(status, AnchorStatus::Ok);
+        assert_eq!(a.status, AnchorStatus::Ok);
+        assert!(!a.is_orphan());
+    }
+
+    /// #158: an anchor with a `quote` that fails to resolve must still
+    /// flip to `Orphan` — the synthetic short-circuit only applies to
+    /// import-only anchors with no real selectors.
+    #[test]
+    fn resolver_still_orphans_real_anchors_that_fail() {
+        let mut a = Anchor {
+            quote: Some("missing quote".into()),
+            sentence_id: Some(scitadel_core::models::sentence_id("a real sentence.")),
+            ..Anchor::default()
+        };
+        let status = resolve_anchor(&mut a, "different text without the quote.");
+        assert_eq!(status, AnchorStatus::Orphan);
+    }
+
     // ---- Read-receipt tests ----
 
     #[test]
@@ -747,6 +887,70 @@ mod tests {
         repo.mark_thread_seen(root.id.as_str(), "lars").unwrap();
         let unread = repo.list_unread("lars", Some("p1")).unwrap();
         assert!(unread.is_empty());
+    }
+
+    #[test]
+    fn papers_with_unread_returns_distinct_paper_ids() {
+        let db = fresh_db_with_paper();
+        // Add a second paper.
+        db.conn()
+            .unwrap()
+            .execute(
+                "INSERT INTO papers (id, title, authors, abstract, created_at, updated_at)
+                 VALUES ('p2', 'Other', '[]', '', '2026-04-28T00:00:00Z', '2026-04-28T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        let repo = SqliteAnnotationRepository::new(db);
+        let on_p1 = sample_root();
+        let on_p2 = Annotation::new_root(
+            scitadel_core::models::PaperId::from("p2"),
+            "claude".into(),
+            "n".into(),
+            Anchor::default(),
+        );
+        repo.create(&on_p1).unwrap();
+        let p1_b = Annotation::new_reply(&on_p1, "claude".into(), "follow".into());
+        repo.create(&p1_b).unwrap();
+        repo.create(&on_p2).unwrap();
+
+        let set = repo.papers_with_unread("lars").unwrap();
+        assert_eq!(set.len(), 2, "two distinct paper_ids despite three rows");
+        assert!(set.contains("p1"));
+        assert!(set.contains("p2"));
+
+        repo.mark_thread_seen(on_p1.id.as_str(), "lars").unwrap();
+        let set = repo.papers_with_unread("lars").unwrap();
+        assert_eq!(set, std::iter::once("p2".to_string()).collect());
+    }
+
+    #[test]
+    fn count_unread_matches_list_unread_length() {
+        let db = fresh_db_with_paper();
+        let repo = SqliteAnnotationRepository::new(db);
+        let root = sample_root();
+        repo.create(&root).unwrap();
+        let reply = Annotation::new_reply(&root, "claude".into(), "follow-up".into());
+        repo.create(&reply).unwrap();
+
+        // Both unread for lars.
+        assert_eq!(repo.count_unread("lars", None).unwrap(), 2);
+        assert_eq!(repo.count_unread("lars", Some("p1")).unwrap(), 2);
+
+        repo.mark_thread_seen(root.id.as_str(), "lars").unwrap();
+        assert_eq!(repo.count_unread("lars", None).unwrap(), 0);
+        assert_eq!(repo.count_unread("lars", Some("p1")).unwrap(), 0);
+
+        // Soft-delete must not be counted.
+        let solo = Annotation::new_root(
+            scitadel_core::models::PaperId::from("p1"),
+            "lars".into(),
+            "doomed".into(),
+            Anchor::default(),
+        );
+        repo.create(&solo).unwrap();
+        repo.soft_delete(solo.id.as_str()).unwrap();
+        assert_eq!(repo.count_unread("lars", None).unwrap(), 0);
     }
 
     #[test]

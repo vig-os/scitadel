@@ -10,6 +10,7 @@ use scitadel_core::models::{DownloadStatus, Paper};
 use crate::data::DataStore;
 use crate::views::util::truncate;
 
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     frame: &mut Frame,
     area: Rect,
@@ -17,6 +18,7 @@ pub fn draw(
     selected: usize,
     starred: &HashSet<String>,
     downloading: &HashSet<String>,
+    papers_with_unread: &HashSet<String>,
 ) {
     let papers = data.load_papers(1000, 0).unwrap_or_default();
     render_paper_table(
@@ -27,9 +29,11 @@ pub fn draw(
         " Papers ",
         starred,
         downloading,
+        papers_with_unread,
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn draw_for_search(
     frame: &mut Frame,
     area: Rect,
@@ -38,13 +42,23 @@ pub fn draw_for_search(
     selected: usize,
     starred: &HashSet<String>,
     downloading: &HashSet<String>,
+    papers_with_unread: &HashSet<String>,
 ) {
     let papers = data.load_papers_for_search(search_id).unwrap_or_default();
     let title = format!(
         " Papers for search {} ",
         search_id.chars().take(8).collect::<String>()
     );
-    render_paper_table(frame, area, &papers, selected, &title, starred, downloading);
+    render_paper_table(
+        frame,
+        area,
+        &papers,
+        selected,
+        &title,
+        starred,
+        downloading,
+        papers_with_unread,
+    );
 }
 
 /// Returns (symbol, color) for the Papers-table state column.
@@ -63,6 +77,7 @@ fn download_cell(paper: &Paper, downloading: &HashSet<String>) -> (&'static str,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_paper_table(
     frame: &mut Frame,
     area: Rect,
@@ -71,6 +86,7 @@ fn render_paper_table(
     title: &str,
     starred: &HashSet<String>,
     downloading: &HashSet<String>,
+    papers_with_unread: &HashSet<String>,
 ) {
     if papers.is_empty() {
         let block = Block::default()
@@ -83,6 +99,7 @@ fn render_paper_table(
 
     let header = Row::new(vec![
         Cell::from("#"),
+        Cell::from(""),
         Cell::from(""),
         Cell::from(""),
         Cell::from("Title"),
@@ -106,11 +123,17 @@ fn render_paper_table(
             } else {
                 " "
             };
+            let unread = if papers_with_unread.contains(p.id.as_str()) {
+                "●"
+            } else {
+                " "
+            };
             let (dl_symbol, dl_color) = download_cell(p, downloading);
 
             Row::new(vec![
                 Cell::from((i + 1).to_string()),
                 Cell::from(star).style(Style::default().fg(crate::theme::theme().emphasis)),
+                Cell::from(unread).style(Style::default().fg(crate::theme::theme().emphasis)),
                 Cell::from(dl_symbol).style(Style::default().fg(dl_color)),
                 Cell::from(truncate(&p.title, 60)),
                 Cell::from(truncate(&authors, 30)),
@@ -121,6 +144,7 @@ fn render_paper_table(
 
     let widths = [
         Constraint::Length(5),
+        Constraint::Length(2),
         Constraint::Length(2),
         Constraint::Length(2),
         Constraint::Min(30),

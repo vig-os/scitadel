@@ -10,7 +10,10 @@ use scitadel_core::models::{
 use scitadel_core::ports::{
     AssessmentRepository, PaperRepository, QuestionRepository, SearchRepository,
 };
-use scitadel_db::sqlite::{Database, SqliteAnnotationRepository, SqlitePaperStateRepository};
+use scitadel_db::sqlite::{
+    Database, SqliteAnnotationRepository, SqlitePaperStateRepository, SqlitePaperTagRepository,
+    SqliteShortlistRepository,
+};
 
 /// Wrapper around the database that loads data for each TUI view.
 pub struct DataStore {
@@ -102,6 +105,43 @@ impl DataStore {
         Ok(SqliteAnnotationRepository::new(self.db.clone()).list_by_paper(paper_id)?)
     }
 
+    /// Total annotations `reader` hasn't acknowledged across all papers.
+    /// Drives the status-bar `[N new]` badge — called every TUI draw,
+    /// so it goes through the SQL `COUNT(*)` rather than materialising
+    /// the rows. (#185)
+    pub fn load_unread_count(&self, reader: &str) -> Result<i64> {
+        Ok(SqliteAnnotationRepository::new(self.db.clone()).count_unread(reader, None)?)
+    }
+
+    /// Annotations `reader` hasn't acknowledged on a specific paper.
+    /// Used by the per-row `●` glyph in the Papers list and the
+    /// `[unread]` markers in the reader-view thread pane. (#185)
+    pub fn load_unread_for_paper(&self, reader: &str, paper_id: &str) -> Result<Vec<Annotation>> {
+        Ok(SqliteAnnotationRepository::new(self.db.clone()).list_unread(reader, Some(paper_id))?)
+    }
+
+    /// Set of paper IDs `reader` has at least one unread annotation
+    /// on. Drives the per-row `●` glyph in the Papers list. (#185)
+    pub fn load_papers_with_unread(&self, reader: &str) -> Result<HashSet<String>> {
+        Ok(SqliteAnnotationRepository::new(self.db.clone()).papers_with_unread(reader)?)
+    }
+
+    /// Every unread annotation across all papers for `reader`,
+    /// oldest-first per the underlying `list_unread` query. Used by
+    /// the inbox overlay (#185 P0) which then groups by paper for
+    /// display.
+    pub fn load_all_unread(&self, reader: &str) -> Result<Vec<Annotation>> {
+        Ok(SqliteAnnotationRepository::new(self.db.clone()).list_unread(reader, None)?)
+    }
+
+    /// Mark a thread (root + replies) as seen by `reader`. Called from
+    /// the TUI on focus-leave / overlay-close so the badge and
+    /// `[unread]` markers clear without a manual action. (#185)
+    pub fn mark_thread_seen(&self, reader: &str, root_id: &str) -> Result<()> {
+        SqliteAnnotationRepository::new(self.db.clone()).mark_thread_seen(root_id, reader)?;
+        Ok(())
+    }
+
     /// Toggle the starred flag for a paper and return the new value.
     pub fn toggle_starred(&self, paper_id: &str, reader: &str) -> Result<bool> {
         Ok(SqlitePaperStateRepository::new(self.db.clone()).toggle_starred(paper_id, reader)?)
@@ -127,6 +167,21 @@ impl DataStore {
             author.to_string(),
             note.to_string(),
             anchor,
+        );
+        SqliteAnnotationRepository::new(self.db.clone()).create(&ann)?;
+        Ok(ann.id.as_str().to_string())
+    }
+
+    /// Create a paper-level note: commentary on the publication as a
+    /// whole, with no quote / char_range. The anchor carries only the
+    /// `paper-note:<paper_id>` sentinel and the resolver short-circuits
+    /// it to Ok. (#185)
+    pub fn create_paper_note(&self, paper_id: &str, note: &str, author: &str) -> Result<String> {
+        let ann = Annotation::new_root(
+            PaperId::from(paper_id),
+            author.to_string(),
+            note.to_string(),
+            scitadel_core::models::paper_note_anchor(paper_id),
         );
         SqliteAnnotationRepository::new(self.db.clone()).create(&ann)?;
         Ok(ann.id.as_str().to_string())
@@ -246,5 +301,197 @@ impl DataStore {
     /// query it (#122).
     pub fn publish_tui_state(&self, state: &scitadel_db::sqlite::TuiState) -> Result<()> {
         Ok(scitadel_db::sqlite::SqliteTuiStateRepository::new(self.db.clone()).set(state)?)
+    }
+
+    /// Test-only: construct a `DataStore` around an in-memory DB so
+    /// unread/mark-seen plumbing can be exercised without a temp dir.
+    #[cfg(test)]
+    fn for_tests() -> Self {
+        let db = Database::open_in_memory().expect("open in-memory db");
+        db.migrate().expect("migrate");
+        Self { db }
+    }
+
+    /// Load the inputs needed by `scitadel_export::write_snapshot` for a
+    /// question + reader (#135 sub-feature B). Returns the shortlist's
+    /// paper IDs in DB order, the hydrated `Paper` rows, and a
+    /// `paper_id → tags` map. Mirrors `load_shortlist` in `scitadel-cli`
+    /// so the CLI and TUI surfaces produce byte-identical snapshots.
+    pub fn load_snapshot_inputs(
+        &self,
+        question_id: &str,
+        reader: &str,
+    ) -> Result<(
+        Vec<String>,
+        Vec<scitadel_core::models::Paper>,
+        std::collections::HashMap<String, Vec<String>>,
+    )> {
+        let (paper_repo, _, _, _, _) = self.db.repositories();
+        let shortlist = SqliteShortlistRepository::new(self.db.clone());
+        let tag_repo = SqlitePaperTagRepository::new(self.db.clone());
+
+        let paper_ids = shortlist
+            .list(question_id, reader)
+            .context("failed to read shortlist")?;
+        let papers: Vec<_> = paper_ids
+            .iter()
+            .filter_map(|id| paper_repo.get(id).ok().flatten())
+            .collect();
+        let mut tags = std::collections::HashMap::new();
+        for id in &paper_ids {
+            let t = tag_repo.tags_for(id).unwrap_or_default();
+            tags.insert(id.clone(), t);
+        }
+        Ok((paper_ids, papers, tags))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DataStore;
+    use scitadel_core::models::{Anchor, Paper, PaperId};
+    use scitadel_core::ports::PaperRepository;
+
+    fn save_paper(store: &DataStore, id: &str, title: &str) {
+        let (paper_repo, _, _, _, _) = store.db.repositories();
+        let mut p = Paper::new(title);
+        p.id = PaperId::from(id);
+        paper_repo.save(&p).unwrap();
+    }
+
+    #[test]
+    fn unread_count_zero_on_empty_db() {
+        let store = DataStore::for_tests();
+        assert_eq!(store.load_unread_count("lars").unwrap(), 0);
+    }
+
+    #[test]
+    fn unread_count_counts_root_and_replies_then_clears_after_mark_thread_seen() {
+        use scitadel_core::models::Annotation;
+        use scitadel_db::sqlite::SqliteAnnotationRepository;
+
+        let store = DataStore::for_tests();
+        save_paper(&store, "p-1", "T");
+        let repo = SqliteAnnotationRepository::new(store.db.clone());
+        let root = Annotation::new_root(
+            PaperId::from("p-1"),
+            "claude".into(),
+            "claim".into(),
+            Anchor {
+                quote: Some("Q".into()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&root).unwrap();
+        let reply = Annotation::new_reply(&root, "claude".into(), "follow".into());
+        repo.create(&reply).unwrap();
+
+        assert_eq!(store.load_unread_count("lars").unwrap(), 2);
+        assert_eq!(store.load_unread_for_paper("lars", "p-1").unwrap().len(), 2);
+
+        store.mark_thread_seen("lars", root.id.as_str()).unwrap();
+        assert_eq!(store.load_unread_count("lars").unwrap(), 0);
+        assert!(
+            store
+                .load_unread_for_paper("lars", "p-1")
+                .unwrap()
+                .is_empty()
+        );
+
+        // Other reader still sees them as unread.
+        assert_eq!(store.load_unread_count("alice").unwrap(), 2);
+    }
+
+    #[test]
+    fn unread_for_paper_scopes_correctly() {
+        use scitadel_core::models::Annotation;
+        use scitadel_db::sqlite::SqliteAnnotationRepository;
+
+        let store = DataStore::for_tests();
+        save_paper(&store, "p-a", "A");
+        save_paper(&store, "p-b", "B");
+        let repo = SqliteAnnotationRepository::new(store.db.clone());
+        let on_a = Annotation::new_root(
+            PaperId::from("p-a"),
+            "claude".into(),
+            "a-note".into(),
+            Anchor {
+                quote: Some("q".into()),
+                ..Anchor::default()
+            },
+        );
+        let on_b = Annotation::new_root(
+            PaperId::from("p-b"),
+            "claude".into(),
+            "b-note".into(),
+            Anchor {
+                quote: Some("q".into()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&on_a).unwrap();
+        repo.create(&on_b).unwrap();
+
+        assert_eq!(store.load_unread_for_paper("lars", "p-a").unwrap().len(), 1);
+        assert_eq!(store.load_unread_for_paper("lars", "p-b").unwrap().len(), 1);
+        assert_eq!(store.load_unread_count("lars").unwrap(), 2);
+    }
+
+    #[test]
+    fn create_paper_note_persists_with_paper_note_sentinel() {
+        let store = DataStore::for_tests();
+        save_paper(&store, "p-a", "Alpha");
+        let id = store
+            .create_paper_note("p-a", "overall: methodology weak", "lars")
+            .unwrap();
+        let anns = store.load_annotations_for_paper("p-a").unwrap();
+        assert_eq!(anns.len(), 1);
+        let ann = &anns[0];
+        assert_eq!(ann.id.as_str(), id);
+        assert_eq!(ann.note, "overall: methodology weak");
+        assert!(
+            ann.anchor.is_paper_note(),
+            "paper note should be recognised by Anchor::is_paper_note(); got anchor={:?}",
+            ann.anchor
+        );
+        assert!(ann.anchor.quote.is_none(), "no quote on paper-level note");
+        assert!(
+            ann.anchor.char_range.is_none(),
+            "no char_range on paper-level note"
+        );
+    }
+
+    #[test]
+    fn create_paper_note_appears_in_load_annotations_for_paper() {
+        // Sanity: paper-note + a regular root annotation co-exist on
+        // the same paper. The TUI later partitions them into two
+        // sections via Anchor::is_paper_note() (#185 PR4 C3).
+        use scitadel_core::models::{Anchor, Annotation};
+        use scitadel_db::sqlite::SqliteAnnotationRepository;
+
+        let store = DataStore::for_tests();
+        save_paper(&store, "p-a", "A");
+        let _ = store
+            .create_paper_note("p-a", "global thought", "lars")
+            .unwrap();
+        let repo = SqliteAnnotationRepository::new(store.db.clone());
+        let anchored = Annotation::new_root(
+            PaperId::from("p-a"),
+            "claude".into(),
+            "passage thought".into(),
+            Anchor {
+                quote: Some("specific phrase".into()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&anchored).unwrap();
+
+        let anns = store.load_annotations_for_paper("p-a").unwrap();
+        assert_eq!(anns.len(), 2);
+        let paper_notes: Vec<_> = anns.iter().filter(|a| a.anchor.is_paper_note()).collect();
+        let anchored_count = anns.iter().filter(|a| !a.anchor.is_paper_note()).count();
+        assert_eq!(paper_notes.len(), 1);
+        assert_eq!(anchored_count, 1);
+        assert_eq!(paper_notes[0].note, "global thought");
     }
 }

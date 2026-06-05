@@ -22,12 +22,19 @@ info:
 # RUST
 # ===============================================================================
 
-# Format check + clippy + tests
+# Quick pre-push lint: format check + clippy on lib + tests. No
+# test execution — that's `just verify`. ~30s on a warm cache.
+# `--tests` is the bit that catches per-test clippy lints and
+# matches CI's Lint job exactly.
 [group('quality')]
-verify:
-    cargo fmt --check
-    cargo clippy --workspace -- -D warnings
-    cargo test --workspace
+lint:
+    cargo fmt --all -- --check
+    cargo clippy --workspace --tests -- -D warnings
+
+# Full pre-PR check: lint + tests. Mirrors what CI runs.
+[group('quality')]
+verify: lint
+    cargo test --workspace --exclude scitadel-tui
 
 # Dependency / license audit (requires cargo-deny)
 [group('quality')]

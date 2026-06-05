@@ -1,0 +1,314 @@
+//! Zotero compat — non-row work that follows a successful import
+//! resolution (#134 step 4 + #162):
+//!
+//! - `note={...}` → an unanchored [`Annotation`] (paper-level), with
+//!   the bib's `keywords={a,b,c}` carried as the annotation's tags.
+//!   Author is the import-time `reader`, matching the convention used
+//!   for TUI / MCP annotation writes.
+//! - `keywords=` *without* a `note=` → paper-level tag rows on
+//!   `paper_tags` (#162). Earlier behavior surfaced these as
+//!   `dropped_keywords` under `--verbose` because paper-tags didn't
+//!   exist as first-class data — they do now, so the data is no
+//!   longer dropped on the floor.
+//! - `file={...}` is always surfaced for `--verbose` logging — the
+//!   issue spec deliberately drops these, since paths in someone
+//!   else's Zotero export are meaningless on the importer's machine.
+//!
+//! The alias side effect is unconditional for all non-Rejected
+//! actions: the imported citekey gets recorded on `paper_aliases`
+//! (#134 step 1) so a future re-import resolves via the alias step
+//! of the match cascade.
+
+use scitadel_core::models::{Anchor, Annotation, PaperId, imported_sentence_id};
+
+use super::merge::MergeAction;
+use super::parse::BibEntry;
+
+/// `source` value recorded on `paper_aliases` rows that originate
+/// here — mirrors the constant in `scitadel_db::sqlite::SOURCE_BIBTEX_IMPORT`.
+/// Re-declared instead of imported to keep `scitadel-export` free of a
+/// `scitadel-db` dependency.
+pub const ALIAS_SOURCE: &str = "bibtex-import";
+
+/// `source` value recorded on `paper_tags` rows that originate here —
+/// mirrors `scitadel_db::sqlite::TAG_SOURCE_BIBTEX_IMPORT` for the
+/// same dep-cycle reason as [`ALIAS_SOURCE`]. Same string value: the
+/// audit columns are deliberately uniform across the two tables.
+pub const TAG_SOURCE: &str = "bibtex-import";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasRecord {
+    pub paper_id: String,
+    pub alias: String,
+    pub source: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagRecord {
+    pub paper_id: String,
+    pub tag: String,
+    pub source: &'static str,
+}
+
+#[derive(Debug, Clone)]
+pub struct SideEffects {
+    /// Citekey-as-alias to record. `None` only when the merge action
+    /// was `Rejected` (no DB writes happen at all).
+    pub alias: Option<AliasRecord>,
+    /// `note=` carrying user's reading context. Built unanchored
+    /// (paper-level), with `bib.keywords` attached as tags.
+    pub annotation: Option<Annotation>,
+    /// `keywords=` from a note-less entry — written to `paper_tags`
+    /// rather than dropped (#162). Empty when keywords rode along on
+    /// an annotation, when there were none, or when the action was
+    /// `Rejected`.
+    pub paper_tags: Vec<TagRecord>,
+    /// `file=` paths — never imported (paths from a foreign machine
+    /// are meaningless), but surfaced in `--verbose`.
+    pub dropped_file: Option<String>,
+}
+
+impl SideEffects {
+    /// Empty bundle — used when `MergeAction::Rejected` short-circuits
+    /// the side-effect plumbing entirely.
+    pub fn rejected() -> Self {
+        Self {
+            alias: None,
+            annotation: None,
+            paper_tags: vec![],
+            dropped_file: None,
+        }
+    }
+
+    /// True when no DB writes nor user-facing logs follow from this
+    /// import row — the caller can short-circuit per-row work.
+    pub fn is_empty(&self) -> bool {
+        self.alias.is_none()
+            && self.annotation.is_none()
+            && self.paper_tags.is_empty()
+            && self.dropped_file.is_none()
+    }
+}
+
+/// Compute side effects for an import row. `paper_id` is the resolved
+/// paper id (post-match or post-create); `reader` is the import-time
+/// identity used as `Annotation.author` to mirror TUI/MCP conventions.
+pub fn compute(paper_id: &str, reader: &str, bib: &BibEntry, action: MergeAction) -> SideEffects {
+    if action == MergeAction::Rejected {
+        return SideEffects::rejected();
+    }
+
+    let alias = Some(AliasRecord {
+        paper_id: paper_id.to_string(),
+        alias: bib.citekey.clone(),
+        source: ALIAS_SOURCE,
+    });
+
+    // keywords-with-note → annotation tags (existing behavior).
+    // keywords-without-note → paper_tags rows (#162 — the fix).
+    let (annotation, paper_tags) = match bib.note.as_deref() {
+        Some(note) if !note.is_empty() => {
+            // Synthetic `sentence_id` so the resolver recognizes this
+            // as an unanchored import on first open instead of flipping
+            // it to `Orphan` (#158). Hash incorporates citekey + note
+            // content so the same `(citekey, note)` pair always
+            // produces the same id — re-import collapses to no-op.
+            let synthetic = Anchor {
+                sentence_id: Some(imported_sentence_id(&bib.citekey, note)),
+                ..Anchor::default()
+            };
+            let mut a = Annotation::new_root(
+                PaperId::from(paper_id),
+                reader.to_string(),
+                note.to_string(),
+                synthetic,
+            );
+            a.tags.clone_from(&bib.keywords);
+            (Some(a), vec![])
+        }
+        _ => {
+            let tags = bib
+                .keywords
+                .iter()
+                .map(|k| TagRecord {
+                    paper_id: paper_id.to_string(),
+                    tag: k.clone(),
+                    source: TAG_SOURCE,
+                })
+                .collect();
+            (None, tags)
+        }
+    };
+
+    SideEffects {
+        alias,
+        annotation,
+        paper_tags,
+        dropped_file: bib.file.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn bib(citekey: &str) -> BibEntry {
+        BibEntry {
+            citekey: citekey.into(),
+            title: None,
+            authors: vec![],
+            year: None,
+            doi: None,
+            arxiv_id: None,
+            pubmed_id: None,
+            openalex_id: None,
+            note: None,
+            keywords: vec![],
+            file: None,
+            extra: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn rejected_action_yields_empty_side_effects() {
+        let mut b = bib("k");
+        b.note = Some("ignored".into());
+        b.keywords = vec!["x".into()];
+        b.file = Some("/p.pdf".into());
+        let se = compute("p1", "lars", &b, MergeAction::Rejected);
+        assert!(se.is_empty());
+        assert!(se.alias.is_none());
+    }
+
+    #[test]
+    fn alias_recorded_for_every_non_rejected_action() {
+        for action in [
+            MergeAction::Created,
+            MergeAction::Updated,
+            MergeAction::Unchanged,
+        ] {
+            let se = compute("p1", "lars", &bib("smith2024"), action);
+            let a = se.alias.expect("alias recorded");
+            assert_eq!(a.paper_id, "p1");
+            assert_eq!(a.alias, "smith2024");
+            assert_eq!(a.source, "bibtex-import");
+        }
+    }
+
+    #[test]
+    fn note_becomes_unanchored_annotation_with_reader_as_author() {
+        let mut b = bib("k");
+        b.note = Some("Read twice; methodology questionable".into());
+        let se = compute("p-x", "lars", &b, MergeAction::Updated);
+        let a = se.annotation.expect("annotation built from note");
+        assert_eq!(a.author, "lars");
+        assert_eq!(a.note, "Read twice; methodology questionable");
+        assert_eq!(a.paper_id.as_str(), "p-x");
+        assert!(a.parent_id.is_none(), "root annotation");
+        // No selectors against paper text — only the synthetic
+        // `sentence_id` marker the resolver uses to short-circuit (#158).
+        assert!(a.anchor.char_range.is_none());
+        assert!(a.anchor.quote.is_none());
+        assert!(a.anchor.prefix.is_none());
+        assert!(a.anchor.suffix.is_none());
+        assert!(a.anchor.is_imported_synthetic());
+    }
+
+    #[test]
+    fn imported_synthetic_sentence_id_is_stable_per_citekey_note() {
+        let mut b1 = bib("smith2024");
+        b1.note = Some("methodology questionable".into());
+        let mut b2 = bib("smith2024");
+        b2.note = Some("methodology questionable".into());
+        let mut b3 = bib("smith2024");
+        b3.note = Some("different note".into());
+        let mut b4 = bib("jones2024");
+        b4.note = Some("methodology questionable".into());
+
+        let a1 = compute("p", "lars", &b1, MergeAction::Updated)
+            .annotation
+            .unwrap();
+        let a2 = compute("p", "lars", &b2, MergeAction::Updated)
+            .annotation
+            .unwrap();
+        let a3 = compute("p", "lars", &b3, MergeAction::Updated)
+            .annotation
+            .unwrap();
+        let a4 = compute("p", "lars", &b4, MergeAction::Updated)
+            .annotation
+            .unwrap();
+
+        assert_eq!(a1.anchor.sentence_id, a2.anchor.sentence_id);
+        assert_ne!(a1.anchor.sentence_id, a3.anchor.sentence_id);
+        assert_ne!(a1.anchor.sentence_id, a4.anchor.sentence_id);
+    }
+
+    #[test]
+    fn keywords_attach_to_annotation_when_note_exists() {
+        let mut b = bib("k");
+        b.note = Some("ok".into());
+        b.keywords = vec!["alpha".into(), "beta".into()];
+        let se = compute("p1", "lars", &b, MergeAction::Updated);
+        let a = se.annotation.unwrap();
+        assert_eq!(a.tags, vec!["alpha", "beta"]);
+        assert!(
+            se.paper_tags.is_empty(),
+            "keywords riding on annotation must not also write paper-tag rows"
+        );
+    }
+
+    #[test]
+    fn keywords_without_note_become_paper_tags() {
+        let mut b = bib("k");
+        b.keywords = vec!["alpha".into(), "beta".into()];
+        let se = compute("p1", "lars", &b, MergeAction::Updated);
+        assert!(se.annotation.is_none());
+        let tags: Vec<&str> = se.paper_tags.iter().map(|t| t.tag.as_str()).collect();
+        assert_eq!(tags, vec!["alpha", "beta"]);
+        for t in &se.paper_tags {
+            assert_eq!(t.paper_id, "p1");
+            assert_eq!(t.source, TAG_SOURCE);
+        }
+    }
+
+    #[test]
+    fn empty_note_string_is_treated_as_no_note() {
+        let mut b = bib("k");
+        b.note = Some(String::new());
+        b.keywords = vec!["x".into()];
+        let se = compute("p1", "lars", &b, MergeAction::Updated);
+        assert!(
+            se.annotation.is_none(),
+            "empty note string must not produce an empty-content annotation"
+        );
+        let tags: Vec<&str> = se.paper_tags.iter().map(|t| t.tag.as_str()).collect();
+        assert_eq!(tags, vec!["x"]);
+    }
+
+    #[test]
+    fn file_field_always_surfaces_under_verbose() {
+        let mut b = bib("k");
+        b.file = Some("/somebody/elses/path.pdf".into());
+        let se = compute("p1", "lars", &b, MergeAction::Created);
+        assert_eq!(se.dropped_file.as_deref(), Some("/somebody/elses/path.pdf"));
+    }
+
+    #[test]
+    fn no_zotero_extras_yields_alias_only() {
+        let se = compute("p1", "lars", &bib("k"), MergeAction::Updated);
+        assert!(se.alias.is_some());
+        assert!(se.annotation.is_none());
+        assert!(se.paper_tags.is_empty());
+        assert!(se.dropped_file.is_none());
+    }
+
+    #[test]
+    fn rejected_action_skips_paper_tags_too() {
+        let mut b = bib("k");
+        b.keywords = vec!["should-not-land".into()];
+        let se = compute("p1", "lars", &b, MergeAction::Rejected);
+        assert!(se.is_empty());
+        assert!(se.paper_tags.is_empty());
+    }
+}
