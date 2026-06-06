@@ -20,6 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Theme is locked once at startup — restart the TUI if the terminal
   flips light/dark mid-session.
 
+## [0.7.1](https://github.com/vig-os/scitadel/compare/0.7.0...0.7.1) (2026-06-06)
+
+
+### Bug Fixes
+
+* **ci:** binaries.yml release upload permissions + manual re-run ([#201](https://github.com/vig-os/scitadel/issues/201)) ([25fe8cd](https://github.com/vig-os/scitadel/commit/25fe8cd77c3f4bcfe156b16c5cc6623274e185bb))
+* **ci:** draft-release flow so binaries attach under immutable releases ([#203](https://github.com/vig-os/scitadel/issues/203)) ([1d1d998](https://github.com/vig-os/scitadel/commit/1d1d9985b148c66def3ec63db6b551d5589d9d61))
+
 ## [0.7.0](https://github.com/vig-os/scitadel/compare/0.6.0...0.7.0) (2026-06-05)
 
 

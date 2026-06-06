@@ -1,6 +1,6 @@
 [package]
 name = "scitadel-scoring"
-version = "0.7.0" # x-release-please-version
+version = "0.7.1" # x-release-please-version
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -16,7 +16,7 @@ default = ["scoring"]
 scoring = []
 
 [dependencies]
-scitadel-core = { path = "../scitadel-core", version = "0.7.0" } # x-release-please-version
+scitadel-core = { path = "../scitadel-core", version = "0.7.1" } # x-release-please-version
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
