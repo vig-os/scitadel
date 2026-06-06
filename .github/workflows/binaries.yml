@@ -1,9 +1,13 @@
-# Builds prebuilt scitadel binaries when a semver tag is pushed, and
-# attaches platform tarballs + SHA256 sums to the GitHub Release.
+# Builds prebuilt scitadel binaries when a semver tag is pushed and attaches
+# platform tarballs + SHA256 sums to the GitHub Release.
 #
-# Triggered on tags matching X.Y.Z (and pre-releases like X.Y.Z-rcN).
-# The Release object should already exist (created by release.yml or
-# manually via `gh release create`); this workflow uploads assets to it.
+# Immutable releases forbid asset uploads after publish, so the flow is:
+# release-please creates the release as a DRAFT (draft + force-tag-creation);
+# the build matrix uploads tarballs to that draft (still mutable); then the
+# `publish` job flips draft -> published once, making it immutable WITH assets.
+#
+# Triggered on tags matching X.Y.Z (and pre-releases like X.Y.Z-rcN), or
+# manually via workflow_dispatch for an existing tag whose release is a draft.
 
 name: Binaries
 
@@ -75,11 +79,24 @@ jobs:
           echo "tarball=$TAR" >> "$GITHUB_OUTPUT"
           echo "checksum=${TAR}.sha256" >> "$GITHUB_OUTPUT"
 
-      - name: Upload to release
+      - name: Upload to draft release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
+          draft: true   # keep it a draft; parallel matrix jobs must not publish
           files: |
             ${{ steps.package.outputs.tarball }}
             ${{ steps.package.outputs.checksum }}
           fail_on_unmatched_files: true
+
+  # Flip the draft to published exactly once, after all platform tarballs are
+  # attached. Publishing makes the release immutable with its assets in place.
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "${{ inputs.tag || github.ref_name }}" --repo "${{ github.repository }}" --draft=false
