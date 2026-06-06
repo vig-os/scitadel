@@ -1,6 +1,6 @@
 [package]
 name = "scitadel-db"
-version = "0.7.0" # x-release-please-version
+version = "0.7.1" # x-release-please-version
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,7 +12,7 @@ description = "SQLite-backed repositories and migrations for scitadel."
 readme = "../../README.md"
 
 [dependencies]
-scitadel-core = { path = "../scitadel-core", version = "0.7.0" } # x-release-please-version
+scitadel-core = { path = "../scitadel-core", version = "0.7.1" } # x-release-please-version
 rusqlite = { workspace = true }
 r2d2 = { workspace = true }
 r2d2_sqlite = { workspace = true }

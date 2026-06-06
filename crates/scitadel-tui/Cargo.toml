@@ -1,6 +1,6 @@
 [package]
 name = "scitadel-tui"
-version = "0.7.0" # x-release-please-version
+version = "0.7.1" # x-release-please-version
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,10 +12,10 @@ description = "Interactive TUI for browsing scitadel searches, papers, and asses
 readme = "../../README.md"
 
 [dependencies]
-scitadel-core = { path = "../scitadel-core", version = "0.7.0" } # x-release-please-version
-scitadel-db = { path = "../scitadel-db", version = "0.7.0" } # x-release-please-version
-scitadel-adapters = { path = "../scitadel-adapters", version = "0.7.0" } # x-release-please-version
-scitadel-export = { path = "../scitadel-export", version = "0.7.0" } # x-release-please-version
+scitadel-core = { path = "../scitadel-core", version = "0.7.1" } # x-release-please-version
+scitadel-db = { path = "../scitadel-db", version = "0.7.1" } # x-release-please-version
+scitadel-adapters = { path = "../scitadel-adapters", version = "0.7.1" } # x-release-please-version
+scitadel-export = { path = "../scitadel-export", version = "0.7.1" } # x-release-please-version
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 anyhow = { workspace = true }
