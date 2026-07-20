@@ -121,7 +121,7 @@ jobs:
 
       - name: Sync Issues and PRs
         id: sync
-        uses: vig-os/sync-issues-action@bad447d330526a7313ffddae084010c39b335fc1  # v0.2.2
+        uses: vig-os/sync-issues-action@285a0af876bac99a0e914a64a1cb925dd913f38a  # v0.4.0
         with:
           app-id: ${{ secrets.COMMIT_APP_ID }}
           app-private-key: ${{ secrets.COMMIT_APP_PRIVATE_KEY }}
@@ -135,7 +135,7 @@ jobs:
       - name: Commit and push changes via API
         id: commit
         if: steps.sync.outputs.modified-files != ''
-        uses: vig-os/commit-action@1bc004353d08d9332a0cb54920b148256220c8e0  # v0.2.0
+        uses: vig-os/commit-action@3a0588ec060d9647bf406e064cf9e6192a431864  # v0.3.1
         env:
           # Use App token so push can bypass branch protection when App is in bypass list
           GH_TOKEN: ${{ steps.generate-token.outputs.token }}
