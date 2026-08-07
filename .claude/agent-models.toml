@@ -1,0 +1,19 @@
+# Managed by vigOS devkit — regenerated on upgrade; local edits are lost.
+# Customize in justfile.project. Bugs / missing tools: https://github.com/vig-os/devkit/issues
+
+# .claude/agent-models.toml
+# Single source of truth for agent model assignments.
+# Referenced by: justfile.worktree (worktree-start) and derive-branch-summary.
+# Values are claude CLI model aliases (resolved to the latest in each family).
+
+[models]
+lightweight = "haiku" # branch naming, quick single-shot tasks
+standard = "sonnet"   # structured output, data gathering, mechanical steps
+autonomous = "opus"   # full agent sessions (solve-and-pr, execute, etc.)
+
+[skill-tiers]
+# Which model tier each skill category should use for delegated sub-steps
+data-gathering = "lightweight" # CLI commands, API calls, file reading, parsing
+formatting = "lightweight"     # template filling, markdown generation, comment posting
+review = "standard"            # code review, structured analysis with clear inputs
+orchestration = "autonomous"   # design, planning, code generation, debugging

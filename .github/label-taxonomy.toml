@@ -1,8 +1,11 @@
+# Managed by vigOS devkit — regenerated on upgrade; local edits are lost.
+# Customize in justfile.project. Bugs / missing tools: https://github.com/vig-os/devkit/issues
+
 # Canonical repository labels.
 # Single source of truth — referenced by:
 #   - uv run setup-labels                   (provision labels on a repo)
-#   - .cursor/skills/issue_triage/SKILL.md  (triage label check)
-#   - .cursor/skills/issue_create/SKILL.md  (agent label mapping)
+#   - .claude/skills/issue_triage/SKILL.md  (triage label check)
+#   - .claude/skills/issue_create/SKILL.md  (agent label mapping)
 #   - .github/ISSUE_TEMPLATE/*.yml          (template label values)
 #
 # Label reconciliation:
@@ -10,6 +13,13 @@
 #   The `setup-labels` command is provided by devcontainer bootstrap tooling.
 #   from this taxonomy. Use `--prune` to remove org-default labels that don't
 #   match the taxonomy. Use `--dry-run` to preview changes first.
+#
+# Repo-local extension:
+#   Declare repo-specific labels in `.github/label-taxonomy.local.toml` (same
+#   [[labels]] schema). That file is never devkit-managed — it survives
+#   upgrades, its labels are reconciled and spared by `--prune`, and on a name
+#   collision the local entry wins (mirrors the justfile.base -> justfile.local
+#   layering).
 
 # ── Type ──────────────────────────────────────────────────────────────────────
 

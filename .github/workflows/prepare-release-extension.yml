@@ -1,0 +1,131 @@
+# Seeded by vigOS devkit — yours to edit; upgrades never overwrite this file.
+# Bugs / missing tools: https://github.com/vig-os/devkit/issues
+
+# Prepare Release Extension — cargo workspace version bump (consumer-owned)
+#
+# The MUTATING seam: prepare-release.yml calls this after `release/X.Y.Z` is cut
+# (and the changelog-freeze commit pushed) and BEFORE the draft PR to main opens,
+# so whatever it commits is in the release PR diff from the start.
+#
+# Why this exists: release-please's `cargo-workspace` plugin used to bump all 8
+# crate versions AND their inter-crate `version = "…"` requirements in lockstep
+# on every release. The devkit train has no equivalent — it owns CHANGELOG.md,
+# the tag and the GitHub Release, not the language manifests. Without this hook
+# the crates published by publish-crates.yml would keep whatever version was
+# last hand-written in Cargo.toml, silently diverging from the release tag.
+#
+# `cargo set-version --workspace X.Y.Z` (cargo-edit) is the drop-in replacement:
+# it rewrites every workspace member's `version`, rewrites the path-dependency
+# `version` requirements between them, and refreshes Cargo.lock.
+#
+# The commit goes through vig-os/commit-action (GitHub API, signed,
+# ruleset-friendly) with the COMMIT_APP token — the same bypass and identity the
+# changelog-freeze commit already uses to write to the protected release branch.
+# FILE_PATHS is intentionally omitted: the action then commits exactly what
+# `cargo set-version` left dirty, which stays correct when a crate is added.
+#
+# Honors dry_run by not running at all (prepare-release.yml also gates the whole
+# prepare phase off on a dry run).
+
+name: Prepare Release Extension
+
+on:  # yamllint disable-line rule:truthy
+  workflow_call:
+    inputs:
+      version:
+        description: "Release version being prepared (X.Y.Z)"
+        required: true
+        type: string
+      release_branch:
+        description: "Release branch just created (release/X.Y.Z)"
+        required: true
+        type: string
+      branch_sha:
+        description: "Post-freeze head SHA the release branch was created from"
+        required: true
+        type: string
+      dry_run:
+        description: "Validate without making changes (extensions must honor it)"
+        required: false
+        default: false
+        type: boolean
+      git_user_name:
+        description: "Git user name for commits"
+        required: false
+        default: "github-actions[bot]"
+        type: string
+      git_user_email:
+        description: "Git user email for commits"
+        required: false
+        default: "41898282+github-actions[bot]@users.noreply.github.com"
+        type: string
+
+# The orchestrator calls this workflow with `secrets: inherit`, so the job below
+# mints the COMMIT_APP token to push to the write-protected release branch.
+permissions:
+  contents: read
+
+jobs:
+  bump-workspace-version:
+    name: Bump cargo workspace to ${{ inputs.version }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    if: ${{ inputs.dry_run != true }}
+    permissions:
+      contents: read
+
+    steps:
+      - name: Generate Commit App Token
+        id: commit_app_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3
+        with:
+          client-id: ${{ secrets.COMMIT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.COMMIT_APP_PRIVATE_KEY }}
+
+      - name: Checkout release branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.release_branch }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-edit
+        run: cargo install cargo-edit --locked
+
+      - name: Set workspace version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          cargo set-version --workspace "$VERSION"
+          echo "Workspace manifests now at $VERSION:"
+          cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | "  \(.name) \(.version)"'
+
+      - name: Verify every crate landed on the release version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          stray=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r --arg v "$VERSION" \
+                '.packages[] | select(.version != $v) | "  - \(.name) is \(.version)"')
+          if [ -n "$stray" ]; then
+            printf '%s\n' "$stray"
+            echo "::error::cargo set-version left one or more crates off $VERSION."
+            exit 1
+          fi
+          echo "All workspace crates are at $VERSION."
+
+      - name: Commit the version bump to the release branch
+        uses: vig-os/commit-action@3a0588ec060d9647bf406e064cf9e6192a431864  # v0.3.1
+        env:
+          GH_TOKEN: ${{ steps.commit_app_token.outputs.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          TARGET_BRANCH: refs/heads/${{ inputs.release_branch }}
+          COMMIT_MESSAGE: |-
+            chore(release): set cargo workspace version to ${{ inputs.version }}
+          ALLOW_EMPTY: "false"
+          MAX_ATTEMPTS: "3"

@@ -23,10 +23,17 @@ repos:
       - id: check-added-large-files
       - id: check-case-conflict
       - id: check-json
+        # The JSONC scaffold files carry a `//` provenance banner (#1053) that
+        # check-json's strict parser rejects; VS Code accepts it. Strict-JSON
+        # files (renovate.json etc.) stay checked.
+        exclude: (^|/)\.vscode/settings\.json$
       - id: check-merge-conflict
       - id: check-symlinks
       - id: check-toml
       - id: check-yaml
+        # git-hooks.nix' check-yaml built-in hardcodes --multi, so match it here
+        # to keep the runner and the checks.pre-commit gate in agreement (#778).
+        args: [--allow-multiple-documents]
       - id: debug-statements
       - id: destroyed-symlinks
       - id: detect-private-key
@@ -51,23 +58,29 @@ repos:
         exclude: ^\.envrc$
 
   # Markdown Linting (excludes auto-generated docs)
-  - repo: https://github.com/jackdewinter/pymarkdown
-    rev: f93643d339dfee2a1022e7b05e8b5a281bfac553  # v0.9.23
+  # pymarkdown from the flake toolchain (vigos nix/pymarkdown.nix, devkit
+  # #1170): the upstream pre-commit repo's native pyjson5 extension cannot load
+  # on bare host runners (ImportError: libstdc++.so.6) — the exact failure this
+  # repo's CI Lint job hit on the 1.6.0 migration PR.
+  - repo: local
     hooks:
       - id: pymarkdown
         name: pymarkdown
+        entry: pymarkdown
+        language: system
+        types: [markdown]
         args: ["-c", ".pymarkdown", "fix"]
         exclude: ^(README\.md|CONTRIBUTE\.md|TESTING\.md)
 
-  # Justfile formatting
-  - repo: local
-    hooks:
-      - id: just-fmt
-        name: just (format justfiles)
-        entry: just --fmt --unstable
-        language: system
-        files: ^justfile(\..*)?$
-        pass_filenames: false
+  # Justfile formatting — retired in #207 (devkit 1.6.0 migration).
+  # `just --fmt` only ever formats the ROOT justfile, and that file is now
+  # devkit-managed: it is not `just --fmt` stable, so the hook rewrote it on
+  # every run, which both loses the managed content and trips CI's
+  # scaffold-drift gate. Pointing it at `justfile.project` instead is no better
+  # — `just --fmt` reflows multi-line recipe comment blocks (it treats only the
+  # last comment line as the doc comment), mangling the comments this repo
+  # relies on. Nothing is lost: with `pass_filenames: false` and no
+  # `--justfile`, the hook never touched `justfile.project` anyway.
 
   # Rust formatting (fast — under 1s on a warm cache). Clippy is
   # NOT a pre-commit hook because it's too slow for every commit;
@@ -82,8 +95,14 @@ repos:
         files: \.rs$
         pass_filenames: false
 
-  # Typo Linting
-  - repo: https://github.com/crate-ci/typos
-    rev: 07d900b8fa1097806b8adb6391b0d3e0ac2fdea7  # v1.39.0
+  # Typo Linting (typos sourced from the flake dev-shell, like the devkit
+  # template). The upstream hook installs a generic-linux binary that a NixOS
+  # host cannot exec at all ("Could not start dynamically linked executable"),
+  # so the hook is resolved from PATH instead — the flake provides it locally
+  # and CI runs `just precommit` inside the same dev-shell. Refs #207.
+  - repo: local
     hooks:
       - id: typos
+        name: typos (source typo checker)
+        entry: typos --force-exclude
+        language: system

@@ -1,59 +1,91 @@
 # Releasing
 
-Releases are automated with [release-please](https://github.com/googleapis/release-please).
-You write [conventional commits](https://www.conventionalcommits.org/); the
-pipeline does the rest.
+Releases run on the **vigOS devkit release train**. The generic, managed flow —
+`prepare-release.yml` → `release.yml` → `promote-release.yml`, the RC train, the
+rollback semantics and the extension seams — is documented once in
+[`DOWNSTREAM_RELEASE.md`](./DOWNSTREAM_RELEASE.md); this page only records what
+is specific to scitadel.
+
+Until 0.6.0 releases were cut by release-please. That system was retired in #207.
 
 ## Flow
 
-1. Land conventional commits on `main` (`feat:`, `fix:`, `feat!:`/`BREAKING CHANGE:`).
-2. `release-please.yml` keeps an open **release PR** that bumps the version and
-   updates `CHANGELOG.md`. Review it as commits accumulate.
-3. **Merge the release PR.** release-please then:
-   - bumps all 8 crate `[package].version`s and their inter-crate dependency
-     requirements in lockstep (`cargo-workspace` plugin) and updates `Cargo.lock`,
-   - creates one unprefixed git tag (e.g. `0.7.0`) and a GitHub Release.
-4. The tag triggers:
-   - `publish-crates.yml` → publishes all crates to crates.io in dependency order,
-   - `binaries.yml` → builds per-platform tarballs and attaches them to the Release.
+1. Land conventional commits on `dev` (the gitflow integration branch).
+2. Keep the `## Unreleased` section of [`CHANGELOG.md`](../CHANGELOG.md) current
+   as you go — the train reads it, it is not generated from commit messages any
+   more.
+3. Dispatch **`prepare-release.yml`** with the target version. It freezes the
+   changelog, cuts `release/X.Y.Z`, runs the prepare seam (below) and opens the
+   draft release PR to `main`.
+4. Dispatch **`release.yml`** (`release_kind: candidate`) as many times as
+   needed to publish `X.Y.Z-rcN` tags, then once with `release_kind: final` to
+   publish tag `X.Y.Z` and its **draft** GitHub Release.
+5. Wait for **`binaries.yml`** to finish attaching the platform tarballs to that
+   draft (see below — assets cannot be added after promotion).
+6. Dispatch **`promote-release.yml`**. It publishes the Release and merges
+   `release/X.Y.Z` into `main`.
+7. Publishing the Release triggers **`publish-crates.yml`**, which pushes all
+   eight crates to crates.io in dependency order.
 
 ## Versioning model
 
-- Single shared version across the workspace. Each `crates/scitadel-*/Cargo.toml`
-  carries an explicit `version = "x.y.z"` (NOT `version.workspace = true` — the
-  `cargo-workspace` plugin requires a literal version to bump). There is no
-  `[workspace.package].version`; release-please owns the per-crate versions.
-- release-please config: [`release-please-config.json`](../release-please-config.json),
-  state: [`.release-please-manifest.json`](../.release-please-manifest.json).
-- Tags are unprefixed `X.Y.Z` (`include-v-in-tag: false`) to match the
-  tag triggers in `publish-crates.yml` and `binaries.yml`.
+Single shared version across the workspace. Each `crates/scitadel-*/Cargo.toml`
+carries an explicit `version = "x.y.z"` (not `version.workspace = true`), and the
+crates depend on each other with explicit `version = "…"` requirements. There is
+no `[workspace.package].version`.
 
-## One-time setup (repo secrets)
+The devkit train owns `CHANGELOG.md`, the tag and the GitHub Release — it does
+**not** touch language manifests. Keeping the manifests in lockstep is this
+repo's job, and it is done by
+[`prepare-release-extension.yml`](../.github/workflows/prepare-release-extension.yml):
+when the release branch is cut it runs `cargo set-version --workspace X.Y.Z`
+(cargo-edit), which rewrites every member version, every inter-crate requirement
+and `Cargo.lock`, then commits the result onto `release/X.Y.Z` so it is part of
+the release PR diff. This replaces release-please's `cargo-workspace` plugin.
 
-| Secret | Why |
+Tags are **unprefixed** `X.Y.Z` (`DEVKIT_TAG_PREFIX` is empty in
+[`.vig-os`](../.vig-os)), matching the tags release-please emitted. The stray
+early `v0.5.0` / `v0.6.0` tags are historical and harmless.
+
+## Release-time workflows owned by this repo
+
+| Workflow | Trigger | What it does |
+| --- | --- | --- |
+| `prepare-release-extension.yml` | called by `prepare-release.yml` | `cargo set-version --workspace`, committed to the release branch |
+| `release-extension.yml` | called by `release.yml` before the tag is cut | crates.io publishability gate at the finalized SHA; failing it rolls the release back |
+| `binaries.yml` | final tag push, or manual dispatch | builds the three platform tarballs + SHA256 sums, uploads them into the still-draft Release |
+| `publish-crates.yml` | `release: published`, or manual dispatch (plus an always-on PR dry-run) | publishes the crates to crates.io |
+
+Ordering matters in exactly one place: **`binaries.yml` must finish before
+`promote-release.yml` runs.** GitHub's immutable releases refuse asset uploads
+once a Release is published, so the tarballs have to land while it is still a
+draft. `binaries.yml` cannot move into the read-only `release-extension.yml`
+seam, because that seam runs before the tag and the Release even exist.
+
+## One-time setup (repo secrets and variables)
+
+| Secret / variable | Why |
 | --- | --- |
-| `RELEASE_PLEASE_TOKEN` | Fine-grained PAT (`contents: write`, `pull-requests: write`). Required so the tag release-please pushes **triggers** `publish-crates.yml`/`binaries.yml` — tags pushed with the default `GITHUB_TOKEN` do not trigger other workflows. Without it the release PR + Release are still created, but publish/binaries won't auto-run. |
-| `CARGO_REGISTRY_TOKEN` | crates.io API token used by `publish-crates.yml` at tag time. |
+| `RELEASE_APP_CLIENT_ID`, `RELEASE_APP_PRIVATE_KEY` | devkit Release App — tags, Releases, promote. See `DOWNSTREAM_RELEASE.md`. |
+| `COMMIT_APP_CLIENT_ID`, `COMMIT_APP_PRIVATE_KEY` | devkit Commit App — the changelog freeze and the workspace version-bump commit. |
+| `CARGO_REGISTRY_TOKEN` (environment `crates-io`) | crates.io API token used by `publish-crates.yml`. |
 
-## First-run checklist
+The retired release-please credentials (`RELEASE_PLEASE_TOKEN`,
+`RELEASE_BOT_APP_ID`, `RELEASE_BOT_PRIVATE_KEY`) can be deleted.
 
-release-please's first release PR for a workspace is worth eyeballing before merge:
+## First release on the train
 
-- [ ] exactly **one** tag will be cut (no per-crate tag collisions),
-- [ ] all 8 `crates/scitadel-*/Cargo.toml` `version`s are bumped,
-- [ ] all internal `scitadel-* = { path = …, version = "…" }` requirements are bumped,
-- [ ] `Cargo.lock` updated,
-- [ ] `CHANGELOG.md` reads correctly.
+The first release after migrating has a one-time sharp edge: `promote-release.yml`
+is not yet dispatchable, because GitHub only registers a `workflow_dispatch`
+workflow that exists on the default branch, and the thing that puts it on `main`
+is the promote merge itself. Follow the **first-release manual promote runbook**
+in the devkit
+[`MIGRATION.md`](https://github.com/vig-os/devkit/blob/main/docs/MIGRATION.md)
+— run it through to the end in one go, it cannot be resumed by the workflow.
+Every subsequent release promotes normally.
 
 ## Plugin version pin
 
 The Claude Code plugin fetches a pinned release binary. After a release, bump
 `plugins/scitadel/bin/VERSION` and `plugins/scitadel/.claude-plugin/plugin.json`
 `version` to the new tag so the plugin installs the matching binary.
-
-## Tag hygiene note
-
-Earlier tags are inconsistent (`v0.5.0` prefixed vs `0.3.0` unprefixed); only the
-unprefixed form triggers the publish/binaries workflows. Going forward
-release-please emits unprefixed tags exclusively. The stray `v*` tags are
-harmless but can be deleted for tidiness if desired.

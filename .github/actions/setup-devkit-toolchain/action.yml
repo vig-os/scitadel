@@ -1,0 +1,381 @@
+# Managed by vigOS devkit — regenerated on upgrade; local edits are lost.
+# Customize in justfile.project. Bugs / missing tools: https://github.com/vig-os/devkit/issues
+
+# Set up the devkit toolchain (mode-aware step-level preamble)
+#
+# The single toolchain preamble for every scaffolded CI/release job (#994).
+# Safe to call as the FIRST step after checkout in every job: it branches on the
+# delivery `mode` (resolved by the resolve-toolchain job) so container and host
+# jobs share one call site
+# (https://github.com/vig-os/devkit/blob/main/docs/rfcs/ADR-conditional-container-toolchain.md).
+# After it runs, plain `run: just sync` / `just precommit` / `gh` steps work
+# identically in every mode.
+#
+# Branches (gated by `if:` on the mode input):
+#   devcontainer / both  in-container: the toolchain is already baked into the
+#                        image, so this only exports the image-relative env
+#                        (UV_PROJECT_ENVIRONMENT, PREK_HOME), applies the git
+#                        safe.directory fix, and runs the prek version-skew guard
+#                        (#854). The image ships the `retry` binary, so no shim.
+#   direnv               host: install Nix + the vig-os Cachix substituter, build
+#                        the repo's OWN flake dev-shell once, prepend its bin
+#                        dirs to PATH (mirrors the devkit's setup-env), then the
+#                        skew guard resolves prek off that PATH.
+#   bare                 host: astral-sh/setup-uv + pinned `uv tool install`
+#                        (just, prek, and the vig-utils release scripts pinned to
+#                        the devkit-version), prepend the uv tool bin dir to PATH.
+#   direnv + bare        both host modes additionally install a self-contained
+#                        `retry` shim via BASH_ENV (the scaffold cannot source a
+#                        devkit-internal script, so the function is embedded).
+
+name: Setup devkit toolchain
+description: Mode-aware step-level toolchain preamble (container in-image env, direnv Nix dev-shell, bare uv install)
+
+inputs:
+  mode:
+    description: Delivery mode (devcontainer|direnv|both|bare) — pass needs.resolve-toolchain.outputs.mode
+    required: true
+  devkit-version:
+    description: >-
+      Devkit version pin for the bare-mode vig-utils install — pass
+      needs.resolve-toolchain.outputs.image-tag. Ignored in the other modes.
+    required: false
+    default: ''
+  cachix-cache:
+    description: Optional consumer-owned Cachix cache name (direnv mode; pulls need no token)
+    required: false
+    default: ''
+  cachix-auth-token:
+    description: Optional Cachix auth token for pushing to cachix-cache (direnv mode)
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    # ── devcontainer / both — in-container, toolchain baked into the image ────
+    - name: Configure in-container toolchain env
+      if: inputs.mode == 'devcontainer' || inputs.mode == 'both'
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Reuse the venv already present in the image instead of creating a new
+        # one, and use the image-baked prek cache. These paths only exist inside
+        # the devcontainer image. UV_PROJECT_ENVIRONMENT is Python/uv-specific,
+        # so gate it on the consumer actually being Python (pyproject.toml at the
+        # repo root); on a non-Python repo it is a no-op (#1028).
+        if [[ -f pyproject.toml ]]; then
+          echo "UV_PROJECT_ENVIRONMENT=/root/assets/workspace/.venv" >> "$GITHUB_ENV"
+        fi
+        echo "PREK_HOME=/opt/prek-cache" >> "$GITHUB_ENV"
+        # The workspace is bind-mounted with a different owner than the image
+        # root user; mark it safe so git operations do not abort.
+        git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+        # Version-skew guard (#854): fail with an actionable message if the CI
+        # image predates the prek hook runner (#778), instead of an opaque
+        # `just precommit` exit 127 deep in the log.
+        if ! command -v prek >/dev/null 2>&1; then
+          echo "::error::'prek' not found in the CI image (ghcr.io/vig-os/devcontainer). The image pinned by .vig-os DEVKIT_VERSION predates the prek hook runner (#778)."
+          echo "Fix: bump .vig-os DEVKIT_VERSION to an image that ships prek, or re-run the devkit installer. See https://github.com/vig-os/devkit/blob/main/docs/MIGRATION.md."
+          exit 1
+        fi
+        echo "prek present: $(command -v prek)"
+
+    # ── direnv — host, provision from the repo's own Nix flake dev-shell ──────
+    # Self-hosted runners (DEVKIT_CI_RUNNER, #1173) usually ship their own Nix;
+    # install-nix-action would abort on them and leave NIX_CONFIG malformed
+    # (#1192), so detect first and take the matching path below.
+    - name: Detect host Nix
+      if: inputs.mode == 'direnv'
+      id: detect-nix
+      shell: bash
+      run: |
+        set -euo pipefail
+        if command -v nix >/dev/null 2>&1; then
+          echo "has-nix=true" >> "$GITHUB_OUTPUT"
+          # Some multi-user host Nix wrappers print --version to stderr (#1198);
+          # fold it into the capture so the log keeps the version, not empty ().
+          # Scrub the ambient NIX_CONFIG (#1216): a self-hosted runner's service
+          # env may carry a malformed one that makes nix error on the config
+          # before printing the version, defeating the diagnostic.
+          echo "Host Nix present: $(command -v nix) ($(env -u NIX_CONFIG nix --version 2>&1))"
+        else
+          echo "has-nix=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    # Nix installer SHA-pinned to match the vig-os toolchain. The vig-os public
+    # Cachix substituter (pull-only, no token) makes the dev-shell a fast
+    # binary-cache pull; accept-flake-config lets the pinned vigos input
+    # contribute its own substituters. Keep extra_nix_config in lockstep with
+    # the "Configure host Nix" step below (enforced by test).
+    - name: Install Nix (upstream CppNix)
+      if: inputs.mode == 'direnv' && steps.detect-nix.outputs.has-nix != 'true'
+      uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342  # v31.11.0
+      with:
+        extra_nix_config: |
+          experimental-features = nix-command flakes
+          accept-flake-config = true
+          extra-substituters = https://vig-os.cachix.org
+          extra-trusted-public-keys = vig-os.cachix.org-1:yoOYRi3bvnM6ThxO0joLt7vtzhTfkq3r6jykeUMg7Bk=
+
+    # Preinstalled host Nix: export the same settings via a well-formed
+    # multi-line NIX_CONFIG instead of installing. On a multi-user host Nix
+    # the substituter entries may be ignored for non-trusted users — Cachix is
+    # an optimization, correctness does not depend on it. Keep the settings in
+    # lockstep with extra_nix_config above (enforced by test).
+    - name: Configure host Nix
+      if: inputs.mode == 'direnv' && steps.detect-nix.outputs.has-nix == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        {
+          echo 'NIX_CONFIG<<DEVKIT_NIX_CONFIG_EOF'
+          echo 'experimental-features = nix-command flakes'
+          echo 'accept-flake-config = true'
+          echo 'extra-substituters = https://vig-os.cachix.org'
+          echo 'extra-trusted-public-keys = vig-os.cachix.org-1:yoOYRi3bvnM6ThxO0joLt7vtzhTfkq3r6jykeUMg7Bk='
+          echo 'DEVKIT_NIX_CONFIG_EOF'
+        } >> "$GITHUB_ENV"
+        echo "Configured preinstalled host Nix via NIX_CONFIG."
+
+    # Optional: push this repo's own closure to a consumer-owned Cachix cache.
+    # Skipped unless the repo passes cachix-cache; pulls need no token, so the
+    # vig-os substituter above already warms the dev-shell.
+    - name: Configure Cachix
+      if: inputs.mode == 'direnv' && inputs.cachix-cache != ''
+      uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71  # v17
+      with:
+        name: ${{ inputs.cachix-cache }}
+        authToken: ${{ inputs.cachix-auth-token }}
+
+    - name: Build repo flake dev-shell and export PATH
+      if: inputs.mode == 'direnv'
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Build the consumer repo's own dev-shell (repo root flake) into a gcroot
+        # profile — a warm Cachix pull — then prepend its nix-store bin dirs to
+        # GITHUB_PATH so every following step runs as if inside `nix develop`.
+        # Mirrors the devkit's setup-env action (adapted: the consumer flake at
+        # the repo root, not the devkit's).
+        nix develop --profile "$RUNNER_TEMP/devkit-dev-profile" --command true
+
+        SHELL_PATH="$(nix develop --profile "$RUNNER_TEMP/devkit-dev-profile" \
+          --command bash -c 'printf "%s" "$PATH"')"
+
+        # Always exclude the flake's podman (rootless podman on GitHub runners
+        # needs the host's setuid newuidmap/newgidmap, which the nix-store podman
+        # cannot see). For a Python consumer (pyproject.toml present) also exclude
+        # the bare CPython so `uv sync` keeps building the venv from a downloaded
+        # manylinux CPython, not the Nix loader — the #698/#703/#729 libstdc++
+        # regression. Library pkgs (python3.<ver>-<pkg>) are unaffected. On a
+        # non-Python repo the Nix python stays on PATH (#1028).
+        STORE_BINS="$(printf '%s' "$SHELL_PATH" | tr ':' '\n' \
+          | grep '^/nix/store' \
+          | grep -v '/nix/store/[^/]*-podman[^/]*/bin')"
+        if [[ -f pyproject.toml ]]; then
+          STORE_BINS="$(printf '%s\n' "$STORE_BINS" \
+            | grep -Ev '/nix/store/[^/]*-python3-[0-9][^/]*/bin')"
+        fi
+        printf '%s\n' "$STORE_BINS" >> "$GITHUB_PATH"
+
+        # Forward the dev-shell's uv Python-download metadata URL (GITHUB_PATH
+        # carries PATH only): `uv sync` needs it to fetch the project's pinned
+        # CPython, which nixpkgs does not package. Python consumers only (#1028).
+        if [[ -f pyproject.toml ]]; then
+          UV_DL_JSON_URL="$(nix develop --profile "$RUNNER_TEMP/devkit-dev-profile" \
+            --command bash -c 'printf "UV_PYTHON_DOWNLOADS_JSON_URL=%s\n" "${UV_PYTHON_DOWNLOADS_JSON_URL:-}"' \
+            | grep '^UV_PYTHON_DOWNLOADS_JSON_URL=' | tail -n1 | cut -d= -f2-)"
+          if [ -n "$UV_DL_JSON_URL" ]; then
+            echo "UV_PYTHON_DOWNLOADS_JSON_URL=$UV_DL_JSON_URL" >> "$GITHUB_ENV"
+          fi
+        fi
+
+        # ── Forward the dev-shell's shellHook environment (#1180) ────────────
+        # GITHUB_PATH carries PATH only, so every env var a project exports from
+        # its flake `shellHook` (tool config, sensible defaults) — present in
+        # every local `nix develop`/direnv session — silently vanished on CI
+        # (vig-os/org-config#40: a shellHook-seeded OTTERDOG_TOKEN placeholder
+        # worked locally, failed on CI). Diff the ambient environment against the
+        # dev-shell environment (the shellHook has run inside `nix develop`) and
+        # forward the vars the dev-shell adds or changes, minus a denylist of
+        # shell session state and Nix/stdenv build machinery that must never leak
+        # into the CI environment. The diff is what keeps ambient host secrets
+        # (already in the runner env, unchanged inside the shell) out of
+        # GITHUB_ENV. Null-delimited dumps + a random GITHUB_ENV heredoc
+        # delimiter keep multi-line and special-character values intact.
+        env -0 > "$RUNNER_TEMP/devkit-host-env"
+        # Dump the dev-shell env to a file INSIDE the shell command: capturing
+        # `nix develop` stdout would also capture shellHook output (the
+        # scaffolded flake echoes a banner), gluing it onto the first NUL
+        # record and corrupting GITHUB_ENV (#1189).
+        nix develop --profile "$RUNNER_TEMP/devkit-dev-profile" \
+          --command bash -c 'env -0 > "$1"' _ "$RUNNER_TEMP/devkit-devshell-env"
+
+        # Denylist: shell session state (must never override the CI shell) and
+        # Nix/stdenv build machinery (PATH is already handled via GITHUB_PATH).
+        devkit_env_denied() {
+          case "$1" in
+            PATH|HOME|USER|LOGNAME|SHELL|TERM|PWD|OLDPWD|SHLVL|IFS|_) return 0 ;;
+            TMPDIR|TMP|TEMP|TEMPDIR) return 0 ;;
+            NIX_*) return 0 ;;
+            out|outputs|src|stdenv|system|builder|name|pname|version|shell|shellHook) return 0 ;;
+            buildInputs|nativeBuildInputs|propagatedBuildInputs|propagatedNativeBuildInputs) return 0 ;;
+            deps*|*Phase|phases|dont*) return 0 ;;
+            configureFlags|cmakeFlags|mesonFlags|makeFlags|patches|strictDeps|enableParallelBuilding) return 0 ;;
+            SOURCE_DATE_EPOCH|HOST_PATH|__structuredAttrs|outputHash*|preferLocalBuild|allowSubstitutes|cmakeDir) return 0 ;;
+            *) return 1 ;;
+          esac
+        }
+
+        # Ambient environment, keyed by name, to detect unchanged vars.
+        declare -A DEVKIT_HOST_ENV=()
+        while IFS= read -r -d '' devkit_kv; do
+          DEVKIT_HOST_ENV["${devkit_kv%%=*}"]="${devkit_kv#*=}"
+        done < "$RUNNER_TEMP/devkit-host-env"
+
+        devkit_env_forwarded=0
+        while IFS= read -r -d '' devkit_kv; do
+          devkit_name="${devkit_kv%%=*}"
+          devkit_value="${devkit_kv#*=}"
+          # A name that is not a valid env identifier can only come from a
+          # corrupted dump record; skip it rather than poisoning GITHUB_ENV
+          # (#1189).
+          if [[ ! "$devkit_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            echo "::warning::Skipping malformed dev-shell env record name."
+            continue
+          fi
+          # Skip vars unchanged from the ambient environment (already present in
+          # the CI env; forwarding them would needlessly re-emit host secrets).
+          if [[ -n "${DEVKIT_HOST_ENV[$devkit_name]+x}" \
+                && "${DEVKIT_HOST_ENV[$devkit_name]}" == "$devkit_value" ]]; then
+            continue
+          fi
+          if devkit_env_denied "$devkit_name"; then
+            continue
+          fi
+          # Random heredoc delimiter: multi-line and special-character values
+          # survive intact and cannot break GITHUB_ENV parsing (GitHub's own
+          # multiline idiom).
+          devkit_delim="DEVKIT_ENV_EOF_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+          {
+            printf '%s<<%s\n' "$devkit_name" "$devkit_delim"
+            printf '%s\n' "$devkit_value"
+            printf '%s\n' "$devkit_delim"
+          } >> "$GITHUB_ENV"
+          devkit_env_forwarded=$((devkit_env_forwarded + 1))
+        done < "$RUNNER_TEMP/devkit-devshell-env"
+        echo "Forwarded $devkit_env_forwarded dev-shell shellHook env var(s) to GITHUB_ENV."
+
+        echo "Repo flake dev-shell provisioned; tools added to PATH."
+
+    - name: Verify toolchain (prek present in dev-shell)
+      if: inputs.mode == 'direnv'
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Skew guard (#854): prek must resolve off the PATH exported above.
+        if ! command -v prek >/dev/null 2>&1; then
+          echo "::error::'prek' is not provided by the repo flake dev-shell — the vigos flake input likely predates the prek hook runner (#778), or the dev-shell failed to build (see logs above)."
+          echo "Fix: 'nix flake update vigos' to a devkit generation that ships prek. See https://github.com/vig-os/devkit/blob/main/docs/MIGRATION.md."
+          exit 1
+        fi
+        echo "prek present: $(command -v prek)"
+
+    # ── bare — host, provision the pinned toolchain with uv ───────────────────
+    - name: Set up uv
+      if: inputs.mode == 'bare'
+      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
+
+    - name: Install host toolchain (just, prek, vig-utils)
+      if: inputs.mode == 'bare'
+      shell: bash
+      env:
+        DEVKIT_VERSION: ${{ inputs.devkit-version }}
+      run: |
+        set -euo pipefail
+        if [[ -z "$DEVKIT_VERSION" ]]; then
+          echo "::error::setup-devkit-toolchain (bare mode) requires 'devkit-version' — pass needs.resolve-toolchain.outputs.image-tag so vig-utils installs at the pinned devkit version."
+          exit 1
+        fi
+        # Pinned to the versions the vig-os toolchain ships; bump via Renovate or
+        # alongside a devkit upgrade. vig-utils supplies the release console
+        # scripts (prepare-changelog, renovate-changelog-pr) that the image bakes
+        # in the other modes — pinned to the same devkit version as .vig-os
+        # (#993, see https://github.com/vig-os/devkit/blob/main/docs/MIGRATION.md).
+        uv tool install rust-just==1.51.0
+        uv tool install prek==0.3.11
+        uv tool install "vig-utils @ git+https://github.com/vig-os/devkit@${DEVKIT_VERSION}#subdirectory=packages/vig-utils"
+        uv tool dir --bin >> "$GITHUB_PATH"
+        echo "Host toolchain installed (just, prek, vig-utils@${DEVKIT_VERSION})."
+
+    # ── host modes (direnv + bare) — embed the retry() shim via BASH_ENV ──────
+    # In-container jobs use the image-baked `retry` binary, so this is skipped
+    # there. The scaffold cannot source the devkit-internal retry.sh, so the
+    # function is embedded self-contained (mirrors setup-env's BASH_ENV wiring).
+    - name: Install retry shell helper (host modes)
+      if: inputs.mode == 'direnv' || inputs.mode == 'bare'
+      shell: bash
+      run: |
+        set -euo pipefail
+        RETRY_HELPER="$RUNNER_TEMP/devkit-retry.sh"
+        PREV_BASH_ENV="${BASH_ENV:-}"
+
+        cat > "$RETRY_HELPER" <<'RETRY_EOF'
+        # shellcheck shell=bash
+        retry() {
+          local retries=3
+          local backoff=1
+          local max_backoff=60
+          local rc=1
+
+          while [ "$#" -gt 0 ]; do
+            case "$1" in
+              --retries) retries="$2"; shift 2 ;;
+              --backoff) backoff="$2"; shift 2 ;;
+              --max-backoff) max_backoff="$2"; shift 2 ;;
+              --) shift; break ;;
+              *) echo "ERROR: Unknown retry option '$1'"; return 2 ;;
+            esac
+          done
+
+          if [ "$#" -eq 0 ]; then
+            echo "ERROR: retry requires a command after '--'"
+            return 2
+          fi
+
+          local attempt=1
+          local current_backoff="$backoff"
+          while [ "$attempt" -le "$retries" ]; do
+            "$@" && return 0
+            rc=$?
+            if [ "$attempt" -lt "$retries" ]; then
+              local wait="$current_backoff"
+              if [ "$wait" -gt "$max_backoff" ]; then
+                wait="$max_backoff"
+              fi
+              echo "Retry $attempt/$retries failed (exit $rc), waiting ${wait}s..."
+              sleep "$wait"
+              current_backoff=$((current_backoff * 2))
+            fi
+            attempt=$((attempt + 1))
+          done
+
+          echo "ERROR: Command failed after $retries attempts: $*"
+          return "$rc"
+        }
+        export -f retry
+        RETRY_EOF
+
+        # Chain any pre-existing BASH_ENV so this shim adds to it rather than
+        # replacing it.
+        if [ -n "$PREV_BASH_ENV" ] && [ -f "$PREV_BASH_ENV" ] && [ "$PREV_BASH_ENV" != "$RETRY_HELPER" ]; then
+          {
+            echo "source \"$PREV_BASH_ENV\""
+            cat "$RETRY_HELPER"
+          } > "${RETRY_HELPER}.merged"
+          mv "${RETRY_HELPER}.merged" "$RETRY_HELPER"
+        fi
+
+        echo "BASH_ENV=$RETRY_HELPER" >> "$GITHUB_ENV"
