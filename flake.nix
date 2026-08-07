@@ -8,14 +8,21 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # Shared vigOS devkit toolchain, pinned to the devkit release this repo
+    # adopts in .vig-os. Its overlay supplies `vig-utils` — the console scripts
+    # the devkit-managed ci.yml calls (`validate-commit-range`,
+    # `check-pr-agent-fingerprints`) — plus a tracked `uv`/`gh`. In direnv mode
+    # CI provisions itself from THIS dev-shell, so the tools have to be here.
+    # Bump deliberately alongside DEVKIT_VERSION.
+    vigos.url = "github:vig-os/devkit/1.6.0";
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay }:
+  outputs = { self, nixpkgs, flake-utils, rust-overlay, vigos }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
           inherit system;
-          overlays = [ rust-overlay.overlays.default ];
+          overlays = [ rust-overlay.overlays.default vigos.overlays.default ];
         };
 
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
@@ -54,6 +61,12 @@
             # typos runs as a language:system hook (the upstream pre-commit repo
             # ships a generic-linux binary that NixOS hosts cannot exec).
             typos
+            # devkit CI toolchain (from the vigos overlay): ci.yml's
+            # commit-checks job runs `uv run validate-commit-range` and
+            # `uv run check-pr-agent-fingerprints`, and in direnv mode it
+            # resolves both off this dev-shell's PATH.
+            uv
+            vig-utils
           ];
 
           shellHook = ''
