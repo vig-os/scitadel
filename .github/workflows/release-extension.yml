@@ -1,0 +1,110 @@
+# Seeded by vigOS devkit — yours to edit; upgrades never overwrite this file.
+# Bugs / missing tools: https://github.com/vig-os/devkit/issues
+
+# Release Extension — crates.io publishability gate (consumer-owned)
+#
+# The devkit release pipeline's designed project extension point: release.yml
+# calls this reusable workflow after finalize_sha is computed and before
+# release-publish tags it. A failure here fails the `extension` job in
+# release.yml, which triggers the consolidated rollback via `needs` — so this is
+# the last gate before a tag is cut.
+#
+# This project uses it as the release-time backstop for crates.io publishing:
+# the workspace is only ever published from a tag, and a crate that is missing
+# required registry metadata (or no longer builds a valid .crate) can otherwise
+# only be discovered AFTER the tag exists — at which point the version is burned
+# and cannot be re-cut. publish-crates.yml runs the identical checks on every PR
+# to dev/main; this job re-runs them at inputs.finalize_sha, the exact commit the
+# tag will point at, so a merge cannot slip broken publish metadata past the PR
+# gate. Read-only (contents: read) — nothing is published here; the live publish
+# runs from publish-crates.yml once the GitHub Release is promoted.
+#
+# Both checks run for candidates as well as finals: an RC is the cheapest place
+# to learn that the workspace has stopped being publishable.
+#
+# Toolchain: this seam provisions the Rust toolchain directly
+# (dtolnay/rust-toolchain, as rust-ci.yml and binaries.yml do) rather than the
+# devkit dev-shell composite. The repo-owned flake carries the full interactive
+# dev shell (vhs, chromium, asciinema); building it here would cost far more than
+# the checks themselves. The workflow_call inputs contract below is fixed —
+# release.yml passes these by name.
+#
+# Token ceiling (#1144): release.yml's `extension` caller job grants this seam a
+# ceiling of contents:read, packages:write, id-token:write, attestations:write.
+# Nothing here needs more than contents:read.
+
+name: Release Extension
+
+on:  # yamllint disable-line rule:truthy
+  workflow_call:
+    inputs:
+      version:
+        description: "Release version"
+        required: true
+        type: string
+      finalize_sha:
+        description: "Finalized commit SHA"
+        required: true
+        type: string
+      release_date:
+        description: "Release date"
+        required: true
+        type: string
+      release_kind:
+        description: "Release kind (candidate or final)"
+        required: true
+        type: string
+      publish_version:
+        description: "Version tag that will be published (X.Y.Z or X.Y.Z-rcN)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  crates-publishable:
+    name: Verify crates.io publishability
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout finalized commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.finalize_sha }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check every crate has publishable metadata
+        # cargo-manifest-level check that each workspace crate carries the
+        # metadata crates.io requires. Does NOT hit the registry, so it also
+        # works for internal deps that are not published yet.
+        env:
+          PUBLISH_VERSION: ${{ inputs.publish_version }}
+        run: |
+          set -euo pipefail
+          missing=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[]
+                     | . as $p
+                     | ["description", "license", "repository"][]
+                     | select(($p[.] // "") == "")
+                     | "  - \($p.name): missing \(.)"')
+          if [ -n "$missing" ]; then
+            echo "Missing publish metadata (publishing $PUBLISH_VERSION):"
+            printf '%s\n' "$missing"
+            echo "::error::One or more workspace crates cannot be published to crates.io."
+            exit 1
+          fi
+          echo "All workspace crates carry the required publish metadata."
+
+      - name: Dry-run publish (leaf crate only)
+        # A full --dry-run on the leaf catches upload-shape issues for the one
+        # crate with no internal deps. Downstream crates can only be fully
+        # dry-run once their upstreams exist on crates.io at the new version, so
+        # those are covered by the real sequential publish in publish-crates.yml.
+        run: cargo publish --dry-run --allow-dirty -p scitadel-core

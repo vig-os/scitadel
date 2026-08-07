@@ -30,6 +30,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replaces the legacy container-CI wiring, and `just sync`/`test`/
   `format`/`update` in `justfile.project` are folded onto the cargo
   toolchain so the managed CI jobs are not silent no-ops.
+- **Releases move from release-please to the devkit release train**
+  (#207). `prepare-release.yml` → `release.yml` → `promote-release.yml`
+  replace the release-please PR-merge flow, and `CHANGELOG.md` is now the
+  hand-maintained input rather than generated output. Tags stay
+  unprefixed `X.Y.Z`. The `cargo-workspace` version lockstep moves to
+  `prepare-release-extension.yml` (`cargo set-version --workspace`), the
+  crates.io publishability gate moves into `release-extension.yml`,
+  `binaries.yml` now uploads into the still-draft Release on the final
+  tag push, and `publish-crates.yml` publishes on `release: published`.
+  See [`docs/RELEASING.md`](docs/RELEASING.md).
+
+### Removed
+
+- **release-please and Dependabot configuration** (#207).
+  `release-please.yml`, `release-please-config.json`,
+  `.release-please-manifest.json`, `.github/dependabot.yml`,
+  `docs/release-bot-setup.md`, `scripts/setup-release-bot.sh` and
+  `scripts/setup-release-token.sh` are gone; Renovate is the devkit
+  dependency path and the release-please App and PAT secrets are no
+  longer read by anything.
 
 ## [0.6.0] - 2026-04-24
 

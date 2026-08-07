@@ -1,76 +1,101 @@
 # Publish scitadel workspace crates to crates.io in dependency order.
 #
-# Triggered on semver tag push (final or pre-release).
-# Each step is idempotent against crates.io — `cargo publish` errors
-# gracefully if the version is already published.
+# Release-train wiring (devkit 1.6.0). Before the migration this fired on the
+# tag push that release-please created. Under the devkit train a final tag is
+# pushed while its GitHub Release is still a DRAFT, and the release only becomes
+# real when promote-release.yml publishes it — so the live publish now hangs off
+# `release: published`. crates.io is irreversible: a version published from a
+# draft that later gets rolled back could never be re-cut, so waiting for the
+# promote is the safe edge. Publishing lands a minute or two after promote
+# instead of at tag time; nothing downstream depends on the ordering.
+#
+# The always-on dry-run stays on PRs so breakage surfaces on the branch.
+# `release-extension.yml` re-runs the same checks at the finalized release SHA,
+# blocking the tag before it is cut (see docs/DOWNSTREAM_RELEASE.md, "Extension
+# Hook"); this file owns the live publish, which needs a registry secret and an
+# `environment:` approval gate the read-only seam must not carry.
+#
+# Each step is idempotent against crates.io — an already-published version is
+# skipped, so a re-dispatch after a partial failure is safe.
 #
 # SETUP (one-time, manual): create a crates.io API token at
-# https://crates.io/me and add it as repository secret CARGO_REGISTRY_TOKEN.
-# Until then, this workflow will fail the auth step and log a clear error.
+# https://crates.io/me and add it as repository secret CARGO_REGISTRY_TOKEN
+# (environment `crates-io`). Until then, the auth step fails with a clear error.
 
 name: Publish crates
 
-on:
-  push:
-    tags:
-      - '[0-9]+.[0-9]+.[0-9]+'
-      - '[0-9]+.[0-9]+.[0-9]+-*'
+on:  # yamllint disable-line rule:truthy
+  release:
+    types: [published]
   pull_request:
     branches: [dev, main]
+  # Manual retry for an already-published release (e.g. a transient
+  # registry/index failure part-way through the sequential publish).
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to publish crates from (e.g. 0.7.0)"
+        required: true
+
+permissions:
+  contents: read
 
 jobs:
-  # Always-on dry-run so breakage surfaces on PRs, not only at tag time.
+  # Always-on dry-run so breakage surfaces on PRs, not only at release time.
   dry-run:
     name: cargo publish --dry-run
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
       - name: Check every crate has publishable metadata
         # cargo-manifest-level check that each workspace crate has the
         # required crates.io metadata fields. Does NOT hit the registry,
         # so it works for internal deps that aren't yet published.
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import subprocess, json, sys
-          meta = json.loads(subprocess.check_output(["cargo", "metadata", "--no-deps", "--format-version", "1"]))
-          required = ["description", "license", "repository"]
-          failed = []
-          for pkg in meta["packages"]:
-              name = pkg["name"]
-              for field in required:
-                  val = pkg.get(field)
-                  if not val:
-                      failed.append(f"{name}: missing {field}")
-          if failed:
-              print("Missing publish metadata:")
-              for f in failed:
-                  print(f"  - {f}")
-              sys.exit(1)
-          print(f"All {len(meta['packages'])} crate(s) have publish metadata.")
-          PY
+          missing=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[]
+                     | . as $p
+                     | ["description", "license", "repository"][]
+                     | select(($p[.] // "") == "")
+                     | "  - \($p.name): missing \(.)"')
+          if [ -n "$missing" ]; then
+            echo "Missing publish metadata:"
+            printf '%s\n' "$missing"
+            exit 1
+          fi
+          echo "All workspace crates carry the required publish metadata."
 
       - name: Dry-run publish (leaf crate only)
         # Full --dry-run on the leaf catches upload-shape issues for the one
         # crate that has no internal deps. Downstream crates can only be
         # fully dry-run after their upstreams exist on crates.io; we rely
-        # on the real sequential publish at tag time to surface those.
+        # on the real sequential publish at release time to surface those.
         run: cargo publish --dry-run --allow-dirty -p scitadel-core
 
-  # Live publish runs only on real tag pushes. Sequential and ordered; we
-  # sleep briefly between crates so the crates.io index has time to catch up.
+  # Live publish runs only for a published (non-pre-release) GitHub Release, or
+  # an explicit re-dispatch. Sequential and ordered; we sleep briefly between
+  # crates so the crates.io index has time to catch up.
   publish:
     name: Publish to crates.io
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    needs: dry-run
+    if: >-
+      (github.event_name == 'release' && github.event.release.prerelease == false)
+      || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: crates-io
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.event.release.tag_name }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
