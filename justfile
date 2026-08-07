@@ -1,13 +1,14 @@
 # Managed by vigOS devkit — regenerated on upgrade; local edits are lost.
 # Customize in justfile.project. Bugs / missing tools: https://github.com/vig-os/devkit/issues
+
 # ===============================================================================
 # MAIN JUSTFILE - Orchestrates all recipe sources
 # ===============================================================================
+
 # Run every recipe under a strict bash so pipelines fail on the first error.
 # Lives here (not justfile.devc) so it applies in ALL delivery modes — direnv
 # and bare have no .devcontainer/justfile.devc, yet their justfile.project
 # recipes must still get pipefail (#854).
-
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
 # Show available commands
@@ -30,7 +31,6 @@ help:
 # working directory" to the dynamic loader. Lives here (not justfile.devc,
 # devcontainer-only) so it is reachable in direnv/bare mode — the case that
 # needs it. Usage from a justfile.project recipe:
-
 # just with-native-libs uvx --from otterdog@1.2.3 otterdog validate --local
 [group('helpers')]
 with-native-libs +command:

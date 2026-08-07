@@ -134,3 +134,11 @@ sync:
 [group('deps')]
 update:
     cargo update
+
+# Coverage variant. No Rust coverage tooling is wired up yet (cargo-llvm-cov
+# would be the candidate); the recipe NAME must exist so the devkit installer's
+# base-recipe append (vig-os/devcontainer#877) — re-run by CI's scaffold-drift
+# gate — sees it resolved and stays a no-op. Until tooling lands, run the tests.
+[group('test')]
+test-cov *args:
+    cargo test --workspace {{ args }}

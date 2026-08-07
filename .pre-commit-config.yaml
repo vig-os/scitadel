@@ -58,11 +58,17 @@ repos:
         exclude: ^\.envrc$
 
   # Markdown Linting (excludes auto-generated docs)
-  - repo: https://github.com/jackdewinter/pymarkdown
-    rev: f93643d339dfee2a1022e7b05e8b5a281bfac553  # v0.9.23
+  # pymarkdown from the flake toolchain (vigos nix/pymarkdown.nix, devkit
+  # #1170): the upstream pre-commit repo's native pyjson5 extension cannot load
+  # on bare host runners (ImportError: libstdc++.so.6) — the exact failure this
+  # repo's CI Lint job hit on the 1.6.0 migration PR.
+  - repo: local
     hooks:
       - id: pymarkdown
         name: pymarkdown
+        entry: pymarkdown
+        language: system
+        types: [markdown]
         args: ["-c", ".pymarkdown", "fix"]
         exclude: ^(README\.md|CONTRIBUTE\.md|TESTING\.md)
 

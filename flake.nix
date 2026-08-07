@@ -67,6 +67,14 @@
             # resolves both off this dev-shell's PATH.
             uv
             vig-utils
+          ]
+          # pymarkdown CLI packaged by devkit (nix/pymarkdown.nix, #1170) so the
+          # markdown hook runs language:system from PATH — the upstream
+          # pre-commit repo's pyjson5 native extension cannot load on bare CI
+          # host runners (libstdc++.so.6). Imported from the pinned vigos input;
+          # not exported as a flake package at 1.6.0.
+          ++ [
+            (import "${vigos}/nix/pymarkdown.nix" pkgs)
           ];
 
           shellHook = ''
