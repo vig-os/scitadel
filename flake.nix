@@ -75,6 +75,14 @@
             echo "  rust   $(rustc --version 2>/dev/null | cut -d' ' -f2)"
             echo "  vhs    $(vhs --version 2>/dev/null | head -1 || echo 'not ready')"
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            # Pin the WRAPPED C toolchain by absolute path (vig-os/devkit#1351):
+            # CI's setup-devkit-toolchain re-exports the dev-shell PATH via
+            # GITHUB_PATH, whose per-line prepend reverses the order, letting the
+            # raw (unwrapped) gcc shadow the cc-wrapper — libsqlite3-sys's
+            # vendored sqlite build then fails to find libc. Absolute paths are
+            # PATH-order-proof; the action forwards shellHook env to CI (#1180).
+            export CC=${pkgs.stdenv.cc}/bin/cc
+            export CXX=${pkgs.stdenv.cc}/bin/c++
           '';
         };
 
