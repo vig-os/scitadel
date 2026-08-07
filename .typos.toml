@@ -1,0 +1,38 @@
+# Seeded by vigOS devkit — yours to edit; upgrades never overwrite this file.
+# Bugs / missing tools: https://github.com/vig-os/devkit/issues
+
+# Typos configuration
+# https://github.com/crate-ci/typos
+
+[default.extend-words]
+# Shell scripting: sed label syntax uses 'ba' (branch to label 'a')
+ba = "ba"
+# CVE policy term (#637): a finding "unexcepted" = not in the exception register
+unexcepted = "unexcepted"
+# version-check.sh duration placeholder (#759): 'Nd' = N days (cf. Nw/Nh/Nm)
+Nd = "Nd"
+# podman rootless-networking helper package name (#1106), not a misspelling
+passt = "passt"
+
+# ── scitadel additions (#207) ────────────────────────────────────────────────
+# The typo checker now resolves from the flake dev-shell rather than the pinned
+# crate-ci/typos pre-commit repo (whose prebuilt binary a NixOS host cannot
+# exec), which brings a newer, more aggressive dictionary. These are the
+# repo-specific false positives it reports.
+# Rust TUI crate this workspace is built on
+ratatui = "ratatui"
+# 'pn' = paper-note, the fixture/identifier prefix used across tests
+# (p-pn, ann-pn-1, `let pn = ...`)
+pn = "pn"
+# 'PN' as read out of "PNGs" in the vhs snapshot prose
+PN = "PN"
+# Hyphenated prefix in the sentence-anchoring ADR: mis-anchor, mis-segmentation
+mis = "mis"
+# Themes doc: an unparseable COLORFGBG value
+unparseable = "unparseable"
+# Unicode normalization test prose: "ef + <U+FB01> + cient" -> "efficient"
+cient = "cient"
+# German-language fixture in the EPO adapter ("Ein Verfahren")
+Ein = "Ein"
+# Read out of "UPDATEs" in a doc comment
+UPDAT = "UPDAT"

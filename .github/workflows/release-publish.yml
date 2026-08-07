@@ -1,0 +1,289 @@
+# Managed by vigOS devkit — regenerated on upgrade; local edits are lost.
+# Customize in justfile.project. Bugs / missing tools: https://github.com/vig-os/devkit/issues
+
+# Publishes git tag and optionally a GitHub Release. Final releases always get a draft release.
+# Candidates get a draft pre-release only when create_release is true (workflow_dispatch input).
+name: Release Publish
+
+on:  # yamllint disable-line rule:truthy
+  workflow_call:
+    inputs:
+      version:
+        description: "Semantic version to release (e.g., 1.2.3)"
+        required: true
+        type: string
+      finalize_sha:
+        description: "Finalized commit SHA to publish"
+        required: true
+        type: string
+      release_date:
+        description: "Release date used for summary output"
+        required: true
+        type: string
+      publish_version:
+        description: "Version tag to publish (X.Y.Z or X.Y.Z-rcN)"
+        required: true
+        type: string
+      release_kind:
+        description: "Release kind (candidate or final)"
+        required: true
+        type: string
+      git_user_name:
+        description: "Git user name for release tag operations"
+        required: false
+        default: "github-actions[bot]"
+        type: string
+      git_user_email:
+        description: "Git user email for release tag operations"
+        required: false
+        default: "41898282+github-actions[bot]@users.noreply.github.com"
+        type: string
+      tag_already_exists:
+        description: "Skip tag create/push when remote tag already points at finalize SHA"
+        required: false
+        default: false
+        type: boolean
+      create_release:
+        description: "For candidates: create draft GitHub pre-release (default false = tag only)"
+        required: false
+        default: false
+        type: boolean
+      toolchain_mode:
+        description: "Delivery mode resolved by the orchestrator (devcontainer|direnv|both|bare)"
+        required: true
+        type: string
+      toolchain_image:
+        description: "Container image resolved by the orchestrator (empty string => host runner)"
+        required: false
+        default: ""
+        type: string
+      devkit_version:
+        description: "Resolved devkit/image version pin (bare-mode vig-utils install; logging)"
+        required: false
+        default: ""
+        type: string
+      tag_prefix:
+        description: "Release tag prefix (DEVKIT_TAG_PREFIX); empty => bare X.Y.Z tags"
+        required: false
+        default: ""
+        type: string
+    secrets:
+      token:
+        required: false
+      # Passed by the caller via `secrets: inherit`; a workflow_call workflow has
+      # a closed secrets set, so every secret it reads must be declared here.
+      GHCR_PULL_TOKEN:
+        description: "GHCR read token for the container image (falls back to github.token)"
+        required: false
+      RELEASE_APP_CLIENT_ID:
+        description: "GitHub App client ID used to mint the release token"
+        required: true
+      RELEASE_APP_PRIVATE_KEY:
+        description: "GitHub App private key used to mint the release token"
+        required: true
+    outputs:
+      tag:
+        description: "Published tag"
+        value: ${{ jobs.publish.outputs.tag }}
+      release_url:
+        description: "Published release URL"
+        value: ${{ jobs.publish.outputs.release_url }}
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  publish:
+    name: Publish Release
+    runs-on: ubuntu-24.04
+    # Conditional container (ADR Option A): empty image => host runner; the GHCR
+    # credentials block is inert on an empty image.
+    container:
+      image: ${{ inputs.toolchain_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GHCR_PULL_TOKEN || github.token }}
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      tag: ${{ steps.out.outputs.tag }}
+      release_url: ${{ steps.out.outputs.release_url }}
+
+    steps:
+      - name: Generate release app token
+        id: release_app_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - name: Resolve auth token
+        id: auth
+        env:
+          PROVIDED_TOKEN: ${{ secrets.token }}
+          FALLBACK_TOKEN: ${{ steps.release_app_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          if [ -n "${PROVIDED_TOKEN:-}" ]; then
+            echo "token=$PROVIDED_TOKEN" >> "$GITHUB_OUTPUT"
+          else
+            echo "token=$FALLBACK_TOKEN" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate release kind
+        env:
+          RELEASE_KIND: ${{ inputs.release_kind }}
+        run: |
+          set -euo pipefail
+          if [ "$RELEASE_KIND" != "candidate" ] && [ "$RELEASE_KIND" != "final" ]; then
+            echo "ERROR: Invalid release_kind '$RELEASE_KIND'"
+            echo "release_kind must be one of: candidate, final"
+            exit 1
+          fi
+
+      - name: Checkout finalized commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.finalize_sha }}
+          fetch-depth: 0
+          token: ${{ steps.auth.outputs.token }}
+
+      - name: Set up devkit toolchain
+        uses: ./.github/actions/setup-devkit-toolchain
+        with:
+          mode: ${{ inputs.toolchain_mode }}
+          devkit-version: ${{ inputs.devkit_version }}
+
+      - name: Configure git
+        env:
+          GIT_USER_NAME: ${{ inputs.git_user_name }}
+          GIT_USER_EMAIL: ${{ inputs.git_user_email }}
+        run: |
+          git config user.name "$GIT_USER_NAME"
+          git config user.email "$GIT_USER_EMAIL"
+
+      - name: Create and push tag
+        if: ${{ !inputs.tag_already_exists }}
+        env:
+          PUBLISH_VERSION: ${{ inputs.publish_version }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+        run: |
+          set -euo pipefail
+          # Compose the actual tag name (prefix + bare publish version) (#1044).
+          PUBLISH_TAG="${TAG_PREFIX}${PUBLISH_VERSION}"
+          git tag -a "$PUBLISH_TAG" -m "Release $PUBLISH_TAG"
+          if ! PUSH_OUTPUT=$(retry --retries 3 --backoff 5 --max-backoff 30 -- git push origin "$PUBLISH_TAG" 2>&1); then
+            printf '%s\n' "$PUSH_OUTPUT"
+            # A tag name whose published release was deleted under release
+            # immutability is permanently retired; pushing it is rejected with
+            # GH013 and no retry or wait can ever succeed.
+            if printf '%s' "$PUSH_OUTPUT" | grep -Eqi "GH013|creations restricted"; then
+              echo "ERROR: Tag name $PUBLISH_TAG is tombstoned by release immutability:"
+              echo "a published GitHub Release for this tag was deleted, permanently retiring the name."
+              echo "This version is burned — re-cut the content as the next patch version."
+              echo "See https://github.com/vig-os/devkit/blob/main/docs/RELEASE_CYCLE.md ('Restarting a Finalized Release — the Point of No Return')."
+              exit 1
+            fi
+            if retry --retries 3 --backoff 5 --max-backoff 30 -- git ls-remote --tags --refs origin "$PUBLISH_TAG" | grep -q "refs/tags/$PUBLISH_TAG$"; then
+              LOCAL_TAG_TARGET_SHA=$(git rev-parse "$PUBLISH_TAG^{}")
+              REMOTE_TAG_TARGET_SHA=$(retry --retries 3 --backoff 5 --max-backoff 30 -- git ls-remote --tags origin "refs/tags/$PUBLISH_TAG^{}" | awk '{print $1}')
+              if [ -z "$REMOTE_TAG_TARGET_SHA" ]; then
+                REMOTE_TAG_TARGET_SHA=$(retry --retries 3 --backoff 5 --max-backoff 30 -- git ls-remote --tags origin "refs/tags/$PUBLISH_TAG" | awk '{print $1}')
+              fi
+              if [ -z "$REMOTE_TAG_TARGET_SHA" ]; then
+                echo "ERROR: Remote tag exists but target SHA could not be resolved: $PUBLISH_TAG"
+                exit 1
+              fi
+              if [ "$REMOTE_TAG_TARGET_SHA" != "$LOCAL_TAG_TARGET_SHA" ]; then
+                echo "ERROR: Remote tag target SHA mismatch for $PUBLISH_TAG"
+                echo "Local tag target:  $LOCAL_TAG_TARGET_SHA"
+                echo "Remote tag target: $REMOTE_TAG_TARGET_SHA"
+                exit 1
+              fi
+              echo "Tag already present on origin with matching target SHA: $PUBLISH_TAG"
+            else
+              echo "ERROR: Failed to push tag $PUBLISH_TAG"
+              exit 1
+            fi
+          fi
+
+      - name: Extract release notes from CHANGELOG
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          awk -v version="$VERSION" '
+            index($0, "## [" version "]") == 1 {found=1; next}
+            /^## \[/ && found {found=0}
+            found
+          ' CHANGELOG.md > /tmp/release-notes.md
+          if [ ! -s /tmp/release-notes.md ]; then
+            echo "No changelog notes found for $VERSION" > /tmp/release-notes.md
+          fi
+
+      - name: Create GitHub Release
+        if: ${{ inputs.release_kind == 'final' || (inputs.release_kind == 'candidate' && inputs.create_release) }}
+        env:
+          PUBLISH_VERSION: ${{ inputs.publish_version }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+          RELEASE_KIND: ${{ inputs.release_kind }}
+          GH_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          # Release object is keyed on the actual (prefixed) tag name (#1044).
+          PUBLISH_TAG="${TAG_PREFIX}${PUBLISH_VERSION}"
+          if RELEASE_JSON=$(retry --retries 2 --backoff 5 --max-backoff 20 -- gh release view "$PUBLISH_TAG" --json isDraft,isPrerelease 2>/dev/null); then
+            IS_DRAFT=$(printf '%s' "$RELEASE_JSON" | jq -r '.isDraft')
+            if [ "$IS_DRAFT" = "true" ]; then
+              echo "Draft GitHub Release already exists for $PUBLISH_TAG; skipping create (retry path)."
+              exit 0
+            fi
+            if [ "$RELEASE_KIND" = "candidate" ]; then
+              IS_PRERELEASE=$(printf '%s' "$RELEASE_JSON" | jq -r '.isPrerelease')
+              if [ "$IS_PRERELEASE" = "true" ]; then
+                echo "Pre-release already exists for $PUBLISH_TAG; skipping create (candidate retry path)."
+                exit 0
+              fi
+            fi
+            echo "ERROR: Published (non-draft) GitHub Release already exists for tag $PUBLISH_TAG"
+            exit 1
+          fi
+          CREATE_ARGS=(--title "$PUBLISH_TAG" --notes-file /tmp/release-notes.md --verify-tag --draft)
+          if [ "$RELEASE_KIND" = "candidate" ]; then
+            CREATE_ARGS+=(--prerelease)
+          fi
+          if ! CREATE_OUTPUT=$(retry --retries 3 --backoff 5 --max-backoff 30 -- gh release create "$PUBLISH_TAG" "${CREATE_ARGS[@]}" 2>&1); then
+            printf '%s\n' "$CREATE_OUTPUT"
+            # A tag name whose published release was deleted under release
+            # immutability is retired forever: release creation for it fails
+            # with GH013 and no retry or wait can ever succeed.
+            if printf '%s' "$CREATE_OUTPUT" | grep -Eqi "GH013|creations restricted"; then
+              echo "ERROR: Tag name $PUBLISH_TAG is tombstoned by release immutability:"
+              echo "a published GitHub Release for this tag was deleted, permanently retiring the name."
+              echo "This version is burned — re-cut the content as the next patch version."
+              echo "See https://github.com/vig-os/devkit/blob/main/docs/RELEASE_CYCLE.md ('Restarting a Finalized Release — the Point of No Return')."
+            fi
+            exit 1
+          fi
+          printf '%s\n' "$CREATE_OUTPUT"
+          if [ "$RELEASE_KIND" = "final" ]; then
+            echo "Draft GitHub Release created; publish from ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases when review is complete."
+          fi
+
+      - name: Set outputs
+        id: out
+        env:
+          PUBLISH_VERSION: ${{ inputs.publish_version }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+          RELEASE_BASE: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          # Published tag and its release URL both carry the prefix (#1044).
+          PUBLISH_TAG="${TAG_PREFIX}${PUBLISH_VERSION}"
+          echo "tag=$PUBLISH_TAG" >> "$GITHUB_OUTPUT"
+          echo "release_url=${RELEASE_BASE}/releases/tag/${PUBLISH_TAG}" >> "$GITHUB_OUTPUT"

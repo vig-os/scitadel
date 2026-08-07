@@ -1,6 +1,9 @@
+# Managed by vigOS devkit — regenerated on upgrade; local edits are lost.
+# Customize in justfile.project. Bugs / missing tools: https://github.com/vig-os/devkit/issues
+
 # CodeQL Static Analysis
 #
-# Runs GitHub CodeQL analysis on Python scripts used in the build toolchain.
+# Runs GitHub CodeQL analysis on Python build tooling and GitHub Actions workflows.
 # While these are build tools (not product code), static analysis provides
 # defense-in-depth for scripts that handle git operations, file I/O, and
 # subprocess execution.
@@ -9,6 +12,26 @@
 #   - Pull requests to dev, release/**, and main
 #   - Pushes to main (post-merge analysis)
 #   - Weekly schedule (catch newly disclosed patterns)
+#
+# NOTE — GitHub default code-scanning setup: this is an *advanced* CodeQL
+# configuration. GitHub rejects its SARIF uploads while the repository's
+# *default* code-scanning setup is enabled ("CodeQL analyses from advanced
+# configurations cannot be processed when the default setup is enabled").
+# To adopt this workflow, disable the default code-scanning setup
+# (Settings -> Code security -> Code scanning). In a scaffolded consumer the
+# devkit renders the `language:` matrix below to match the repo (Python ->
+# python, Node -> javascript-typescript, Rust omits its leg; `actions` is
+# always analyzed) but never changes the code-scanning API setting for you.
+#
+# NOTE — private repositories: CodeQL requires GitHub Advanced Security, which
+# is unavailable on Free-plan private repos, so the analysis can never succeed
+# there. The `analyze` job is therefore guarded with
+# `if: ${{ !github.event.repository.private }}`: private repos get a skipped
+# (neutral) run instead of a permanently red one, and a repo later flipped
+# public starts scanning automatically with no re-scaffold. The guard is valid
+# on every trigger this workflow declares — `github.event.repository.private` is
+# populated for `pull_request`, `push`, and (since GitHub's 2022-09-27 change
+# adding repository info to scheduled-run payloads) `schedule`.
 
 name: CodeQL
 
@@ -22,7 +45,7 @@ on:  # yamllint disable-line rule:truthy
     branches:
       - main
     paths:
-      - '**.py'
+      - '.github/workflows/**'
   schedule:
     - cron: '15 2 * * 1'  # Monday at 02:15 UTC
 
@@ -31,7 +54,10 @@ permissions: {}  # restrict default; job declares its own
 jobs:
   analyze:
     name: CodeQL Analysis
-    runs-on: ubuntu-22.04
+    # Skip on private repos: CodeQL needs GHAS (unavailable on Free-plan private
+    # repos), so it would fail permanently. See the header note for details.
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       security-events: write   # upload SARIF results
@@ -41,18 +67,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: ['python']
+        language: ['actions']
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@95e58e9a2cdfd71adc6e0353d5c52f41a045d225  # v4
+        uses: github/codeql-action/init@d1ba80a13dd99fba24a470575428917156a28b43  # v4
         with:
           languages: ${{ matrix.language }}
 
       - name: Run CodeQL analysis
-        uses: github/codeql-action/analyze@95e58e9a2cdfd71adc6e0353d5c52f41a045d225  # v4
+        uses: github/codeql-action/analyze@d1ba80a13dd99fba24a470575428917156a28b43  # v4
         with:
           category: '/language:${{ matrix.language }}'

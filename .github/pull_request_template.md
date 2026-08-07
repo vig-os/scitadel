@@ -1,3 +1,6 @@
+<!-- Managed by vigOS devkit — regenerated on upgrade; local edits are lost. -->
+<!-- Customize in justfile.project. Bugs / missing tools: https://github.com/vig-os/devkit/issues -->
+
 ## Description
 
 <!-- Provide a clear and concise description of what this PR does. -->
@@ -31,7 +34,7 @@
      If no changelog update is needed, write "No changelog needed" and explain why.
      Example:
      ### Added
-     - **SSH agent forwarding** ([#42](https://github.com/vig-os/devcontainer/issues/42))
+     - **SSH agent forwarding** ([#42](https://github.com/vig-os/devkit/issues/42))
        - Forward host SSH agent into devcontainer for seamless git authentication
 -->
 
@@ -40,7 +43,6 @@
 <!-- Describe the tests you ran and how to verify your changes -->
 - [ ] Tests pass locally (`just test`)
 - [ ] Manual testing performed (describe below)
-- [ ] VHS tape added or updated for user-visible TUI/CLI changes (`just vhs`) — or `[tape-exempt: <reason>]` is included in a commit message for non-user-visible internal work
 
 ### Manual Testing Details
 

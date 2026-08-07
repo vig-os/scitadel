@@ -101,3 +101,36 @@ conductor-trust:
 conductor *args='':
     just conductor-trust
     uv run conductor run --repo vig-os/scitadel {{ args }}
+
+# ===============================================================================
+# BASE RECIPES required by the devkit-managed ci.yml (vig-os/devcontainer#877).
+# Since devkit 0.4.0 these live in justfile.project (preserved on upgrade); the
+# shipped ci.yml calls `just sync`, `just precommit` and `just test`. The
+# templates assume a Python/uv project, so they are folded onto this workspace's
+# Rust toolchain here — a pyproject.toml-gated body would be a silent no-op.
+# ===============================================================================
+
+# Format code
+[group('quality')]
+format:
+    cargo fmt --all
+
+# Run the git-hook suite (prek) on all files
+[group('quality')]
+precommit:
+    prek run --all-files
+
+# Run the workspace test suite (ci.yml "Tests" job)
+[group('test')]
+test *args:
+    cargo test --workspace {{ args }}
+
+# Fetch dependencies (ci.yml runs this before lint and test)
+[group('deps')]
+sync:
+    cargo fetch
+
+# Update all dependencies
+[group('deps')]
+update:
+    cargo update

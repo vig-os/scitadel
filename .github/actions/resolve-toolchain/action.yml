@@ -1,0 +1,293 @@
+# Managed by vigOS devkit — regenerated on upgrade; local edits are lost.
+# Customize in justfile.project. Bugs / missing tools: https://github.com/vig-os/devkit/issues
+
+# Resolve devkit toolchain (mode + image)
+#
+# Evolves resolve-image (#994): reads the `.vig-os` manifest and emits the
+# delivery mode alongside the container image, so a leading `resolve-toolchain`
+# job can drive the Option-A conditional-`container:` pattern
+# (https://github.com/vig-os/devkit/blob/main/docs/rfcs/ADR-conditional-container-toolchain.md).
+# The `resolve-image` action
+# stays in place for now; it is retired by #991/#989.
+#
+# Outputs:
+#   mode       devcontainer | direnv | both | bare. A manifest-bearing repo with
+#              no DEVKIT_MODE key defaults to `both` — today's container
+#              behavior — so un-migrated pins keep resolving.
+#   image      ghcr.io/vig-os/devcontainer:<tag> for the container-ish modes
+#              (devcontainer/both); an EXPLICIT EMPTY STRING for the host modes
+#              (direnv/bare). Per the ADR the output is ALWAYS emitted, never
+#              omitted: an empty container image makes the downstream job run on
+#              the host runner.
+#   image-tag  the bare resolved version tag (for logging/compat, and doubles as
+#              the devkit-version to plumb into setup-devkit-toolchain's bare
+#              branch).
+
+name: Resolve devkit toolchain
+description: Resolve the delivery mode + devcontainer image tag from .vig-os for mode-aware CI jobs
+
+inputs:
+  image-tag:
+    description: Optional image tag override
+    required: false
+    default: ''
+  registry-token:
+    description: >-
+      Optional GHCR token for authenticated manifest probes (private or
+      rate-limited images). When empty, the probe runs anonymously (public
+      images). Only used for the container-ish modes.
+    required: false
+    default: ''
+  registry-username:
+    description: Username paired with registry-token for docker login
+    required: false
+    default: ''
+
+outputs:
+  mode:
+    description: Delivery mode (devcontainer|direnv|both|bare)
+    value: ${{ steps.resolve.outputs.mode }}
+  image:
+    description: Container image (ghcr.io/... for container modes, empty string for host modes)
+    value: ${{ steps.resolve.outputs.image }}
+  drift-image:
+    description: >-
+      Devcontainer image ref for EVERY mode (empty only when no tag resolved),
+      for the scaffold-drift job that `docker run`s the scaffold on the host.
+      Keeps the ghcr.io/vig-os/devcontainer literal out of ci.yml (#1295).
+    value: ${{ steps.resolve.outputs.drift-image }}
+  image-tag:
+    description: Resolved image/version tag
+    value: ${{ steps.resolve.outputs.tag }}
+  tag-prefix:
+    description: Release tag prefix from DEVKIT_TAG_PREFIX (empty string => bare tags)
+    value: ${{ steps.resolve.outputs.tag-prefix }}
+  floating-tags:
+    description: Floating tag levels from DEVKIT_FLOATING_TAGS (subset of major,minor; empty => off)
+    value: ${{ steps.resolve.outputs.floating-tags }}
+  runner-json:
+    description: >-
+      JSON array of runner labels from DEVKIT_CI_RUNNER (comma-separated), for
+      use with fromJSON() in `runs-on`. Defaults to ["ubuntu-24.04"] when the
+      key is absent.
+    value: ${{ steps.resolve.outputs.runner-json }}
+  refs-optional-types:
+    description: >-
+      Comma-separated commit types whose Refs line is optional, mapped from
+      DEVKIT_REFS_POLICY for validate-commit-range. `chore` (default/absent),
+      the full types list (`optional`), or the `none` sentinel (`required`).
+    value: ${{ steps.resolve.outputs.refs-optional-types }}
+  drift-check:
+    description: >-
+      Scaffold-drift gate toggle from DEVKIT_DRIFT_CHECK: `true` (default/absent)
+      keeps ci.yml's scaffold-drift job enabled, `false` self-skips it. Emitted
+      for every mode so the job's `if:` can gate on it with no re-scaffold.
+    value: ${{ steps.resolve.outputs.drift-check }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve mode + image tag
+      id: resolve
+      shell: bash
+      env:
+        INPUT_IMAGE_TAG: ${{ inputs.image-tag }}
+      run: |
+        set -euo pipefail
+
+        MODE=""
+        DEVKIT_VERSION=""
+        LEGACY_VERSION=""
+        TAG_PREFIX=""
+        FLOATING_TAGS=""
+        CI_RUNNER=""
+        REFS_POLICY=""
+        DRIFT_CHECK=""
+
+        if [[ -f .vig-os ]]; then
+          # Tolerant KEY=VALUE parsing shared with resolve-image (#781): capture
+          # DEVKIT_MODE and both version keys, preferring the renamed
+          # DEVKIT_VERSION over the legacy DEVCONTAINER_VERSION after the read so
+          # line order never matters.
+          while IFS= read -r line || [[ -n "${line:-}" ]]; do
+            [[ -z "${line//[[:space:]]/}" ]] && continue
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+            case "$line" in
+              DEVKIT_MODE=*|DEVKIT_VERSION=*|DEVCONTAINER_VERSION=*|DEVKIT_TAG_PREFIX=*|DEVKIT_FLOATING_TAGS=*|DEVKIT_CI_RUNNER=*|DEVKIT_REFS_POLICY=*|DEVKIT_DRIFT_CHECK=*)
+                key="${line%%=*}"
+                value="${line#*=}"
+                value="${value#"${value%%[![:space:]]*}"}"
+                value="${value%"${value##*[![:space:]]}"}"
+
+                if [[ "$value" =~ ^\".*\"$ ]]; then
+                  value="${value:1:-1}"
+                elif [[ "$value" =~ ^\'.*\'$ ]]; then
+                  value="${value:1:-1}"
+                fi
+
+                case "$key" in
+                  DEVKIT_MODE) MODE="$value" ;;
+                  DEVKIT_VERSION) DEVKIT_VERSION="$value" ;;
+                  DEVCONTAINER_VERSION) LEGACY_VERSION="$value" ;;
+                  DEVKIT_TAG_PREFIX) TAG_PREFIX="$value" ;;
+                  DEVKIT_FLOATING_TAGS) FLOATING_TAGS="$value" ;;
+                  DEVKIT_CI_RUNNER) CI_RUNNER="$value" ;;
+                  DEVKIT_REFS_POLICY) REFS_POLICY="$value" ;;
+                  DEVKIT_DRIFT_CHECK) DRIFT_CHECK="$value" ;;
+                esac
+                ;;
+            esac
+          done < .vig-os
+        fi
+
+        # Missing DEVKIT_MODE defaults to `both` (today's container behavior).
+        MODE="${MODE:-both}"
+
+        # Refuse an unknown/corrupt mode loudly (mirrors the init-workspace.sh
+        # persisted-mode guard): a typo'd value must never be silently
+        # classified as a host mode and flip a container repo's CI onto host
+        # runners.
+        case "$MODE" in
+          devcontainer|direnv|both|bare) ;;
+          *)
+            echo "::error::Invalid DEVKIT_MODE in .vig-os: $MODE (expected: devcontainer | direnv | both | bare)"
+            exit 1
+            ;;
+        esac
+        echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+
+        # Release tag prefix (#1044): freeform, empty by default (= bare tags).
+        # Emitted for every mode; only the release/promote workflows consume it,
+        # composing it onto tag names/URLs at the publishing edge.
+        echo "tag-prefix=$TAG_PREFIX" >> "$GITHUB_OUTPUT"
+
+        # Floating tag levels (#1045): comma-separated subset of major,minor;
+        # empty by default (= off). Only promote-release consumes it, force-moving
+        # <prefix>X / <prefix>X.Y at the final release commit.
+        echo "floating-tags=$FLOATING_TAGS" >> "$GITHUB_OUTPUT"
+
+        # CI runner labels (#1173): DEVKIT_CI_RUNNER is a comma-separated label
+        # list routed into `runs-on` via fromJSON() by the downstream CI
+        # jobs. Absent => the hosted default, so existing consumers are unchanged.
+        # Emitted for every mode, ALWAYS a valid JSON array (single label =>
+        # ["ubuntu-24.04"]); whitespace around each label is trimmed and empty
+        # entries dropped so a trailing/spaced comma never yields a blank label.
+        CI_RUNNER="${CI_RUNNER:-ubuntu-24.04}"
+        RUNNER_JSON="["
+        runner_first=1
+        IFS=',' read -ra runner_labels <<< "$CI_RUNNER"
+        for label in "${runner_labels[@]}"; do
+          label="${label#"${label%%[![:space:]]*}"}"
+          label="${label%"${label##*[![:space:]]}"}"
+          [[ -z "$label" ]] && continue
+          if [[ "$runner_first" -eq 1 ]]; then runner_first=0; else RUNNER_JSON+=","; fi
+          RUNNER_JSON+="\"$label\""
+        done
+        # An all-blank value (e.g. DEVKIT_CI_RUNNER=" ,") falls back to the default.
+        [[ "$runner_first" -eq 1 ]] && RUNNER_JSON+="\"ubuntu-24.04\""
+        RUNNER_JSON+="]"
+        echo "runner-json=$RUNNER_JSON" >> "$GITHUB_OUTPUT"
+
+        # Refs policy (#1282): map DEVKIT_REFS_POLICY to the --refs-optional-types
+        # list validate-commit-range consumes in the commit-checks job. This is
+        # the single mapping point for the CI surface; it MIRRORS render_refs_policy
+        # in assets/init-workspace.sh (two renderers, one key — keep in lockstep).
+        # The loud enum guard lives at the write path (init-workspace.sh); here an
+        # unexpected/absent value defaults safely to `chore` (today's behavior) so
+        # CI never breaks on a surprise literal. `required` uses a `none` sentinel
+        # type (no real commit is type `none`) because an empty list is parsed as
+        # falsy by the tool and reverts to the {chore} default.
+        case "$REFS_POLICY" in
+          optional) REFS_OPTIONAL_TYPES="feat,fix,docs,chore,refactor,perf,test,ci,build,revert,style" ;;
+          required) REFS_OPTIONAL_TYPES="none" ;;
+          *)        REFS_OPTIONAL_TYPES="chore" ;;
+        esac
+        echo "refs-optional-types=$REFS_OPTIONAL_TYPES" >> "$GITHUB_OUTPUT"
+
+        # Scaffold-drift gate (#1295): DEVKIT_DRIFT_CHECK toggles ci.yml's
+        # scaffold-drift job. Absent/empty => `true` (enabled), so existing
+        # consumers gain the gate on adoption; only an explicit `false` disables
+        # it. Emitted for every mode; the loud value guard lives at the write path
+        # (init-workspace.sh), so any non-`false` literal here defaults to enabled
+        # (fail-safe: the drift check runs). The job self-skips on `false` via its
+        # `if:`, so flipping the knob needs no re-scaffold.
+        DRIFT_CHECK="${DRIFT_CHECK:-true}"
+        [[ "$DRIFT_CHECK" == "false" ]] || DRIFT_CHECK="true"
+        echo "drift-check=$DRIFT_CHECK" >> "$GITHUB_OUTPUT"
+
+        # Resolve the version tag: explicit override wins, else DEVKIT_VERSION,
+        # else the legacy DEVCONTAINER_VERSION.
+        TAG="$INPUT_IMAGE_TAG"
+        if [[ -z "$TAG" ]]; then
+          TAG="${DEVKIT_VERSION:-$LEGACY_VERSION}"
+        fi
+        echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+        case "$MODE" in
+          devcontainer|both)
+            # Container-ish modes need a resolvable tag to build the image ref.
+            if [[ -z "$TAG" ]]; then
+              echo "::error::Could not resolve DEVKIT_VERSION (or legacy DEVCONTAINER_VERSION) from .vig-os and no image-tag override was provided (mode=$MODE)."
+              exit 1
+            fi
+            IMAGE="ghcr.io/vig-os/devcontainer:${TAG}"
+            ;;
+          direnv|bare)
+            # Host modes: no container image. Emit an EXPLICIT empty string
+            # (never omit) so the downstream `container:` runs on the host
+            # (ADR Option A). Explicit arm — unknown modes were rejected above,
+            # so the statement is closed.
+            IMAGE=""
+            ;;
+        esac
+        echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+        # Scaffold-drift image (#1295): the devcontainer image ref for EVERY mode
+        # (empty only when no tag resolved). Unlike `image` above — which is an
+        # explicit empty string for host modes so downstream `container:` runs on
+        # the host — the scaffold-drift job `docker run`s the image itself (the
+        # scaffold assets live only in the image, and a direnv/bare consumer's
+        # jobs otherwise never pull it). Emitting the ref here keeps the
+        # `ghcr.io/vig-os/devcontainer` literal out of the scaffolded ci.yml (the
+        # #991 single-source-of-truth invariant).
+        DRIFT_IMAGE=""
+        [[ -n "$TAG" ]] && DRIFT_IMAGE="ghcr.io/vig-os/devcontainer:${TAG}"
+        echo "drift-image=$DRIFT_IMAGE" >> "$GITHUB_OUTPUT"
+        echo "Resolved mode=$MODE tag=${TAG:-<none>} image=${IMAGE:-<host>}"
+
+    - name: Validate image accessibility
+      # Only the container-ish modes emit a non-empty image; host modes skip the
+      # probe entirely (no image needed).
+      if: steps.resolve.outputs.image != ''
+      shell: bash
+      env:
+        IMAGE: ${{ steps.resolve.outputs.image }}
+        REGISTRY_TOKEN: ${{ inputs.registry-token }}
+        REGISTRY_USERNAME: ${{ inputs.registry-username }}
+      run: |
+        set -euo pipefail
+        echo "Validating image availability: $IMAGE"
+
+        # Authenticate before the probe when a token is supplied, so private or
+        # rate-limited images resolve. The anonymous path is kept for public
+        # images (empty token).
+        if [[ -n "$REGISTRY_TOKEN" ]]; then
+          echo "Authenticating to ghcr.io as '${REGISTRY_USERNAME}'"
+          if ! echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$REGISTRY_USERNAME" --password-stdin; then
+            echo "::error::Failed to authenticate to ghcr.io as '${REGISTRY_USERNAME}'. Check the GHCR_PULL_TOKEN secret and that it grants packages:read."
+            exit 1
+          fi
+        fi
+
+        # Do not swallow stderr: capture it so an auth/denied failure can be
+        # distinguished from a genuinely missing tag.
+        if ! PROBE_ERR="$(docker manifest inspect "$IMAGE" 2>&1 >/dev/null)"; then
+          echo "$PROBE_ERR"
+          if echo "$PROBE_ERR" | grep -qiE 'unauthorized|denied|authentication|forbidden|toomanyrequests|rate limit'; then
+            echo "::error::Cannot access image manifest: ${IMAGE} — authentication required or denied. Set the GHCR_PULL_TOKEN secret (or grant the workflow token packages:read) and pass it to this action."
+          else
+            echo "::error::Cannot access image manifest: ${IMAGE} — the tag does not exist or is not readable. Check that DEVKIT_VERSION (or legacy DEVCONTAINER_VERSION) in .vig-os points at a published image tag."
+          fi
+          exit 1
+        fi

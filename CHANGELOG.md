@@ -20,6 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Theme is locked once at startup — restart the TUI if the terminal
   flips light/dark mid-session.
 
+### Changed
+
+- **vigOS devkit scaffold upgraded 0.3.3 → 1.6.0** (#207). Delivery
+  mode `direnv` (the repo-owned `flake.nix`/`.envrc` stay in charge of
+  the dev shell) and workflow model `gitflow`; the stale 0.3.3-era
+  `.devcontainer/` is pruned. The git-hook runner is now `prek` instead
+  of `pre-commit` (added to the dev shell), the scaffolded `ci.yml`
+  replaces the legacy container-CI wiring, and `just sync`/`test`/
+  `format`/`update` in `justfile.project` are folded onto the cargo
+  toolchain so the managed CI jobs are not silent no-ops.
+
 ## [0.6.0] - 2026-04-24
 
 The "actually read what you found" release. Closes the workflow gap

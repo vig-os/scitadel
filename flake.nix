@@ -48,7 +48,12 @@
             # Git / CI
             git
             gh
-            pre-commit
+            # devkit >= 0.4.0 runs the hooks through `prek`; the `pre-commit`
+            # binary is gone from the image and the .githooks shims call `prek`.
+            prek
+            # typos runs as a language:system hook (the upstream pre-commit repo
+            # ships a generic-linux binary that NixOS hosts cannot exec).
+            typos
           ];
 
           shellHook = ''

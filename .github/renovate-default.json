@@ -3,8 +3,13 @@
   "extends": ["config:recommended"],
   "timezone": "Etc/UTC",
   "schedule": ["before 9am on monday"],
-  "baseBranches": ["dev"],
+  "baseBranchPatterns": ["dev"],
   "rebaseWhen": "conflicted",
+  "lockFileMaintenance": {
+    "description": "Interim mechanism for transitive npm vulnerability coverage: a weekly lockfile regeneration picks up in-range fixes for indirect dependencies that never appear in package.json. Alert-driven transitive remediation is unimplemented upstream (open idea thread: https://github.com/renovatebot/renovate/discussions/41825) and the former transitiveRemediation option was removed from Renovate. Refs https://github.com/vig-os/devkit/issues/1041.",
+    "enabled": true,
+    "schedule": ["before 9am on monday"]
+  },
   "gitIgnoredAuthors": ["41898282+github-actions[bot]@users.noreply.github.com"],
   "packageRules": [
     {
@@ -23,27 +28,63 @@
       "semanticCommitScope": "actions"
     },
     {
-      "description": "Python (PEP 621 + uv) — pin ranges, group minor/patch",
-      "matchManagers": ["pep621", "uv"],
-      "matchUpdateTypes": ["minor", "patch"],
-      "groupName": "python (minor and patch)",
+      "description": "Python (PEP 621) — always pin ranges",
+      "matchManagers": ["pep621"],
       "rangeStrategy": "pin",
       "semanticCommitType": "build",
       "semanticCommitScope": "pip"
     },
     {
-      "description": "Python — major updates stay separate",
-      "matchManagers": ["pep621", "uv"],
-      "matchUpdateTypes": ["major"],
-      "rangeStrategy": "pin",
-      "semanticCommitType": "build",
-      "semanticCommitScope": "pip"
+      "description": "requires-python is a deliberate range: the Nix toolchain pins the exact interpreter via flake.lock, so an == pin is redundant and unsatisfiable against nixpkgs. Exempt it from the pin rule above. Refs #666.",
+      "matchManagers": ["pep621"],
+      "matchDepTypes": ["requires-python"],
+      "enabled": false
+    },
+    {
+      "description": "Python — group minor/patch",
+      "matchManagers": ["pep621"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "python (minor and patch)"
     },
     {
       "description": "npm",
       "matchManagers": ["npm"],
       "semanticCommitType": "build",
       "semanticCommitScope": "npm"
+    },
+    {
+      "description": "npm — group dev dependencies (they never ship in the bundle)",
+      "matchManagers": ["npm"],
+      "matchDepTypes": ["devDependencies"],
+      "groupName": "npm dev dependencies"
+    },
+    {
+      "description": "npm — group runtime minor/patch; majors stay separate",
+      "matchManagers": ["npm"],
+      "matchDepTypes": ["dependencies"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "npm (minor and patch)"
+    },
+    {
+      "description": "Devkit-managed workflows and composite actions are regenerated wholesale on every devkit upgrade, so their SHA-pinned action digests are advanced upstream by devkit's own Renovate and shipped with each devkit release — never here. Disabling them stops duplicate/clobbering pin-bump PRs in consumer repos. This rule is intentionally last so a consumer's own later packageRules (in their preserved renovate.json) win: a consumer that wants to manage a specific managed file can re-enable it there. Refs vig-os/devkit#1332.",
+      "matchFileNames": [
+        ".github/workflows/ci.yml",
+        ".github/workflows/codeql.yml",
+        ".github/workflows/devkit-upgrade.yml",
+        ".github/workflows/prepare-release.yml",
+        ".github/workflows/promote-release.yml",
+        ".github/workflows/release-core.yml",
+        ".github/workflows/release-publish.yml",
+        ".github/workflows/release.yml",
+        ".github/workflows/renovate-changelog-build.yml",
+        ".github/workflows/renovate-changelog-commit.yml",
+        ".github/workflows/scorecard.yml",
+        ".github/workflows/sync-issues.yml",
+        ".github/workflows/sync-main-to-dev.yml",
+        ".github/actions/setup-devkit-toolchain/**",
+        ".github/actions/resolve-toolchain/**"
+      ],
+      "enabled": false
     }
   ]
 }

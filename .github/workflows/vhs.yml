@@ -1,6 +1,6 @@
 name: VHS
 
-on:
+on:  # yamllint disable-line rule:truthy
   pull_request:
     branches: [dev, main]
   push:

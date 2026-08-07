@@ -1,5 +1,8 @@
+# Managed by vigOS devkit — regenerated on upgrade; local edits are lost.
+# Customize in justfile.project. Bugs / missing tools: https://github.com/vig-os/devkit/issues
+
 blank_issues_enabled: false
 contact_links:
   - name: Documentation
-    url: https://github.com/vig-os/devcontainer/tree/dev/docs
+    url: https://github.com/vig-os/devkit/tree/dev/docs
     about: Browse project documentation before opening an issue
