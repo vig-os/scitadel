@@ -59,6 +59,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `scitadel auth login` accepts piped stdin instead of requiring a tty,
   so credentials can be provisioned non-interactively.
 
+### Security
+
+- **Upgrade `rmcp` 0.17 → 3.4.1** to clear three Dependabot advisories
+  that all affect versions below the fixed releases below. Scitadel
+  itself only enables the `server` + `transport-io` + `macros` feature
+  set (stdio MCP server used by `scitadel mcp`), so the practical
+  exposure was smaller than the advisory blast radius suggests, but
+  the audit trail is what matters — the vulnerable code is no longer
+  in the dependency graph.
+  - GHSA affecting `rmcp < 1.4.0` — DNS-rebinding via missing Host
+    header validation on the Streamable HTTP server transport.
+  - GHSA affecting `rmcp < 2.0.0` — OAuth resource-URI spoofing +
+    session-table leak in the Streamable HTTP server transport.
+  - GHSA affecting `rmcp < 2.1.0` — sensitive HTTP header leak on
+    cross-origin redirect in the OAuth client.
+
+  API migration: `Implementation`, `ProgressNotificationParam`,
+  `ResourceUpdatedNotificationParam` and `ServerInfo` (aliased to
+  `ServerConfig` in 3.x, alias deprecated) became `#[non_exhaustive]`,
+  so the server-info builder and every notification param is
+  constructed through the new `::new(...)` / `.with_*()` helpers
+  instead of struct literals. Behaviour is unchanged — same 41 tools,
+  same names, same descriptions, same input schemas (the previously
+  emitted internal Rust struct name in each `inputSchema.title` is
+  dropped, which is an improvement not a regression). #185
+  subscribe / notify wiring and progress notifications continue to
+  work identically over the stdio transport.
+
 ## [0.7.0](https://github.com/vig-os/scitadel/compare/0.6.0...0.7.0) (2026-06-05)
 
 
