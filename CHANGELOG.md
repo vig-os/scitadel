@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- **Nix flake package** (#205). `packages.<system>.default` builds the
+  `scitadel` binary (`buildRustPackage`, pinned toolchain, nix-provided
+  OpenSSL/SQLite), so `nix run github:vig-os/scitadel` works and
+  downstream flakes can install it declaratively. The package version is
+  read from `Cargo.toml`, so it tracks every release bump.
+
 ### Changed
 
 - **vigOS devkit scaffold upgraded 0.3.3 → 1.6.0** (#207). Delivery

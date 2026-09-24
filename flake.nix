@@ -28,8 +28,45 @@
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
         };
+
+        # Build the `scitadel` binary with the pinned toolchain (edition 2024
+        # needs rustc >= 1.85, which the stable rust-overlay provides).
+        rustPlatform = pkgs.makeRustPlatform {
+          cargo = rustToolchain;
+          rustc = rustToolchain;
+        };
       in
       {
+        packages.default = rustPlatform.buildRustPackage {
+          pname = "scitadel";
+          # Single shared workspace version — read it so release bumps carry over.
+          version = (builtins.fromTOML (builtins.readFile ./crates/scitadel-cli/Cargo.toml)).package.version;
+          src = self;
+          cargoLock.lockFile = ./Cargo.lock;
+
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          # Modern nixpkgs unifies the Apple SDK into the stdenv, so no explicit
+          # Security/SystemConfiguration frameworks are needed on Darwin.
+          buildInputs = [
+            pkgs.openssl
+            pkgs.sqlite
+          ];
+
+          # Use the nix-provided openssl/sqlite, not vendored copies.
+          env.OPENSSL_NO_VENDOR = "1";
+
+          # Only the `scitadel` binary (scitadel-cli) is wanted; it pulls in the
+          # core/db/adapters/mcp crates transitively.
+          cargoBuildFlags = [ "-p scitadel-cli" ];
+          # Tests hit the network / a live SQLite DB — skip in the sandbox.
+          doCheck = false;
+
+          meta = {
+            description = "Scitadel — programmable, reproducible scientific literature retrieval (CLI + TUI + MCP)";
+            mainProgram = "scitadel";
+          };
+        };
+
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             # Rust
