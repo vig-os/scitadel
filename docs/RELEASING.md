@@ -68,7 +68,8 @@ seam, because that seam runs before the tag and the Release even exist.
 | --- | --- |
 | `RELEASE_APP_CLIENT_ID`, `RELEASE_APP_PRIVATE_KEY` | devkit Release App — tags, Releases, promote. See `DOWNSTREAM_RELEASE.md`. |
 | `COMMIT_APP_CLIENT_ID`, `COMMIT_APP_PRIVATE_KEY` | devkit Commit App — the changelog freeze and the workspace version-bump commit. |
-| `CARGO_REGISTRY_TOKEN` (environment `crates-io`) | crates.io API token used by `publish-crates.yml`. |
+| crates.io **trusted publishing** (preferred) | On crates.io, for **each** of the 8 `scitadel-*` crates: *Settings → Trusted Publishing → Add* a GitHub publisher with owner `vig-os`, repository `scitadel`, workflow `publish-crates.yml`, environment `crates-io`. `publish-crates.yml` then mints a short-lived token per run via `rust-lang/crates-io-auth-action`; nothing expires. |
+| `CARGO_REGISTRY_TOKEN` (fallback) | Repo secret, used only when trusted publishing is not configured. crates.io tokens expire (the 0.8.0 publish failed on one), so prefer trusted publishing. |
 
 The retired release-please credentials (`RELEASE_PLEASE_TOKEN`,
 `RELEASE_BOT_APP_ID`, `RELEASE_BOT_PRIVATE_KEY`) can be deleted.

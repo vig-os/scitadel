@@ -91,6 +91,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: crates-io
+    permissions:
+      contents: read
+      id-token: write  # crates.io trusted publishing (OIDC)
     steps:
       - uses: actions/checkout@v6
         with:
@@ -99,18 +102,33 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Verify CARGO_REGISTRY_TOKEN is set
+      # Trusted publishing: exchange this job's OIDC token for a short-lived
+      # crates.io token (revoked when the job ends), so there is no long-lived
+      # secret to expire — the 0.8.0 publish failed on an expired
+      # CARGO_REGISTRY_TOKEN. Needs each crate's trusted publisher configured on
+      # crates.io (docs/RELEASING.md); until then the secret is the fallback.
+      - name: Authenticate with crates.io (trusted publishing)
+        id: auth
+        continue-on-error: true
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18  # v1.0.5
+
+      - name: Resolve the publish token
         env:
-          TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          OIDC_TOKEN: ${{ steps.auth.outputs.token }}
+          SECRET_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          if [ -z "$TOKEN" ]; then
-            echo "::error::CARGO_REGISTRY_TOKEN is not set. Add a repo secret first."
+          if [ -n "$OIDC_TOKEN" ]; then
+            echo "Publishing with a trusted-publishing token."
+          elif [ -n "$SECRET_TOKEN" ]; then
+            echo "::warning::Trusted publishing unavailable; falling back to CARGO_REGISTRY_TOKEN."
+          else
+            echo "::error::No crates.io credentials: configure trusted publishing (docs/RELEASING.md) or set CARGO_REGISTRY_TOKEN."
             exit 1
           fi
 
       - name: Publish in dependency order
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
           publish_one() {
