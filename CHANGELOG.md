@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `binaries.yml` now uploads into the still-draft Release on the final
   tag push, and `publish-crates.yml` publishes on `release: published`.
   See [`docs/RELEASING.md`](docs/RELEASING.md).
+- `[openalex] api_key` in `config.toml` means the **API key** now, not
+  the email (#212). Pre-0.8 configs still load: an address-shaped
+  `api_key` is read as `email`. `scitadel init` writes
+  `[openalex] email = "…"` and never writes the key to disk.
+- `scitadel auth login` accepts piped stdin instead of requiring a tty,
+  so credentials can be provisioned non-interactively.
 
 ### Removed
 
@@ -67,15 +73,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `scitadel history`, the MCP `search` payload's new `failed_sources`
   field and as an export warning), and never displace the other
   sources' results.
-
-### Changed
-
-- `[openalex] api_key` in `config.toml` means the **API key** now, not
-  the email (#212). Pre-0.8 configs still load: an address-shaped
-  `api_key` is read as `email`. `scitadel init` writes
-  `[openalex] email = "…"` and never writes the key to disk.
-- `scitadel auth login` accepts piped stdin instead of requiring a tty,
-  so credentials can be provisioned non-interactively.
 
 ## [0.7.0](https://github.com/vig-os/scitadel/compare/0.6.0...0.7.0) (2026-06-05)
 
