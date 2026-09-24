@@ -9,20 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-### Changed
-
-### Deprecated
-
-### Removed
-
-### Fixed
-
-### Security
-
-## [0.8.0] - TBD
-
-### Added
-
 - **Nix flake package** (#205). `packages.<system>.default` builds the
   `scitadel` binary (`buildRustPackage`, pinned toolchain, nix-provided
   OpenSSL/SQLite), so `nix run github:vig-os/scitadel` works and
