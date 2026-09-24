@@ -610,10 +610,7 @@ pub fn check_source(creds: &SourceCredentials) -> Result<(), MissingCredential> 
 pub fn key_location(key: &CredentialKey) -> String {
     if get(key.store_key).is_some() {
         backend().label().to_string()
-    } else if std::env::var(key.env_var)
-        .ok()
-        .is_some_and(|v| !v.is_empty())
-    {
+    } else if std::env::var(key.env_var).is_ok_and(|v| !v.is_empty()) {
         "env".to_string()
     } else {
         "missing".to_string()

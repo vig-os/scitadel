@@ -243,7 +243,10 @@ fn auth_login_works_on_a_linux_box_with_no_secret_service() {
 /// item is absent, `clear` removes it — and, critically, a *reachable*
 /// service keeps stderr silent, which is how detection tells it apart from
 /// a missing D-Bus session.
-#[cfg(unix)]
+///
+/// Not on macOS: detection prefers the Keychain there, so the stub is
+/// never consulted.
+#[cfg(all(unix, not(target_os = "macos")))]
 const SECRET_TOOL_STUB: &str = r#"#!/bin/sh
 set -eu
 db="$SECRET_TOOL_STUB_DB"
@@ -269,7 +272,7 @@ esac
 
 /// `dir` first on `$PATH`, so the stub shadows any real `secret-tool`
 /// while the shell utilities it calls stay reachable.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn path_with(dir: &Path) -> std::ffi::OsString {
     let mut entries = vec![dir.to_path_buf()];
     if let Some(existing) = std::env::var_os("PATH") {
@@ -278,7 +281,7 @@ fn path_with(dir: &Path) -> std::ffi::OsString {
     std::env::join_paths(entries).unwrap()
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn install_secret_tool_stub(dir: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
 
@@ -292,7 +295,7 @@ fn install_secret_tool_stub(dir: &Path) -> PathBuf {
 
 /// With a Secret Service reachable, detection must pick it over the file
 /// store — and round-trip credentials through it.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn secret_service_is_preferred_when_secret_tool_answers() {
     let tmp = TempDir::new().unwrap();
@@ -361,7 +364,7 @@ fn secret_service_is_preferred_when_secret_tool_answers() {
 /// `secret-tool` on PATH but no D-Bus session: the probe writes to stderr,
 /// and detection must fall back to the file store instead of failing every
 /// `auth login` — the failure mode reported in #212.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn an_unreachable_secret_service_falls_back_to_the_file_store() {
     use std::os::unix::fs::PermissionsExt;
