@@ -1,4 +1,4 @@
-//! MCP server using rmcp 0.17's `tool_router` macro.
+//! MCP server using rmcp 3.x's `tool_router` macro.
 //!
 //! Each tool is a method on `ScitadelServer` annotated with `#[tool]`.
 //! Aggregate request structs implement `Deserialize + JsonSchema` and
@@ -29,14 +29,11 @@ async fn notify(
     message: impl Into<String>,
 ) {
     let Some(token) = token else { return };
-    let result = peer
-        .notify_progress(ProgressNotificationParam {
-            progress_token: token.clone(),
-            progress,
-            total,
-            message: Some(message.into()),
-        })
-        .await;
+    let mut param = ProgressNotificationParam::new(token.clone(), progress).with_message(message);
+    if let Some(total) = total {
+        param = param.with_total(total);
+    }
+    let result = peer.notify_progress(param).await;
     if let Err(e) = result {
         tracing::warn!(error = %e, "failed to send progress notification");
     }
@@ -776,9 +773,9 @@ impl ScitadelServer {
                         }
                         let result = peer
                             .notify_resource_updated(
-                                rmcp::model::ResourceUpdatedNotificationParam {
-                                    uri: uri_for_task.clone(),
-                                },
+                                rmcp::model::ResourceUpdatedNotificationParam::new(
+                                    uri_for_task.clone(),
+                                ),
                             )
                             .await;
                         if let Err(e) = result {
@@ -802,9 +799,9 @@ impl ScitadelServer {
                         );
                         let _ = peer
                             .notify_resource_updated(
-                                rmcp::model::ResourceUpdatedNotificationParam {
-                                    uri: uri_for_task.clone(),
-                                },
+                                rmcp::model::ResourceUpdatedNotificationParam::new(
+                                    uri_for_task.clone(),
+                                ),
                             )
                             .await;
                     }
@@ -1124,21 +1121,14 @@ impl ScitadelServer {
 }
 
 #[tool_handler(router = self.tool_router)]
-// rmcp 0.17's `tool_handler` expands to `async fn`s with no `.await`
+// rmcp 3.x's `tool_handler` expands to `async fn`s with no `.await`
 // (clippy 1.98 `unused_async_trait_impl`); the signature is rmcp's, not ours.
 #[allow(clippy::unused_async_trait_impl)]
 impl ServerHandler for ScitadelServer {
-    fn get_info(&self) -> rmcp::model::ServerInfo {
-        use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
-        ServerInfo {
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: "scitadel".into(),
-                version: env!("CARGO_PKG_VERSION").into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        }
+    fn get_info(&self) -> rmcp::model::ServerConfig {
+        use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("scitadel", env!("CARGO_PKG_VERSION")))
     }
 }
 

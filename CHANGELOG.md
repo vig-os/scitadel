@@ -20,6 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Theme is locked once at startup — restart the TUI if the terminal
   flips light/dark mid-session.
 
+### Changed
+
+- `[openalex] api_key` in `config.toml` means the **API key** now, not
+  the email (#212). Pre-0.8 configs still load: an address-shaped
+  `api_key` is read as `email`. `scitadel init` writes
+  `[openalex] email = "…"` and never writes the key to disk.
+- `scitadel auth login` accepts piped stdin instead of requiring a tty,
+  so credentials can be provisioned non-interactively.
+
 ### Fixed
 
 - **OpenAlex API-key support** (#212). The adapter now sends
@@ -50,28 +59,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   field and as an export warning), and never displace the other
   sources' results.
 
-### Changed
-
-- `[openalex] api_key` in `config.toml` means the **API key** now, not
-  the email (#212). Pre-0.8 configs still load: an address-shaped
-  `api_key` is read as `email`. `scitadel init` writes
-  `[openalex] email = "…"` and never writes the key to disk.
-- `scitadel auth login` accepts piped stdin instead of requiring a tty,
-  so credentials can be provisioned non-interactively.
-
 ### Security
 
-- **Upgrade ratatui 0.29 → 0.30 and crossterm 0.28 → 0.29.** Clears
-  the Dependabot advisory on `lru < 0.16.3` (`IterMut` Stacked Borrows
-  unsoundness — [RUSTSEC-style report on lru]) that ratatui 0.29
-  pulled in through its pinned `lru 0.12`. ratatui 0.30 depends on
-  `ratatui-core`, which uses `lru ^0.18`, so the workspace now
-  resolves to `lru 0.18.x` and the alert clears. No user-visible
-  behaviour changes — layouts, colour themes (Dalton Dark / Bright /
-  auto-detect), keybindings, OSC 11 background probe and the two-pane
-  reader all render identically.
-
-[RUSTSEC-style report on lru]: https://github.com/jeromefroe/lru-rs/issues/226
+- **Patched transitive dependencies** for open advisories, lockfile-only
+  (semver-compatible): `openssl` 0.10.75 → 0.10.81 (several memory-safety
+  advisories), `rustls-webpki` 0.103.9 → 0.103.15 (CRL panic DoS, name
+  constraints), `rpassword` 7.4.0 → 7.5.4 (partial password reveal),
+  `rand` 0.9.2 → 0.9.5 / 0.10.0 → 0.10.3 (unsound with a custom logger).
+- **`rmcp` 0.17 → 3.4.1** (#215), clearing its advisories: DNS
+  rebinding and a session-table leak in the Streamable HTTP server
+  transport, OAuth resource-URI spoofing, and a header leak on
+  cross-origin redirects. scitadel only runs the stdio server, so
+  exposure was small. The MCP surface is unchanged (same 41 tools and
+  schemas); only the internal Rust struct name is dropped from each
+  tool's `inputSchema.title`.
+- **ratatui 0.29 → 0.30, crossterm 0.28 → 0.29** (#215). ratatui 0.29
+  pinned `lru` 0.12, affected by the `lru < 0.16.3` `IterMut`
+  unsoundness advisory; 0.30 resolves `lru` 0.18. No visible change:
+  layouts, themes, keybindings and the two-pane reader render the same.
 
 ## [0.7.0](https://github.com/vig-os/scitadel/compare/0.6.0...0.7.0) (2026-06-05)
 
