@@ -9,16 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Light mode + auto-detect** (#137, theme iter 2). Adds
-  `Theme::DALTON_BRIGHT` (Dalton Bright palette ported from upstream)
-  and runtime theme resolution: `--theme <name>` CLI flag on
-  `scitadel tui` (highest precedence) → `SCITADEL_THEME` env var →
-  `[ui] theme = "..."` in config → `auto`. `auto` probes `COLORFGBG`
-  to pick light vs dark and falls back to dark when unset/unparseable.
-  OSC 11 fallback intentionally deferred (raw-tty + timeout dance);
-  `--theme` is the documented escape hatch when `COLORFGBG` is wrong.
-  Theme is locked once at startup — restart the TUI if the terminal
-  flips light/dark mid-session.
+- **Nix flake package** (#205). `packages.<system>.default` builds the
+  `scitadel` binary (`buildRustPackage`, pinned toolchain, nix-provided
+  OpenSSL/SQLite), so `nix run github:vig-os/scitadel` works and
+  downstream flakes can install it declaratively. The package version is
+  read from `Cargo.toml`, so it tracks every release bump.
 
 ### Fixed
 
