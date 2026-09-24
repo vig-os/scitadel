@@ -2886,7 +2886,7 @@ dependencies = [
 
 [[package]]
 name = "scitadel-adapters"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "insta",
@@ -2903,7 +2903,7 @@ dependencies = [
 
 [[package]]
 name = "scitadel-cli"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2929,7 +2929,7 @@ dependencies = [
 
 [[package]]
 name = "scitadel-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2950,7 +2950,7 @@ dependencies = [
 
 [[package]]
 name = "scitadel-db"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "chrono",
  "insta",
@@ -2968,7 +2968,7 @@ dependencies = [
 
 [[package]]
 name = "scitadel-export"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "biblatex",
  "chrono",
@@ -2985,7 +2985,7 @@ dependencies = [
 
 [[package]]
 name = "scitadel-mcp"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3009,7 +3009,7 @@ dependencies = [
 
 [[package]]
 name = "scitadel-scoring"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3026,7 +3026,7 @@ dependencies = [
 
 [[package]]
 name = "scitadel-tui"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "chrono",

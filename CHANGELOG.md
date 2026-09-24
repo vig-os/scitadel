@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-## [0.8.0] - TBD
+## [0.8.0](https://github.com/vig-os/scitadel/releases/tag/0.8.0) - 2026-09-24
 
 ### Added
 
