@@ -36,3 +36,6 @@ cient = "cient"
 Ein = "Ein"
 # Read out of "UPDATEs" in a doc comment
 UPDAT = "UPDAT"
+# DOTA — the chelator (e.g. "DOTA lutetium"), a real search term in the
+# OpenAlex adapter tests (#212), not a misspelling of "data"
+DOTA = "DOTA"
