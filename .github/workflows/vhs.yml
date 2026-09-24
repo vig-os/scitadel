@@ -173,7 +173,7 @@ jobs:
 
       - name: Upload tape artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: vhs-snapshots-${{ matrix.shard.name }}
           path: tests/vhs/snapshots/
