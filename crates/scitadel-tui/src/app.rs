@@ -1787,10 +1787,7 @@ fn step_prompt(prompt: &mut Option<AnnotationPrompt>, code: KeyCode) -> Option<P
 /// Tests and tape runs can force the offline branch by setting
 /// `SCITADEL_FORCE_OFFLINE=1`.
 async fn probe_network() -> bool {
-    if std::env::var("SCITADEL_FORCE_OFFLINE")
-        .ok()
-        .is_some_and(|v| !v.is_empty() && v != "0")
-    {
+    if std::env::var("SCITADEL_FORCE_OFFLINE").is_ok_and(|v| !v.is_empty() && v != "0") {
         return false;
     }
     let client = match reqwest::Client::builder()
