@@ -48,7 +48,7 @@ jobs:
             os: macos-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.tag || github.ref }}
 
@@ -80,7 +80,7 @@ jobs:
           echo "checksum=${TAR}.sha256" >> "$GITHUB_OUTPUT"
 
       - name: Upload to draft release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           draft: true   # keep it a draft; parallel matrix jobs must not publish
