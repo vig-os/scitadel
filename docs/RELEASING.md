@@ -51,8 +51,8 @@ early `v0.5.0` / `v0.6.0` tags are historical and harmless.
 
 | Workflow | Trigger | What it does |
 | --- | --- | --- |
-| `prepare-release-extension.yml` | called by `prepare-release.yml` | `cargo set-version --workspace`, committed to the release branch |
-| `release-extension.yml` | called by `release.yml` before the tag is cut | crates.io publishability gate at the finalized SHA; failing it rolls the release back |
+| `prepare-release-extension.yml` | called by `prepare-release.yml` | `cargo set-version --workspace` + plugin pin, committed to the release branch |
+| `release-extension.yml` | called by `release.yml` before the tag is cut | crates.io publishability gate (`cargo publish --workspace --dry-run`) at the finalized SHA; failing it rolls the release back |
 | `binaries.yml` | final tag push, or manual dispatch | builds the three platform tarballs + SHA256 sums, uploads them into the still-draft Release |
 | `publish-crates.yml` | `release: published`, or manual dispatch (plus an always-on PR dry-run) | publishes the crates to crates.io |
 
@@ -86,6 +86,8 @@ Every subsequent release promotes normally.
 
 ## Plugin version pin
 
-The Claude Code plugin fetches a pinned release binary. After a release, bump
-`plugins/scitadel/bin/VERSION` and `plugins/scitadel/.claude-plugin/plugin.json`
-`version` to the new tag so the plugin installs the matching binary.
+The Claude Code plugin fetches the release binary named by
+`plugins/scitadel/bin/VERSION`. `prepare-release-extension.yml` sets it (and
+`plugins/scitadel/.claude-plugin/plugin.json` `version`) on the release branch,
+so the new pin reaches `main` in the same promote that publishes the Release it
+points at — never ahead of it, never behind. No manual bump.

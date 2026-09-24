@@ -77,8 +77,10 @@ jobs:
           ref: ${{ inputs.finalize_sha }}
           persist-credentials: false
 
+      # No build cache: this runs once per release, and restoring a cache
+      # before building checked-out code is a cache-poisoning vector (CodeQL
+      # actions/cache-poisoning/poisonable-step).
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
 
       - name: Check every crate has publishable metadata
         # cargo-manifest-level check that each workspace crate carries the
@@ -102,9 +104,9 @@ jobs:
           fi
           echo "All workspace crates carry the required publish metadata."
 
-      - name: Dry-run publish (leaf crate only)
-        # A full --dry-run on the leaf catches upload-shape issues for the one
-        # crate with no internal deps. Downstream crates can only be fully
-        # dry-run once their upstreams exist on crates.io at the new version, so
-        # those are covered by the real sequential publish in publish-crates.yml.
-        run: cargo publish --dry-run --allow-dirty -p scitadel-core
+      - name: Dry-run publish (whole workspace)
+        # Cargo >= 1.90 packages and verifies every crate in dependency order,
+        # resolving the not-yet-published inter-crate versions against the
+        # locally packaged upstreams — so all 8 crates are proven publishable
+        # at the release version before the tag exists.
+        run: cargo publish --workspace --dry-run --allow-dirty

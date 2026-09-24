@@ -119,6 +119,21 @@ jobs:
           fi
           echo "All workspace crates are at $VERSION."
 
+      - name: Pin the Claude plugin to the release binary
+        # The plugin (plugins/scitadel) downloads the release tarball named by
+        # bin/VERSION. Bumping it here puts the new pin on main in the same
+        # promote that publishes the Release it points at, so the plugin never
+        # references an unpublished (draft) release.
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$VERSION" > plugins/scitadel/bin/VERSION
+          manifest=plugins/scitadel/.claude-plugin/plugin.json
+          jq --arg v "$VERSION" '.version = $v' "$manifest" > "$manifest.tmp"
+          mv "$manifest.tmp" "$manifest"
+          echo "Plugin pinned to $VERSION."
+
       - name: Commit the version bump to the release branch
         uses: vig-os/commit-action@3a0588ec060d9647bf406e064cf9e6192a431864  # v0.3.1
         env:
@@ -126,6 +141,6 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           TARGET_BRANCH: refs/heads/${{ inputs.release_branch }}
           COMMIT_MESSAGE: |-
-            chore(release): set cargo workspace version to ${{ inputs.version }}
+            chore(release): set workspace and plugin version to ${{ inputs.version }}
           ALLOW_EMPTY: "false"
           MAX_ATTEMPTS: "3"
