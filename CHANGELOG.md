@@ -9,11 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Nix flake package** (#205). `packages.<system>.default` builds the
-  `scitadel` binary (`buildRustPackage`, pinned toolchain, nix-provided
-  OpenSSL/SQLite), so `nix run github:vig-os/scitadel` works and
-  downstream flakes can install it declaratively. The package version is
-  read from `Cargo.toml`, so it tracks every release bump.
+- **Light mode + auto-detect** (#137, theme iter 2). Adds
+  `Theme::DALTON_BRIGHT` (Dalton Bright palette ported from upstream)
+  and runtime theme resolution: `--theme <name>` CLI flag on
+  `scitadel tui` (highest precedence) → `SCITADEL_THEME` env var →
+  `[ui] theme = "..."` in config → `auto`. `auto` probes `COLORFGBG`
+  to pick light vs dark and falls back to dark when unset/unparseable.
+  OSC 11 fallback intentionally deferred (raw-tty + timeout dance);
+  `--theme` is the documented escape hatch when `COLORFGBG` is wrong.
+  Theme is locked once at startup — restart the TUI if the terminal
+  flips light/dark mid-session.
 
 ### Fixed
 
@@ -61,6 +66,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   advisories), `rustls-webpki` 0.103.9 → 0.103.15 (CRL panic DoS, name
   constraints), `rpassword` 7.4.0 → 7.5.4 (partial password reveal),
   `rand` 0.9.2 → 0.9.5 / 0.10.0 → 0.10.3 (unsound with a custom logger).
+- **`rmcp` 0.17 → 3.4.1** (#215), clearing its advisories: DNS
+  rebinding and a session-table leak in the Streamable HTTP server
+  transport, OAuth resource-URI spoofing, and a header leak on
+  cross-origin redirects. scitadel only runs the stdio server, so
+  exposure was small. The MCP surface is unchanged (same 41 tools and
+  schemas); only the internal Rust struct name is dropped from each
+  tool's `inputSchema.title`.
 
 ## [0.7.0](https://github.com/vig-os/scitadel/compare/0.6.0...0.7.0) (2026-06-05)
 
