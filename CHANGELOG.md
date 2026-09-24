@@ -59,6 +59,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `scitadel auth login` accepts piped stdin instead of requiring a tty,
   so credentials can be provisioned non-interactively.
 
+## [0.7.1](https://github.com/vig-os/scitadel/compare/0.7.0...0.7.1) (2026-09-24)
+
+
+### Bug Fixes
+
+* **ci:** binaries.yml release upload permissions + manual re-run ([#201](https://github.com/vig-os/scitadel/issues/201)) ([25fe8cd](https://github.com/vig-os/scitadel/commit/25fe8cd77c3f4bcfe156b16c5cc6623274e185bb))
+* **ci:** draft-release flow so binaries attach under immutable releases ([#203](https://github.com/vig-os/scitadel/issues/203)) ([1d1d998](https://github.com/vig-os/scitadel/commit/1d1d9985b148c66def3ec63db6b551d5589d9d61))
+* **openalex:** API key, Linux credential store, real error reporting ([#213](https://github.com/vig-os/scitadel/issues/213)) ([0c864cd](https://github.com/vig-os/scitadel/commit/0c864cd141c4608df7743af71dcfa8ec0dbf25b4))
+
 ## [0.7.0](https://github.com/vig-os/scitadel/compare/0.6.0...0.7.0) (2026-06-05)
 
 
