@@ -134,6 +134,21 @@ jobs:
           mv "$manifest.tmp" "$manifest"
           echo "Plugin pinned to $VERSION."
 
+      - name: Collect the files the bump changed
+        # commit-action's git-status auto-detection finds nothing in this job
+        # (the 0.8.0 prepare committed no bump), so pass the paths explicitly —
+        # and fail rather than let a release branch go out on the old version.
+        id: changed
+        run: |
+          set -euo pipefail
+          files=$(git status --porcelain --untracked-files=no | awk '{print $2}' | paste -sd, -)
+          if [ -z "$files" ]; then
+            echo "::error::The version bump changed no files; refusing to continue."
+            exit 1
+          fi
+          echo "Committing: $files"
+          echo "files=$files" >> "$GITHUB_OUTPUT"
+
       - name: Commit the version bump to the release branch
         uses: vig-os/commit-action@3a0588ec060d9647bf406e064cf9e6192a431864  # v0.3.1
         env:
@@ -142,5 +157,6 @@ jobs:
           TARGET_BRANCH: refs/heads/${{ inputs.release_branch }}
           COMMIT_MESSAGE: |-
             chore(release): set workspace and plugin version to ${{ inputs.version }}
+          FILE_PATHS: ${{ steps.changed.outputs.files }}
           ALLOW_EMPTY: "false"
           MAX_ATTEMPTS: "3"
