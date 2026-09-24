@@ -20,6 +20,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Theme is locked once at startup — restart the TUI if the terminal
   flips light/dark mid-session.
 
+### Fixed
+
+- **OpenAlex API-key support** (#212). The adapter now sends
+  `api_key=<key>` on every request — search, fetch-by-id, batch
+  fetch-by-ids, `cited_by`/snowball and the download OA-location lookup.
+  Keyless requests are metered against a shared per-IP daily budget and
+  return `HTTP 429 … Insufficient budget` once it is spent, which made
+  OpenAlex unusable. The key resolves from the secret store
+  (`openalex.api_key`), `SCITADEL_OPENALEX_API_KEY`, or
+  `[openalex] api_key` in `.scitadel/config.toml`. The email stays the
+  polite-pool `mailto` under `openalex.email` /
+  `SCITADEL_OPENALEX_EMAIL`, and `scitadel auth login openalex` now asks
+  for both.
+- **Credential store works on Linux** (#212). `scitadel auth login` no
+  longer dies with `failed to run security CLI: No such file or
+  directory` off macOS. The backend is picked at runtime: macOS
+  Keychain via `security`, else the Secret Service via `secret-tool`
+  (GNOME Keyring, KWallet, KeePassXC…), else a `0600` TOML file under
+  the XDG config dir. `scitadel auth status` names the backend in use,
+  and `SCITADEL_CREDENTIAL_BACKEND` overrides the choice. Secret values
+  are never logged or echoed.
+- **Adapter errors are no longer reported as `0 results`** (#212).
+  `OpenAlexAdapter::search` never checked the HTTP status, so a 429 body
+  parsed to an empty result list and printed `[+] openalex: 0 results`.
+  Failures now surface as `[!] openalex: HTTP 429 Too Many Requests —
+  <message>`, are recorded on the search run (so they show in
+  `scitadel history`, the MCP `search` payload's new `failed_sources`
+  field and as an export warning), and never displace the other
+  sources' results.
+
+### Changed
+
+- `[openalex] api_key` in `config.toml` means the **API key** now, not
+  the email (#212). Pre-0.8 configs still load: an address-shaped
+  `api_key` is read as `email`. `scitadel init` writes
+  `[openalex] email = "…"` and never writes the key to disk.
+- `scitadel auth login` accepts piped stdin instead of requiring a tty,
+  so credentials can be provisioned non-interactively.
+
 ## [0.7.0](https://github.com/vig-os/scitadel/compare/0.6.0...0.7.0) (2026-06-05)
 
 
