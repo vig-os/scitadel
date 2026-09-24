@@ -63,11 +63,11 @@ rpassword = "7"
 clap = { version = "4", features = ["derive"] }
 
 # TUI
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 
 # MCP
-rmcp = { version = "0.17", features = ["server", "transport-io", "macros"] }
+rmcp = { version = "3.4", features = ["server", "transport-io", "macros"] }
 schemars = "1"
 
 # Content extraction (PDF / HTML → text)
