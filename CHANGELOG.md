@@ -73,6 +73,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exposure was small. The MCP surface is unchanged (same 41 tools and
   schemas); only the internal Rust struct name is dropped from each
   tool's `inputSchema.title`.
+- **ratatui 0.29 → 0.30, crossterm 0.28 → 0.29** (#215). ratatui 0.29
+  pinned `lru` 0.12, affected by the `lru < 0.16.3` `IterMut`
+  unsoundness advisory; 0.30 resolves `lru` 0.18. No visible change:
+  layouts, themes, keybindings and the two-pane reader render the same.
 
 ## [0.7.0](https://github.com/vig-os/scitadel/compare/0.6.0...0.7.0) (2026-06-05)
 
