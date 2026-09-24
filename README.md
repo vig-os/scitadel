@@ -48,6 +48,17 @@ cargo install --path crates/scitadel-cli --locked
 
 This drops a single `scitadel` binary into `~/.cargo/bin` (make sure that's on your `PATH`). CLI, TUI, and MCP server are all subcommands of the same binary.
 
+### With Nix
+
+The flake exposes the binary as its default package:
+
+```bash
+nix run github:vig-os/scitadel -- --help       # try it without installing
+nix profile install github:vig-os/scitadel     # install into your profile
+```
+
+Downstream flakes can consume it as `inputs.scitadel.packages.${system}.default`.
+
 ### As a Claude MCP server
 
 **User scope (available in every session, everywhere):**
@@ -74,7 +85,7 @@ Verify with `claude mcp list`.
 # Initialize the database (creates ./.scitadel/scitadel.db)
 scitadel init
 
-# Store credentials in your OS keychain (one-time, per source)
+# Store credentials in your OS secret store (one-time, per source)
 scitadel auth login pubmed
 scitadel auth login openalex
 scitadel auth status
@@ -256,7 +267,7 @@ Where scitadel stands against the [full envisioned pipeline](docs/rfcs/RFC-001-2
 |--------|-----|-------|
 | **PubMed** | E-utilities (esearch + efetch) | Set `SCITADEL_PUBMED_API_KEY` for higher rate limits |
 | **arXiv** | Atom feed | No key required |
-| **OpenAlex** | REST via PyAlex | Set `SCITADEL_OPENALEX_EMAIL` for polite pool |
+| **OpenAlex** | REST | Set `SCITADEL_OPENALEX_API_KEY` — keyless calls share a per-IP daily budget and 429 once spent. `SCITADEL_OPENALEX_EMAIL` adds the polite-pool `mailto` |
 | **INSPIRE-HEP** | REST API | No key required |
 
 ## CLI reference
@@ -273,8 +284,8 @@ scitadel snowball <search-id>          Run citation chaining from a search
 scitadel tui                           Launch the interactive TUI
 scitadel mcp                           Start the MCP server (stdio)
 scitadel download <doi>                Fetch PDF (Unpaywall) or publisher HTML
-scitadel auth login <source>           Store credentials in OS keychain
-scitadel auth status                   List configured credentials
+scitadel auth login <source>           Store credentials in the OS secret store
+scitadel auth status                   Show the credential backend and what is configured
 scitadel init                          Initialize the database
 ```
 
@@ -319,22 +330,57 @@ scitadel init                          Initialize the database
 
 ## Configuration
 
-Credentials resolve in this order: **OS keychain → environment variable → `.scitadel/config.toml` → empty**. For most users the keychain path is best — `scitadel auth login <source>` prompts you and stores the secret securely.
+Credentials resolve in this order: **secret store → environment variable → `.scitadel/config.toml` → empty**. For most users the secret store is best — `scitadel auth login <source>` prompts you and stores the secret there.
 
-| Source | Keychain key | Env var | Notes |
-|--------|-------------|---------|-------|
+| Source | Store key | Env var | Notes |
+|--------|-----------|---------|-------|
 | PubMed | `pubmed.api_key` | `SCITADEL_PUBMED_API_KEY` | Optional, higher rate limits |
-| OpenAlex | `openalex.email` | `SCITADEL_OPENALEX_EMAIL` | Polite pool |
+| OpenAlex | `openalex.api_key` | `SCITADEL_OPENALEX_API_KEY` | Required in practice — see below |
+| OpenAlex | `openalex.email` | `SCITADEL_OPENALEX_EMAIL` | Optional polite-pool `mailto` |
 | PatentsView | `patentsview.api_key` | `SCITADEL_PATENTSVIEW_KEY` | Free registration |
 | Lens | `lens.api_token` | `SCITADEL_LENS_TOKEN` | Free tier |
 | EPO OPS | `epo.consumer_key` + `epo.consumer_secret` | `SCITADEL_EPO_KEY`, `SCITADEL_EPO_SECRET` | Registered app |
 | Anthropic | _(not stored)_ | `ANTHROPIC_API_KEY` | Required for `assess`, `snowball`, MCP scoring |
+
+### Credential store backends
+
+`scitadel auth status` prints the backend it resolved, and
+`SCITADEL_CREDENTIAL_BACKEND` overrides the choice.
+
+| Backend | Selected when | Where secrets live |
+|---------|---------------|--------------------|
+| `macos-keychain` | macOS with the `security` CLI | Login keychain, service `scitadel` |
+| `secret-service` | `secret-tool` on `$PATH` and a Secret Service answering (GNOME Keyring, KWallet, KeePassXC…) | The running keyring |
+| `file` | Nothing else available — headless boxes, containers, CI | `$XDG_CONFIG_HOME/scitadel/credentials.toml`, mode `0600` |
+
+The file backend is plain text. It is a fallback, not a vault: prefer a
+real secret service where one exists, or pass the credential by
+environment variable.
+
+### OpenAlex keys
+
+OpenAlex takes two separate credentials:
+
+- **`api_key`** — needed in practice. Keyless requests are billed against a
+  shared per-IP daily budget and start returning `HTTP 429 … Insufficient
+  budget` once it is spent.
+- **`email`** — the optional polite-pool `mailto` contact address, also used
+  for Unpaywall lookups during download.
+
+`scitadel auth login openalex` asks for both; press enter to skip the email.
+
+Configs written by scitadel ≤ 0.7 stored the email under
+`[openalex] api_key`. They still load: an address-shaped `api_key` is read
+as the email. Rewrite it as `[openalex] email = "…"` when convenient, and
+keep the real key in the secret store rather than in a committed
+`config.toml`.
 
 Other knobs:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SCITADEL_DB` | `./.scitadel/scitadel.db` | Database path |
+| `SCITADEL_CREDENTIAL_BACKEND` | auto-detected | `macos-keychain`, `secret-service` or `file` |
 | `SCITADEL_CHAT_MODEL` | `claude-sonnet-4-6` | Model used for scoring |
 | `SCITADEL_CHAT_MAX_TOKENS` | `4096` | Max completion tokens |
 | `SCITADEL_SCORING_CONCURRENCY` | `5` | Parallel scoring requests |
