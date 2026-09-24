@@ -1,0 +1,11 @@
+{
+  "name": "scitadel",
+  "version": "0.7.0",
+  "description": "Scitadel literature-management MCP server — annotate papers, search sources, and expose your reading to an adjacent agent.",
+  "author": {
+    "name": "scitadel contributors",
+    "url": "https://github.com/vig-os/scitadel"
+  },
+  "homepage": "https://github.com/vig-os/scitadel",
+  "license": "MIT OR Apache-2.0"
+}

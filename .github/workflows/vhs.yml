@@ -36,7 +36,7 @@ jobs:
       matrix:
         shard:
           - name: cli
-            tapes: "cli-bib-import.tape cli-bib-rekey.tape cli-question-workflow.tape cli-search.tape"
+            tapes: "cli-bib-import.tape cli-bib-rekey.tape cli-question-workflow.tape cli-search.tape cli-auth.tape"
           - name: tui-launch
             tapes: "tui-launch.tape init-wizard.tape"
           - name: tui-papers
@@ -193,7 +193,7 @@ jobs:
         run: |
           set -euo pipefail
           declared=$(cat <<'EOF' | tr ' ' '\n' | sed '/^$/d' | sort
-          cli-bib-import.tape cli-bib-rekey.tape cli-question-workflow.tape cli-search.tape
+          cli-bib-import.tape cli-bib-rekey.tape cli-question-workflow.tape cli-search.tape cli-auth.tape
           tui-launch.tape init-wizard.tape
           papers-download-state.tape queue-tab.tape reading-queue-star.tape question-dashboard.tape tui-inbox.tape
           tui-annotation-write.tape tui-annotations-reader.tape annotations-in-detail.tape tui-export-keybind.tape tui-paper-note.tape

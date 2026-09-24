@@ -1,0 +1,57 @@
+# Automated releases via release-please.
+#
+# On every push to main, release-please maintains a "release PR" that bumps the
+# workspace version and updates CHANGELOG.md from conventional commits
+# (feat:/fix:/etc.). Merging that PR:
+#   - bumps all 8 crate versions + their inter-dependency requirements in
+#     lockstep (cargo-workspace plugin) and updates Cargo.lock,
+#   - creates a single unprefixed git tag (e.g. `0.7.0`) and a GitHub Release.
+#
+# That tag then triggers the existing tag-driven workflows:
+#   - publish-crates.yml  → publishes all crates to crates.io (dependency order)
+#   - binaries.yml        → builds per-platform tarballs and attaches them
+#                           to the GitHub Release
+#
+# IMPORTANT — token: tags/releases created with the default GITHUB_TOKEN do NOT
+# trigger other workflows (GitHub's recursion guard). For publish-crates.yml and
+# binaries.yml to fire, release-please must push the tag with a GitHub App token
+# (preferred) or a PAT. Setup: docs/release-bot-setup.md.
+#
+# Token resolution (graceful fallback): GitHub App → PAT → GITHUB_TOKEN.
+# With only GITHUB_TOKEN the release PR and Release are still created, but
+# downstream publish/binaries won't auto-run.
+#
+# Required config:
+#   RELEASE_BOT_APP_ID       (repo variable) — GitHub App id  [preferred]
+#   RELEASE_BOT_PRIVATE_KEY  (repo secret)   — GitHub App private key
+#   RELEASE_PLEASE_TOKEN     (repo secret)   — PAT fallback   [optional]
+#   CARGO_REGISTRY_TOKEN     (repo secret)   — crates.io publish at tag time
+
+name: release-please
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      # Preferred: mint a short-lived GitHub App token (no expiry, bot identity).
+      # Skipped automatically until RELEASE_BOT_APP_ID is configured.
+      - uses: actions/create-github-app-token@v1
+        id: app-token
+        if: ${{ vars.RELEASE_BOT_APP_ID != '' }}
+        with:
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+      - uses: googleapis/release-please-action@v4
+        with:
+          # App token → PAT → GITHUB_TOKEN (skipped step yields an empty string).
+          token: ${{ steps.app-token.outputs.token || secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
