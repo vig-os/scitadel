@@ -1,0 +1,24 @@
+# Repo-specific root .gitignore entries — yours to edit; upgrades never
+# overwrite this file. This is the durable committed home for repo-ROOT ignores:
+# git honors a root ignore only from the root .gitignore, which devkit
+# regenerates on every upgrade, so entries added HERE are appended to that
+# regenerated .gitignore and survive. Put durable repo-root ignores below (not
+# in the managed .gitignore, where hand edits are lost).
+#
+# Examples (uncomment / add your own):
+#   /scratch/
+#   /secrets.local.yaml
+
+# Migrated from the managed root .gitignore on upgrade (#1111).
+.scitadel/
+results.bib
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/scheduled_tasks.json
+.conductor/
+.vscode/*
+!.vscode/mcp.json
+vscode-scitadel/
+tests/vhs/snapshots/
+/secrets/
+/.sops.yaml

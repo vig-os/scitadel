@@ -1,25 +1,46 @@
-# Builds prebuilt scitadel binaries when a semver tag is pushed and attaches
-# platform tarballs + SHA256 sums to the GitHub Release.
+# Builds prebuilt scitadel binaries when a final semver tag is pushed, and
+# attaches platform tarballs + SHA256 sums to that tag's GitHub Release.
 #
-# Immutable releases forbid asset uploads after publish, so the flow is:
-# release-please creates the release as a DRAFT (draft + force-tag-creation);
-# the build matrix uploads tarballs to that draft (still mutable); then the
-# `publish` job flips draft -> published once, making it immutable WITH assets.
+# Release-train wiring (devkit 1.6.0). This is the one piece of the old
+# release-please flow that CANNOT move into `release-extension.yml`: the seam
+# runs BEFORE release-publish.yml creates the tag and the draft Release, so
+# there is nothing to attach assets to yet, and uploading assets needs
+# `contents: write`, above the seam's read-only ceiling. Per
+# docs/DOWNSTREAM_RELEASE.md ("Permission ceiling"), that belongs in a
+# consumer-owned tag-push workflow with its own token grant — this file.
 #
-# Triggered on tags matching X.Y.Z (and pre-releases like X.Y.Z-rcN), or
-# manually via workflow_dispatch for an existing tag whose release is a draft.
+# Ordering, and why assets must land while the Release is still a DRAFT:
+#   1. release.yml (final) pushes tag X.Y.Z with the Release App token — an App
+#      token, so this workflow does fire — and immediately creates the DRAFT
+#      GitHub Release for it.
+#   2. this workflow builds each target and uploads into that draft.
+#   3. promote-release.yml publishes the draft. Under GitHub's immutable
+#      releases a PUBLISHED release can no longer take assets, so nothing may
+#      upload after promote — hence the tag-push trigger rather than
+#      `release: published` (which is where publish-crates.yml now hangs).
+#
+# => Wait for this workflow to finish before dispatching promote-release.yml.
+#
+# The upload step waits for the draft Release to exist rather than creating it:
+# release-publish.yml owns that object (its notes and its draft state), and a
+# racing `gh release create` here would break the promote-time validation.
+#
+# Candidates (X.Y.Z-rcN) are not built: the train publishes an RC as a bare tag
+# with no GitHub Release unless release.yml is dispatched with
+# `create-release: true`, so there is usually no release to attach to. Use the
+# workflow_dispatch input to build assets for an RC (or to retry a final) whose
+# draft release does exist.
 
 name: Binaries
 
-on:
+on:  # yamllint disable-line rule:truthy
   push:
     tags:
       - '[0-9]+.[0-9]+.[0-9]+'
-      - '[0-9]+.[0-9]+.[0-9]+-*'
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build and upload assets for (e.g. 0.7.0)"
+        description: "Existing tag whose draft release should get assets (e.g. 0.7.0)"
         required: true
 
 # Needed to upload assets to the GitHub Release. Without this the default
@@ -36,21 +57,26 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+          # Cross-compiled on Apple Silicon: the macos-13 Intel image is retired
+          # (the 0.7.0 draft never got this asset), and Intel runners are on
+          # their way out. Xcode ships both SDKs; cc-rs passes the target on.
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
           - target: aarch64-apple-darwin
             os: macos-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -64,13 +90,15 @@ jobs:
       - name: Package tarball
         id: package
         shell: bash
+        env:
+          VERSION: ${{ inputs.tag || github.ref_name }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          VERSION="${{ inputs.tag || github.ref_name }}"
-          DIST_NAME="${BINARY_NAME}-${VERSION}-${{ matrix.target }}"
+          DIST_NAME="${BINARY_NAME}-${VERSION}-${TARGET}"
           STAGE=$(mktemp -d)
           mkdir -p "${STAGE}/${DIST_NAME}"
-          cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${STAGE}/${DIST_NAME}/"
+          cp "target/${TARGET}/release/${BINARY_NAME}" "${STAGE}/${DIST_NAME}/"
           cp README.md LICENSE-APACHE LICENSE-MIT CHANGELOG.md "${STAGE}/${DIST_NAME}/"
           TAR="${DIST_NAME}.tar.gz"
           (cd "$STAGE" && tar czf "$TAR" "$DIST_NAME")
@@ -79,24 +107,30 @@ jobs:
           echo "tarball=$TAR" >> "$GITHUB_OUTPUT"
           echo "checksum=${TAR}.sha256" >> "$GITHUB_OUTPUT"
 
-      - name: Upload to draft release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
-          draft: true   # keep it a draft; parallel matrix jobs must not publish
-          files: |
-            ${{ steps.package.outputs.tarball }}
-            ${{ steps.package.outputs.checksum }}
-          fail_on_unmatched_files: true
-
-  # Flip the draft to published exactly once, after all platform tarballs are
-  # attached. Publishing makes the release immutable with its assets in place.
-  publish:
-    name: Publish release
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Publish the release
+      - name: Upload assets to the draft release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "${{ inputs.tag || github.ref_name }}" --repo "${{ github.repository }}" --draft=false
+          TAG: ${{ inputs.tag || github.ref_name }}
+          TARBALL: ${{ steps.package.outputs.tarball }}
+          CHECKSUM: ${{ steps.package.outputs.checksum }}
+        run: |
+          set -euo pipefail
+          # release-publish.yml creates the draft Release moments after it
+          # pushes the tag, so on a tag-push run it is normally already there;
+          # poll anyway so a slow publish job cannot lose the assets.
+          for attempt in $(seq 1 30); do
+            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              echo "::error::No GitHub Release found for tag $TAG after 5 minutes; cannot attach assets."
+              exit 1
+            fi
+            echo "Waiting for the GitHub Release for $TAG (attempt $attempt/30)..."
+            sleep 10
+          done
+          # --clobber makes a re-dispatch idempotent. Never `gh release create`
+          # here: release-publish.yml owns the Release object.
+          gh release upload "$TAG" "$TARBALL" "$CHECKSUM" \
+            --repo "$GITHUB_REPOSITORY" --clobber

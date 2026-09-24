@@ -1,3 +1,6 @@
+# Managed by vigOS devkit — regenerated on upgrade; local edits are lost.
+# Customize in justfile.project. Bugs / missing tools: https://github.com/vig-os/devkit/issues
+
 # OpenSSF Scorecard
 #
 # Runs the OpenSSF Scorecard analysis on a weekly schedule and on pushes
@@ -6,6 +9,15 @@
 #
 # Docs: https://securityscorecards.dev/
 # Action: https://github.com/ossf/scorecard-action
+#
+# NOTE — private repositories: OpenSSF Scorecard only supports public repos, so
+# the analysis can never succeed on a private one. The `analysis` job is guarded
+# with `if: ${{ !github.event.repository.private }}`: private repos get a skipped
+# (neutral) run instead of a permanently red one, and a repo later flipped public
+# starts scanning automatically with no re-scaffold. The guard is valid on every
+# trigger this workflow declares — `github.event.repository.private` is populated
+# for `push` and (since GitHub's 2022-09-27 change adding repository info to
+# scheduled-run payloads) `schedule`.
 
 name: Scorecard
 
@@ -23,7 +35,10 @@ permissions: {}  # restrict default; job declares its own
 jobs:
   analysis:
     name: Scorecard Analysis
-    runs-on: ubuntu-22.04
+    # Skip on private repos: OpenSSF Scorecard is public-only, so it would fail
+    # permanently. See the header note for details.
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       security-events: write   # upload SARIF results
@@ -32,19 +47,19 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
       - name: Run Scorecard analysis
-        uses: ossf/scorecard-action@4eaacf0543bb3f2c246792bd56e8cdeffafb205a  # v2.4.3
+        uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc  # v2.4.4
         with:
           results_file: results.sarif
           results_format: sarif
           publish_results: true
 
       - name: Upload SARIF to GitHub Security
-        uses: github/codeql-action/upload-sarif@95e58e9a2cdfd71adc6e0353d5c52f41a045d225  # v4
+        uses: github/codeql-action/upload-sarif@d1ba80a13dd99fba24a470575428917156a28b43  # v4
         with:
           sarif_file: results.sarif
           category: 'scorecard'

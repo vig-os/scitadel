@@ -1,3 +1,6 @@
+# Managed by vigOS devkit — regenerated on upgrade; local edits are lost.
+# Customize in justfile.project. Bugs / missing tools: https://github.com/vig-os/devkit/issues
+
 # Workflow to sync issues and PRs to markdown files
 # Uses:
 # - sync-issues action from this public repository (vig-os/sync-issues-action)
@@ -38,60 +41,77 @@ on:  # yamllint disable-line rule:truthy
 permissions: {}  # restrict default; job declares its own
 
 jobs:
-  resolve-image:
-    name: Resolve image tag
-    runs-on: ubuntu-22.04
+  resolve-toolchain:
+    name: Resolve toolchain
+    runs-on: ubuntu-24.04
     timeout-minutes: 2
     permissions:
       contents: read
+      packages: read
     outputs:
+      mode: ${{ steps.resolve.outputs.mode }}
+      image: ${{ steps.resolve.outputs.image }}
       image-tag: ${{ steps.resolve.outputs.image-tag }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          persist-credentials: false
           sparse-checkout: |
             .vig-os
-            .github/actions/resolve-image
+            .github/actions/resolve-toolchain
           sparse-checkout-cone-mode: false
 
-      - name: Resolve container image
+      - name: Resolve toolchain
         id: resolve
-        uses: ./.github/actions/resolve-image
+        uses: ./.github/actions/resolve-toolchain
+        with:
+          registry-token: ${{ secrets.GHCR_PULL_TOKEN || github.token }}
+          registry-username: ${{ github.actor }}
 
   sync:
-    needs: [resolve-image]
-    runs-on: ubuntu-22.04
+    needs: [resolve-toolchain]
+    runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/vig-os/devcontainer:${{ needs.resolve-image.outputs.image-tag }}
+      image: ${{ needs.resolve-toolchain.outputs.image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GHCR_PULL_TOKEN || github.token }}
     timeout-minutes: 10
     # Prevent concurrent runs to avoid race conditions when committing and cache collisions
     concurrency:
       group: sync-issues-${{ github.repository }}
       cancel-in-progress: true
     permissions:
-      contents: write
+      contents: read
       issues: read
       pull-requests: read
-      actions: write  # Required for cache deletion
+      actions: write  # Required for cache deletion (gh api DELETE on github.token)
+      packages: read
 
     steps:
       - name: Generate a token
         id: generate-token
-        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3  # v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3
         with:
-          app-id: ${{ secrets.COMMIT_APP_ID }}
+          client-id: ${{ secrets.COMMIT_APP_CLIENT_ID }}
           private-key: ${{ secrets.COMMIT_APP_PRIVATE_KEY }}
 
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ github.event.inputs.target-branch || 'dev' }}
           persist-credentials: false
 
+      - name: Set up devkit toolchain
+        uses: ./.github/actions/setup-devkit-toolchain
+        with:
+          mode: ${{ needs.resolve-toolchain.outputs.mode }}
+          devkit-version: ${{ needs.resolve-toolchain.outputs.image-tag }}
+
       - name: Restore sync state (last synced timestamp)
         id: restore-state
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: .sync-state
           key: sync-issues-state-${{ github.repository }}
@@ -104,6 +124,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # This step runs `if: always()`, so it can fire after the job died
+          # before toolchain setup — before the `retry` shim exists. Without a
+          # fallback, `retry` in the CACHE_ID assignment below would emit
+          # "command not found" and `head` would still exit 0, silently masking
+          # the failure. Define a one-shot fallback (no retries) so a healthy
+          # run still uses the real shim and an early-failure run degrades
+          # gracefully. This cleanup is best-effort (continue-on-error).
+          command -v retry >/dev/null 2>&1 || retry() { while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done; shift; "$@"; }
           echo "Attempting to delete old cache to prevent save collisions..."
           # Wait a moment to ensure any previous cache saves have completed
           sleep 2
@@ -114,14 +142,37 @@ jobs:
           if [ -n "$CACHE_ID" ]; then
             echo "Found cache ID: $CACHE_ID, attempting deletion..."
             retry --retries 3 --backoff 3 --max-backoff 15 -- \
-              gh api repos/${{ github.repository }}/actions/caches/$CACHE_ID -X DELETE && echo "Cache deleted successfully" || echo "Cache deletion failed (may be locked or already deleted)"
+              gh api repos/${{ github.repository }}/actions/caches/"$CACHE_ID" -X DELETE && echo "Cache deleted successfully" || echo "Cache deletion failed (may be locked or already deleted)"
           else
             echo "No cache found with key: $CACHE_KEY (this is OK for first run)"
           fi
 
+      - name: Compute incremental cutoff (self-heal on cache miss)
+        id: cutoff
+        if: github.event.inputs.force-update != 'true'
+        env:
+          CACHE_HIT: ${{ steps.restore-state.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          if [ "$CACHE_HIT" = "true" ]; then
+            # State restored from cache: let the action read the state file.
+            echo "updated-since=" >> "$GITHUB_OUTPUT"
+            echo "Cache hit: incremental sync from the restored state file."
+          else
+            # Cache miss (a repository rename, or the routine 7-day cache
+            # eviction). Without state the action would re-sync the entire
+            # issue/PR history from epoch and exhaust the GitHub API rate limit.
+            # Fall back to a bounded look-back that safely covers the eviction
+            # gap; older items are already in the committed archives, and
+            # force-update still forces a full rebuild.
+            SINCE="$(date -u -d '14 days ago' '+%Y-%m-%dT%H:%M:%SZ')"
+            echo "updated-since=$SINCE" >> "$GITHUB_OUTPUT"
+            echo "Cache miss: bounded incremental sync since $SINCE (14-day look-back)."
+          fi
+
       - name: Sync Issues and PRs
         id: sync
-        uses: vig-os/sync-issues-action@bad447d330526a7313ffddae084010c39b335fc1  # v0.2.2
+        uses: vig-os/sync-issues-action@285a0af876bac99a0e914a64a1cb925dd913f38a  # v0.4.0
         with:
           app-id: ${{ secrets.COMMIT_APP_ID }}
           app-private-key: ${{ secrets.COMMIT_APP_PRIVATE_KEY }}
@@ -130,12 +181,12 @@ jobs:
           sync-prs: 'true'
           include-closed: 'true'
           state-file: '.sync-state/last-sync.txt'
-          updated-since: ${{ (github.event.inputs.force-update == 'true' && '1970-01-01T00:00:00Z') || '' }}
+          updated-since: ${{ (github.event.inputs.force-update == 'true' && '1970-01-01T00:00:00Z') || steps.cutoff.outputs.updated-since }}
 
       - name: Commit and push changes via API
         id: commit
         if: steps.sync.outputs.modified-files != ''
-        uses: vig-os/commit-action@1bc004353d08d9332a0cb54920b148256220c8e0  # v0.2.0
+        uses: vig-os/commit-action@3a0588ec060d9647bf406e064cf9e6192a431864  # v0.3.1
         env:
           # Use App token so push can bypass branch protection when App is in bypass list
           GH_TOKEN: ${{ steps.generate-token.outputs.token }}
@@ -147,7 +198,7 @@ jobs:
 
       - name: Save sync state
         if: always()
-        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: .sync-state
           key: sync-issues-state-${{ github.repository }}

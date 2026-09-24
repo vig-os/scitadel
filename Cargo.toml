@@ -11,9 +11,11 @@ members = [
     "crates/scitadel-tui",
 ]
 
-# Per-crate versions are explicit and kept in lockstep by release-please
-# (the cargo-workspace plugin); there is intentionally no shared
-# workspace.package.version for it to drift against.
+# Per-crate versions are explicit and kept in lockstep by
+# `cargo set-version --workspace`, run from
+# .github/workflows/prepare-release-extension.yml when the release branch is
+# cut; there is intentionally no shared workspace.package.version for it to
+# drift against.
 [workspace.package]
 edition = "2024"
 license = "MIT OR Apache-2.0"
@@ -61,11 +63,11 @@ rpassword = "7"
 clap = { version = "4", features = ["derive"] }
 
 # TUI
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 
 # MCP
-rmcp = { version = "0.17", features = ["server", "transport-io", "macros"] }
+rmcp = { version = "3.4", features = ["server", "transport-io", "macros"] }
 schemars = "1"
 
 # Content extraction (PDF / HTML → text)

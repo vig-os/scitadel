@@ -1,4 +1,7 @@
 ---
+# Managed by vigOS devkit — regenerated on upgrade; local edits are lost.
+# Customize in justfile.project. Bugs / missing tools: https://github.com/vig-os/devkit/issues
+
 name: Documentation
 description: Request a documentation update or addition
 title: '[DOCS] '
@@ -41,8 +44,8 @@ body:
         Which files need to be modified? Remember: edit templates in
         `docs/templates/`, not generated files.
       placeholder: |
-        - docs/templates/CONTRIBUTE.md.j2 (source template)
-        - docs/RELEASE_CYCLE.md
+        - https://github.com/vig-os/devkit/blob/main/docs/templates/CONTRIBUTE.md.j2 (source template)
+        - https://github.com/vig-os/devkit/blob/main/docs/RELEASE_CYCLE.md
     validations:
       required: true
   - type: textarea
