@@ -1124,6 +1124,9 @@ impl ScitadelServer {
 }
 
 #[tool_handler(router = self.tool_router)]
+// rmcp 0.17's `tool_handler` expands to `async fn`s with no `.await`
+// (clippy 1.98 `unused_async_trait_impl`); the signature is rmcp's, not ours.
+#[allow(clippy::unused_async_trait_impl)]
 impl ServerHandler for ScitadelServer {
     fn get_info(&self) -> rmcp::model::ServerInfo {
         use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
