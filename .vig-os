@@ -1,2 +1,119 @@
-# vig-os devcontainer configuration
-DEVCONTAINER_VERSION=0.3.3
+# vig-os devcontainer configuration — declarative project manifest (#885).
+# Flat KEY=VALUE lines with '#' comments; consumers parse line-based and
+# ignore unknown keys. init-workspace.sh resolves every value on (re)scaffold
+# (flag/env > .vig-os > prompt/default) and writes the result back here, so
+# upgrades need no mode/identity flags. Future per-project devkit flags
+# (e.g. the #883 hook opt-out) live in this file too.
+
+# Scaffold/image version pin (managed by release automation). Readers also
+# accept the legacy DEVCONTAINER_VERSION key for un-migrated consumers (#781).
+DEVKIT_VERSION=1.6.0
+
+# Delivery mode: devcontainer | direnv | both | bare. Ships empty (= unset:
+# resolved and written back on scaffold) so an aborted upgrade can never
+# persist a mode this repo did not choose.
+DEVKIT_MODE=direnv
+
+# Workflow model: gitflow (default) | trunk. Empty (= unset) resolves to the
+# gitflow default — long-lived `dev` + `main` with sync-main-to-dev.yml, no
+# change for devkit or existing consumers. `trunk` opts a repo into a
+# trunk-based flow: feature/bugfix/chore branches merge straight to `main`,
+# releases fork release/X.Y.Z from main and merge back into main, and the `dev`
+# branch and sync-main-to-dev.yml disappear. Realized entirely at scaffold time
+# (an anchored dev->main render + a sync-main-to-dev copy-exclude), mirroring
+# DEVKIT_MODE. Written back only for trunk, so a gitflow .vig-os is unchanged (#1205).
+DEVKIT_WORKFLOW=
+
+# Project identity (persisted SHORT_NAME / ORG_NAME / GITHUB_REPOSITORY);
+# written back by init-workspace.sh — edit only to deliberately rename.
+DEVKIT_PROJECT=scitadel
+DEVKIT_ORG=vigOS
+DEVKIT_REPO=vig-os/scitadel
+
+# Reserved: space-separated capability modules for the project dev-shell,
+# mirroring mkProjectShell's `modules = [ ... ]` in flake.nix (#884).
+DEVKIT_MODULES=""
+
+# Release tag prefix applied ONLY at the publishing edge — the pushed tag name
+# and the changelog release link. Empty (default) => bare X.Y.Z tags (no change
+# for devkit or existing consumers). Action-publishing repos set `v` for the
+# `actions/checkout@v5` ecosystem convention (#1044). The `version` input, the
+# `release/X.Y.Z` branch name, and the `## [X.Y.Z]` freeze heading stay bare.
+DEVKIT_TAG_PREFIX=
+
+# Opt-in floating major/minor tags, force-moved at promote to the final release
+# commit (comma-separated subset of `major,minor`; empty/absent => off). e.g.
+# `major,minor` moves <prefix>X and <prefix>X.Y so consumers can pin
+# `uses: owner/repo@v0`. Composes with DEVKIT_TAG_PREFIX; final releases only (#1045).
+DEVKIT_FLOATING_TAGS=
+
+# CI runner labels for the scaffolded ci.yml toolchain jobs (lint, test,
+# commit-checks) and the summary gate — comma-separated, e.g.
+# `self-hosted,linux,x64,meatgrinder`. Empty (default) => the hosted `ubuntu-24.04`
+# runner (no change for existing consumers). Routed into `runs-on` via
+# resolve-toolchain's `runner-json` output; the resolve-toolchain and
+# dependency-review jobs always stay on the hosted default (#1173).
+DEVKIT_CI_RUNNER=
+
+# Branch the scaffolded sync-issues job commits to. Empty (default) resolves to
+# the workflow-model default — `dev` (gitflow) / `main` (trunk) — unchanged for
+# existing consumers. A repo whose `main` carries a require-PR ruleset (which
+# refuses the sync job's direct API push, #1227) sets a dedicated UNPROTECTED
+# mirror branch, e.g. `sync/issue-mirror`; the sync job bootstraps it from the
+# default branch head if absent. The mirror diverges permanently and is never
+# merged back — each sync run regenerates full state (#1228).
+DEVKIT_SYNC_TARGET=
+
+# Cron override for the sync-issues schedule trigger (5-field cron, validated at
+# scaffold time). Empty (default) => the daily `0 2 * * *`. e.g. `0 5 * * 0` runs
+# the sync weekly on Sundays. Realized at scaffold time because schedule triggers
+# cannot take inputs (#1228).
+DEVKIT_SYNC_SCHEDULE=
+
+# Scaffold feature groups this repo opts OUT of — a comma-separated,
+# whitespace-tolerant subset of: release, renovate, sync-issues, scanning,
+# gh-templates, skills, worktree, devkit-upgrade. Empty (default) => every group is scaffolded
+# (no change for existing consumers). A disabled group is never shipped, and a
+# copy left by a prior scaffold is pruned on upgrade; clearing the key re-ships
+# it on the next `--force`. Consumer-owned extension seams
+# (release-extension.yml, prepare-release-extension.yml) and renovate.json are
+# left in place if present (never pruned). Governs scaffold SHAPE only, not the
+# flake — an unknown name aborts the scaffold loudly (#1284).
+DEVKIT_FEATURES_DISABLED=
+
+# Refs-line enforcement policy for the commit-message gate, driving BOTH the
+# validate-commit-msg pre-commit hook and CI's validate-commit-range from this
+# one key. Empty (default) resolves to `chore-optional` — every type but `chore`
+# requires a `Refs:` line — unchanged for devkit or existing consumers.
+# `optional` never requires Refs (any approved type may omit it); `required`
+# demands Refs on every type, `chore` included. Realized at scaffold time (an
+# anchored render of the hook arg + resolve-toolchain's `refs-optional-types`
+# output); written back only for a non-default value (#1282).
+DEVKIT_REFS_POLICY=
+
+# Auto-upgrade opt-out for the scaffolded devkit-upgrade.yml workflow. Empty
+# (default) or any value other than `false` keeps the WEEKLY schedule path
+# enabled — it polls devkit's latest release and, when this repo's DEVKIT_VERSION
+# is behind, opens the adoption PR. `false` disables ONLY the schedule; manual
+# `workflow_dispatch` (the release-train / rc re-bump path) always runs. A
+# runtime gate read from this file — no re-scaffold to flip. Written back only
+# for a non-default (`false`) value, so a default .vig-os is unchanged (#1296).
+DEVKIT_AUTO_UPGRADE=
+
+# Paths the devkit-upgrade workflow resets (git checkout --) after the scaffold
+# regeneration but before the adoption commit, so they never ride along in the
+# upgrade diff — e.g. a consumer's generated-doc churn. Comma-separated,
+# whitespace-tolerant (like DEVKIT_FEATURES_DISABLED). Empty (default) => no
+# exclusions. A runtime gate read from this file; written back only for a
+# non-empty value (#1296).
+DEVKIT_UPGRADE_EXCLUDE=
+
+# Scaffold-drift CI gate: true (default) | false. Empty (= unset) resolves to
+# `true` — ci.yml's `scaffold-drift` job re-runs the pinned devkit version's
+# scaffold over the checkout and fails a PR whose managed files diverge from it
+# (DEVKIT_VERSION bumped without re-scaffold, or a managed file hand-edited).
+# `*.project` files and persisted values in this manifest are exempt by
+# construction (the scaffold never overwrites them). Pure runtime gate — CI reads
+# it via resolve-toolchain's `drift-check` output, so flipping it takes effect
+# with no re-scaffold; the value round-trips across `--force` upgrades (#1295).
+DEVKIT_DRIFT_CHECK=

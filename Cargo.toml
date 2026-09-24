@@ -11,9 +11,11 @@ members = [
     "crates/scitadel-tui",
 ]
 
-# Per-crate versions are explicit and kept in lockstep by release-please
-# (the cargo-workspace plugin); there is intentionally no shared
-# workspace.package.version for it to drift against.
+# Per-crate versions are explicit and kept in lockstep by
+# `cargo set-version --workspace`, run from
+# .github/workflows/prepare-release-extension.yml when the release branch is
+# cut; there is intentionally no shared workspace.package.version for it to
+# drift against.
 [workspace.package]
 edition = "2024"
 license = "MIT OR Apache-2.0"

@@ -34,7 +34,7 @@ Each tape writes artifacts next to itself under `snapshots/<tape-name>/`.
 
 ## CI
 
-Today `rust-ci.yml` does **not** run tapes (needs a Linux runner with `vhs`
-+ `ttyd` + `ffmpeg` installed). That wiring is tracked as a follow-up once
+Today `rust-ci.yml` does **not** run tapes (needs a Linux runner with `vhs` +
+`ttyd` + `ffmpeg` installed). That wiring is tracked as a follow-up once
 golden-file comparison is in place. For now, run tapes locally as part of
 your PR review and attach a fresh GIF to the description.

@@ -1,3 +1,6 @@
+# Managed by vigOS devkit — regenerated on upgrade; local edits are lost.
+# Customize in justfile.project. Bugs / missing tools: https://github.com/vig-os/devkit/issues
+
 # Canonical blocklist for AI agent identity fingerprints.
 # Referenced by: validate-commit-msg, pre-commit hooks.
 # Refs: #163
@@ -24,6 +27,6 @@ emails = ["cursoragent@cursor.com", "noreply@cursor.com", "github-actions[bot]"]
 # Patterns that legitimately contain blocked names (regex, stripped before checking)
 # These are removed from content before name/email matching runs.
 allow_patterns = [
-  "\\.[a-zA-Z][\\w-]*/[\\w./-]*", # dotfile paths: .cursor/skills/, .claude/commands/
+  "\\.[a-zA-Z][\\w-]*/[\\w./-]*", # dotfile paths: .claude/skills/, .claude/commands/
   "[A-Z]+\\.md",                  # doc files: CLAUDE.md
 ]
