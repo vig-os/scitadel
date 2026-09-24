@@ -73,7 +73,7 @@ pub async fn search_tool(
     let adapters = scitadel_adapters::build_adapters_full(
         &source_list,
         &config.pubmed.api_key,
-        &config.openalex.api_key,
+        &config.openalex.auth(),
         &config.patentsview.api_key,
         &config.lens.api_key,
         &config.epo.consumer_key,
@@ -109,11 +109,16 @@ pub async fn search_tool(
     let outcome_lines: Vec<String> = search_record
         .source_outcomes
         .iter()
-        .map(|o| {
-            format!(
+        .map(|o| match &o.error {
+            // A failed source reports why, never "0 results" (#212).
+            Some(err) => format!(
+                "  {}: {} ({}, {:.0}ms)",
+                o.source, err, o.status, o.latency_ms
+            ),
+            None => format!(
                 "  {}: {} results ({}, {:.0}ms)",
                 o.source, o.result_count, o.status, o.latency_ms
-            )
+            ),
         })
         .collect();
 
@@ -135,6 +140,15 @@ pub async fn search_tool(
         "sources": search_record.source_outcomes,
         "total_candidates": search_record.total_candidates,
         "total_unique_papers": papers.len(),
+        "failed_sources": search_record
+            .source_outcomes
+            .iter()
+            .filter(|o| o.status != scitadel_core::models::SourceStatus::Success)
+            .map(|o| serde_json::json!({
+                "source": o.source,
+                "error": o.error,
+            }))
+            .collect::<Vec<_>>(),
         "summary": summary,
     });
 
@@ -160,8 +174,19 @@ pub fn list_searches_tool(limit: i64) -> Result<String, String> {
                 .iter()
                 .filter(|o| o.status == scitadel_core::models::SourceStatus::Success)
                 .count();
+            let failed: Vec<&str> = s
+                .source_outcomes
+                .iter()
+                .filter(|o| o.status != scitadel_core::models::SourceStatus::Success)
+                .map(|o| o.source.as_str())
+                .collect();
+            let failed_note = if failed.is_empty() {
+                String::new()
+            } else {
+                format!("  [!] failed: {}", failed.join(", "))
+            };
             format!(
-                "{}  {}  \"{}\"  {} papers  {}/{} sources ok",
+                "{}  {}  \"{}\"  {} papers  {}/{} sources ok{failed_note}",
                 s.id.short(),
                 s.created_at.format("%Y-%m-%d %H:%M"),
                 s.query,
@@ -522,7 +547,7 @@ pub async fn download_paper_tool(
     let out_dir = output_dir.map_or_else(|| config.papers_dir(), std::path::PathBuf::from);
 
     let downloader =
-        scitadel_adapters::download::PaperDownloader::new(config.openalex.api_key.clone(), 60.0);
+        scitadel_adapters::download::PaperDownloader::new(config.openalex.auth(), 60.0);
 
     let result = if let Some(pid) = paper_id {
         let db = open_db()?;
@@ -762,8 +787,7 @@ async fn fetch_and_store_references(paper_id: &str) -> Result<CitationFetchOutco
         format!("Paper '{paper_id}' has no openalex_id; reference fetch needs it.")
     })?;
 
-    let adapter =
-        scitadel_adapters::openalex::OpenAlexAdapter::new(config.openalex.api_key.clone(), 30.0);
+    let adapter = scitadel_adapters::openalex::OpenAlexAdapter::new(config.openalex.auth(), 30.0);
     let work = adapter
         .fetch_work_by_id(&source_openalex)
         .await
@@ -807,8 +831,7 @@ async fn fetch_and_store_citations(
         format!("Paper '{paper_id}' has no openalex_id; citation fetch needs it.")
     })?;
 
-    let adapter =
-        scitadel_adapters::openalex::OpenAlexAdapter::new(config.openalex.api_key.clone(), 30.0);
+    let adapter = scitadel_adapters::openalex::OpenAlexAdapter::new(config.openalex.auth(), 30.0);
 
     let citing_works = adapter
         .fetch_cited_by(&source_openalex, limit)
@@ -1559,11 +1582,9 @@ const SOURCE_REGISTRY: &[SourceInfo] = &[
     },
     SourceInfo {
         name: "openalex",
-        description: "Open scholarly-works graph covering most disciplines. The polite-pool email gets 10 req/s; without it you share the global 10 req/s pool.",
-        // Stored under `openalex.api_key` in config for historical reasons;
-        // users authenticate by putting their contact email there, not a real key.
-        credential_fields: &["polite_pool_email"],
-        rate_limit_hint: "10 req/s in the polite pool (with email), otherwise shared.",
+        description: "Open scholarly-works graph covering most disciplines. An api_key is needed in practice: keyless requests are metered against a shared per-IP daily budget and 429 once it is spent. The polite-pool email is a separate, optional contact address.",
+        credential_fields: &["api_key", "email"],
+        rate_limit_hint: "10 req/s; keyless calls share a per-IP daily budget.",
     },
     SourceInfo {
         name: "inspire",
@@ -1620,10 +1641,8 @@ fn is_source_configured(src: &SourceInfo, config: &scitadel_core::config::Config
         // Sources with no credentials are always considered configured.
         "arxiv" | "inspire" => true,
         "pubmed" => !config.pubmed.api_key.is_empty(),
-        // OpenAlex stores the polite-pool email under `openalex.api_key`
-        // (historical naming); an empty string means polite pool is off
-        // but the adapter still works, so we report configured only when
-        // the email is actually present.
+        // The API key is what makes OpenAlex usable past the shared
+        // per-IP budget; the polite-pool email alone is not enough (#212).
         "openalex" => !config.openalex.api_key.is_empty(),
         "patentsview" => !config.patentsview.api_key.is_empty(),
         "lens" => !config.lens.api_key.is_empty(),
@@ -2513,12 +2532,19 @@ mod tests {
     fn configured_flips_on_credential_presence() {
         let mut config = Config::default();
         config.openalex.api_key.clear();
+        config.openalex.email.clear();
         let oa = SOURCE_REGISTRY
             .iter()
             .find(|s| s.name == "openalex")
             .unwrap();
         assert!(!is_source_configured(oa, &config));
-        config.openalex.api_key = "lars@example.org".into();
+
+        // The polite-pool email is not a substitute for the key: keyless
+        // requests still 429 once the shared per-IP budget is spent (#212).
+        config.openalex.email = "lars@example.org".into();
+        assert!(!is_source_configured(oa, &config));
+
+        config.openalex.api_key = "oa-key-123".into();
         assert!(is_source_configured(oa, &config));
     }
 

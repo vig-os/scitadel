@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use scitadel_adapters::download::{AccessStatus, DownloadFormat, PaperDownloader};
+use scitadel_core::config::OpenAlexAuth;
 use scitadel_core::models::Paper;
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
@@ -181,7 +182,7 @@ fn open_with_system_viewer(path: &std::path::Path) -> Result<(), String> {
 pub fn spawn_download_paper(
     tx: UnboundedSender<TaskUpdate>,
     paper: Paper,
-    email: String,
+    openalex: OpenAlexAuth,
     out_dir: PathBuf,
 ) -> Uuid {
     let id = Uuid::new_v4();
@@ -212,7 +213,7 @@ pub fn spawn_download_paper(
             status: TaskStatus::Running,
         });
 
-        let downloader = PaperDownloader::new(email, 60.0);
+        let downloader = PaperDownloader::new(openalex, 60.0);
         let status = match downloader.download_paper(&paper, &out_dir).await {
             Ok(result) => TaskStatus::Done {
                 path: result.path,

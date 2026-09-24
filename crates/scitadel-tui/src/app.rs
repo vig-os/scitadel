@@ -15,6 +15,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Tabs;
 use tokio::sync::mpsc;
 
+use scitadel_core::config::OpenAlexAuth;
+
 use crate::data::DataStore;
 use crate::tasks::{Task, TaskKind, TaskStatus, TaskUpdate, spawn_download_paper};
 use crate::views::annotation_prompt::{AnnotationPrompt, PromptCommit, PromptSubmission};
@@ -130,7 +132,9 @@ pub struct App {
     /// Last `TuiState` written to the DB, used by `publish_tui_state`
     /// to skip redundant UPDATEs when the user hasn't moved (#122).
     pub last_published_state: Option<scitadel_db::sqlite::TuiState>,
-    pub unpaywall_email: String,
+    /// OpenAlex polite-pool address + metered API key, used by the
+    /// download chain (Unpaywall wants the email; OpenAlex wants both).
+    pub openalex: OpenAlexAuth,
     pub papers_dir: PathBuf,
     pub show_institutional_hint: bool,
     pub reader: String,
@@ -272,7 +276,7 @@ pub(crate) struct StatusToast {
 impl App {
     fn new(
         data: DataStore,
-        unpaywall_email: String,
+        openalex: OpenAlexAuth,
         papers_dir: PathBuf,
         show_institutional_hint: bool,
         reader: String,
@@ -299,7 +303,7 @@ impl App {
             queue_selected: 0,
             tasks: Vec::new(),
             last_published_state: None,
-            unpaywall_email,
+            openalex,
             papers_dir,
             show_institutional_hint,
             reader,
@@ -1002,7 +1006,7 @@ impl App {
         spawn_download_paper(
             self.task_tx.clone(),
             paper,
-            self.unpaywall_email.clone(),
+            self.openalex.clone(),
             self.papers_dir.clone(),
         );
     }
@@ -1467,20 +1471,14 @@ fn tui_state_key(
 
 pub fn run(
     db_path: &Path,
-    unpaywall_email: String,
+    openalex: OpenAlexAuth,
     papers_dir: PathBuf,
     show_institutional_hint: bool,
     reader: String,
     startup_toast: Option<String>,
 ) -> Result<()> {
     let data = DataStore::open(db_path)?;
-    let mut app = App::new(
-        data,
-        unpaywall_email,
-        papers_dir,
-        show_institutional_hint,
-        reader,
-    );
+    let mut app = App::new(data, openalex, papers_dir, show_institutional_hint, reader);
     app.startup_toast = startup_toast;
 
     enable_raw_mode()?;
@@ -1789,10 +1787,7 @@ fn step_prompt(prompt: &mut Option<AnnotationPrompt>, code: KeyCode) -> Option<P
 /// Tests and tape runs can force the offline branch by setting
 /// `SCITADEL_FORCE_OFFLINE=1`.
 async fn probe_network() -> bool {
-    if std::env::var("SCITADEL_FORCE_OFFLINE")
-        .ok()
-        .is_some_and(|v| !v.is_empty() && v != "0")
-    {
+    if std::env::var("SCITADEL_FORCE_OFFLINE").is_ok_and(|v| !v.is_empty() && v != "0") {
         return false;
     }
     let client = match reqwest::Client::builder()
@@ -1853,7 +1848,10 @@ mod tests {
 
         let app = App::new(
             data,
-            "demo@example.org".into(),
+            OpenAlexAuth {
+                email: "demo@example.org".into(),
+                ..OpenAlexAuth::default()
+            },
             papers_dir.clone(),
             false,
             "lars".into(),
