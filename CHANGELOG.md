@@ -59,6 +59,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `scitadel auth login` accepts piped stdin instead of requiring a tty,
   so credentials can be provisioned non-interactively.
 
+### Security
+
+- **Upgrade ratatui 0.29 → 0.30 and crossterm 0.28 → 0.29.** Clears
+  the Dependabot advisory on `lru < 0.16.3` (`IterMut` Stacked Borrows
+  unsoundness — [RUSTSEC-style report on lru]) that ratatui 0.29
+  pulled in through its pinned `lru 0.12`. ratatui 0.30 depends on
+  `ratatui-core`, which uses `lru ^0.18`, so the workspace now
+  resolves to `lru 0.18.x` and the alert clears. No user-visible
+  behaviour changes — layouts, colour themes (Dalton Dark / Bright /
+  auto-detect), keybindings, OSC 11 background probe and the two-pane
+  reader all render identically.
+
+[RUSTSEC-style report on lru]: https://github.com/jeromefroe/lru-rs/issues/226
+
 ## [0.7.0](https://github.com/vig-os/scitadel/compare/0.6.0...0.7.0) (2026-06-05)
 
 
