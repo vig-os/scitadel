@@ -54,6 +54,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `scitadel auth login` accepts piped stdin instead of requiring a tty,
   so credentials can be provisioned non-interactively.
 
+### Security
+
+- **Patched transitive dependencies** for open advisories, lockfile-only
+  (semver-compatible): `openssl` 0.10.75 → 0.10.81 (several memory-safety
+  advisories), `rustls-webpki` 0.103.9 → 0.103.15 (CRL panic DoS, name
+  constraints), `rpassword` 7.4.0 → 7.5.4 (partial password reveal),
+  `rand` 0.9.2 → 0.9.5 / 0.10.0 → 0.10.3 (unsound with a custom logger).
+
 ## [0.7.0](https://github.com/vig-os/scitadel/compare/0.6.0...0.7.0) (2026-06-05)
 
 
