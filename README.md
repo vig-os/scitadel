@@ -48,6 +48,17 @@ cargo install --path crates/scitadel-cli --locked
 
 This drops a single `scitadel` binary into `~/.cargo/bin` (make sure that's on your `PATH`). CLI, TUI, and MCP server are all subcommands of the same binary.
 
+### With Nix
+
+The flake exposes the binary as its default package:
+
+```bash
+nix run github:vig-os/scitadel -- --help       # try it without installing
+nix profile install github:vig-os/scitadel     # install into your profile
+```
+
+Downstream flakes can consume it as `inputs.scitadel.packages.${system}.default`.
+
 ### As a Claude MCP server
 
 **User scope (available in every session, everywhere):**

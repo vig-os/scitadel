@@ -32,7 +32,8 @@
       {
         packages.default = rustPlatform.buildRustPackage {
           pname = "scitadel";
-          version = "0.7.0";
+          # Single shared workspace version — read it so release bumps carry over.
+          version = (builtins.fromTOML (builtins.readFile ./crates/scitadel-cli/Cargo.toml)).package.version;
           src = self;
           cargoLock.lockFile = ./Cargo.lock;
 
