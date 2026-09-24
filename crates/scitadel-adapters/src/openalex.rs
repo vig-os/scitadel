@@ -1,20 +1,90 @@
 use async_trait::async_trait;
 use reqwest::Client;
 
+use scitadel_core::config::OpenAlexAuth;
 use scitadel_core::error::CoreError;
 use scitadel_core::models::CandidatePaper;
 use scitadel_core::ports::SourceAdapter;
 
-const OPENALEX_API_URL: &str = "https://api.openalex.org/works";
+pub const OPENALEX_API_URL: &str = "https://api.openalex.org/works";
+
+/// Longest error body excerpt echoed back to the user. Enough for
+/// OpenAlex's "Insufficient budget…" text without dumping a whole page.
+const MAX_ERROR_EXCERPT: usize = 200;
 
 pub struct OpenAlexAdapter {
-    email: String,
+    auth: OpenAlexAuth,
     timeout: f64,
+    base_url: String,
+}
+
+/// Build the query string for an OpenAlex request.
+///
+/// Both credentials go on *every* request: `mailto` for the polite pool
+/// and `api_key` for the metered quota. Without the key OpenAlex bills
+/// the call against a shared per-IP daily budget and starts answering
+/// 429 once that is spent (#212). Empty credentials are omitted rather
+/// than sent blank.
+fn query_params(auth: &OpenAlexAuth, extra: &[(&str, &str)]) -> Vec<(String, String)> {
+    let mut params: Vec<(String, String)> = extra
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+    if !auth.email.is_empty() {
+        params.push(("mailto".into(), auth.email.clone()));
+    }
+    if !auth.api_key.is_empty() {
+        params.push(("api_key".into(), auth.api_key.clone()));
+    }
+    params
+}
+
+/// Turn an OpenAlex error body into a short human-readable clause.
+///
+/// OpenAlex answers failures with `{"error": …, "message": …}`; anything
+/// else is echoed verbatim. Truncated, and returns an empty string when
+/// there is nothing useful to say, so callers can append it blindly.
+fn error_detail(body: &str) -> String {
+    let body = body.trim();
+    if body.is_empty() {
+        return String::new();
+    }
+    let message = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            ["message", "error"]
+                .iter()
+                .find_map(|k| v.get(*k).and_then(|m| m.as_str()).map(str::to_string))
+        })
+        .unwrap_or_else(|| body.to_string());
+
+    let message = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if message.is_empty() {
+        return String::new();
+    }
+    if message.chars().count() > MAX_ERROR_EXCERPT {
+        let truncated: String = message.chars().take(MAX_ERROR_EXCERPT).collect();
+        format!(" — {truncated}…")
+    } else {
+        format!(" — {message}")
+    }
 }
 
 impl OpenAlexAdapter {
-    pub fn new(email: String, timeout: f64) -> Self {
-        Self { email, timeout }
+    pub fn new(auth: OpenAlexAuth, timeout: f64) -> Self {
+        Self {
+            auth,
+            timeout,
+            base_url: OPENALEX_API_URL.to_string(),
+        }
+    }
+
+    /// Point the adapter at a different `/works` endpoint. Test seam for
+    /// the HTTP-behaviour suite; production always uses the default.
+    #[must_use]
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into();
+        self
     }
 
     /// Fetch the full Work JSON for a single paper by its short OpenAlex
@@ -25,8 +95,8 @@ impl OpenAlexAdapter {
         &self,
         openalex_id: &str,
     ) -> Result<serde_json::Value, CoreError> {
-        self.fetch_from(&format!("{OPENALEX_API_URL}/{openalex_id}"), &[])
-            .await
+        let url = format!("{}/{openalex_id}", self.base_url);
+        self.fetch_from(&url, &[]).await
     }
 
     /// Fetch a batch of Works by their short OpenAlex ids (W…) in one
@@ -52,7 +122,7 @@ impl OpenAlexAdapter {
         let filter = format!("openalex_id:{}", ids.join("|"));
         let payload = self
             .fetch_from(
-                OPENALEX_API_URL,
+                &self.base_url,
                 &[("filter", filter.as_str()), ("per_page", "50")],
             )
             .await?;
@@ -75,7 +145,7 @@ impl OpenAlexAdapter {
         let per_page = limit.clamp(1, 200).to_string();
         let payload = self
             .fetch_from(
-                OPENALEX_API_URL,
+                &self.base_url,
                 &[("filter", filter.as_str()), ("per_page", per_page.as_str())],
             )
             .await?;
@@ -86,6 +156,10 @@ impl OpenAlexAdapter {
             .unwrap_or_default())
     }
 
+    /// Single HTTP path for every OpenAlex call, so the credentials and
+    /// the status check can't be forgotten at one call site (they were:
+    /// `search` used to skip the status check entirely and reported a
+    /// 429 body as zero results — #212).
     async fn fetch_from(
         &self,
         url: &str,
@@ -94,30 +168,32 @@ impl OpenAlexAdapter {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs_f64(self.timeout))
             .build()
-            .map_err(|e| CoreError::Adapter("openalex".into(), e.to_string()))?;
-
-        let mut params: Vec<(&str, String)> =
-            extra.iter().map(|(k, v)| (*k, (*v).to_string())).collect();
-        if !self.email.is_empty() {
-            params.push(("mailto", self.email.clone()));
-        }
+            .map_err(adapter_err)?;
 
         let resp = client
             .get(url)
-            .query(&params)
+            .query(&query_params(&self.auth, extra))
             .send()
             .await
-            .map_err(|e| CoreError::Adapter("openalex".into(), e.to_string()))?;
-        if !resp.status().is_success() {
+            .map_err(adapter_err)?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            // Never interpolate the request URL: it carries `api_key`,
+            // and this string lands in logs and the search-run record.
+            let body = resp.text().await.unwrap_or_default();
             return Err(CoreError::Adapter(
                 "openalex".into(),
-                format!("HTTP {} for {url}", resp.status()),
+                format!("HTTP {status}{}", error_detail(&body)),
             ));
         }
-        resp.json()
-            .await
-            .map_err(|e| CoreError::Adapter("openalex".into(), e.to_string()))
+
+        resp.json().await.map_err(adapter_err)
     }
+}
+
+fn adapter_err(e: impl std::fmt::Display) -> CoreError {
+    CoreError::Adapter("openalex".into(), e.to_string())
 }
 
 /// Extract the short OpenAlex id (`W2741809807`) from either a full URL
@@ -170,30 +246,13 @@ impl SourceAdapter for OpenAlexAdapter {
         query: &str,
         max_results: usize,
     ) -> Result<Vec<CandidatePaper>, CoreError> {
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs_f64(self.timeout))
-            .build()
-            .map_err(|e| CoreError::Adapter("openalex".into(), e.to_string()))?;
-
-        let mut params = vec![
-            ("search", query.to_string()),
-            ("per_page", max_results.to_string()),
-        ];
-        if !self.email.is_empty() {
-            params.push(("mailto", self.email.clone()));
-        }
-
-        let resp = client
-            .get(OPENALEX_API_URL)
-            .query(&params)
-            .send()
-            .await
-            .map_err(|e| CoreError::Adapter("openalex".into(), e.to_string()))?;
-
-        let data: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| CoreError::Adapter("openalex".into(), e.to_string()))?;
+        let per_page = max_results.to_string();
+        let data = self
+            .fetch_from(
+                &self.base_url,
+                &[("search", query), ("per_page", per_page.as_str())],
+            )
+            .await?;
 
         let works = data
             .get("results")
@@ -352,6 +411,94 @@ pub fn work_to_paper_dict(work: &serde_json::Value) -> serde_json::Map<String, s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn params_map(auth: &OpenAlexAuth, extra: &[(&str, &str)]) -> Vec<(String, String)> {
+        query_params(auth, extra)
+    }
+
+    fn lookup<'a>(params: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        params
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn query_params_send_the_api_key_on_every_request() {
+        let auth = OpenAlexAuth {
+            email: "me@example.org".into(),
+            api_key: "oa-key-123".into(),
+        };
+        let params = params_map(&auth, &[("search", "DOTA lutetium"), ("per_page", "5")]);
+
+        assert_eq!(lookup(&params, "api_key"), Some("oa-key-123"));
+        assert_eq!(lookup(&params, "mailto"), Some("me@example.org"));
+        assert_eq!(lookup(&params, "search"), Some("DOTA lutetium"));
+        assert_eq!(lookup(&params, "per_page"), Some("5"));
+    }
+
+    #[test]
+    fn query_params_keep_the_email_as_the_polite_pool_mailto() {
+        // Regression guard for #212: the email must never be sent as the
+        // API key, which is what the old single-field config implied.
+        let auth = OpenAlexAuth {
+            email: "me@example.org".into(),
+            api_key: String::new(),
+        };
+        let params = params_map(&auth, &[]);
+        assert_eq!(lookup(&params, "mailto"), Some("me@example.org"));
+        assert_eq!(lookup(&params, "api_key"), None);
+    }
+
+    #[test]
+    fn query_params_omit_blank_credentials() {
+        let params = params_map(&OpenAlexAuth::default(), &[("per_page", "50")]);
+        assert_eq!(params, vec![("per_page".to_string(), "50".to_string())]);
+    }
+
+    #[test]
+    fn query_params_cover_the_filter_endpoints() {
+        let auth = OpenAlexAuth {
+            email: String::new(),
+            api_key: "k".into(),
+        };
+        // cited_by / snowball / batch-fetch all funnel through `filter`.
+        for extra in [
+            vec![("filter", "cites:W1"), ("per_page", "25")],
+            vec![("filter", "openalex_id:W1|W2"), ("per_page", "50")],
+            vec![],
+        ] {
+            let params = params_map(&auth, &extra);
+            assert_eq!(
+                lookup(&params, "api_key"),
+                Some("k"),
+                "api_key missing for {extra:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn error_detail_extracts_the_openalex_message() {
+        let body = r#"{"error":"Insufficient budget","message":"This request has no API key."}"#;
+        assert_eq!(error_detail(body), " — This request has no API key.");
+    }
+
+    #[test]
+    fn error_detail_falls_back_to_the_error_field_then_the_raw_body() {
+        assert_eq!(
+            error_detail(r#"{"error":"Insufficient budget"}"#),
+            " — Insufficient budget"
+        );
+        assert_eq!(error_detail("upstream is down"), " — upstream is down");
+        assert_eq!(error_detail("   "), "");
+    }
+
+    #[test]
+    fn error_detail_truncates_a_long_body() {
+        let detail = error_detail(&"x".repeat(1000));
+        assert!(detail.ends_with('…'));
+        assert_eq!(detail.chars().count(), MAX_ERROR_EXCERPT + 4); // " — " + text + "…"
+    }
 
     #[test]
     fn test_reconstruct_abstract() {
