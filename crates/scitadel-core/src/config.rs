@@ -65,6 +65,86 @@ impl Default for EpoConfig {
     }
 }
 
+/// Resolved OpenAlex credentials, carried as one value so the adapter,
+/// the download chain and the TUI can't drift apart on which half they
+/// were handed (#212).
+///
+/// * `email` — polite-pool `mailto` contact address (also used for Unpaywall).
+/// * `api_key` — the metered key OpenAlex requires once the shared
+///   per-IP budget is spent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OpenAlexAuth {
+    pub email: String,
+    pub api_key: String,
+}
+
+impl OpenAlexAuth {
+    /// True when neither credential is set — the fully anonymous path
+    /// that OpenAlex now meters against a shared per-IP daily budget.
+    pub fn is_anonymous(&self) -> bool {
+        self.email.is_empty() && self.api_key.is_empty()
+    }
+}
+
+/// OpenAlex adapter configuration.
+///
+/// OpenAlex needs two *different* credentials, which scitadel <= 0.7
+/// conflated into a single `api_key` field that actually held the
+/// polite-pool email. They are separate keys now: `email` is the
+/// `mailto` contact address, `api_key` is the real metered API key.
+/// Configs written by older versions still load — see
+/// [`OpenAlexConfig::migrate_legacy_email`] (#212).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAlexConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_timeout")]
+    pub timeout: f64,
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+    /// Polite-pool contact address, sent as `mailto=`.
+    #[serde(default)]
+    pub email: String,
+    /// Metered API key, sent as `api_key=`.
+    #[serde(default)]
+    pub api_key: String,
+}
+
+impl Default for OpenAlexConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            timeout: 30.0,
+            max_retries: 3,
+            email: String::new(),
+            api_key: String::new(),
+        }
+    }
+}
+
+impl OpenAlexConfig {
+    /// Move a legacy `api_key = "me@example.org"` into `email`.
+    ///
+    /// Pre-0.8 `config.toml` files stored the polite-pool email under
+    /// `api_key`. An `@` is the discriminant: OpenAlex API keys are
+    /// opaque tokens and never contain one, while every email address
+    /// does. Only applied when `email` is still unset, so a config that
+    /// sets both keys explicitly is left alone.
+    pub fn migrate_legacy_email(&mut self) {
+        if self.email.is_empty() && self.api_key.contains('@') {
+            self.email = std::mem::take(&mut self.api_key);
+        }
+    }
+
+    /// The credential pair this config resolves to.
+    pub fn auth(&self) -> OpenAlexAuth {
+        OpenAlexAuth {
+            email: self.email.clone(),
+            api_key: self.api_key.clone(),
+        }
+    }
+}
+
 /// Configuration for Claude-based scoring.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatConfig {
@@ -139,7 +219,7 @@ pub struct Config {
     #[serde(default)]
     pub arxiv: SourceConfig,
     #[serde(default)]
-    pub openalex: SourceConfig,
+    pub openalex: OpenAlexConfig,
     #[serde(default)]
     pub inspire: SourceConfig,
     #[serde(default)]
@@ -181,7 +261,7 @@ impl Default for Config {
             default_sources: default_sources(),
             pubmed: SourceConfig::default(),
             arxiv: SourceConfig::default(),
-            openalex: SourceConfig::default(),
+            openalex: OpenAlexConfig::default(),
             inspire: SourceConfig::default(),
             patentsview: SourceConfig::default(),
             lens: SourceConfig::default(),
@@ -251,9 +331,20 @@ pub fn load_config() -> Config {
     )
     .unwrap_or_default();
 
-    config.openalex.api_key = resolve(
+    // Untangle the pre-0.8 layout (email stored under `api_key`) before
+    // either field is used as a fallback for its own credential (#212).
+    config.openalex.migrate_legacy_email();
+
+    config.openalex.email = resolve(
         "openalex.email",
         "SCITADEL_OPENALEX_EMAIL",
+        &config.openalex.email,
+    )
+    .unwrap_or_default();
+
+    config.openalex.api_key = resolve(
+        "openalex.api_key",
+        "SCITADEL_OPENALEX_API_KEY",
         &config.openalex.api_key,
     )
     .unwrap_or_default();
@@ -307,5 +398,110 @@ pub fn load_config() -> Config {
 /// Load config from a specific TOML file path.
 pub fn load_config_from(path: &Path) -> Result<Config, crate::error::CoreError> {
     let contents = std::fs::read_to_string(path)?;
-    toml::from_str(&contents).map_err(|e| crate::error::CoreError::Config(e.to_string()))
+    let mut config: Config =
+        toml::from_str(&contents).map_err(|e| crate::error::CoreError::Config(e.to_string()))?;
+    config.openalex.migrate_legacy_email();
+    Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn openalex_from_toml(body: &str) -> OpenAlexConfig {
+        let mut cfg: OpenAlexConfig = toml::from_str(body).unwrap();
+        cfg.migrate_legacy_email();
+        cfg
+    }
+
+    #[test]
+    fn a_pre_0_8_config_keeps_working() {
+        // scitadel <= 0.7 wrote the polite-pool email into `api_key` (#212).
+        let cfg = openalex_from_toml(r#"api_key = "lars@example.org""#);
+        assert_eq!(cfg.email, "lars@example.org");
+        assert_eq!(cfg.api_key, "", "an email is not an API key");
+    }
+
+    #[test]
+    fn a_real_api_key_is_left_where_it_is() {
+        let cfg = openalex_from_toml(r#"api_key = "oa-key-123""#);
+        assert_eq!(cfg.api_key, "oa-key-123");
+        assert_eq!(cfg.email, "");
+    }
+
+    #[test]
+    fn an_explicit_pair_is_never_rewritten() {
+        let cfg = openalex_from_toml(
+            r#"
+            email = "lars@example.org"
+            api_key = "oa-key-123"
+            "#,
+        );
+        assert_eq!(cfg.email, "lars@example.org");
+        assert_eq!(cfg.api_key, "oa-key-123");
+    }
+
+    #[test]
+    fn migration_does_not_clobber_an_email_that_is_already_set() {
+        // Pathological but possible: both fields hold addresses.
+        let cfg = openalex_from_toml(
+            r#"
+            email = "new@example.org"
+            api_key = "old@example.org"
+            "#,
+        );
+        assert_eq!(cfg.email, "new@example.org");
+        assert_eq!(cfg.api_key, "old@example.org");
+    }
+
+    #[test]
+    fn migration_is_idempotent() {
+        let mut cfg = openalex_from_toml(r#"api_key = "lars@example.org""#);
+        cfg.migrate_legacy_email();
+        cfg.migrate_legacy_email();
+        assert_eq!(cfg.email, "lars@example.org");
+        assert_eq!(cfg.api_key, "");
+    }
+
+    #[test]
+    fn auth_carries_both_halves() {
+        let cfg = openalex_from_toml(
+            r#"
+            email = "lars@example.org"
+            api_key = "oa-key-123"
+            "#,
+        );
+        let auth = cfg.auth();
+        assert_eq!(auth.email, "lars@example.org");
+        assert_eq!(auth.api_key, "oa-key-123");
+        assert!(!auth.is_anonymous());
+        assert!(OpenAlexAuth::default().is_anonymous());
+    }
+
+    #[test]
+    fn load_config_from_migrates_a_legacy_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "db_path = \"/tmp/x.db\"\n\n[openalex]\napi_key = \"lars@example.org\"\n",
+        )
+        .unwrap();
+
+        let config = load_config_from(&path).unwrap();
+        assert_eq!(config.openalex.email, "lars@example.org");
+        assert_eq!(config.openalex.api_key, "");
+    }
+
+    #[test]
+    fn a_config_without_an_openalex_section_defaults_to_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "db_path = \"/tmp/x.db\"\n").unwrap();
+
+        let config = load_config_from(&path).unwrap();
+        assert!(config.openalex.auth().is_anonymous());
+        assert!(config.openalex.enabled);
+        assert!((config.openalex.timeout - 30.0).abs() < f64::EPSILON);
+    }
 }

@@ -2,8 +2,22 @@ use std::time::Instant;
 
 use tracing::{info, warn};
 
+use crate::error::CoreError;
 use crate::models::{CandidatePaper, Search, SourceOutcome, SourceStatus};
 use crate::ports::SourceAdapter;
+
+/// Message recorded on a failed `SourceOutcome`.
+///
+/// `CoreError::Adapter` renders as `adapter error: <source> — <msg>`, but
+/// the outcome already carries the source name, so the prefix is dropped:
+/// what lands in the search record (and in `[!] openalex: …`) is the bare
+/// `HTTP 429 Too Many Requests — Insufficient budget…` (#212).
+fn outcome_error(e: &CoreError) -> String {
+    match e {
+        CoreError::Adapter(_, msg) => msg.clone(),
+        other => other.to_string(),
+    }
+}
 
 /// Run a single adapter with retry logic. Never panics.
 async fn run_adapter(
@@ -36,7 +50,7 @@ async fn run_adapter(
                 );
             }
             Err(e) => {
-                last_error = e.to_string();
+                last_error = outcome_error(&e);
                 warn!(
                     source = adapter.name(),
                     attempt = attempt + 1,
@@ -126,13 +140,13 @@ pub async fn run_search(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::CoreError;
     use async_trait::async_trait;
 
     struct MockAdapter {
         name: String,
         results: Vec<CandidatePaper>,
         should_fail: bool,
+        error: String,
     }
 
     #[async_trait]
@@ -147,7 +161,7 @@ mod tests {
             _max_results: usize,
         ) -> Result<Vec<CandidatePaper>, CoreError> {
             if self.should_fail {
-                Err(CoreError::Adapter(self.name.clone(), "mock failure".into()))
+                Err(CoreError::Adapter(self.name.clone(), self.error.clone()))
             } else {
                 Ok(self.results.clone())
             }
@@ -160,6 +174,7 @@ mod tests {
             name: "mock".into(),
             results: vec![CandidatePaper::new("mock", "1", "Test Paper")],
             should_fail: false,
+            error: String::new(),
         })];
 
         let (search, candidates) = run_search("test query", &adapters, 50, 1).await;
@@ -169,17 +184,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failure_outcome_carries_the_adapter_message_verbatim() {
+        // #212: a 429 must survive into the search record as an error,
+        // not be flattened into a zero-result success.
+        let adapters: Vec<Box<dyn SourceAdapter>> = vec![Box::new(MockAdapter {
+            name: "openalex".into(),
+            results: vec![],
+            should_fail: true,
+            error: "HTTP 429 Too Many Requests — Insufficient budget.".into(),
+        })];
+
+        let (search, candidates) = run_search("test", &adapters, 50, 1).await;
+        assert!(candidates.is_empty());
+
+        let outcome = &search.source_outcomes[0];
+        assert_eq!(outcome.status, SourceStatus::Failed);
+        assert_eq!(outcome.result_count, 0);
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some("HTTP 429 Too Many Requests — Insufficient budget."),
+            "the source prefix belongs in `outcome.source`, not the message"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_source_does_not_drop_the_others_results() {
+        let adapters: Vec<Box<dyn SourceAdapter>> = vec![
+            Box::new(MockAdapter {
+                name: "openalex".into(),
+                results: vec![],
+                should_fail: true,
+                error: "HTTP 429 Too Many Requests".into(),
+            }),
+            Box::new(MockAdapter {
+                name: "arxiv".into(),
+                results: vec![
+                    CandidatePaper::new("arxiv", "1", "Paper A"),
+                    CandidatePaper::new("arxiv", "2", "Paper B"),
+                ],
+                should_fail: false,
+                error: String::new(),
+            }),
+        ];
+
+        let (search, candidates) = run_search("test", &adapters, 50, 1).await;
+        assert_eq!(candidates.len(), 2, "arxiv results must survive the 429");
+        assert_eq!(search.total_candidates, 2);
+
+        let failed: Vec<&str> = search
+            .source_outcomes
+            .iter()
+            .filter(|o| o.status == SourceStatus::Failed)
+            .map(|o| o.source.as_str())
+            .collect();
+        assert_eq!(failed, vec!["openalex"]);
+    }
+
+    #[tokio::test]
     async fn test_run_search_partial_failure() {
         let adapters: Vec<Box<dyn SourceAdapter>> = vec![
             Box::new(MockAdapter {
                 name: "good".into(),
                 results: vec![CandidatePaper::new("good", "1", "Paper A")],
                 should_fail: false,
+                error: String::new(),
             }),
             Box::new(MockAdapter {
                 name: "bad".into(),
                 results: vec![],
                 should_fail: true,
+                error: "mock failure".into(),
             }),
         ];
 
