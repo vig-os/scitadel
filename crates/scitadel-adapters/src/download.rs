@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use scitadel_core::config::OpenAlexAuth;
 use scitadel_core::models::{Paper, doi_to_filename, validate_doi};
 
 use crate::error::AdapterError;
@@ -127,17 +128,19 @@ pub fn detect_access_status(html: &str) -> AccessStatus {
 /// Downloads papers by DOI using Unpaywall (OA PDFs) with publisher HTML fallback.
 pub struct PaperDownloader {
     client: reqwest::Client,
-    email: String,
+    /// Polite-pool `mailto` plus the metered OpenAlex key. Unpaywall only
+    /// ever needs the email; the OpenAlex leg needs both (#212).
+    openalex: OpenAlexAuth,
 }
 
 impl PaperDownloader {
-    pub fn new(email: String, timeout_secs: f64) -> Self {
+    pub fn new(openalex: OpenAlexAuth, timeout_secs: f64) -> Self {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs_f64(timeout_secs))
             .user_agent("scitadel/0.1 (paper downloader)")
             .build()
             .expect("failed to build HTTP client");
-        Self { client, email }
+        Self { client, openalex }
     }
 
     /// Download by DOI only — kept for the CLI `download <doi>` path.
@@ -236,7 +239,10 @@ impl PaperDownloader {
         doi: &str,
         output_dir: &Path,
     ) -> Result<DownloadResult, AdapterError> {
-        let url = format!("https://api.unpaywall.org/v2/{}?email={}", doi, self.email);
+        let url = format!(
+            "https://api.unpaywall.org/v2/{}?email={}",
+            doi, self.openalex.email
+        );
 
         let resp = self
             .client
@@ -403,11 +409,23 @@ impl PaperDownloader {
         output_dir: &Path,
     ) -> Result<DownloadResult, AdapterError> {
         let id = openalex_id.trim_start_matches("https://openalex.org/");
-        let api_url = format!("https://api.openalex.org/works/{id}");
+        let api_url = format!("{}/{id}", crate::openalex::OPENALEX_API_URL);
+
+        // Same credential pair as the search path: an unauthenticated
+        // lookup is billed against the shared per-IP budget and starts
+        // 429-ing once it's spent (#212).
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        if !self.openalex.email.is_empty() {
+            query.push(("mailto", self.openalex.email.as_str()));
+        }
+        if !self.openalex.api_key.is_empty() {
+            query.push(("api_key", self.openalex.api_key.as_str()));
+        }
 
         let resp = self
             .client
             .get(&api_url)
+            .query(&query)
             .send()
             .await
             .map_err(|e| AdapterError::Network(format!("OpenAlex API failed: {e}")))?;

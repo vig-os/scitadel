@@ -8,22 +8,23 @@ pub mod openalex;
 pub mod patentsview;
 pub mod pubmed;
 
+use scitadel_core::config::OpenAlexAuth;
 use scitadel_core::ports::SourceAdapter;
 
 /// Build adapter instances from source names.
 pub fn build_adapters(
     sources: &[String],
     pubmed_api_key: &str,
-    openalex_email: &str,
+    openalex: &OpenAlexAuth,
 ) -> Result<Vec<Box<dyn SourceAdapter>>, error::AdapterError> {
-    build_adapters_full(sources, pubmed_api_key, openalex_email, "", "", "", "")
+    build_adapters_full(sources, pubmed_api_key, openalex, "", "", "", "")
 }
 
 /// Build adapter instances with all credential options.
 pub fn build_adapters_full(
     sources: &[String],
     pubmed_api_key: &str,
-    openalex_email: &str,
+    openalex: &OpenAlexAuth,
     patentsview_key: &str,
     lens_token: &str,
     epo_key: &str,
@@ -44,7 +45,7 @@ pub fn build_adapters_full(
             }
             "openalex" => {
                 adapters.push(Box::new(openalex::OpenAlexAdapter::new(
-                    openalex_email.to_string(),
+                    openalex.clone(),
                     30.0,
                 )));
             }

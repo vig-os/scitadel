@@ -60,7 +60,7 @@ pub fn list_themes() -> Result<()> {
 
 pub fn tui(theme_override: Option<&str>) -> Result<()> {
     let config = load_config();
-    let email = config.openalex.api_key.clone();
+    let openalex = config.openalex.auth();
     let papers_dir = config.papers_dir();
     let reader = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
     // Resolve theme before any rendering so the very first frame uses
@@ -72,7 +72,7 @@ pub fn tui(theme_override: Option<&str>) -> Result<()> {
     let toast = format!("theme: {label}");
     scitadel_tui::run(
         &config.db_path,
-        email,
+        openalex,
         papers_dir,
         config.ui.show_institutional_hint,
         reader,
@@ -107,7 +107,7 @@ pub fn init(opts: InitOptions) -> Result<()> {
     let email = opts
         .email
         .or_else(|| {
-            if interactive && config.openalex.api_key.is_empty() {
+            if interactive && config.openalex.email.is_empty() {
                 prompt_line(
                     "OpenAlex / Unpaywall email (used for OA PDF lookups, recommended)",
                     "",
@@ -116,7 +116,7 @@ pub fn init(opts: InitOptions) -> Result<()> {
                 None
             }
         })
-        .unwrap_or_else(|| config.openalex.api_key.clone());
+        .unwrap_or_else(|| config.openalex.email.clone());
 
     let sources = opts
         .sources
@@ -145,7 +145,7 @@ pub fn init(opts: InitOptions) -> Result<()> {
         config.ui.theme.clone()
     };
 
-    config.openalex.api_key.clone_from(&email);
+    config.openalex.email.clone_from(&email);
     config.default_sources.clone_from(&sources);
     config.ui.theme.clone_from(&theme);
 
@@ -166,10 +166,13 @@ pub fn init(opts: InitOptions) -> Result<()> {
     println!("  Sources:        {}", sources.join(", "));
     println!("  Theme:          {theme}");
 
+    // OpenAlex is in this list now: keyless requests are metered against
+    // a shared per-IP daily budget and 429 once it's spent (#212).
     let keyed_sources_needed: Vec<&str> = sources
         .iter()
         .filter_map(|s| match s.as_str() {
             "patentsview" | "lens" | "epo" => Some(s.as_str()),
+            "openalex" if config.openalex.api_key.is_empty() => Some(s.as_str()),
             _ => None,
         })
         .collect();
@@ -267,9 +270,12 @@ fn write_config_toml(path: &std::path::Path, config: &scitadel_core::config::Con
         .collect::<Vec<_>>()
         .join(", ");
     writeln!(out, "default_sources = [{sources}]").unwrap();
-    if !config.openalex.api_key.is_empty() {
+    // `email` is the polite-pool mailto; `api_key` is the real key. Never
+    // write the key here — `scitadel auth login openalex` puts it in the
+    // secret store, and config.toml is routinely committed (#212).
+    if !config.openalex.email.is_empty() {
         out.push_str("\n[openalex]\n");
-        writeln!(out, "api_key = \"{}\"", config.openalex.api_key).unwrap();
+        writeln!(out, "email = \"{}\"", config.openalex.email).unwrap();
     }
     // Only persist `ui.theme` when it diverges from the default so
     // users who never picked a non-default value keep an empty `[ui]`
@@ -338,7 +344,7 @@ pub async fn search(
     let adapters = scitadel_adapters::build_adapters_full(
         &source_list,
         &config.pubmed.api_key,
-        &config.openalex.api_key,
+        &config.openalex.auth(),
         &config.patentsview.api_key,
         &config.lens.api_key,
         &config.epo.consumer_key,
@@ -364,19 +370,16 @@ pub async fn search(
 
     println!("  Sources queried: {}", search_record.source_outcomes.len());
     for outcome in &search_record.source_outcomes {
-        let icon = if outcome.status == scitadel_core::models::SourceStatus::Success {
-            "+"
-        } else {
-            "!"
-        };
-        print!(
-            "  [{icon}] {}: {} results ({:.0}ms)",
-            outcome.source, outcome.result_count, outcome.latency_ms
+        println!("{}", format_outcome_line(outcome));
+    }
+    let failed_sources = failed_source_names(&search_record);
+    if !failed_sources.is_empty() {
+        println!(
+            "  [!] {} of {} source(s) failed ({}) — results below are incomplete.",
+            failed_sources.len(),
+            search_record.source_outcomes.len(),
+            failed_sources.join(", ")
         );
-        if let Some(ref err) = outcome.error {
-            print!(" - {err}");
-        }
-        println!();
     }
     println!("  Total candidates: {}", search_record.total_candidates);
 
@@ -427,13 +430,17 @@ pub fn history(limit: i64) -> Result<()> {
     }
 
     for s in &searches {
-        let success_count = s
-            .source_outcomes
-            .iter()
-            .filter(|o| o.status == scitadel_core::models::SourceStatus::Success)
-            .count();
+        let failed = failed_source_names(s);
+        let success_count = s.source_outcomes.len() - failed.len();
+        // Name the sources that failed, so a run that silently lost a
+        // whole source is visible in history rather than just short (#212).
+        let failed_note = if failed.is_empty() {
+            String::new()
+        } else {
+            format!("  [!] failed: {}", failed.join(", "))
+        };
         println!(
-            "  {}  {}  \"{}\"  {} papers  {}/{} sources ok",
+            "  {}  {}  \"{}\"  {} papers  {}/{} sources ok{failed_note}",
             s.id.short(),
             s.created_at.format("%Y-%m-%d %H:%M"),
             s.query,
@@ -444,6 +451,37 @@ pub fn history(limit: i64) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// One `Sources queried` line for a source outcome.
+///
+/// A failed source reports its error, never "0 results" — the two are not
+/// the same thing, and collapsing them let a dead source pass for an empty
+/// one in both human and agent workflows (#212).
+fn format_outcome_line(outcome: &scitadel_core::models::SourceOutcome) -> String {
+    if outcome.status == scitadel_core::models::SourceStatus::Success {
+        format!(
+            "  [+] {}: {} results ({:.0}ms)",
+            outcome.source, outcome.result_count, outcome.latency_ms
+        )
+    } else {
+        format!(
+            "  [!] {}: {} ({:.0}ms)",
+            outcome.source,
+            outcome.error.as_deref().unwrap_or("unknown error"),
+            outcome.latency_ms
+        )
+    }
+}
+
+/// Sources whose outcome in a search run was anything but success.
+fn failed_source_names(search: &scitadel_core::models::Search) -> Vec<&str> {
+    search
+        .source_outcomes
+        .iter()
+        .filter(|o| o.status != scitadel_core::models::SourceStatus::Success)
+        .map(|o| o.source.as_str())
+        .collect()
 }
 
 pub fn show(id: &str) -> Result<()> {
@@ -478,6 +516,18 @@ pub fn export(search_id: &str, format: &str, output: Option<PathBuf>) -> Result<
         let searches = search_repo.list_searches(100)?;
         resolve_prefix(&searches, search_id, |s| s.id.as_str())?.clone()
     };
+
+    // An export built on a run where a source blew up is incomplete;
+    // say so on stderr so it can't pass for a full sweep (#212).
+    let failed = failed_source_names(&search);
+    if !failed.is_empty() {
+        eprintln!(
+            "warning: search {} had {} failed source(s) ({}) — this export is incomplete.",
+            search.id.short(),
+            failed.len(),
+            failed.join(", ")
+        );
+    }
 
     let results = search_repo.get_results(search.id.as_str())?;
     let paper_ids: std::collections::HashSet<&str> =
@@ -701,7 +751,7 @@ pub async fn download(doi: &str, output_dir: Option<PathBuf>) -> Result<()> {
     let out_dir = output_dir.unwrap_or_else(|| config.papers_dir());
 
     let downloader =
-        scitadel_adapters::download::PaperDownloader::new(config.openalex.api_key.clone(), 60.0);
+        scitadel_adapters::download::PaperDownloader::new(config.openalex.auth(), 60.0);
 
     println!("Downloading paper: {doi}");
     println!("  Output dir: {}", out_dir.display());
@@ -1035,16 +1085,40 @@ pub async fn bib_watch(
 
 pub fn auth_login(source: &str) -> Result<()> {
     let creds = find_source_credentials(source)?;
+    let backend = credentials::backend();
 
-    println!("Storing credentials for '{source}' in system keychain.");
-
-    for key in creds.keys {
-        let value = prompt_credential(key.label, key.secret)?;
-        credentials::store(key.keychain_key, &value).map_err(|e| anyhow::anyhow!("{e}"))?;
-        println!("  Stored: {}", key.keychain_key);
+    println!(
+        "Storing credentials for '{source}' — backend: {}",
+        backend.describe()
+    );
+    if backend == credentials::Backend::File {
+        println!(
+            "  Note: no OS secret service was found, so credentials go to a \
+             plain-text file with mode 0600."
+        );
     }
 
-    println!("Done. Credentials saved to system keychain.");
+    for key in creds.keys {
+        let label = if key.optional {
+            format!("{} — press enter to skip", key.label)
+        } else {
+            key.label.to_string()
+        };
+        let value = prompt_credential(&label, key.secret)?;
+
+        if value.is_empty() {
+            if key.optional {
+                println!("  Skipped: {}", key.store_key);
+                continue;
+            }
+            bail!("{} is required for '{source}'", key.label);
+        }
+
+        credentials::store(key.store_key, &value).map_err(|e| anyhow::anyhow!("{e}"))?;
+        println!("  Stored: {}", key.store_key);
+    }
+
+    println!("Done. Credentials saved to the {backend} store.");
     Ok(())
 }
 
@@ -1052,9 +1126,9 @@ pub fn auth_logout(source: &str) -> Result<()> {
     let creds = find_source_credentials(source)?;
 
     for key in creds.keys {
-        match credentials::delete(key.keychain_key) {
-            Ok(()) => println!("  Removed: {}", key.keychain_key),
-            Err(e) => println!("  Skip: {} ({e})", key.keychain_key),
+        match credentials::delete(key.store_key) {
+            Ok(()) => println!("  Removed: {}", key.store_key),
+            Err(e) => println!("  Skip: {} ({e})", key.store_key),
         }
     }
 
@@ -1063,6 +1137,7 @@ pub fn auth_logout(source: &str) -> Result<()> {
 }
 
 pub fn auth_status() -> Result<()> {
+    println!("Credential store: {}\n", credentials::backend().describe());
     println!("Source credentials status:\n");
 
     for creds in credentials::ALL_SOURCES {
@@ -1075,23 +1150,16 @@ pub fn auth_status() -> Result<()> {
         println!("  [{icon}] {:<14} {status}", creds.source);
 
         for key in creds.keys {
-            let loc = if credentials::get_keychain(key.keychain_key).is_some() {
-                "keychain"
-            } else if std::env::var(key.env_var)
-                .ok()
-                .as_ref()
-                .is_some_and(|v| !v.is_empty())
-            {
-                "env"
-            } else {
-                "missing"
-            };
-            println!("      {}: {loc}", key.label);
+            // Location only — the value itself is never printed.
+            println!("      {}: {}", key.label, credentials::key_location(key));
         }
     }
 
     println!("\nSources without credentials (no auth needed):");
     println!("  [+] arxiv");
+    println!(
+        "\nOverride the store with SCITADEL_CREDENTIAL_BACKEND=macos-keychain|secret-service|file."
+    );
     Ok(())
 }
 
@@ -1625,19 +1693,96 @@ mod bib_diff_tests {
     }
 }
 
+/// Prompt for one credential. Secrets are read without echo when stdin is
+/// a terminal; when it is a pipe there is no echo to suppress and
+/// `rpassword` would fail outright on the missing tty, so a plain line
+/// read keeps `scitadel auth login … < creds.txt` working.
 fn prompt_credential(label: &str, secret: bool) -> Result<String> {
-    if secret {
-        // Read without echo
-        print!("  {label}: ");
-        std::io::stdout().flush()?;
+    print!("  {label}: ");
+    std::io::stdout().flush()?;
+
+    let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+
+    if secret && tty {
         let value = rpassword::read_password().context("failed to read password")?;
-        Ok(value)
-    } else {
-        print!("  {label}: ");
-        std::io::stdout().flush()?;
-        let mut value = String::new();
-        std::io::stdin().read_line(&mut value)?;
-        Ok(value.trim().to_string())
+        println!();
+        return Ok(value.trim().to_string());
+    }
+
+    let mut value = String::new();
+    std::io::stdin().read_line(&mut value)?;
+    if !tty {
+        // Piped input echoes nothing, so close the prompt line ourselves.
+        println!();
+    }
+    Ok(value.trim().to_string())
+}
+
+#[cfg(test)]
+mod search_output_tests {
+    use super::{failed_source_names, format_outcome_line};
+    use scitadel_core::models::{Search, SourceOutcome, SourceStatus};
+
+    fn outcome(
+        source: &str,
+        status: SourceStatus,
+        count: i32,
+        error: Option<&str>,
+    ) -> SourceOutcome {
+        SourceOutcome {
+            source: source.into(),
+            status,
+            result_count: count,
+            latency_ms: 58.4,
+            error: error.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_failed_source_reports_the_error_not_zero_results() {
+        let line = format_outcome_line(&outcome(
+            "openalex",
+            SourceStatus::Failed,
+            0,
+            Some("HTTP 429 Too Many Requests — Insufficient budget."),
+        ));
+        assert_eq!(
+            line,
+            "  [!] openalex: HTTP 429 Too Many Requests — Insufficient budget. (58ms)"
+        );
+        assert!(
+            !line.contains("0 results"),
+            "a dead source must never look like an empty one: {line}"
+        );
+    }
+
+    #[test]
+    fn a_failed_source_without_a_message_still_reads_as_a_failure() {
+        let line = format_outcome_line(&outcome("lens", SourceStatus::Failed, 0, None));
+        assert_eq!(line, "  [!] lens: unknown error (58ms)");
+    }
+
+    #[test]
+    fn a_genuinely_empty_source_still_reports_zero_results() {
+        let line = format_outcome_line(&outcome("pubmed", SourceStatus::Success, 0, None));
+        assert_eq!(line, "  [+] pubmed: 0 results (58ms)");
+    }
+
+    #[test]
+    fn a_successful_source_reports_its_count() {
+        let line = format_outcome_line(&outcome("arxiv", SourceStatus::Success, 12, None));
+        assert_eq!(line, "  [+] arxiv: 12 results (58ms)");
+    }
+
+    #[test]
+    fn failed_source_names_lists_every_non_success_status() {
+        let mut search = Search::new("q");
+        search.source_outcomes = vec![
+            outcome("arxiv", SourceStatus::Success, 3, None),
+            outcome("openalex", SourceStatus::Failed, 0, Some("HTTP 429")),
+            outcome("lens", SourceStatus::Skipped, 0, None),
+        ];
+        assert_eq!(failed_source_names(&search), vec!["openalex", "lens"]);
     }
 }
 

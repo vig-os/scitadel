@@ -9,16 +9,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Light mode + auto-detect** (#137, theme iter 2). Adds
-  `Theme::DALTON_BRIGHT` (Dalton Bright palette ported from upstream)
-  and runtime theme resolution: `--theme <name>` CLI flag on
-  `scitadel tui` (highest precedence) → `SCITADEL_THEME` env var →
-  `[ui] theme = "..."` in config → `auto`. `auto` probes `COLORFGBG`
-  to pick light vs dark and falls back to dark when unset/unparseable.
-  OSC 11 fallback intentionally deferred (raw-tty + timeout dance);
-  `--theme` is the documented escape hatch when `COLORFGBG` is wrong.
-  Theme is locked once at startup — restart the TUI if the terminal
-  flips light/dark mid-session.
+- **Nix flake package** (#205). `packages.<system>.default` builds the
+  `scitadel` binary (`buildRustPackage`, pinned toolchain, nix-provided
+  OpenSSL/SQLite), so `nix run github:vig-os/scitadel` works and
+  downstream flakes can install it declaratively. The package version is
+  read from `Cargo.toml`, so it tracks every release bump.
+
+### Fixed
+
+- **OpenAlex API-key support** (#212). The adapter now sends
+  `api_key=<key>` on every request — search, fetch-by-id, batch
+  fetch-by-ids, `cited_by`/snowball and the download OA-location lookup.
+  Keyless requests are metered against a shared per-IP daily budget and
+  return `HTTP 429 … Insufficient budget` once it is spent, which made
+  OpenAlex unusable. The key resolves from the secret store
+  (`openalex.api_key`), `SCITADEL_OPENALEX_API_KEY`, or
+  `[openalex] api_key` in `.scitadel/config.toml`. The email stays the
+  polite-pool `mailto` under `openalex.email` /
+  `SCITADEL_OPENALEX_EMAIL`, and `scitadel auth login openalex` now asks
+  for both.
+- **Credential store works on Linux** (#212). `scitadel auth login` no
+  longer dies with `failed to run security CLI: No such file or
+  directory` off macOS. The backend is picked at runtime: macOS
+  Keychain via `security`, else the Secret Service via `secret-tool`
+  (GNOME Keyring, KWallet, KeePassXC…), else a `0600` TOML file under
+  the XDG config dir. `scitadel auth status` names the backend in use,
+  and `SCITADEL_CREDENTIAL_BACKEND` overrides the choice. Secret values
+  are never logged or echoed.
+- **Adapter errors are no longer reported as `0 results`** (#212).
+  `OpenAlexAdapter::search` never checked the HTTP status, so a 429 body
+  parsed to an empty result list and printed `[+] openalex: 0 results`.
+  Failures now surface as `[!] openalex: HTTP 429 Too Many Requests —
+  <message>`, are recorded on the search run (so they show in
+  `scitadel history`, the MCP `search` payload's new `failed_sources`
+  field and as an export warning), and never displace the other
+  sources' results.
+
+### Changed
+
+- `[openalex] api_key` in `config.toml` means the **API key** now, not
+  the email (#212). Pre-0.8 configs still load: an address-shaped
+  `api_key` is read as `email`. `scitadel init` writes
+  `[openalex] email = "…"` and never writes the key to disk.
+- `scitadel auth login` accepts piped stdin instead of requiring a tty,
+  so credentials can be provisioned non-interactively.
+
+## [0.7.0](https://github.com/vig-os/scitadel/compare/0.6.0...0.7.0) (2026-06-05)
+
+
+### Features
+
+* **annotations:** synthetic sentence_id for unanchored imported notes ([#158](https://github.com/vig-os/scitadel/issues/158)) ([#172](https://github.com/vig-os/scitadel/issues/172)) ([f83f054](https://github.com/vig-os/scitadel/commit/f83f0544d559d49225575657359e71f4e462dad8))
+* **bib:** --strategy interactive + PromptResolver hook ([#170](https://github.com/vig-os/scitadel/issues/170)) ([bcbc75e](https://github.com/vig-os/scitadel/commit/bcbc75eb55e61927971629d1eac99dfd5ea50060)), closes [#161](https://github.com/vig-os/scitadel/issues/161)
+* **bib:** ambiguous alias is a per-row failure, not a silent create ([#160](https://github.com/vig-os/scitadel/issues/160)) ([#164](https://github.com/vig-os/scitadel/issues/164)) ([d6c3140](https://github.com/vig-os/scitadel/commit/d6c31405060d674ce035bc1d6d1e31d35b7d75e3))
+* **bib:** bib diff — entry-level structural diff ([#135](https://github.com/vig-os/scitadel/issues/135) sub-feature C of 3) ([#181](https://github.com/vig-os/scitadel/issues/181)) ([930c709](https://github.com/vig-os/scitadel/commit/930c709cd516a9f996fc8df81510eb274bc0a99b))
+* **bib:** CSL-JSON 1.0.2 export + sidecar format discriminant ([#135](https://github.com/vig-os/scitadel/issues/135) sub-feature A of 3) ([#180](https://github.com/vig-os/scitadel/issues/180)) ([744482a](https://github.com/vig-os/scitadel/commit/744482a54859221925d484e1d42936a29d8ad4dd))
+* **bib:** import surface — parser + matcher + merger + Zotero compat ([#134](https://github.com/vig-os/scitadel/issues/134), PR-A of 3) ([#153](https://github.com/vig-os/scitadel/issues/153)) ([91648f4](https://github.com/vig-os/scitadel/commit/91648f4464dd5f3c7771de0321b25c23b56caa75))
+* **bib:** rekey escape hatch — CLI + MCP + audit log ([#134](https://github.com/vig-os/scitadel/issues/134), PR-B of 3) ([#154](https://github.com/vig-os/scitadel/issues/154)) ([66b1b41](https://github.com/vig-os/scitadel/commit/66b1b412b3588d8ee01dd16df02c3323a83697c3))
+* **bib:** snapshot + verify + .scitadel-bib.lock sidecar ([#178](https://github.com/vig-os/scitadel/issues/178), [#132](https://github.com/vig-os/scitadel/issues/132) carry-over) ([#179](https://github.com/vig-os/scitadel/issues/179)) ([f2cb357](https://github.com/vig-os/scitadel/commit/f2cb3575e111ada4ffbd0077b6ba8adda0b85f54))
+* **bib:** watch — debounced live snapshot with hash-and-skip ([#134](https://github.com/vig-os/scitadel/issues/134), PR-C of 3) ([#155](https://github.com/vig-os/scitadel/issues/155)) ([991ec35](https://github.com/vig-os/scitadel/commit/991ec359588218b235d593a1a40f1de33ba50e7f))
+* create_paper_note — quote-less paper-level commentary ([#185](https://github.com/vig-os/scitadel/issues/185) PR4/5) ([#191](https://github.com/vig-os/scitadel/issues/191)) ([5449ab2](https://github.com/vig-os/scitadel/commit/5449ab2b18a124af00542de623d25be913a2ebd0))
+* **mcp:** event-driven push — broadcast + subscribe_annotations ([#185](https://github.com/vig-os/scitadel/issues/185) PR3/5) ([#190](https://github.com/vig-os/scitadel/issues/190)) ([348993c](https://github.com/vig-os/scitadel/commit/348993c8239a22fe09a87901a1192b94083410c1))
+* **mcp:** read_paper folds annotations by default ([#185](https://github.com/vig-os/scitadel/issues/185) PR1/5) ([#186](https://github.com/vig-os/scitadel/issues/186)) ([23d61ba](https://github.com/vig-os/scitadel/commit/23d61ba7c6c590415e601bfecfdc3036672cdc27))
+* **papers:** paper_tags table for keyword-only Zotero imports ([#174](https://github.com/vig-os/scitadel/issues/174)) ([6408f91](https://github.com/vig-os/scitadel/commit/6408f9124bf5392b68f5ff08163f413dfd43d999))
+* **tui:** consume unread state — badge, glyph, inbox, focus-leave ([#185](https://github.com/vig-os/scitadel/issues/185) PR2/5) ([#189](https://github.com/vig-os/scitadel/issues/189)) ([f04af29](https://github.com/vig-os/scitadel/commit/f04af29d9380cd22e7327ecb2cc6b9aa918fd0bb))
+* **tui:** E keybind on Question Dashboard exports bibliography ([#182](https://github.com/vig-os/scitadel/issues/182)) ([d4bd08b](https://github.com/vig-os/scitadel/commit/d4bd08b43136c733665572995a0f1936695f117c))
+* **tui:** light mode + auto-detect ([#137](https://github.com/vig-os/scitadel/issues/137), theme iter 2) ([#151](https://github.com/vig-os/scitadel/issues/151)) ([0cfd1e0](https://github.com/vig-os/scitadel/commit/0cfd1e0d81d5f04afc0df13b0dbaff4451191000))
+* **tui:** OSC 11 background-color query for theme auto-detect (theme iter 3) ([#183](https://github.com/vig-os/scitadel/issues/183)) ([98e8b91](https://github.com/vig-os/scitadel/commit/98e8b91ff6b18b849e5ef3b2822e6edfb532b417))
+* **tui:** runtime theme-toggle hotkey (theme iter 3) ([#184](https://github.com/vig-os/scitadel/issues/184)) ([b49507b](https://github.com/vig-os/scitadel/commit/b49507b44cc7fd2f420dfefbb1516eac9c62318b)), closes [#175](https://github.com/vig-os/scitadel/issues/175)
+* **tui:** theme iter 2 residuals — list-themes, init prompt, toast, docs ([#137](https://github.com/vig-os/scitadel/issues/137)) ([#177](https://github.com/vig-os/scitadel/issues/177)) ([e06e413](https://github.com/vig-os/scitadel/commit/e06e41361f30d770738c7251173647a0a9fb17f7))
+
+
+### Bug Fixes
+
+* **ci:** release-please single-tag config ([#199](https://github.com/vig-os/scitadel/issues/199)) ([3e371d0](https://github.com/vig-os/scitadel/commit/3e371d0ee4272df252f919e3e146681eb696e80f))
+* **db:** unicode-aware title+year matching ([#159](https://github.com/vig-os/scitadel/issues/159)) ([#171](https://github.com/vig-os/scitadel/issues/171)) ([dc069a7](https://github.com/vig-os/scitadel/commit/dc069a7d27172a797155e82e3924f1c40944fec5))
+* **tui:** selection fidelity for two-pane reader ([#185](https://github.com/vig-os/scitadel/issues/185) PR5/5) ([#192](https://github.com/vig-os/scitadel/issues/192)) ([4f5638c](https://github.com/vig-os/scitadel/commit/4f5638c7ca4594510c16bcb9985b8447a22d358c))
+* **tui:** serialize env-mutating theme tests ([#165](https://github.com/vig-os/scitadel/issues/165)) ([#169](https://github.com/vig-os/scitadel/issues/169)) ([20004e8](https://github.com/vig-os/scitadel/commit/20004e8242a11908b668c1555463446aed3a7c7b))
 
 ## [0.6.0] - 2026-04-24
 

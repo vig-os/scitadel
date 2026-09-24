@@ -247,3 +247,9 @@ result-*
 # VHS tape outputs (v1 has no golden-file comparison; tapes are run locally).
 # Re-enable when structural-similarity snapshotting lands.
 tests/vhs/snapshots/
+
+# Local SOPS secret store — kept OUT of this public repo. GitHub Actions secrets
+# (RELEASE_BOT_PRIVATE_KEY etc.) are CI's source of truth; the encrypted files
+# here are a local record only. See docs/release-bot-setup.md.
+/secrets/
+/.sops.yaml

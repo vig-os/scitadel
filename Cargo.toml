@@ -11,8 +11,10 @@ members = [
     "crates/scitadel-tui",
 ]
 
+# Per-crate versions are explicit and kept in lockstep by release-please
+# (the cargo-workspace plugin); there is intentionally no shared
+# workspace.package.version for it to drift against.
 [workspace.package]
-version = "0.6.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/vig-os/scitadel"
