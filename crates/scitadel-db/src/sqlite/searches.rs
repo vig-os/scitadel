@@ -20,6 +20,11 @@ impl SqliteSearchRepository {
     /// prefix maps to its full record. See the doc-comment on the
     /// question repo's `find_by_id_prefix` for the SQL rationale.
     pub fn find_by_id_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<Search>, CoreError> {
+        // Defensive gate — see the doc-comment on
+        // `SqliteQuestionRepository::find_by_id_prefix`.
+        if !super::is_valid_id_prefix(prefix) {
+            return Ok(Vec::new());
+        }
         let conn = self.db.conn()?;
         let pattern = format!("{prefix}*");
         let mut stmt = conn

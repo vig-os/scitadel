@@ -101,6 +101,11 @@ impl SqliteAnnotationRepository {
         prefix: &str,
         limit: usize,
     ) -> Result<Vec<Annotation>, DbError> {
+        // Defensive gate — see the doc-comment on
+        // `SqliteQuestionRepository::find_by_id_prefix`.
+        if !crate::sqlite::is_valid_id_prefix(prefix) {
+            return Ok(Vec::new());
+        }
         let conn = self.db.conn()?;
         let pattern = format!("{prefix}*");
         let mut stmt = conn.prepare(

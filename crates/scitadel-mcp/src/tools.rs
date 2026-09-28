@@ -1888,6 +1888,19 @@ where
     if let Some(hit) = get_exact(id_or_prefix)? {
         return Ok(hit);
     }
+    // Validation gate — never let raw input into the `id GLOB
+    // '{prefix}*'` scan. Empty → `*` matches everything (a one-row
+    // table would silently resolve to that row); `*`, `?`, `[`, `]`
+    // are GLOB metacharacters that would let inputs like `"a?"`
+    // match unrelated records. A 1-3 char accidental input can't be
+    // a plausible id either. Report as not-found so the message
+    // shape agents / consumers match on stays constant. See
+    // `scitadel_db::sqlite::is_valid_id_prefix` for the full
+    // rationale + char-set. Defensively re-checked in each DB
+    // `find_by_id_prefix` so a future direct caller can't skip it.
+    if !scitadel_db::sqlite::is_valid_id_prefix(id_or_prefix) {
+        return Err(format!("{entity} '{id_or_prefix}' not found."));
+    }
     let matches = find_prefix(id_or_prefix, 2)?;
     match matches.len() {
         0 => Err(format!("{entity} '{id_or_prefix}' not found.")),

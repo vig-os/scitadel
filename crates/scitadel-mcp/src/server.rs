@@ -1609,6 +1609,75 @@ mod tests {
         );
     }
 
+    /// #232 review blocker: hostile / accidental inputs (empty
+    /// string, GLOB metacharacters, too-short prefixes) must never
+    /// let a write tool resolve to a real row. Before the validation
+    /// gate, `add_search_terms(question_id="")` in a one-row table
+    /// would GLOB to `*` and silently write terms to that single
+    /// question; `question_id="a?"` would match any 2-char-first row.
+    /// This test seeds exactly one question and confirms every hostile
+    /// shape yields `Question '<input>' not found.` — no write, no
+    /// ambiguous "matches many" leak.
+    #[test]
+    fn hostile_prefix_shapes_never_resolve_even_when_one_row_matches() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_tmp, db_path) = seed_env_db();
+
+        // Seed exactly one question. A GLOB('*') would resolve to it
+        // pre-fix; the validation gate must prevent that.
+        let db = scitadel_db::sqlite::Database::open(&db_path).unwrap();
+        let (_, _, q_repo, _, _) = db.repositories();
+        let mut q = scitadel_core::models::ResearchQuestion::new("only one");
+        q.id = scitadel_core::models::QuestionId::from("aabbccdd11112222333344445555ffff");
+        q_repo.save_question(&q).unwrap();
+
+        // Every hostile shape must fail with the standard not-found
+        // error, not silently resolve to the seed question.
+        for hostile in ["", "*", "?", "[a]", "abc*", "a?", "a", "ab", "abc"] {
+            let err = super::tools::add_search_terms_tool(hostile, &["x".into()], None)
+                .expect_err("hostile prefix must be rejected");
+            assert!(
+                err.starts_with(&format!("Question '{hostile}' not found.")),
+                "hostile input {hostile:?} produced unexpected error: {err}"
+            );
+        }
+
+        // Sanity: the seed question is untouched (no terms leaked in).
+        let terms = q_repo.get_terms(q.id.as_str()).unwrap();
+        assert!(
+            terms.is_empty(),
+            "no hostile input should have written any term row"
+        );
+
+        // Sanity: a legitimate 4-char prefix of the seed still resolves,
+        // proving the gate blocks hostile input without breaking real
+        // short prefixes.
+        super::tools::add_search_terms_tool("aabb", &["real".into()], None)
+            .expect("legitimate 4-char prefix must resolve");
+    }
+
+    /// Same hostile-input contract for search ids via `get_papers` —
+    /// belt-and-braces for the other end of the resolver family.
+    #[test]
+    fn hostile_search_prefix_never_resolves_to_a_lone_row() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_tmp, db_path) = seed_env_db();
+
+        let db = scitadel_db::sqlite::Database::open(&db_path).unwrap();
+        let (_, search_repo, _, _, _) = db.repositories();
+        let mut s = scitadel_core::models::Search::new("q");
+        s.id = scitadel_core::models::SearchId::from("11112222333344445555666677778888");
+        search_repo.save(&s).unwrap();
+
+        for hostile in ["", "*", "?", "[a]", "abc*", "a?", "abc"] {
+            let err = super::tools::get_papers_tool(hostile).expect_err("must reject");
+            assert!(
+                err.starts_with(&format!("Search '{hostile}' not found.")),
+                "hostile search input {hostile:?}: {err}"
+            );
+        }
+    }
+
     /// No-such-id: pre-#232 message shape (`Question '<id>' not
     /// found.`) preserved so downstream consumers keep matching it.
     #[test]

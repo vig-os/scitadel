@@ -26,6 +26,14 @@ impl SqliteQuestionRepository {
         prefix: &str,
         limit: usize,
     ) -> Result<Vec<ResearchQuestion>, CoreError> {
+        // Defensive gate — never let raw input into the GLOB pattern.
+        // MCP / CLI already validate before calling, but a future
+        // caller that forgets would otherwise silently match `*` and
+        // resolve to whatever row happens to be first. See
+        // `is_valid_id_prefix` for the char-set rationale.
+        if !super::is_valid_id_prefix(prefix) {
+            return Ok(Vec::new());
+        }
         let conn = self.db.conn()?;
         let pattern = format!("{prefix}*");
         let mut stmt = conn
