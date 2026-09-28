@@ -88,9 +88,10 @@ jobs:
           ref: ${{ inputs.release_branch }}
           persist-credentials: false
 
-      # Toolchain pinned in rust-toolchain.toml (#229) — @master + no
-      # toolchain: input reads it.
-      - uses: dtolnay/rust-toolchain@master
+      # Toolchain pinned in rust-toolchain.toml (#229); rustup on the runner
+      # honours the file automatically.
+      - name: Install pinned Rust toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: rustup show active-toolchain && rustc --version
 

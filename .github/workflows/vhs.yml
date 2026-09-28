@@ -51,9 +51,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # Toolchain comes from rust-toolchain.toml (#229). @master + no
-      # `toolchain:` input tells dtolnay/rust-toolchain to read the file.
-      - uses: dtolnay/rust-toolchain@master
+      # Toolchain comes from repo-root rust-toolchain.toml (#229): the
+      # pre-installed rustup on the runner honours the file automatically.
+      - name: Install pinned Rust toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: rustup show active-toolchain && rustc --version
 

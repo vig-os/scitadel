@@ -10,17 +10,23 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Every job reads the channel + components from the repo-root
-  # `rust-toolchain.toml` (#229): dtolnay/rust-toolchain@master with no
-  # `toolchain:` input auto-detects that file, so the same version resolves
-  # here and under `nix develop`. The `rustup show` step prints the resolved
-  # toolchain into the log so a drift is visible at a glance.
+  # Every job resolves the Rust toolchain from the repo-root
+  # `rust-toolchain.toml` (#229) via the rustup that GitHub's runner images
+  # already ship: `rustup show active-toolchain || rustup toolchain install`
+  # reads the file, installs the pinned channel + components on first run, and
+  # rustup's per-directory override then routes every subsequent `cargo` /
+  # `rustc` call to that toolchain. The dtolnay action doesn't auto-detect the
+  # file (it errors on missing `toolchain:` input), so raw rustup is the
+  # single-source-of-truth path — nothing here hardcodes 1.98.1. `rustup show
+  # active-toolchain` prints the resolved channel into the log so a drift is
+  # visible at a glance.
   lint:
     name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@master
+      - name: Install pinned Rust toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: rustup show active-toolchain && rustc --version && cargo clippy --version
       - run: cargo fmt --check
@@ -34,7 +40,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@master
+      - name: Install pinned Rust toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: rustup show active-toolchain && rustc --version
       - run: cargo test --workspace
@@ -45,7 +52,8 @@ jobs:
     if: github.event_name == 'schedule'
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@master
+      - name: Install pinned Rust toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: rustup show active-toolchain && rustc --version
       - run: cargo test --workspace --features contract-tests
