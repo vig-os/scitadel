@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **OpenAlex title-aware search + DOI → metadata lookup**
+  ([#210](https://github.com/vig-os/scitadel/issues/210)). Two additions
+  aimed at citation-verification workloads that were forced to leave
+  scitadel for `curl`.
+  - `scitadel search --field <mode>` and MCP `search { field }` route
+    OpenAlex through `filter=title.search:` (`title`), or a title-first
+    broad-fallback merge (`auto`), instead of the pre-#210 broad
+    `search=` (`any`, still the default so existing users see no
+    change). Live probes recorded on the branch: for the exact title
+    *Estimating the Dimension of a Model* the broad path scans 4.07M
+    hits; `title.search:` narrows to 474 and pins the Schwarz-1978
+    target at rank 1. Only the OpenAlex leg of a federated search sees
+    the flag; other sources are untouched. When non-default, the mode
+    is written into the persisted search `parameters` so `history` /
+    `find_similar_searches` reflect how it was run.
+  - `scitadel resolve-doi <doi>` (CLI) and `resolve_doi` (MCP) resolve
+    a DOI to a full `Paper` via OpenAlex `/works/doi:<doi>`. DOIs are
+    validated + canonicalised in scitadel-core before the request —
+    malformed input never hits the wire. A well-formed DOI OpenAlex
+    doesn't know about becomes a clear "not found" (Ok(None) at the
+    adapter, non-zero exit at the CLI, structured error at the tool).
+    Persists the resolved paper by default so `show` / `download` /
+    `assess` can address it by id; `--no-save` prints only. When a row
+    with the DOI already exists, its id is preserved so annotations
+    keep resolving.
+  - Wire-level tests: `openalex_http.rs` gains eight wiremock cases
+    covering the title endpoint, the auto merge/dedup, the DOI hit /
+    URL-prefixed / 404 / 500 / malformed paths. Plus five new unit
+    tests for `SearchField` parsing / defaulting.
+
 ### Changed
 
 - **vigOS devkit scaffold upgraded 1.6.0 → 1.17.0**
@@ -44,6 +74,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   past its reach and would have ridden along indefinitely.
 
 ### Fixed
+
+- **OpenAlex "exact title returns nothing relevant"**
+  ([#210](https://github.com/vig-os/scitadel/issues/210)). Route with
+  `--field title` (or `--field auto`) to escape the fulltext-relevance
+  noise that made classic titles surface far below topically-adjacent
+  hits. The pre-#210 default (`--field any`) is unchanged.
 
 ### Security
 

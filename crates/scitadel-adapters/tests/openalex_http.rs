@@ -4,7 +4,7 @@
 //! reach the wire on every endpoint, and that a non-2xx response becomes
 //! an `Err` rather than an empty result set.
 
-use scitadel_adapters::openalex::OpenAlexAdapter;
+use scitadel_adapters::openalex::{OpenAlexAdapter, SearchField};
 use scitadel_core::config::OpenAlexAuth;
 use scitadel_core::ports::SourceAdapter;
 use wiremock::matchers::{method, path, path_regex, query_param};
@@ -254,4 +254,211 @@ async fn the_orchestrator_records_a_429_as_a_failed_source() {
             .unwrap()
             .contains("Insufficient budget")
     );
+}
+
+// ---------- #210: title-aware search + DOI lookup ----------
+
+/// Live probe evidence (recorded 2026-09 while implementing #210):
+///
+/// - `GET /works?search=Estimating+the+Dimension+of+a+Model` — 4.07M
+///   hits, target #1 today but historically drowned by fulltext noise.
+/// - `GET /works?filter=title.search:Estimating+the+Dimension+of+a+Model` —
+///   474 hits, target #1, all top results are the Schwarz paper.
+/// - `GET /works?filter=display_name.search:…` is aliased server-side
+///   to `title.search`, so we standardise on the latter.
+///
+/// The wiremock tests below encode both call shapes and the auto path's
+/// "title first, broad fills the tail" merge.
+#[tokio::test]
+async fn title_search_hits_the_title_filter_endpoint() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/works"))
+        .and(query_param("api_key", "oa-key-123"))
+        .and(query_param(
+            "filter",
+            "title.search:Estimating the Dimension of a Model",
+        ))
+        .and(query_param("per_page", "5"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(works_page(&["Estimating the Dimension of a Model"])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let results = adapter(&server)
+        .search_field("Estimating the Dimension of a Model", 5, SearchField::Title)
+        .await
+        .expect("title search should succeed");
+    assert_eq!(results.len(), 1);
+    assert!(results[0].title.contains("Estimating the Dimension"));
+}
+
+#[tokio::test]
+async fn auto_search_prefers_title_hits_and_pads_from_broad() {
+    let server = MockServer::start().await;
+    // Title leg returns two hits, share one work id (W100) with the broad
+    // leg so the dedup path is exercised.
+    Mock::given(method("GET"))
+        .and(path("/works"))
+        .and(query_param("filter", "title.search:BIC"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(works_page(&["Title A", "Title B"])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Broad leg returns three hits; W100 overlaps title, W102/W103 fresh.
+    Mock::given(method("GET"))
+        .and(path("/works"))
+        .and(query_param("search", "BIC"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": [
+                {"id": "https://openalex.org/W100", "title": "Title A"},
+                {"id": "https://openalex.org/W102", "title": "Broad C"},
+                {"id": "https://openalex.org/W103", "title": "Broad D"},
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let results = adapter(&server)
+        .search_field("BIC", 5, SearchField::Auto)
+        .await
+        .expect("auto search should succeed");
+
+    // Title hits come first, dedup drops W100 from broad, tail padded.
+    assert_eq!(results.len(), 4);
+    assert_eq!(results[0].title, "Title A");
+    assert_eq!(results[1].title, "Title B");
+    assert_eq!(results[2].title, "Broad C");
+    assert_eq!(results[3].title, "Broad D");
+    // Rank is re-numbered across the merged list.
+    assert_eq!(results[0].rank, Some(1));
+    assert_eq!(results[3].rank, Some(4));
+}
+
+#[tokio::test]
+async fn auto_search_skips_the_broad_leg_when_title_already_full() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/works"))
+        .and(query_param("filter", "title.search:BIC"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(works_page(&["A", "B", "C"])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // `search=` path must NOT fire when title returned max_results.
+    Mock::given(method("GET"))
+        .and(path("/works"))
+        .and(query_param("search", "BIC"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let results = adapter(&server)
+        .search_field("BIC", 3, SearchField::Auto)
+        .await
+        .expect("auto search should succeed");
+    assert_eq!(results.len(), 3);
+}
+
+#[tokio::test]
+async fn fetch_paper_by_doi_returns_some_on_hit() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/works/doi:10.1214/aos/1176344136"))
+        .and(query_param("api_key", "oa-key-123"))
+        .and(query_param("mailto", "me@example.org"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "https://openalex.org/W2146855196",
+            "title": "Estimating the Dimension of a Model",
+            "publication_year": 1978,
+            "doi": "https://doi.org/10.1214/aos/1176344136",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let paper = adapter(&server)
+        .fetch_paper_by_doi("10.1214/aos/1176344136")
+        .await
+        .expect("DOI lookup should not error")
+        .expect("known DOI should resolve");
+    assert_eq!(paper.title, "Estimating the Dimension of a Model");
+    assert_eq!(paper.year, Some(1978));
+    assert_eq!(paper.doi.as_deref(), Some("10.1214/aos/1176344136"));
+    assert_eq!(paper.openalex_id.as_deref(), Some("W2146855196"));
+    // Canonical paper id = short OpenAlex id, same as work_to_paper.
+    assert_eq!(paper.id.as_str(), "W2146855196");
+}
+
+#[tokio::test]
+async fn fetch_paper_by_doi_normalises_url_prefixed_input() {
+    let server = MockServer::start().await;
+    // Regardless of "https://doi.org/…" or bare form, the path segment
+    // MUST be the lowercase canonical DOI.
+    Mock::given(method("GET"))
+        .and(path("/works/doi:10.1038/test"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "https://openalex.org/W555",
+            "title": "Ok",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let paper = adapter(&server)
+        .fetch_paper_by_doi("https://doi.org/10.1038/TEST")
+        .await
+        .expect("DOI lookup should succeed")
+        .expect("known DOI should resolve");
+    assert_eq!(paper.title, "Ok");
+}
+
+#[tokio::test]
+async fn fetch_paper_by_doi_returns_none_on_404() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/works/doi:.*"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("<html>Not Found</html>"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = adapter(&server)
+        .fetch_paper_by_doi("10.9999/xxx-nothing")
+        .await
+        .expect("404 must become Ok(None), not Err");
+    assert!(result.is_none(), "404 for a well-formed DOI = not found");
+}
+
+#[tokio::test]
+async fn fetch_paper_by_doi_rejects_a_malformed_doi_before_the_wire() {
+    // No mocks mounted — the adapter MUST fail fast without an HTTP call.
+    let server = MockServer::start().await;
+    let err = adapter(&server)
+        .fetch_paper_by_doi("not-a-doi")
+        .await
+        .expect_err("malformed DOI must be rejected");
+    let msg = err.to_string();
+    assert!(msg.contains("invalid DOI"), "{msg}");
+    assert!(msg.contains("not-a-doi"), "{msg}");
+}
+
+#[tokio::test]
+async fn fetch_paper_by_doi_surfaces_a_500_as_an_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/works/doi:.*"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .mount(&server)
+        .await;
+    let err = adapter(&server)
+        .fetch_paper_by_doi("10.1214/aos/1176344136")
+        .await
+        .expect_err("a 500 must not read as not-found");
+    assert!(err.to_string().contains("500"), "{err}");
 }

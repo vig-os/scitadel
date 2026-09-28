@@ -293,11 +293,15 @@ pub async fn search(
     sources: String,
     max_results: usize,
     question_id: Option<String>,
+    field: &str,
 ) -> Result<()> {
     let config = load_config();
     let db = Database::open(&config.db_path).context("failed to open database")?;
     db.migrate().context("migration failed")?;
     let (paper_repo, search_repo, q_repo, _, _) = db.repositories();
+
+    let openalex_field = scitadel_adapters::SearchField::parse(field)
+        .map_err(|e| anyhow::anyhow!("--field: {e}"))?;
 
     let mut parameters = serde_json::Map::new();
     let mut query = query;
@@ -341,7 +345,7 @@ pub async fn search(
     let query = query.context("Provide a QUERY argument or use --question")?;
     let source_list: Vec<String> = sources.split(',').map(|s| s.trim().to_string()).collect();
 
-    let adapters = scitadel_adapters::build_adapters_full(
+    let adapters = scitadel_adapters::build_adapters_with_field(
         &source_list,
         &config.pubmed.api_key,
         &config.openalex.auth(),
@@ -349,13 +353,31 @@ pub async fn search(
         &config.lens.api_key,
         &config.epo.consumer_key,
         &config.epo.consumer_secret,
+        openalex_field,
     )
     .context("failed to build adapters")?;
 
-    println!("Searching {} for: {query}", source_list.join(", "));
+    let field_note = match openalex_field {
+        scitadel_adapters::SearchField::Any => String::new(),
+        f => format!(" (openalex field={})", f.as_str()),
+    };
+    println!(
+        "Searching {} for: {query}{field_note}",
+        source_list.join(", ")
+    );
 
     let (mut search_record, candidates) =
         scitadel_core::services::orchestrator::run_search(&query, &adapters, max_results, 3).await;
+
+    // Record the OpenAlex field mode when the user picked a non-default —
+    // makes `history` / re-runs reproducible without guessing what the
+    // caller had set (#210).
+    if openalex_field != scitadel_adapters::SearchField::default() {
+        parameters.insert(
+            "openalex_field".into(),
+            serde_json::Value::String(openalex_field.as_str().to_string()),
+        );
+    }
 
     search_record.parameters = serde_json::Value::Object({
         let mut p: serde_json::Map<String, serde_json::Value> =
@@ -742,6 +764,75 @@ pub async fn assess(
     println!("\n  Scored: {} papers", assessments.len());
     println!("  Average relevance: {avg:.2}");
     println!("  Relevant (>=0.6): {relevant}/{}", assessments.len());
+
+    Ok(())
+}
+
+/// `scitadel resolve-doi <doi>` — resolve a DOI to full metadata via
+/// OpenAlex `/works/doi:<doi>` (#210).
+///
+/// Persists the resolved paper to the DB (skippable with `--no-save`)
+/// so the follow-on flow (`show`, `download`, `assess`) can address it
+/// by id. A malformed DOI is rejected without an HTTP round trip; a
+/// well-formed DOI OpenAlex doesn't know about exits 1 with a clear
+/// "not found" message rather than an empty JSON envelope.
+pub async fn resolve_doi(doi: &str, json: bool, no_save: bool) -> Result<()> {
+    use scitadel_core::ports::PaperRepository as _;
+
+    let config = load_config();
+    let adapter = scitadel_adapters::openalex::OpenAlexAdapter::new(config.openalex.auth(), 30.0);
+
+    let paper = adapter
+        .fetch_paper_by_doi(doi)
+        .await
+        .with_context(|| format!("OpenAlex lookup for DOI {doi} failed"))?
+        .ok_or_else(|| anyhow::anyhow!("no OpenAlex record for DOI {doi}"))?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&paper)?);
+    } else {
+        let authors = if paper.authors.is_empty() {
+            "(none)".to_string()
+        } else {
+            paper.authors.join(", ")
+        };
+        println!("Resolved DOI: {}", paper.doi.as_deref().unwrap_or(doi));
+        println!("  Title:    {}", paper.title);
+        println!("  Authors:  {authors}");
+        println!(
+            "  Year:     {}",
+            paper.year.map_or_else(|| "N/A".into(), |y| y.to_string())
+        );
+        println!("  Journal:  {}", paper.journal.as_deref().unwrap_or("N/A"));
+        println!(
+            "  OpenAlex: {}",
+            paper.openalex_id.as_deref().unwrap_or("N/A")
+        );
+        println!("  Paper ID: {}", paper.id);
+    }
+
+    if !no_save {
+        let db = open_db()?;
+        let (paper_repo, _, _, _, _) = db.repositories();
+        // If a row with this DOI already exists, keep its id so history /
+        // annotations don't break; otherwise the resolved paper's own id
+        // (the short OpenAlex id) becomes the canonical id.
+        let existing = paper
+            .doi
+            .as_deref()
+            .and_then(|d| paper_repo.find_by_doi(d).ok().flatten());
+        if let Some(existing_id) = existing.as_ref().map(|p| p.id.clone()) {
+            // Save under the existing id so downstream references (annotations,
+            // search_results) keep resolving.
+            let mut merged = paper.clone();
+            merged.id = existing_id;
+            paper_repo.save(&merged).context("save resolved paper")?;
+            println!("  (updated existing DB row: {})", merged.id.short());
+        } else {
+            paper_repo.save(&paper).context("save resolved paper")?;
+            println!("  (saved to DB as: {})", paper.id.short());
+        }
+    }
 
     Ok(())
 }
