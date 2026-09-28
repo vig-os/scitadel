@@ -3,13 +3,13 @@
 # lowercase letters, digits, hyphens, and underscores.
 #
 # Usage: check-skill-names.sh [skills_dir]
-#   skills_dir  Path to scan (default: .cursor/skills)
+#   skills_dir  Path to scan (default: .claude/skills)
 #
 # Exit 0 if all names are valid, 1 if any are invalid.
 
 set -euo pipefail
 
-skills_dir="${1:-.cursor/skills}"
+skills_dir="${1:-.claude/skills}"
 
 if [[ ! -d "$skills_dir" ]]; then
     echo "Error: directory not found: $skills_dir" >&2

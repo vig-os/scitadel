@@ -14,7 +14,7 @@
     # `check-pr-agent-fingerprints`) — plus a tracked `uv`/`gh`. In direnv mode
     # CI provisions itself from THIS dev-shell, so the tools have to be here.
     # Bump deliberately alongside DEVKIT_VERSION.
-    vigos.url = "github:vig-os/devkit/1.6.0";
+    vigos.url = "github:vig-os/devkit/1.17.0";
   };
 
   outputs = { self, nixpkgs, flake-utils, rust-overlay, vigos }:
@@ -98,6 +98,14 @@
             # typos runs as a language:system hook (the upstream pre-commit repo
             # ships a generic-linux binary that NixOS hosts cannot exec).
             typos
+            # shellcheck runs as a language:system hook for the same reason
+            # (vig-os/devkit#778): the shellcheck-py wheel bundles a manylinux
+            # binary a non-FHS userland cannot exec, and uv cannot build that
+            # wheel under Python 3.14 at all.
+            shellcheck
+            # actionlint backs the hook devkit 1.16.0 added (#1660); its bundled
+            # shellcheck pass over `run:` blocks resolves shellcheck from PATH.
+            actionlint
             # devkit CI toolchain (from the vigos overlay): ci.yml's
             # commit-checks job runs `uv run validate-commit-range` and
             # `uv run check-pr-agent-fingerprints`, and in direnv mode it
