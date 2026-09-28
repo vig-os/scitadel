@@ -441,7 +441,12 @@ Paper -< Citation >- Paper
 
 ## Development
 
-Requires a stable Rust toolchain.
+The Rust toolchain is pinned in [`rust-toolchain.toml`](./rust-toolchain.toml)
+and used by both `nix develop` and every CI workflow, so `just lint` locally
+and CI's `Lint` job always agree. `rustup` picks the pinned channel up
+automatically the first time you run `cargo` in the repo. Bump the file
+deliberately (one PR), then run `nix flake update rust-overlay` so the overlay
+knows the new channel — see [`docs/RELEASING.md`](docs/RELEASING.md#rust-toolchain-bumps).
 
 ```bash
 # Build

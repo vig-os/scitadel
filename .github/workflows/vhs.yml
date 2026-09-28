@@ -51,8 +51,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Toolchain comes from rust-toolchain.toml (#229). @master + no
+      # `toolchain:` input tells dtolnay/rust-toolchain to read the file.
+      - uses: dtolnay/rust-toolchain@master
       - uses: Swatinem/rust-cache@v2
+      - run: rustup show active-toolchain && rustc --version
 
       - name: Install ffmpeg + ttyd
         run: |

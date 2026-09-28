@@ -78,11 +78,17 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Toolchain channel + components come from repo-root rust-toolchain.toml
+      # (#229); dtolnay/rust-toolchain@master with no `toolchain:` input reads
+      # that file. `targets:` stays here — the pinned toolchain still needs the
+      # x86_64-apple-darwin cross-target rustup-installed for the matrix cross
+      # build (macos-latest is Apple Silicon).
+      - uses: dtolnay/rust-toolchain@master
         with:
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
+      - run: rustup show active-toolchain && rustc --version
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }} -p scitadel-cli

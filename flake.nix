@@ -25,9 +25,13 @@
           overlays = [ rust-overlay.overlays.default vigos.overlays.default ];
         };
 
-        rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-          extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
-        };
+        # Single source of truth: rust-toolchain.toml pins the channel and
+        # components for both the dev shell and packages.default (below), so
+        # local `just lint` and CI's clippy job can never diverge again (#229).
+        # rust-overlay must be current enough to know the pinned channel — bump
+        # its input with `nix flake update rust-overlay` after bumping the file.
+        rustToolchain =
+          pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 
         # Build the `scitadel` binary with the pinned toolchain (edition 2024
         # needs rustc >= 1.85, which the stable rust-overlay provides).

@@ -1,0 +1,14 @@
+# Single source of truth for the Rust toolchain used by:
+#   - `nix develop` / direnv (flake.nix builds it via
+#     `rust-bin.fromRustupToolchainFile`)
+#   - `nix build .#default` (the buildRustPackage in flake.nix)
+#   - every GitHub Actions workflow (`dtolnay/rust-toolchain@stable` is
+#     replaced by `@master` reading this file via `toolchain: file`; rustup on
+#     hosted runners also honours it automatically)
+#
+# Bumped deliberately, one line change, one PR — never drift local vs. CI
+# again. Refs #229.
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"
+components = ["clippy", "rustfmt", "rust-src", "rust-analyzer"]

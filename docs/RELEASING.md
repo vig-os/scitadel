@@ -88,3 +88,27 @@ The Claude Code plugin fetches the release binary named by
 `plugins/scitadel/.claude-plugin/plugin.json` `version`) on the release branch,
 so the new pin reaches `main` in the same promote that publishes the Release it
 points at — never ahead of it, never behind. No manual bump.
+
+## Rust toolchain bumps
+
+The Rust toolchain used everywhere — `nix develop`, `nix build .#default`, and
+every GitHub Actions workflow — is pinned by
+[`rust-toolchain.toml`](../rust-toolchain.toml) at the repo root. Local
+`just lint` and CI's `Lint` job cannot drift because they resolve the same
+channel from the same file (rustup honours it on both sides; the flake reads it
+via `rust-bin.fromRustupToolchainFile`). Refs #229.
+
+To bump the toolchain:
+
+1. Edit the `channel` in `rust-toolchain.toml` (one line).
+2. Run `nix flake update rust-overlay` so the overlay's manifest set knows the
+   new channel. Do **not** touch `nixpkgs` — the shell's other packages stay on
+   the pinned nixpkgs, only the Rust toolchain moves.
+3. `nix develop -c rustc --version` should print the new channel; run
+   `just verify` and `nix build .#default` to catch new clippy lints, new
+   deprecation warnings and any workspace incompatibilities.
+4. Land in a dedicated PR — never fold a toolchain bump into a feature PR.
+
+Renovate does not track this file today (the enabled managers are
+`github-actions`, `pep621`, `uv`, `npm`); by design, toolchain bumps stay
+deliberate and reviewed in their own PR.
