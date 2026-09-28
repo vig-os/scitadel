@@ -20,16 +20,6 @@ on:  # yamllint disable-line rule:truthy
         required: false
         default: false
         type: boolean
-      git-user-name:
-        description: "Git user name for release commits"
-        required: false
-        default: "github-actions[bot]"
-        type: string
-      git-user-email:
-        description: "Git user email for release commits"
-        required: false
-        default: "41898282+github-actions[bot]@users.noreply.github.com"
-        type: string
       rc-number:
         description: "Candidate RC index (e.g. 21 for X.Y.Z-rc21). Omit to auto-increment from existing tags."
         required: false
@@ -55,7 +45,7 @@ jobs:
   # `image` in the host modes makes the container jobs run on the runner.
   resolve-toolchain:
     name: Resolve toolchain
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 2
     outputs:
       mode: ${{ steps.resolve.outputs.mode }}
@@ -91,8 +81,6 @@ jobs:
       version: ${{ inputs.version }}
       release_kind: ${{ inputs.release-kind }}
       dry_run: ${{ inputs.dry-run }}
-      git_user_name: ${{ inputs.git-user-name }}
-      git_user_email: ${{ inputs.git-user-email }}
       rc_number: ${{ inputs.rc-number || '' }}
       toolchain_mode: ${{ needs.resolve-toolchain.outputs.mode }}
       toolchain_image: ${{ needs.resolve-toolchain.outputs.image }}
@@ -140,8 +128,6 @@ jobs:
       release_date: ${{ needs.core.outputs.release_date }}
       publish_version: ${{ needs.core.outputs.publish_version }}
       release_kind: ${{ needs.core.outputs.release_kind }}
-      git_user_name: ${{ inputs.git-user-name }}
-      git_user_email: ${{ inputs.git-user-email }}
       tag_already_exists: ${{ needs.core.outputs.tag_already_exists == 'true' }}
       create_release: ${{ inputs.create-release }}
       toolchain_mode: ${{ needs.resolve-toolchain.outputs.mode }}
@@ -153,7 +139,7 @@ jobs:
   rollback:
     name: Rollback on Failure
     needs: [resolve-toolchain, core, extension, publish]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     container:
       image: ${{ needs.resolve-toolchain.outputs.image }}
       credentials:
@@ -181,11 +167,10 @@ jobs:
     steps:
       # Provision the toolchain unconditionally: the failure-issue and
       # branch-rollback steps below run independently (on different guards) and
-      # both need `retry`/`gh`/`git` — in the host modes those come from the
-      # composite, so it must run even when the guarded release-branch checkout
-      # is skipped. Checkout the workflow ref first so the local composite (and,
-      # in direnv mode, the repo flake) resolves; the guarded checkout below
-      # re-checks out the release branch with the commit token when needed.
+      # both need `retry`/`gh` — in the host modes those come from the
+      # composite. Checkout the workflow ref first so the local composite (and,
+      # in direnv mode, the repo flake) resolves; the rollback itself works
+      # through the Git Data API and needs no release-branch checkout (#1462).
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -211,37 +196,101 @@ jobs:
           client-id: ${{ secrets.COMMIT_APP_CLIENT_ID }}
           private-key: ${{ secrets.COMMIT_APP_PRIVATE_KEY }}
 
-      - name: Checkout release branch
-        if: ${{ needs.core.outputs.pre_finalize_sha != '' }}
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          fetch-depth: 0
-          token: ${{ steps.commit_app_token.outputs.token }}
-
-      - name: Configure git
-        if: ${{ needs.core.outputs.pre_finalize_sha != '' }}
-        env:
-          GIT_USER_NAME: ${{ inputs.git-user-name }}
-          GIT_USER_EMAIL: ${{ inputs.git-user-email }}
-        run: |
-          git config user.name "$GIT_USER_NAME"
-          git config user.email "$GIT_USER_EMAIL"
-
       - name: Rollback release branch
         if: ${{ needs.core.outputs.pre_finalize_sha != '' }}
         continue-on-error: true
         env:
+          GH_TOKEN: ${{ steps.commit_app_token.outputs.token }}
           VERSION: ${{ needs.core.outputs.version }}
           PRE_SHA: ${{ needs.core.outputs.pre_finalize_sha }}
+          RELEASE_KIND: ${{ needs.core.outputs.release_kind }}
+          FINALIZE_RESULT: ${{ needs.core.outputs.finalize_result }}
+          FINALIZE_COMMIT_SHA: ${{ needs.core.outputs.finalize_commit_sha }}
+          FINAL_TIP_SHA: ${{ needs.core.outputs.finalize_sha }}
         run: |
           set -euo pipefail
-          retry --retries 3 --backoff 3 --max-backoff 20 -- git fetch origin "release/$VERSION"
-          git checkout "release/$VERSION"
-          if git reset --hard "$PRE_SHA" 2>/dev/null; then
-            if retry --retries 3 --backoff 5 --max-backoff 30 -- git push --force-with-lease origin "release/$VERSION"; then
-              echo "Release branch rolled back"
+          REPO="${{ github.repository }}"
+          BRANCH_REF="heads/release/$VERSION"
+
+          # Guard (#1462): if finalize never ran, this run wrote nothing to
+          # the branch — leave it alone no matter where the tip is.
+          if [ "$FINALIZE_RESULT" = "skipped" ] || [ -z "$FINALIZE_RESULT" ]; then
+            echo "Finalize never ran (result: '${FINALIZE_RESULT:-none}'); nothing to roll back"
+            exit 0
+          fi
+
+          # Guard (#1462): candidates are branch-neutral — finalize commits
+          # only on final releases, so there is nothing to roll back either.
+          if [ "$RELEASE_KIND" != "final" ]; then
+            echo "Release kind '$RELEASE_KIND' writes no finalize commit; nothing to roll back"
+            exit 0
+          fi
+
+          CURRENT_SHA=$(retry --retries 3 --backoff 5 --max-backoff 30 -- \
+            gh api "repos/$REPO/git/refs/$BRANCH_REF" --jq '.object.sha')
+
+          if [ "$CURRENT_SHA" = "$PRE_SHA" ]; then
+            echo "Branch already at pre-finalization SHA, no rollback needed"
+            exit 0
+          fi
+
+          # Sole parent of a commit; empty for merge commits (never this run's).
+          parent_of() {
+            retry --retries 3 --backoff 5 --max-backoff 30 -- \
+              gh api "repos/$REPO/git/commits/$1" \
+                --jq 'if (.parents | length) == 1 then .parents[0].sha else "" end'
+          }
+
+          # Guard (#1462): revert only what THIS run wrote. The tip must be
+          # exactly the finalize commit — optionally with the sync-issues
+          # commit on top — parented on the pre-finalization snapshot.
+          # Anything else means the branch moved during the run: refuse
+          # loudly instead of clobbering foreign commits.
+          SAFE=false
+          if [ -n "$FINALIZE_COMMIT_SHA" ] && [ "$(parent_of "$FINALIZE_COMMIT_SHA")" = "$PRE_SHA" ]; then
+            if [ "$CURRENT_SHA" = "$FINALIZE_COMMIT_SHA" ]; then
+              SAFE=true
+            elif [ -n "$FINAL_TIP_SHA" ] && [ "$CURRENT_SHA" = "$FINAL_TIP_SHA" ]; then
+              # The only legitimate commit on top of finalize's is the
+              # sync-issues one — and a foreign PR squash-merged mid-run is
+              # single-parent too, so parentage alone cannot tell them apart
+              # (#1462). Gate on the sync commit's fixed message and, where
+              # the org's commit bot name is a known constant, its author.
+              TIP_FACTS=$(retry --retries 3 --backoff 5 --max-backoff 30 -- \
+                gh api "repos/$REPO/git/commits/$FINAL_TIP_SHA" \
+                  --jq '[(if (.parents | length) == 1 then .parents[0].sha else "" end), .author.name, (.message | split("\n")[0])] | join("\t")')
+              IFS=$'\t' read -r TIP_PARENT TIP_AUTHOR TIP_TITLE <<< "$TIP_FACTS"
+              if [ "$TIP_PARENT" = "$FINALIZE_COMMIT_SHA" ] \
+                && [ "$TIP_TITLE" = "chore: sync issues and PRs" ] \
+                && { [ -z "${SYNC_COMMIT_AUTHOR:-}" ] || [ "$TIP_AUTHOR" = "$SYNC_COMMIT_AUTHOR" ]; }; then
+                SAFE=true
+              fi
             fi
           fi
+
+          if [ "$SAFE" != "true" ]; then
+            echo "::error::Refusing to roll back release/$VERSION: branch tip $CURRENT_SHA is not the commit(s) this run wrote (finalize commit: '${FINALIZE_COMMIT_SHA:-none}', post-finalize tip: '${FINAL_TIP_SHA:-none}', pre-finalize: $PRE_SHA). The branch moved during the run; leave it as is and revert the finalize commit manually if needed."
+            exit 1
+          fi
+
+          # Safe: the tip holds only this run's commits, so resetting the tree
+          # to the pre-finalization snapshot is exactly a revert of them.
+          echo "Rolling back release branch to pre-finalization state..."
+          TREE_SHA=$(retry --retries 3 --backoff 5 --max-backoff 30 -- \
+            gh api "repos/$REPO/git/commits/$PRE_SHA" --jq '.tree.sha')
+
+          REVERT_SHA=$(retry --retries 3 --backoff 5 --max-backoff 30 -- \
+            gh api -X POST "repos/$REPO/git/commits" \
+              -f message="revert: undo finalize release $VERSION (workflow rollback)" \
+              -f tree="$TREE_SHA" \
+              -f "parents[]=$CURRENT_SHA" \
+              --jq '.sha')
+
+          retry --retries 3 --backoff 5 --max-backoff 30 -- \
+            gh api "repos/$REPO/git/refs/$BRANCH_REF" \
+              -X PATCH \
+              -f sha="$REVERT_SHA"
+          echo "✓ Release branch rolled back via revert commit $REVERT_SHA (tree at $PRE_SHA)"
 
       - name: Create failure issue
         if: ${{ needs.core.outputs.version != '' }}
@@ -262,7 +311,7 @@ jobs:
           **Release PR:** #$PR_NUMBER
 
           **Automatic rollback attempted:**
-          - Release branch reset to pre-finalization state (best-effort)
+          - Release branch: this run's finalize commit(s) reverted, but only when the branch tip matched exactly what the run wrote — otherwise the branch is left untouched and the rollback step fails loudly instead (vig-os/devkit#1462)
 
           **Tag status (forward-fix policy):**
           - Release tags are not deleted by automation (workflow choice; GitHub immutable-release lock-in applies only after a release is **published** when that setting is enabled). If a tag was pushed before the failure, it remains on the remote.

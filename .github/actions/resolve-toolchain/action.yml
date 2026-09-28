@@ -68,21 +68,52 @@ outputs:
   runner-json:
     description: >-
       JSON array of runner labels from DEVKIT_CI_RUNNER (comma-separated), for
-      use with fromJSON() in `runs-on`. Defaults to ["ubuntu-24.04"] when the
+      use with fromJSON() in `runs-on`. Defaults to ["ubuntu-26.04"] when the
       key is absent.
     value: ${{ steps.resolve.outputs.runner-json }}
+  dev-profile-path:
+    description: >-
+      Absolute dev-shell gcroot profile path from DEVKIT_DEV_PROFILE_PATH,
+      plumbed into setup-devkit-toolchain's `dev-profile-path`. Empty (default)
+      => the action's own `$RUNNER_TEMP/devkit-dev-profile`. A value that cannot
+      persist (relative, or inside the runner's `_work` tree) fails here, before
+      any lane realises the dev-shell (#1601).
+    value: ${{ steps.resolve.outputs.dev-profile-path }}
   refs-optional-types:
     description: >-
-      Comma-separated commit types whose Refs line is optional, mapped from
-      DEVKIT_REFS_POLICY for validate-commit-range. `chore` (default/absent),
-      the full types list (`optional`), or the `none` sentinel (`required`).
+      Comma-separated commit types whose Refs line is optional, for
+      validate-commit-range. DEVKIT_REFS_OPTIONAL_TYPES names the set
+      directly and wins; otherwise DEVKIT_REFS_POLICY maps to `chore`
+      (default/absent), the resolved commit-types list (`optional`), or the
+      `none` sentinel (`required`).
     value: ${{ steps.resolve.outputs.refs-optional-types }}
+  commit-types:
+    description: >-
+      Comma-separated approved commit types from DEVKIT_COMMIT_TYPES for
+      validate-commit-range's `--types`. The stock 11-type list when the key
+      is absent/empty (or carries an out-of-charset value — fail-safe, the
+      loud guard lives at the scaffold write path).
+    value: ${{ steps.resolve.outputs.commit-types }}
+  branch-types:
+    description: >-
+      Comma-separated issue-numbered branch types from DEVKIT_BRANCH_TYPES for
+      the commit-checks branch-name gate. The stock set when the key is
+      absent/empty (or carries an out-of-charset value — fail-safe, the loud
+      guard lives at the scaffold write path).
+    value: ${{ steps.resolve.outputs.branch-types }}
   drift-check:
     description: >-
       Scaffold-drift gate toggle from DEVKIT_DRIFT_CHECK: `true` (default/absent)
       keeps ci.yml's scaffold-drift job enabled, `false` self-skips it. Emitted
       for every mode so the job's `if:` can gate on it with no re-scaffold.
     value: ${{ steps.resolve.outputs.drift-check }}
+  languages:
+    description: >-
+      Comma-separated project languages DECLARED in DEVKIT_LANGUAGES, for the
+      ci.yml gate that fails when a declared language's marker file is gone. An
+      EXPLICIT EMPTY STRING when the key is absent/empty (nothing declared), so
+      a language-neutral repo — and any consumer predating the key — stays green.
+    value: ${{ steps.resolve.outputs.languages }}
 
 runs:
   using: composite
@@ -101,8 +132,13 @@ runs:
         TAG_PREFIX=""
         FLOATING_TAGS=""
         CI_RUNNER=""
+        DEV_PROFILE_PATH=""
         REFS_POLICY=""
+        REFS_OPTIONAL_TYPES_RAW=""
+        COMMIT_TYPES=""
+        BRANCH_TYPES=""
         DRIFT_CHECK=""
+        LANGUAGES=""
 
         if [[ -f .vig-os ]]; then
           # Tolerant KEY=VALUE parsing shared with resolve-image (#781): capture
@@ -114,7 +150,7 @@ runs:
             [[ "$line" =~ ^[[:space:]]*# ]] && continue
 
             case "$line" in
-              DEVKIT_MODE=*|DEVKIT_VERSION=*|DEVCONTAINER_VERSION=*|DEVKIT_TAG_PREFIX=*|DEVKIT_FLOATING_TAGS=*|DEVKIT_CI_RUNNER=*|DEVKIT_REFS_POLICY=*|DEVKIT_DRIFT_CHECK=*)
+              DEVKIT_MODE=*|DEVKIT_VERSION=*|DEVCONTAINER_VERSION=*|DEVKIT_TAG_PREFIX=*|DEVKIT_FLOATING_TAGS=*|DEVKIT_CI_RUNNER=*|DEVKIT_DEV_PROFILE_PATH=*|DEVKIT_REFS_POLICY=*|DEVKIT_REFS_OPTIONAL_TYPES=*|DEVKIT_COMMIT_TYPES=*|DEVKIT_BRANCH_TYPES=*|DEVKIT_DRIFT_CHECK=*|DEVKIT_LANGUAGES=*)
                 key="${line%%=*}"
                 value="${line#*=}"
                 value="${value#"${value%%[![:space:]]*}"}"
@@ -133,8 +169,13 @@ runs:
                   DEVKIT_TAG_PREFIX) TAG_PREFIX="$value" ;;
                   DEVKIT_FLOATING_TAGS) FLOATING_TAGS="$value" ;;
                   DEVKIT_CI_RUNNER) CI_RUNNER="$value" ;;
+                  DEVKIT_DEV_PROFILE_PATH) DEV_PROFILE_PATH="$value" ;;
                   DEVKIT_REFS_POLICY) REFS_POLICY="$value" ;;
+                  DEVKIT_REFS_OPTIONAL_TYPES) REFS_OPTIONAL_TYPES_RAW="$value" ;;
+                  DEVKIT_COMMIT_TYPES) COMMIT_TYPES="$value" ;;
+                  DEVKIT_BRANCH_TYPES) BRANCH_TYPES="$value" ;;
                   DEVKIT_DRIFT_CHECK) DRIFT_CHECK="$value" ;;
+                  DEVKIT_LANGUAGES) LANGUAGES="$value" ;;
                 esac
                 ;;
             esac
@@ -171,9 +212,9 @@ runs:
         # list routed into `runs-on` via fromJSON() by the downstream CI
         # jobs. Absent => the hosted default, so existing consumers are unchanged.
         # Emitted for every mode, ALWAYS a valid JSON array (single label =>
-        # ["ubuntu-24.04"]); whitespace around each label is trimmed and empty
+        # ["ubuntu-26.04"]); whitespace around each label is trimmed and empty
         # entries dropped so a trailing/spaced comma never yields a blank label.
-        CI_RUNNER="${CI_RUNNER:-ubuntu-24.04}"
+        CI_RUNNER="${CI_RUNNER:-ubuntu-26.04}"
         RUNNER_JSON="["
         runner_first=1
         IFS=',' read -ra runner_labels <<< "$CI_RUNNER"
@@ -185,9 +226,116 @@ runs:
           RUNNER_JSON+="\"$label\""
         done
         # An all-blank value (e.g. DEVKIT_CI_RUNNER=" ,") falls back to the default.
-        [[ "$runner_first" -eq 1 ]] && RUNNER_JSON+="\"ubuntu-24.04\""
+        [[ "$runner_first" -eq 1 ]] && RUNNER_JSON+="\"ubuntu-26.04\""
         RUNNER_JSON+="]"
         echo "runner-json=$RUNNER_JSON" >> "$GITHUB_OUTPUT"
+
+        # Dev-shell gcroot profile path (#1601): DEVKIT_DEV_PROFILE_PATH moves
+        # the direnv dev-shell's gcroot out of RUNNER_TEMP, which an ephemeral
+        # self-hosted runner wipes between jobs while its /nix/store persists —
+        # leaving the closure every CI run needs unrooted and collectable by the
+        # host's nix.gc. Absent/empty => the toolchain action's own RUNNER_TEMP
+        # default, so every existing consumer is unchanged.
+        #
+        # Vetted HERE, once, on the hosted producer job: a value no host could
+        # make persistent is a manifest typo, and catching it after three
+        # toolchain lanes have each realised a dev-shell helps nobody. What only
+        # the target host can answer — is the directory there, is it writable —
+        # stays in the action's step. Neither may fall back silently: a
+        # job-scoped gcroot is indistinguishable from the bug.
+        DEV_PROFILE_PATH_RAW="$DEV_PROFILE_PATH"
+        # Trim trailing slashes: `--profile /a/b/` and `/a/b` name the same
+        # gcroot, and the step takes `dirname` of the value.
+        DEV_PROFILE_PATH="${DEV_PROFILE_PATH%"${DEV_PROFILE_PATH##*[!/]}"}"
+        if [[ -n "$DEV_PROFILE_PATH" ]]; then
+          if [[ "$DEV_PROFILE_PATH" != /* ]]; then
+            echo "::error::Invalid DEVKIT_DEV_PROFILE_PATH in .vig-os: $DEV_PROFILE_PATH (must be an ABSOLUTE path — a relative one resolves against the checkout, which the runner wipes between jobs)"
+            exit 1
+          fi
+          # `_work` is the runner's work-tree root and `_temp` its RUNNER_TEMP
+          # leaf — both runner-internal names, and both wiped between ephemeral
+          # jobs. GITHUB_WORKSPACE lives under `_work` too. This catches the
+          # mistake the knob exists to prevent (rooting inside the very tree the
+          # runner clears); it cannot prove an arbitrary path is persistent, and
+          # does not try to.
+          case "$DEV_PROFILE_PATH" in
+            */_work/*|*/_work|*/_temp/*|*/_temp)
+              echo "::error::Invalid DEVKIT_DEV_PROFILE_PATH in .vig-os: $DEV_PROFILE_PATH (inside the runner's own work tree — RUNNER_TEMP and GITHUB_WORKSPACE both live there and are wiped between jobs). Point it at a persistent directory outside the runner workspace, e.g. /var/lib/devkit/gcroots/dev-profile"
+              exit 1
+              ;;
+          esac
+        elif [[ -n "${DEV_PROFILE_PATH_RAW:-}" ]]; then
+          # Only reachable for a value that was nothing but slashes ("/"), which
+          # the trim above empties: a gcroot cannot be the filesystem root.
+          echo "::error::Invalid DEVKIT_DEV_PROFILE_PATH in .vig-os: $DEV_PROFILE_PATH_RAW (must name a profile path, not the filesystem root)"
+          exit 1
+        fi
+        echo "dev-profile-path=$DEV_PROFILE_PATH" >> "$GITHUB_OUTPUT"
+
+        # Commit types (#1431): resolve DEVKIT_COMMIT_TYPES into the --types
+        # list validate-commit-range consumes in the commit-checks job. This is
+        # the single mapping point for the CI surface; it MIRRORS
+        # render_commit_types in assets/init-workspace.sh (two renderers, one
+        # key — keep in lockstep). The loud charset guard lives at the write
+        # path (init-workspace.sh); here an out-of-charset entry falls back to
+        # the stock list with a warning (fail-safe: a broken value must never
+        # break — or weaken — the gate). Whitespace around entries is trimmed
+        # and empty entries dropped, matching the runner-label parsing above.
+        DEFAULT_COMMIT_TYPES="feat,fix,docs,chore,refactor,perf,test,ci,build,revert,style"
+        RESOLVED_COMMIT_TYPES=""
+        if [[ -n "$COMMIT_TYPES" ]]; then
+          commit_types_valid=1
+          IFS=',' read -ra type_entries <<< "$COMMIT_TYPES"
+          for entry in "${type_entries[@]}"; do
+            entry="${entry#"${entry%%[![:space:]]*}"}"
+            entry="${entry%"${entry##*[![:space:]]}"}"
+            [[ -z "$entry" ]] && continue
+            if [[ ! "$entry" =~ ^[a-z][a-z0-9]*$ ]]; then
+              commit_types_valid=0
+              break
+            fi
+            RESOLVED_COMMIT_TYPES+="${RESOLVED_COMMIT_TYPES:+,}$entry"
+          done
+          if [[ "$commit_types_valid" -ne 1 ]]; then
+            echo "::warning::Invalid DEVKIT_COMMIT_TYPES in .vig-os ('$COMMIT_TYPES'); falling back to the default approved types."
+            RESOLVED_COMMIT_TYPES=""
+          fi
+        fi
+        # An all-blank value falls back to the default (like DEVKIT_CI_RUNNER).
+        RESOLVED_COMMIT_TYPES="${RESOLVED_COMMIT_TYPES:-$DEFAULT_COMMIT_TYPES}"
+        echo "commit-types=$RESOLVED_COMMIT_TYPES" >> "$GITHUB_OUTPUT"
+
+        # Branch types (#1432): resolve DEVKIT_BRANCH_TYPES into the
+        # issue-numbered type set the commit-checks branch-name gate consumes.
+        # Single mapping point for the CI surface; MIRRORS render_branch_types
+        # in assets/init-workspace.sh (two renderers, one key — keep in
+        # lockstep). Same guard philosophy as commit-types above: the loud
+        # charset guard lives at the write path, here an out-of-charset entry
+        # falls back to the stock set with a warning (fail-safe: a broken
+        # value must never break — or weaken — the gate).
+        DEFAULT_BRANCH_TYPES="feature,bugfix,hotfix,release,docs,test,refactor"
+        RESOLVED_BRANCH_TYPES=""
+        if [[ -n "$BRANCH_TYPES" ]]; then
+          branch_types_valid=1
+          IFS=',' read -ra btype_entries <<< "$BRANCH_TYPES"
+          for entry in "${btype_entries[@]}"; do
+            entry="${entry#"${entry%%[![:space:]]*}"}"
+            entry="${entry%"${entry##*[![:space:]]}"}"
+            [[ -z "$entry" ]] && continue
+            if [[ ! "$entry" =~ ^[a-z][a-z0-9]*$ ]]; then
+              branch_types_valid=0
+              break
+            fi
+            RESOLVED_BRANCH_TYPES+="${RESOLVED_BRANCH_TYPES:+,}$entry"
+          done
+          if [[ "$branch_types_valid" -ne 1 ]]; then
+            echo "::warning::Invalid DEVKIT_BRANCH_TYPES in .vig-os ('$BRANCH_TYPES'); falling back to the default branch types."
+            RESOLVED_BRANCH_TYPES=""
+          fi
+        fi
+        # An all-blank value falls back to the default (like DEVKIT_CI_RUNNER).
+        RESOLVED_BRANCH_TYPES="${RESOLVED_BRANCH_TYPES:-$DEFAULT_BRANCH_TYPES}"
+        echo "branch-types=$RESOLVED_BRANCH_TYPES" >> "$GITHUB_OUTPUT"
 
         # Refs policy (#1282): map DEVKIT_REFS_POLICY to the --refs-optional-types
         # list validate-commit-range consumes in the commit-checks job. This is
@@ -195,14 +343,53 @@ runs:
         # in assets/init-workspace.sh (two renderers, one key — keep in lockstep).
         # The loud enum guard lives at the write path (init-workspace.sh); here an
         # unexpected/absent value defaults safely to `chore` (today's behavior) so
-        # CI never breaks on a surprise literal. `required` uses a `none` sentinel
-        # type (no real commit is type `none`) because an empty list is parsed as
-        # falsy by the tool and reverts to the {chore} default.
+        # CI never breaks on a surprise literal. `optional` mirrors the RESOLVED
+        # commit-types list above — the custom DEVKIT_COMMIT_TYPES when set
+        # (#1431), else the stock 11 — so the gate never requires Refs for a type
+        # it just accepted. `required` uses a `none` sentinel type (no real commit
+        # is type `none`) because an empty list is parsed as falsy by the tool and
+        # reverts to the {chore} default.
         case "$REFS_POLICY" in
-          optional) REFS_OPTIONAL_TYPES="feat,fix,docs,chore,refactor,perf,test,ci,build,revert,style" ;;
+          optional) REFS_OPTIONAL_TYPES="$RESOLVED_COMMIT_TYPES" ;;
           required) REFS_OPTIONAL_TYPES="none" ;;
           *)        REFS_OPTIONAL_TYPES="chore" ;;
         esac
+
+        # Refs-optional types (#1633): DEVKIT_REFS_OPTIONAL_TYPES names the
+        # exempt set directly and WINS over the policy enum above — the
+        # documented precedence, mirrored in init-workspace.sh and
+        # nix/hooks.nix (three renderers, one resolution). Same guard
+        # philosophy as commit-types/branch-types: the loud guard (charset AND
+        # subset-of-approved-types) lives at the write path, and here a bad
+        # value falls back with a warning rather than failing the job. But
+        # fail-safe for an EXEMPTION list means the SMALLEST set, not the stock
+        # mapping: falling back to `optional` would switch the Refs gate off
+        # for every type because the narrower key had a typo. So the fallback
+        # clamps to `chore` unless the policy is already narrower (`none`).
+        # This is the one place the #1431 commit-types analogy inverts — there
+        # the stock list is a subset of any sane custom one, here it is not.
+        if [[ -n "$REFS_OPTIONAL_TYPES_RAW" ]]; then
+          resolved_refs_optional=""
+          refs_optional_valid=1
+          IFS=',' read -ra refs_optional_entries <<< "$REFS_OPTIONAL_TYPES_RAW"
+          for entry in "${refs_optional_entries[@]}"; do
+            entry="${entry#"${entry%%[![:space:]]*}"}"
+            entry="${entry%"${entry##*[![:space:]]}"}"
+            [[ -z "$entry" ]] && continue
+            if [[ ! "$entry" =~ ^[a-z][a-z0-9]*$ ]] \
+              || [[ ",$RESOLVED_COMMIT_TYPES," != *",$entry,"* ]]; then
+              refs_optional_valid=0
+              break
+            fi
+            resolved_refs_optional+="${resolved_refs_optional:+,}$entry"
+          done
+          if [[ "$refs_optional_valid" -ne 1 ]]; then
+            [[ "$REFS_OPTIONAL_TYPES" != "none" ]] && REFS_OPTIONAL_TYPES="chore"
+            echo "::warning::Invalid DEVKIT_REFS_OPTIONAL_TYPES in .vig-os ('$REFS_OPTIONAL_TYPES_RAW'); falling back to '$REFS_OPTIONAL_TYPES' (an invalid exemption list never relaxes the gate)."
+          elif [[ -n "$resolved_refs_optional" ]]; then
+            REFS_OPTIONAL_TYPES="$resolved_refs_optional"
+          fi
+        fi
         echo "refs-optional-types=$REFS_OPTIONAL_TYPES" >> "$GITHUB_OUTPUT"
 
         # Scaffold-drift gate (#1295): DEVKIT_DRIFT_CHECK toggles ci.yml's
@@ -215,6 +402,26 @@ runs:
         DRIFT_CHECK="${DRIFT_CHECK:-true}"
         [[ "$DRIFT_CHECK" == "false" ]] || DRIFT_CHECK="true"
         echo "drift-check=$DRIFT_CHECK" >> "$GITHUB_OUTPUT"
+
+        # Declared languages (#1478): DEVKIT_LANGUAGES is the repo's own
+        # statement of which language projects it carries — a DECLARATION the
+        # scaffold seeds and only ever grows, never a detection cache. Normalize
+        # only (trim each entry, drop empties); the enum guard lives at the write
+        # path (init-workspace.sh) and the ci.yml gate skips a name it cannot map
+        # to a marker, so a surprise literal warns instead of breaking CI.
+        # Emitted for every mode, ALWAYS (an explicit empty string when nothing
+        # is declared) so the gate can treat empty as "nothing to assert".
+        RESOLVED_LANGUAGES=""
+        if [[ -n "$LANGUAGES" ]]; then
+          IFS=',' read -ra language_entries <<< "$LANGUAGES"
+          for entry in "${language_entries[@]}"; do
+            entry="${entry#"${entry%%[![:space:]]*}"}"
+            entry="${entry%"${entry##*[![:space:]]}"}"
+            [[ -z "$entry" ]] && continue
+            RESOLVED_LANGUAGES+="${RESOLVED_LANGUAGES:+,}$entry"
+          done
+        fi
+        echo "languages=$RESOLVED_LANGUAGES" >> "$GITHUB_OUTPUT"
 
         # Resolve the version tag: explicit override wins, else DEVKIT_VERSION,
         # else the legacy DEVCONTAINER_VERSION.

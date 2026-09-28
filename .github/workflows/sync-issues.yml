@@ -43,7 +43,7 @@ permissions: {}  # restrict default; job declares its own
 jobs:
   resolve-toolchain:
     name: Resolve toolchain
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 2
     permissions:
       contents: read
@@ -71,7 +71,7 @@ jobs:
 
   sync:
     needs: [resolve-toolchain]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     container:
       image: ${{ needs.resolve-toolchain.outputs.image }}
       credentials:
@@ -172,9 +172,9 @@ jobs:
 
       - name: Sync Issues and PRs
         id: sync
-        uses: vig-os/sync-issues-action@285a0af876bac99a0e914a64a1cb925dd913f38a  # v0.4.0
+        uses: vig-os/sync-issues-action@b62c8eca72f4ee7177caee4f689ee080a5997164  # v0.5.0
         with:
-          app-id: ${{ secrets.COMMIT_APP_ID }}
+          client-id: ${{ secrets.COMMIT_APP_CLIENT_ID }}
           app-private-key: ${{ secrets.COMMIT_APP_PRIVATE_KEY }}
           output-dir: ${{ github.event.inputs.output-dir || 'docs' }}
           sync-issues: 'true'
@@ -186,7 +186,7 @@ jobs:
       - name: Commit and push changes via API
         id: commit
         if: steps.sync.outputs.modified-files != ''
-        uses: vig-os/commit-action@3a0588ec060d9647bf406e064cf9e6192a431864  # v0.3.1
+        uses: vig-os/commit-action@7ba7e1ae17547813e708d4cc6a771a09f978f724  # v0.3.3
         env:
           # Use App token so push can bypass branch protection when App is in bypass list
           GH_TOKEN: ${{ steps.generate-token.outputs.token }}

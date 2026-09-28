@@ -20,16 +20,6 @@ on:  # yamllint disable-line rule:truthy
         required: false
         default: false
         type: boolean
-      git_user_name:
-        description: "Git user name for release commits"
-        required: false
-        default: "github-actions[bot]"
-        type: string
-      git_user_email:
-        description: "Git user email for release commits"
-        required: false
-        default: "41898282+github-actions[bot]@users.noreply.github.com"
-        type: string
       rc_number:
         description: "Candidate RC index (e.g. 21 for X.Y.Z-rc21). Omit to auto-increment from existing tags."
         required: false
@@ -68,6 +58,10 @@ on:  # yamllint disable-line rule:truthy
       RELEASE_APP_PRIVATE_KEY:
         description: "GitHub App private key used to mint the release token"
         required: true
+      # Both COMMIT_APP_* entries below are flipped to `required: false` at
+      # scaffold time when DEVKIT_COMMIT_APP_ENVIRONMENT is set (#1710): the pair
+      # then lives only as ENVIRONMENT secrets, which `secrets: inherit` cannot
+      # deliver, and the `finalize` job's own `environment:` supplies them instead.
       COMMIT_APP_CLIENT_ID:
         description: "GitHub App client ID used to mint the verified-commit token"
         required: true
@@ -96,6 +90,15 @@ on:  # yamllint disable-line rule:truthy
       finalize_sha:
         description: "Release branch SHA after finalization"
         value: ${{ jobs.finalize.outputs.finalize_sha }}
+      finalize_result:
+        # jobs.finalize.result would be the natural source, but actionlint's
+        # jobs-context type for workflow_call outputs only carries `outputs`,
+        # so the ran/skipped signal is derived from a first-step marker.
+        description: "'ran' when the finalize job started, 'skipped' when it never ran (#1462)"
+        value: ${{ jobs.finalize.outputs.finalize_ran == 'true' && 'ran' || 'skipped' }}
+      finalize_commit_sha:
+        description: "Exact commit SHA the finalize job pushed (empty when none) (#1462)"
+        value: ${{ jobs.finalize.outputs.finalize_commit_sha }}
       tag_already_exists:
         description: "Remote publish tag already exists at finalize SHA (retry path)"
         value: ${{ jobs.finalize.outputs.tag_already_exists }}
@@ -114,7 +117,7 @@ permissions:
 jobs:
   validate:
     name: Validate Release Core
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       pull-requests: read
@@ -208,14 +211,15 @@ jobs:
           echo "pre_finalize_sha=$PRE_FINALIZE_SHA" >> "$GITHUB_OUTPUT"
           echo "Pre-finalization SHA: $PRE_FINALIZE_SHA"
 
+      # Content, not just the heading: a hotfix branch (prepare-hotfix.yml)
+      # is seeded with an EMPTY `## [X.Y.Z] - TBD` section that the fix PR
+      # fills, so a bare grep would let an unfilled section ship (#1625).
       - name: Verify CHANGELOG has TBD entry
         env:
           VERSION: ${{ steps.vars.outputs.version }}
         run: |
-          if ! grep -Fq "## [$VERSION] - TBD" CHANGELOG.md; then
-            echo "ERROR: CHANGELOG.md does not contain '## [$VERSION] - TBD'"
-            exit 1
-          fi
+          set -euo pipefail
+          prepare-changelog validate --version "$VERSION" CHANGELOG.md
 
       - name: Compute publish version
         id: publish_meta
@@ -291,7 +295,7 @@ jobs:
           PR_JSON=$(retry --retries 3 --backoff 5 --max-backoff 30 -- gh pr list \
             --head "release/$VERSION" \
             --base main \
-            --json number,isDraft,reviewDecision,statusCheckRollup \
+            --json number,isDraft,statusCheckRollup \
             --limit 1)
 
           PR_COUNT=$(echo "$PR_JSON" | jq 'length')
@@ -302,44 +306,44 @@ jobs:
 
           PR_NUMBER=$(echo "$PR_JSON" | jq -r '.[0].number')
           IS_DRAFT=$(echo "$PR_JSON" | jq -r '.[0].isDraft')
-          REVIEW_DECISION=$(echo "$PR_JSON" | jq -r '.[0].reviewDecision')
           echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
 
-          # The draft + approval gate applies only to the final release, which
-          # burns the immutable X.Y.Z tag. Release candidates are disposable
-          # verification artifacts (auto-incrementing rcN tags, never touch
-          # :latest, no GitHub Release, pruned at promote), so they gate on CI
-          # only and may run against a still-draft, not-yet-approved PR. The
-          # approval that protects `main` is re-enforced by promote-release's
-          # merge job regardless. See #902.
+          # The draft gate applies only to the final release, which burns the
+          # immutable X.Y.Z tag. Release candidates are disposable verification
+          # artifacts (auto-incrementing rcN tags, never touch :latest, no
+          # GitHub Release, pruned at promote), so they gate on CI only and may
+          # run against a still-draft PR (#902). Neither kind gates on review
+          # state here: the single human sign-off of the cycle is collected by
+          # promote-release's validate/merge gates, where it lands on the
+          # release content exactly as it ships — finalize commits included
+          # (#1504).
           if [ "$RELEASE_KIND" = "final" ]; then
             if [ "$IS_DRAFT" = "true" ]; then
               echo "ERROR: PR #$PR_NUMBER is still in draft"
               exit 1
             fi
-            if [ "$REVIEW_DECISION" = "APPROVED" ]; then
-              echo "PR #$PR_NUMBER is approved"
-            elif [ "$REVIEW_DECISION" = "null" ] || [ -z "$REVIEW_DECISION" ]; then
-              # Bot approval fallback when gh pr list leaves reviewDecision empty (#438)
-              APPROVED_COUNT=$(retry --retries 3 --backoff 5 --max-backoff 30 -- gh api \
-                --paginate --slurp \
-                "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/reviews" \
-                | jq 'add | map(select(.state == "APPROVED")) | length')
-              if [ "$APPROVED_COUNT" -eq 0 ]; then
-                echo "ERROR: PR #$PR_NUMBER is not approved (reviewDecision: $REVIEW_DECISION, approved reviews: 0)"
-                exit 1
-              fi
-              echo "reviewDecision='$REVIEW_DECISION' but $APPROVED_COUNT approved review(s) found"
-            else
-              echo "ERROR: PR #$PR_NUMBER is not approved (status: $REVIEW_DECISION)"
-              exit 1
-            fi
           else
-            echo "Release kind '$RELEASE_KIND': deferring draft/approval gate to the final release (CI checks still enforced below)"
+            echo "Release kind '$RELEASE_KIND': deferring the draft gate to the final release (CI checks still enforced below)"
           fi
 
           STATUS_ROLLUP=$(echo "$PR_JSON" | jq -r '.[0].statusCheckRollup // []')
-          CI_FAILED=$(echo "$STATUS_ROLLUP" | jq '[.[] | select(.conclusion == "FAILURE" or .conclusion == "ERROR")] | length')
+
+          # Evaluate only the LATEST run of each check name (#1522), the way
+          # `gh pr checks` does: a superseded workflow run leaves its FAILURE
+          # check runs attached to the same head SHA and would refuse a branch
+          # that is actually green (#1516). Recency key is startedAt, not
+          # completedAt — completedAt is null while a rerun is in flight, which
+          # would rank the live run oldest and let the stale FAILURE win.
+          # StatusContexts carry context/createdAt instead of name/startedAt
+          # and have no rerun history, so each one is its own latest.
+          # Classify on a normalized verdict (#1538): CheckRuns carry
+          # `conclusion`, StatusContexts `state`, and neither has the other's
+          # field, so `.conclusion // .state` buckets both kinds without
+          # double-counting — an in-progress CheckRun still resolves to null
+          # and counts as pending.
+          LATEST_CHECKS=$(echo "$STATUS_ROLLUP" | jq '[group_by(.name // .context // "?")[] | max_by(.startedAt // .createdAt // "")]')
+
+          CI_FAILED=$(echo "$LATEST_CHECKS" | jq '[.[] | (.conclusion // .state) as $v | select($v == "FAILURE" or $v == "ERROR")] | length')
           if [ "$CI_FAILED" != "0" ]; then
             echo "ERROR: PR #$PR_NUMBER has failed CI checks"
             exit 1
@@ -373,11 +377,12 @@ jobs:
   finalize:
     name: Finalize Release Core
     needs: validate
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       actions: read
       contents: read
       packages: read
+      pull-requests: read    # bot-PR metadata for changelog synthesis (#1423)
     container:
       image: ${{ inputs.toolchain_image }}
       credentials:
@@ -391,8 +396,19 @@ jobs:
     outputs:
       finalize_sha: ${{ steps.finalize.outputs.finalize_sha }}
       tag_already_exists: ${{ steps.tag_state.outputs.tag_already_exists }}
+      # Exact commit this job pushed: the caller's rollback job refuses to
+      # touch the branch unless its tip matches what this run wrote (#1462).
+      finalize_commit_sha: ${{ steps.finalize_commit.outputs.commit-sha }}
+      # Set by the first step, so a skipped job yields an empty string: the
+      # rollback job must not touch the branch when finalize never ran (#1462).
+      finalize_ran: ${{ steps.started.outputs.value }}
 
     steps:
+      # Ran/skipped marker for the finalize_result workflow output (#1462).
+      - name: Mark finalize as started
+        id: started
+        run: echo "value=true" >> "$GITHUB_OUTPUT"
+
       - name: Generate commit app token
         id: commit_app_token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3
@@ -432,6 +448,21 @@ jobs:
         with:
           mode: ${{ inputs.toolchain_mode }}
           devkit-version: ${{ inputs.devkit_version }}
+
+      # Regenerate the bot-entry block inside [VERSION] - TBD before stamping
+      # the date: any bot PR merged into the release branch mid-train is
+      # reachable from HEAD here, so it cannot ship unchronicled (#1423).
+      # Candidates stay changelog-neutral, matching the rest of finalize.
+      - name: Synthesize bot changelog entries
+        if: ${{ inputs.release_kind == 'final' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+        run: |
+          set -euo pipefail
+          synthesize-bot-changelog --version "$VERSION" --tag-prefix "$TAG_PREFIX"
 
       - name: Finalize CHANGELOG date
         if: ${{ inputs.release_kind == 'final' }}
@@ -494,7 +525,8 @@ jobs:
 
       - name: Commit and push finalization changes via API
         if: ${{ inputs.release_kind == 'final' }}
-        uses: vig-os/commit-action@3a0588ec060d9647bf406e064cf9e6192a431864  # v0.3.1
+        id: finalize_commit
+        uses: vig-os/commit-action@7ba7e1ae17547813e708d4cc6a771a09f978f724  # v0.3.3
         env:
           GH_TOKEN: ${{ steps.commit_app_token.outputs.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
@@ -640,7 +672,7 @@ jobs:
   test:
     name: Test Finalized Release
     needs: [validate, finalize]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     container:
       image: ${{ inputs.toolchain_image }}
       credentials:

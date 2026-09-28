@@ -210,16 +210,19 @@ jobs:
           fail=0
           if [ -n "$unsharded" ]; then
             echo "::error::tape(s) on disk but not assigned to any shard in vhs.yml:"
+            # shellcheck disable=SC2001  # indents every line of a multi-line var
             echo "$unsharded" | sed 's/^/  /'
             fail=1
           fi
           if [ -n "$stale" ]; then
             echo "::error::tape(s) declared in a shard but missing on disk:"
+            # shellcheck disable=SC2001  # indents every line of a multi-line var
             echo "$stale" | sed 's/^/  /'
             fail=1
           fi
           if [ -n "$dupes" ]; then
             echo "::error::tape(s) appear in more than one shard:"
+            # shellcheck disable=SC2001  # indents every line of a multi-line var
             echo "$dupes" | sed 's/^/  /'
             fail=1
           fi
@@ -277,6 +280,7 @@ jobs:
           BASE="origin/${{ github.base_ref }}"
           CHANGED=$(git diff --name-only "$BASE"...HEAD)
           echo "Changed files:"
+          # shellcheck disable=SC2001  # indents every line of a multi-line var
           echo "$CHANGED" | sed 's/^/  /'
 
           TUI_CHANGED=$(echo "$CHANGED" | grep -E '^crates/scitadel-(tui|cli)/src/' || true)
@@ -289,6 +293,7 @@ jobs:
 
           if [ -n "$TAPE_CHANGED" ]; then
             echo "TUI/CLI changed and at least one tape was added/updated:"
+            # shellcheck disable=SC2001  # indents every line of a multi-line var
             echo "$TAPE_CHANGED" | sed 's/^/  /'
             exit 0
           fi

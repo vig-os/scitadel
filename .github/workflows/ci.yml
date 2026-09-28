@@ -29,6 +29,13 @@
 # produces the output — chicken-and-egg); `dependency-review` stays hosted too
 # (public-repo-only, toolchain-free, and reads GitHub's dependency-graph API).
 #
+# Dev-shell gcroot (#1601): those same three lanes pass the resolved
+# `dev-profile-path` (from the optional `.vig-os` key DEVKIT_DEV_PROFILE_PATH)
+# into the toolchain action. An EPHEMERAL self-hosted runner wipes RUNNER_TEMP —
+# and with it the dev-shell's gcroot — between jobs while its /nix/store
+# persists, so the closure every run needs is left collectable by the host's
+# nix.gc. Absent => the RUNNER_TEMP default, unchanged for hosted consumers.
+#
 # Jobs:
 #   1. resolve-toolchain — Resolve delivery mode + image from .vig-os
 #   2. lint              — Pre-commit hooks
@@ -67,6 +74,21 @@ on:  # yamllint disable-line rule:truthy
         required: false
         type: string
 
+# Cancel a superseded run instead of letting it burn runner slots (#1602): a
+# force-push or rapid follow-up leaves the previous run's every lane finishing
+# for a commit that no longer matters — wasted minutes on a hosted runner, and
+# on a self-hosted consumer with a small fixed slot pool the replacement run
+# queues behind its own predecessor. Grouping per workflow AND per ref keeps
+# distinct refs (other PRs, dispatches on other branches) independent.
+# `!= 'push'` rather than a bare `true`: neither trigger is `push` today, so the
+# guard is inert, but a deploy gating on the exact-commit CI run must stay
+# satisfiable if one is ever added. Not `== 'pull_request'` either — a
+# dispatched re-test superseding the previous one is wanted. A cancelled run
+# cannot green the required check: the summary job trips on `cancelled` (#1371).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
 permissions:
   contents: read
   packages: read
@@ -74,16 +96,27 @@ permissions:
 jobs:
   resolve-toolchain:
     name: Resolve toolchain
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 2
     outputs:
       mode: ${{ steps.resolve.outputs.mode }}
       image: ${{ steps.resolve.outputs.image }}
       image-tag: ${{ steps.resolve.outputs.image-tag }}
       runner-json: ${{ steps.resolve.outputs.runner-json }}
+      # Dev-shell gcroot (#1601): re-export the vetted DEVKIT_DEV_PROFILE_PATH
+      # so the toolchain lanes — the ones runner-json can move onto a
+      # self-hosted host — root the dev-shell where an ephemeral job cannot
+      # wipe it.
+      dev-profile-path: ${{ steps.resolve.outputs.dev-profile-path }}
       # Refs policy (#1282): re-export the composite action's mapped
       # --refs-optional-types list so commit-checks can consume it via needs.
       refs-optional-types: ${{ steps.resolve.outputs.refs-optional-types }}
+      # Commit types (#1431): re-export the resolved approved-types list so
+      # commit-checks can consume it via needs.
+      commit-types: ${{ steps.resolve.outputs.commit-types }}
+      # Branch types (#1432): re-export the resolved branch-type set so the
+      # commit-checks branch-name gate can consume it via needs.
+      branch-types: ${{ steps.resolve.outputs.branch-types }}
       # Scaffold-drift gate (#1295): re-export the DEVKIT_DRIFT_CHECK toggle so
       # the scaffold-drift job's `if:` can self-skip when a consumer opts out,
       # plus the all-modes image ref it `docker run`s (keeps the ghcr literal in
@@ -99,6 +132,9 @@ jobs:
           sparse-checkout: |
             .vig-os
             .github/actions/resolve-toolchain
+            pyproject.toml
+            package.json
+            Cargo.toml
           sparse-checkout-cone-mode: false
 
       - name: Resolve toolchain
@@ -108,6 +144,65 @@ jobs:
           registry-token: ${{ secrets.GHCR_PULL_TOKEN || github.token }}
           registry-username: ${{ github.actor }}
           image-tag: ${{ inputs.image-tag }}
+
+      # Declared-language gate (#1478). `just test` / `just lint` are guarded on
+      # `[ -f pyproject.toml ]` and exit 0 when it is absent, so a repo whose
+      # entire Python project was deleted still reported a green `Tests` check
+      # (#1466) — CI could not tell "no suite by design" from "the suite
+      # vanished". The `.vig-os` declaration is the missing evidence; this step
+      # asserts it.
+      #
+      # ONE gate for the whole workflow, run as a step of resolve-toolchain
+      # rather than as its own job: every toolchain job already `needs:` this
+      # one, so a failure here stops lint/test/commit-checks before they start
+      # (which covers the identical lint/format blind spot at the same time), it
+      # reuses the checkout this job already performs, and it costs no extra
+      # runner, container pull or `needs:` edge in the summary gate. The marker
+      # files are added to the sparse checkout above for exactly this step.
+      #
+      # A language-neutral repo declares nothing and stays green. `nix` is
+      # declared but never gated: it has no single marker file (flake.nix ships
+      # with every direnv scaffold), so its absence is not decidable from a path.
+      # The declared list reaches the shell via env, never inline `${{ }}` (the
+      # zizmor template-injection gate / #1279 env-routing pattern).
+      - name: Check declared languages
+        env:
+          LANGUAGES: ${{ steps.resolve.outputs.languages }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$LANGUAGES" ]]; then
+            echo "No languages declared in .vig-os (DEVKIT_LANGUAGES) — nothing to check."
+            exit 0
+          fi
+
+          MISSING=()
+          IFS=',' read -ra declared <<< "$LANGUAGES"
+          for lang in "${declared[@]}"; do
+            case "$lang" in
+              python) marker="pyproject.toml" ;;
+              node) marker="package.json" ;;
+              rust) marker="Cargo.toml" ;;
+              nix)
+                echo "Declared language 'nix': no single marker file — not gated."
+                continue
+                ;;
+              *)
+                echo "::warning::Unknown language '$lang' in DEVKIT_LANGUAGES — not gated. Expected a subset of: python, node, rust, nix."
+                continue
+                ;;
+            esac
+            if [[ -f "$marker" ]]; then
+              echo "Declared language '$lang': $marker present."
+            else
+              echo "::error::Declared language '$lang' but $marker is missing from the repository root."
+              MISSING+=("$lang ($marker)")
+            fi
+          done
+
+          if [[ ${#MISSING[@]} -gt 0 ]]; then
+            echo "::error::.vig-os declares language(s) whose project file is gone: ${MISSING[*]}. The lint/test recipes skip a language whose marker file is absent, so nothing else in this workflow would notice. Restore the missing file(s), or — if the language was dropped deliberately — remove it from DEVKIT_LANGUAGES in .vig-os."
+            exit 1
+          fi
 
   lint:
     name: Lint & Format
@@ -142,6 +237,7 @@ jobs:
           devkit-version: ${{ needs.resolve-toolchain.outputs.image-tag }}
           cachix-cache: ${{ vars.CACHIX_CACHE }}
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          dev-profile-path: ${{ needs.resolve-toolchain.outputs.dev-profile-path }}
 
       - name: Sync project dependencies
         run: just sync
@@ -177,6 +273,7 @@ jobs:
           devkit-version: ${{ needs.resolve-toolchain.outputs.image-tag }}
           cachix-cache: ${{ vars.CACHIX_CACHE }}
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          dev-profile-path: ${{ needs.resolve-toolchain.outputs.dev-profile-path }}
 
       - name: Sync project dependencies
         run: just sync
@@ -217,6 +314,51 @@ jobs:
           devkit-version: ${{ needs.resolve-toolchain.outputs.image-tag }}
           cachix-cache: ${{ vars.CACHIX_CACHE }}
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          dev-profile-path: ${{ needs.resolve-toolchain.outputs.dev-profile-path }}
+
+      # Branch-name gate (#1432 / #1430): validate the PR head ref against the
+      # same branch-type set the local no-commit-to-branch guard renders from.
+      # The local hook depends on local git config a fresh clone does not have
+      # (core.hooksPath), so this is the enforcement point that survives an
+      # un-initialised clone. The allowed set is a SUPERSET of the local
+      # guard's: automation branches never run local hooks but do open PRs.
+      # The head ref is attacker-controlled text, so it reaches the check via
+      # env, never inline ${{ }} (the zizmor template-injection gate / #1279
+      # env-routing pattern); the type set is mapped once from
+      # DEVKIT_BRANCH_TYPES by resolve-toolchain.
+      - name: Validate branch name
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          BRANCH_TYPES: ${{ needs.resolve-toolchain.outputs.branch-types }}
+        run: |
+          set -euo pipefail
+          TYPES_ALTERNATION="${BRANCH_TYPES//,/|}"
+          # Every alternative is individually ^...$-anchored:
+          #   main|dev                 long-lived branches (committing on them
+          #                            is allowed locally; a deliberate PR
+          #                            from one stays possible)
+          #   chore/<slug>             issue-less maintenance branches — also
+          #                            covers the sync-main-to-dev and
+          #                            devkit-upgrade bot branches
+          #   <type>/<issue>-<slug>    issue-numbered topic branches
+          #                            (DEVKIT_BRANCH_TYPES)
+          #   worktree/<n>             autonomous worktree pipeline
+          #   renovate/*               Renovate's namespace (#1433); free-form
+          #                            names (dots, parentheses)
+          #   release/X.Y.Z            release-train branches (prepare-release
+          #                            creates release/$VERSION, bare semver)
+          ALLOWED="^(main|dev)$"
+          ALLOWED+="|^chore/[a-z0-9]+(-[a-z0-9]+)*$"
+          ALLOWED+="|^(${TYPES_ALTERNATION})/[0-9]+-[a-z0-9]+(-[a-z0-9]+)*$"
+          ALLOWED+="|^worktree/[0-9]+$"
+          ALLOWED+="|^renovate/.+$"
+          ALLOWED+="|^release/[0-9]+\.[0-9]+\.[0-9]+$"
+          if printf '%s' "${HEAD_REF}" | grep -qE "${ALLOWED}"; then
+            echo "Branch name OK: ${HEAD_REF}"
+          else
+            echo "::error::Branch name '${HEAD_REF}' does not follow the convention <type>/<issue>-<summary> (types: ${BRANCH_TYPES}) or chore/<summary>. See docs/COMMIT_MESSAGE_STANDARD.md and the branch-naming skill."
+            exit 1
+          fi
 
       # The PR title is attacker-controlled text, so it reaches the validator as
       # an environment variable — never interpolated into the shell command.
@@ -229,11 +371,12 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          # Refs policy (#1282): the resolved --refs-optional-types list reaches
+          # Refs policy (#1282) + commit types (#1431): the resolved lists reach
           # the validator via env, never inline ${{ }} in the run block (the
-          # zizmor template-injection gate / #1279 env-routing pattern). Mapped
-          # once from DEVKIT_REFS_POLICY by resolve-toolchain.
+          # zizmor template-injection gate / #1279 env-routing pattern). Each is
+          # mapped once from its .vig-os key by resolve-toolchain.
           REFS_OPTIONAL_TYPES: ${{ needs.resolve-toolchain.outputs.refs-optional-types }}
+          COMMIT_TYPES: ${{ needs.resolve-toolchain.outputs.commit-types }}
         run: |
           set -euo pipefail
           BASE_SHA="$(git merge-base "origin/${BASE_REF}" "${HEAD_SHA}")"
@@ -253,6 +396,7 @@ jobs:
             --base "${BASE_SHA}" \
             --head "${HEAD_SHA}" \
             --title "${PR_TITLE}" \
+            --types "${COMMIT_TYPES}" \
             --refs-optional-types "${REFS_OPTIONAL_TYPES}" \
             --blocked-patterns .github/agent-blocklist.toml \
             ${EXCLUDE[@]+"${EXCLUDE[@]}"}
@@ -352,6 +496,71 @@ jobs:
               exit 1
             '
 
+  # Warn-only staleness report (#1497): scaffold-drift resolves its comparison
+  # image from the consumer's own DEVKIT_VERSION pin, so "behind the latest
+  # devkit release" is invisible to it by construction — a consumer sat two
+  # minor versions behind with a green drift check. This job answers that
+  # question with a cheap API query and NEVER fails the build: the report is a
+  # ::warning annotation plus a step-summary block, not a gate. Deliberately
+  # not gated on DEVKIT_DRIFT_CHECK (no docker, no image pull — disabling the
+  # expensive drift gate must not silence the cheap staleness report) and
+  # deliberately absent from the summary gate's needs (warn-only must never
+  # block a merge).
+  devkit-staleness:
+    name: Devkit staleness
+    needs: [resolve-toolchain]
+    runs-on: ${{ fromJSON(needs.resolve-toolchain.outputs.runner-json) }}
+    timeout-minutes: 5
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+
+    steps:
+      - name: Compare DEVKIT_VERSION against the latest devkit release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PIN: ${{ needs.resolve-toolchain.outputs.image-tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PIN" ]; then
+            echo "No DEVKIT_VERSION pin resolved; nothing to compare."
+            exit 0
+          fi
+          # Stable releases only: drafts and prereleases never count as "the
+          # release you are behind". Every failure path (offline runner, API
+          # error, missing gh on a self-hosted runner) degrades to a skip.
+          RELEASES="$(gh api repos/vig-os/devkit/releases --paginate \
+            --jq '.[] | select((.draft or .prerelease) | not) | .tag_name' 2>/dev/null || true)"
+          if [ -z "$RELEASES" ]; then
+            echo "Could not list devkit releases (offline or API error); skipping the staleness report."
+            exit 0
+          fi
+          LATEST="$(printf '%s\n' "$RELEASES" | sort -V | tail -n1)"
+          if [ "$PIN" = "$LATEST" ]; then
+            echo "DEVKIT_VERSION ${PIN} is the latest devkit release."
+            exit 0
+          fi
+          # Count the stable releases strictly newer than the pin. GNU
+          # `sort -V` orders `X.Y.Z-rcN` AFTER `X.Y.Z` (Debian convention, the
+          # opposite of semver), so map the prerelease dash to a tilde — which
+          # version-sorts before the final — and an rc pin counts as behind
+          # its own published final.
+          SORT_PIN="$(printf '%s' "$PIN" | sed 's/-/~/')"
+          BEHIND="$(printf '%s\n%s\n' "$RELEASES" "$SORT_PIN" | sort -uV \
+            | awk -v pin="$SORT_PIN" 'f { c++ } $0 == pin { f = 1 } END { print c + 0 }')"
+          if [ "$BEHIND" -eq 0 ]; then
+            echo "DEVKIT_VERSION ${PIN} is ahead of the latest published release (${LATEST})."
+            exit 0
+          fi
+          echo "::warning::DEVKIT_VERSION ${PIN} is ${BEHIND} release(s) behind the latest devkit release (${LATEST}). Run the devkit-upgrade workflow or 'install.sh --force --version ${LATEST}' to catch up."
+          {
+            echo "## Devkit staleness"
+            echo ""
+            echo "- **Pinned:** \`${PIN}\`"
+            echo "- **Latest:** \`${LATEST}\`"
+            echo "- **Behind:** ${BEHIND} stable release(s)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # Blocks PRs that introduce known-vulnerable dependencies, off GitHub's
   # dependency graph (lockfiles + action pins alike) — no toolchain, no
   # container, no resolve-toolchain. Doubly guarded, mirroring the codeql.yml
@@ -367,7 +576,7 @@ jobs:
   # Dependency graph: gh api -X PUT repos/OWNER/REPO/vulnerability-alerts (#1166).
   dependency-review:
     name: Dependency Review
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     if: ${{ github.event_name == 'pull_request' && !github.event.repository.private }}
     permissions:
@@ -406,39 +615,45 @@ jobs:
           echo "Dependency review: ${{ needs.dependency-review.result }}"
           echo ""
 
+          # Fail on 'failure' AND on 'cancelled': a cancelled job (timeout,
+          # concurrency cancel, runner eviction) produced no verdict, and this
+          # aggregate is the required check — treating it as green would let an
+          # unfinished CI run merge (#1371, #1414). 'skipped' stays tolerated:
+          # push/dispatch runs and PR-only jobs skip legitimately.
           FAILED=false
 
           if [ "${{ needs.resolve-toolchain.result }}" = "failure" ] || [ "${{ needs.resolve-toolchain.result }}" = "cancelled" ]; then
-            echo "ERROR: Toolchain resolution failed"
+            echo "ERROR: Toolchain resolution failed or was cancelled"
             FAILED=true
           fi
 
-          if [ "${{ needs.lint.result }}" = "failure" ]; then
-            echo "ERROR: Lint checks failed"
+          if [ "${{ needs.lint.result }}" = "failure" ] || [ "${{ needs.lint.result }}" = "cancelled" ]; then
+            echo "ERROR: Lint checks failed or were cancelled"
             FAILED=true
           fi
 
-          if [ "${{ needs.test.result }}" = "failure" ]; then
-            echo "ERROR: Tests failed"
+          if [ "${{ needs.test.result }}" = "failure" ] || [ "${{ needs.test.result }}" = "cancelled" ]; then
+            echo "ERROR: Tests failed or were cancelled"
             FAILED=true
           fi
 
-          if [ "${{ needs.commit-checks.result }}" = "failure" ]; then
-            echo "ERROR: Commit message checks failed"
+          if [ "${{ needs.commit-checks.result }}" = "failure" ] || [ "${{ needs.commit-checks.result }}" = "cancelled" ]; then
+            echo "ERROR: Commit message checks failed or were cancelled"
             FAILED=true
           fi
 
-          # Skipped on push/dispatch and when DEVKIT_DRIFT_CHECK=false; only a
-          # genuine failure (managed-file drift) trips the gate.
-          if [ "${{ needs.scaffold-drift.result }}" = "failure" ]; then
-            echo "ERROR: Scaffold drift detected"
+          # Skipped on push/dispatch and when DEVKIT_DRIFT_CHECK=false; a
+          # genuine failure (managed-file drift) or a cancel trips the gate.
+          if [ "${{ needs.scaffold-drift.result }}" = "failure" ] || [ "${{ needs.scaffold-drift.result }}" = "cancelled" ]; then
+            echo "ERROR: Scaffold drift detected or check cancelled"
             FAILED=true
           fi
 
           # Skipped on push/dispatch and on private repos (same skip-is-OK
-          # treatment as commit-checks); only a genuine failure trips the gate.
-          if [ "${{ needs.dependency-review.result }}" = "failure" ]; then
-            echo "ERROR: Dependency review failed"
+          # treatment as commit-checks); a genuine failure or a cancel trips
+          # the gate.
+          if [ "${{ needs.dependency-review.result }}" = "failure" ] || [ "${{ needs.dependency-review.result }}" = "cancelled" ]; then
+            echo "ERROR: Dependency review failed or was cancelled"
             FAILED=true
           fi
 

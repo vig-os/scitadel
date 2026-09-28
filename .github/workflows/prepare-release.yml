@@ -15,16 +15,6 @@ on:  # yamllint disable-line rule:truthy
         required: false
         default: false
         type: boolean
-      git-user-name:
-        description: "Git user name for commits"
-        required: false
-        default: "github-actions[bot]"
-        type: string
-      git-user-email:
-        description: "Git user email for commits"
-        required: false
-        default: "41898282+github-actions[bot]@users.noreply.github.com"
-        type: string
 
 permissions:
   contents: read
@@ -33,7 +23,7 @@ permissions:
 jobs:
   validate:
     name: Validate Release Preparation
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     outputs:
       version: ${{ steps.vars.outputs.version }}
@@ -41,6 +31,7 @@ jobs:
       mode: ${{ steps.resolve.outputs.mode }}
       image: ${{ steps.resolve.outputs.image }}
       image-tag: ${{ steps.resolve.outputs.image-tag }}
+      tag-prefix: ${{ steps.resolve.outputs.tag-prefix }}
 
     steps:
       - name: Checkout repository
@@ -92,6 +83,24 @@ jobs:
             exit 1
           fi
 
+      - name: Verify no other release train is in flight
+        run: |
+          set -euo pipefail
+          # Single-train policy (#1627), symmetric with prepare-hotfix.yml: a
+          # regular train cut while a hotfix release/* is in flight predates
+          # the fix, so promoting it afterwards silently reintroduces the
+          # regression, and promoting it first moves the floating refs
+          # backwards. Refuse instead of relying on a cherry-pick obligation;
+          # promote or abandon the other train first.
+          IN_FLIGHT=$(git ls-remote --heads origin 'release/*' | awk '{ sub("^refs/heads/", "", $2); print $2 }')
+          if [ -n "$IN_FLIGHT" ]; then
+            echo "ERROR: Another release train is in flight; a second train cannot be cut alongside it:"
+            while IFS= read -r branch; do echo "  $branch"; done <<< "$IN_FLIGHT"
+            echo "Promote or abandon it first (just promote-release / just abandon-release), then retry"
+            exit 1
+          fi
+          echo "✓ No other release train in flight"
+
       - name: Verify tag does not exist
         env:
           VERSION: ${{ steps.vars.outputs.version }}
@@ -110,20 +119,47 @@ jobs:
             exit 1
           fi
 
-      - name: Verify CHANGELOG has Unreleased section entries
+      # Sync-ordering guard (#1680). The freeze below takes DEV's ## Unreleased,
+      # but main can carry commits dev has not received yet: prepare-hotfix cuts
+      # from main, and promote-release merges the release branch into it.
+      # sync-main-to-dev.yml opens a PR carrying them back on every push to
+      # main, but nothing forces that PR to be merged before the next train is
+      # cut. Cutting ahead of it silently drops those changelog entries from the
+      # frozen section, so the release ships without describing changes it
+      # contains — invisible until someone goes looking. This is the same
+      # comparison sync-main-to-dev.yml uses to decide whether to open the PR,
+      # so the lane that carries the commits and the lane that demands them
+      # agree by construction rather than by coincidence. The trunk workflow
+      # model deletes this whole block at scaffold time: releases cut from main
+      # there and sync-main-to-dev.yml is copy-excluded.
+      - name: Verify dev is not behind main
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main dev
+          if ! git show-ref --verify --quiet refs/remotes/origin/main; then
+            echo "ERROR: remote branch 'origin/main' not found after fetch."
+            exit 1
+          fi
+          if ! git show-ref --verify --quiet refs/remotes/origin/dev; then
+            echo "ERROR: remote branch 'origin/dev' not found after fetch."
+            exit 1
+          fi
+          BEHIND=$(git rev-list --count origin/main ^origin/dev)
+          if [ "$BEHIND" != "0" ]; then
+            echo "ERROR: dev is behind main by $BEHIND commit(s)"
+            echo "main carries changes dev has not received, so the frozen section would omit them"
+            echo "Merge the open chore/sync-main-to-dev-* PR (Sync main to dev workflow), then re-dispatch"
+            exit 1
+          fi
+
+      # The Unreleased content gate lives in the prepare job (after bot-entry
+      # synthesis, which needs the devkit toolchain this host job does not
+      # have): a train whose only changes are bot PRs must still pass (#1423).
+      - name: Verify CHANGELOG has Unreleased section
         run: |
           set -euo pipefail
           if ! grep -q "^## Unreleased" CHANGELOG.md; then
             echo "ERROR: CHANGELOG.md is missing '## Unreleased' section"
-            exit 1
-          fi
-          if ! awk '
-            /^## Unreleased$/ {in_unreleased=1; next}
-            /^## \[/ && in_unreleased {exit 1}
-            in_unreleased && /^[[:space:]]*-[[:space:]]/ {found_entry=1}
-            END {exit(found_entry ? 0 : 1)}
-          ' CHANGELOG.md; then
-            echo "ERROR: CHANGELOG.md Unreleased section has no entries"
             exit 1
           fi
 
@@ -143,7 +179,7 @@ jobs:
   prepare:
     name: Prepare Release Branch
     needs: validate
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     container:
       image: ${{ needs.validate.outputs.image }}
       credentials:
@@ -157,6 +193,7 @@ jobs:
     permissions:
       contents: read
       packages: read
+      pull-requests: read    # bot-PR metadata for changelog synthesis (#1423)
     # Exposed to the extension, open-pr, and rollback jobs. The PR body (changelog)
     # and the rollback anchors (pre-freeze/post-freeze SHAs) were step outputs when
     # this job also opened the PR and rolled back inline; the extension hook (#1059)
@@ -164,7 +201,7 @@ jobs:
     outputs:
       changelog: ${{ steps.changelog.outputs.changelog }}
       prepare_start_sha: ${{ steps.pre_state.outputs.prepare_start_sha }}
-      dev_sha: ${{ steps.create_branch.outputs.dev_sha }}
+      freeze_sha: ${{ steps.freeze_wait.outputs.freeze_sha }}
 
     steps:
       - name: Generate Commit App Token
@@ -196,6 +233,69 @@ jobs:
             gh api "repos/${{ github.repository }}/git/ref/heads/dev" --jq '.object.sha')
           echo "prepare_start_sha=$PREPARE_START_SHA" >> "$GITHUB_OUTPUT"
 
+      # The release branch is cut from the base BEFORE the changelog freeze, so
+      # that the freeze target is free to be either branch (#1479). That keeps
+      # this file model-agnostic: the trunk render is a literal substitution of
+      # the freeze target (release/X.Y.Z there, so the freeze never pushes to
+      # the protected trunk and the release PR carries a real commit), with no
+      # step reordering. The branch starts at the PRE-freeze base SHA and is
+      # fast-forwarded onto the freeze commit further down.
+      - name: Create release branch from dev
+        id: create_branch
+        env:
+          GH_TOKEN: ${{ steps.commit_app_token.outputs.token }}
+          RELEASE_BRANCH: ${{ needs.validate.outputs.release_branch }}
+          PREPARE_START_SHA: ${{ steps.pre_state.outputs.prepare_start_sha }}
+        run: |
+          set -euo pipefail
+          BRANCH_CREATED=true
+          retry --retries 3 --backoff 5 --max-backoff 60 -- \
+            gh api "repos/${{ github.repository }}/git/refs" \
+            -f ref="refs/heads/$RELEASE_BRANCH" \
+            -f sha="$PREPARE_START_SHA" || {
+              if retry --retries 2 --backoff 5 --max-backoff 20 -- \
+                gh api "repos/${{ github.repository }}/git/ref/heads/$RELEASE_BRANCH" >/dev/null 2>&1; then
+                echo "Release branch already exists: $RELEASE_BRANCH"
+                BRANCH_CREATED=false
+              else
+                exit 1
+              fi
+            }
+          echo "branch_created=$BRANCH_CREATED" >> "$GITHUB_OUTPUT"
+
+      # Absorbs GitHub's ref read-after-write lag before anything else touches
+      # the branch — under a trunk render the very next writer is the changelog
+      # freeze itself, which targets this branch.
+      - name: Verify release branch is resolvable
+        env:
+          GH_TOKEN: ${{ steps.commit_app_token.outputs.token }}
+          RELEASE_BRANCH: ${{ needs.validate.outputs.release_branch }}
+        run: |
+          set -euo pipefail
+          retry --retries 10 --backoff 2 --max-backoff 30 -- \
+            gh api "repos/${{ github.repository }}/git/ref/heads/$RELEASE_BRANCH" --jq '.object.sha'
+          echo "✓ Release branch ref verified as resolvable"
+
+      # Bot-PR entries (Renovate, devkit adoptions) are synthesized into
+      # Unreleased right before the freeze so they ride the freeze commit; the
+      # per-PR changelog pipeline they replace conflicted every open bot PR on
+      # the same Unreleased lines (#1423).
+      - name: Synthesize bot changelog entries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}
+          TAG_PREFIX: ${{ needs.validate.outputs.tag-prefix }}
+        run: |
+          set -euo pipefail
+          synthesize-bot-changelog --tag-prefix "$TAG_PREFIX"
+
+      # The content gate runs here, after synthesis, because this job has the
+      # devkit toolchain and the host-only validate job does not (#1423).
+      - name: Verify CHANGELOG has Unreleased section entries
+        run: |
+          set -euo pipefail
+          prepare-changelog validate CHANGELOG.md
+
       - name: Prepare CHANGELOG (freeze + reset)
         env:
           VERSION: ${{ needs.validate.outputs.version }}
@@ -226,7 +326,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Commit prepared CHANGELOG to dev via API
-        uses: vig-os/commit-action@3a0588ec060d9647bf406e064cf9e6192a431864  # v0.3.1
+        uses: vig-os/commit-action@7ba7e1ae17547813e708d4cc6a771a09f978f724  # v0.3.3
         env:
           GH_TOKEN: ${{ steps.commit_app_token.outputs.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
@@ -239,56 +339,67 @@ jobs:
             and create fresh empty Unreleased section for continued development.
           FILE_PATHS: CHANGELOG.md
 
-      - name: Create release branch from dev
-        id: create_branch
+      - name: Wait for the freeze commit to become visible
+        id: freeze_wait
         env:
           GH_TOKEN: ${{ steps.commit_app_token.outputs.token }}
-          RELEASE_BRANCH: ${{ needs.validate.outputs.release_branch }}
+          FREEZE_REF: heads/dev
           PREPARE_START_SHA: ${{ steps.pre_state.outputs.prepare_start_sha }}
         run: |
           set -euo pipefail
-          # Wait for dev to advance past the pre-freeze SHA before branching (#617).
-          # The freeze commit-action updates dev's ref, but a REST ref read can
-          # briefly return the stale pre-freeze SHA (read-after-write lag); branching
-          # then would create release/X.Y.Z without the freeze. `retry` only retries
-          # on failure, so a stale-but-successful read slips through -- assert the SHA
-          # actually changed instead of trusting the first read.
-          DEV_SHA=""
+          # Wait for the freeze target to advance past the pre-freeze SHA (#617).
+          # The freeze commit-action updates that ref, but a REST ref read can
+          # briefly return the stale pre-freeze SHA (read-after-write lag); acting
+          # on it would fast-forward release/X.Y.Z to a commit without the freeze.
+          # `retry` only retries on failure, so a stale-but-successful read slips
+          # through -- assert the SHA actually changed instead of trusting the
+          # first read.
+          FREEZE_SHA=""
           for attempt in $(seq 1 8); do
-            DEV_SHA=$(retry --retries 3 --backoff 5 --max-backoff 60 -- \
-              gh api "repos/${{ github.repository }}/git/ref/heads/dev" --jq '.object.sha')
-            if [ "$DEV_SHA" != "$PREPARE_START_SHA" ]; then
+            FREEZE_SHA=$(retry --retries 3 --backoff 5 --max-backoff 60 -- \
+              gh api "repos/${{ github.repository }}/git/ref/$FREEZE_REF" --jq '.object.sha')
+            if [ "$FREEZE_SHA" != "$PREPARE_START_SHA" ]; then
               break
             fi
-            echo "dev still at pre-freeze SHA $DEV_SHA (attempt $attempt/8); waiting for freeze to propagate..."
+            echo "$FREEZE_REF still at pre-freeze SHA $FREEZE_SHA (attempt $attempt/8); waiting for the freeze to propagate..."
             sleep 5
           done
-          if [ "$DEV_SHA" = "$PREPARE_START_SHA" ]; then
-            echo "ERROR: dev did not advance past pre-freeze SHA $PREPARE_START_SHA; freeze commit not visible"
+          if [ "$FREEZE_SHA" = "$PREPARE_START_SHA" ]; then
+            echo "ERROR: $FREEZE_REF did not advance past pre-freeze SHA $PREPARE_START_SHA; freeze commit not visible"
             exit 1
           fi
-          retry --retries 3 --backoff 5 --max-backoff 60 -- \
-            gh api "repos/${{ github.repository }}/git/refs" \
-            -f ref="refs/heads/$RELEASE_BRANCH" \
-            -f sha="$DEV_SHA" || {
-              if retry --retries 2 --backoff 5 --max-backoff 20 -- \
-                gh api "repos/${{ github.repository }}/git/ref/heads/$RELEASE_BRANCH" >/dev/null 2>&1; then
-                echo "Release branch already exists: $RELEASE_BRANCH"
-              else
-                exit 1
-              fi
-            }
-          echo "dev_sha=$DEV_SHA" >> "$GITHUB_OUTPUT"
+          echo "freeze_sha=$FREEZE_SHA" >> "$GITHUB_OUTPUT"
 
-      - name: Verify release branch is resolvable
+      # Fast-forward release/X.Y.Z onto the freeze commit, so the branch (and
+      # every downstream consumer of `freeze_sha`) carries the frozen CHANGELOG.
+      # The update is NON-force: under gitflow the branch sits exactly one commit
+      # behind the freeze, a genuine fast-forward; under trunk the freeze already
+      # landed ON this branch, so the SHAs match and the step short-circuits.
+      #
+      # Gated on this run having created the branch: a pre-existing release/X.Y.Z
+      # (a re-prepare race -- `validate` normally refuses it) may carry commits
+      # that are NOT ancestors of the freeze commit, where the update is not a
+      # fast-forward at all and force=false would rightly refuse it. Skipping
+      # keeps the tolerant behaviour that branch creation has always had. (#1479)
+      - name: Fast-forward release branch to the freeze commit
+        if: ${{ steps.create_branch.outputs.branch_created == 'true' }}
         env:
           GH_TOKEN: ${{ steps.commit_app_token.outputs.token }}
           RELEASE_BRANCH: ${{ needs.validate.outputs.release_branch }}
+          FREEZE_SHA: ${{ steps.freeze_wait.outputs.freeze_sha }}
         run: |
           set -euo pipefail
-          retry --retries 10 --backoff 2 --max-backoff 30 -- \
-            gh api "repos/${{ github.repository }}/git/ref/heads/$RELEASE_BRANCH" --jq '.object.sha'
-          echo "✓ Release branch ref verified as resolvable"
+          BRANCH_SHA=$(retry --retries 3 --backoff 5 --max-backoff 60 -- \
+            gh api "repos/${{ github.repository }}/git/ref/heads/$RELEASE_BRANCH" --jq '.object.sha')
+          if [ "$BRANCH_SHA" = "$FREEZE_SHA" ]; then
+            echo "✓ $RELEASE_BRANCH already carries the freeze commit"
+          else
+            retry --retries 3 --backoff 5 --max-backoff 60 -- \
+              gh api -X PATCH "repos/${{ github.repository }}/git/refs/heads/$RELEASE_BRANCH" \
+              -f sha="$FREEZE_SHA" \
+              -F force=false
+            echo "✓ Fast-forwarded $RELEASE_BRANCH to the freeze commit $FREEZE_SHA"
+          fi
 
       # The release branch keeps the empty ## Unreleased section (no stripping).
       # main therefore retains ## Unreleased above the dated release, matching
@@ -310,16 +421,14 @@ jobs:
     with:
       version: ${{ needs.validate.outputs.version }}
       release_branch: ${{ needs.validate.outputs.release_branch }}
-      branch_sha: ${{ needs.prepare.outputs.dev_sha }}
+      branch_sha: ${{ needs.prepare.outputs.freeze_sha }}
       dry_run: ${{ inputs.dry-run }}
-      git_user_name: ${{ inputs.git-user-name }}
-      git_user_email: ${{ inputs.git-user-email }}
     secrets: inherit
 
   open-pr:
     name: Open Draft Release PR
     needs: [validate, prepare, extension]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     container:
       image: ${{ needs.validate.outputs.image }}
       credentials:
@@ -388,6 +497,21 @@ jobs:
           if [ -n "$EXISTING_PR_URL" ]; then
             PR_URL="$EXISTING_PR_URL"
           else
+            # Same-SHA guard (#1479): GitHub refuses to open a pull request whose
+            # head and base resolve to the same commit ("No commits between main
+            # and release/X.Y.Z"). That is precisely what a release branch cut
+            # from a post-freeze base produces, and a local-git simulation cannot
+            # express the server-side refusal (why #1206 could not catch it), so
+            # the topology is asserted here where the diagnosis is unambiguous.
+            BASE_SHA=$(retry --retries 3 --backoff 5 --max-backoff 60 -- \
+              gh api "repos/${{ github.repository }}/git/ref/heads/main" --jq '.object.sha')
+            HEAD_SHA=$(retry --retries 3 --backoff 5 --max-backoff 60 -- \
+              gh api "repos/${{ github.repository }}/git/ref/heads/$RELEASE_BRANCH" --jq '.object.sha')
+            if [ "$BASE_SHA" = "$HEAD_SHA" ]; then
+              echo "ERROR: $RELEASE_BRANCH and main are the same commit ($HEAD_SHA)"
+              echo "The release PR would carry zero commits; the changelog freeze did not reach $RELEASE_BRANCH."
+              exit 1
+            fi
             PR_URL=$(retry --retries 3 --backoff 5 --max-backoff 60 -- \
               gh pr create \
                 --base main \
@@ -409,7 +533,7 @@ jobs:
   rollback:
     name: Roll Back Prepare Release on Failure or Cancellation
     needs: [validate, prepare, extension, open-pr]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     container:
       image: ${{ needs.validate.outputs.image }}
       credentials:
@@ -463,22 +587,28 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.commit_app_token.outputs.token }}
           RELEASE_BRANCH: ${{ needs.validate.outputs.release_branch }}
+          FREEZE_REF: heads/dev
           PREPARE_START_SHA: ${{ needs.prepare.outputs.prepare_start_sha }}
-          POST_FREEZE_DEV_SHA: ${{ needs.prepare.outputs.dev_sha }}
+          POST_FREEZE_SHA: ${{ needs.prepare.outputs.freeze_sha }}
         run: |
           set -euo pipefail
           CHANGELOG_ROLLBACK_NEEDED=false
           retry --retries 3 --backoff 5 --max-backoff 60 -- \
             gh api -X DELETE "repos/${{ github.repository }}/git/refs/heads/$RELEASE_BRANCH" || true
 
-          if [ -z "${PREPARE_START_SHA:-}" ] || [ -z "${POST_FREEZE_DEV_SHA:-}" ]; then
+          if [ -z "${PREPARE_START_SHA:-}" ] || [ -z "${POST_FREEZE_SHA:-}" ]; then
             echo "changelog_rollback_needed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          CURRENT_DEV_SHA=$(retry --retries 3 --backoff 5 --max-backoff 60 -- \
-            gh api "repos/${{ github.repository }}/git/ref/heads/dev" --jq '.object.sha')
-          if [ "$CURRENT_DEV_SHA" != "$POST_FREEZE_DEV_SHA" ]; then
+          # Read the freeze target AFTER the delete above, and tolerate a missing
+          # ref: under a trunk render the freeze lives on the release branch that
+          # was just deleted, so an unresolvable ref is the correct "the freeze is
+          # already gone, nothing to restore" answer -- and the restore commit
+          # below can then never touch the trunk (#1479).
+          CURRENT_FREEZE_SHA=$(retry --retries 3 --backoff 5 --max-backoff 60 -- \
+            gh api "repos/${{ github.repository }}/git/ref/$FREEZE_REF" --jq '.object.sha' || echo "")
+          if [ "$CURRENT_FREEZE_SHA" != "$POST_FREEZE_SHA" ]; then
             echo "changelog_rollback_needed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -486,7 +616,7 @@ jobs:
           retry --retries 3 --backoff 5 --max-backoff 60 -- \
             gh api "repos/${{ github.repository }}/contents/CHANGELOG.md?ref=$PREPARE_START_SHA" --jq '.content' | tr -d '\n' | base64 -d > /tmp/changelog.pre.md
           retry --retries 3 --backoff 5 --max-backoff 60 -- \
-            gh api "repos/${{ github.repository }}/contents/CHANGELOG.md?ref=$CURRENT_DEV_SHA" --jq '.content' | tr -d '\n' | base64 -d > /tmp/changelog.current.md
+            gh api "repos/${{ github.repository }}/contents/CHANGELOG.md?ref=$CURRENT_FREEZE_SHA" --jq '.content' | tr -d '\n' | base64 -d > /tmp/changelog.current.md
           if ! cmp -s /tmp/changelog.pre.md /tmp/changelog.current.md; then
             cp /tmp/changelog.pre.md CHANGELOG.md
             CHANGELOG_ROLLBACK_NEEDED=true
@@ -495,7 +625,7 @@ jobs:
 
       - name: Commit CHANGELOG rollback to dev via API
         if: ${{ steps.rollback_prepare.outputs.changelog_rollback_needed == 'true' }}
-        uses: vig-os/commit-action@3a0588ec060d9647bf406e064cf9e6192a431864  # v0.3.1
+        uses: vig-os/commit-action@7ba7e1ae17547813e708d4cc6a771a09f978f724  # v0.3.3
         env:
           GH_TOKEN: ${{ steps.commit_app_token.outputs.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}

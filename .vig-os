@@ -7,7 +7,7 @@
 
 # Scaffold/image version pin (managed by release automation). Readers also
 # accept the legacy DEVCONTAINER_VERSION key for un-migrated consumers (#781).
-DEVKIT_VERSION=1.6.0
+DEVKIT_VERSION=1.17.0
 
 # Delivery mode: devcontainer | direnv | both | bare. Ships empty (= unset:
 # resolved and written back on scaffold) so an aborted upgrade can never
@@ -49,11 +49,24 @@ DEVKIT_FLOATING_TAGS=
 
 # CI runner labels for the scaffolded ci.yml toolchain jobs (lint, test,
 # commit-checks) and the summary gate — comma-separated, e.g.
-# `self-hosted,linux,x64,meatgrinder`. Empty (default) => the hosted `ubuntu-24.04`
+# `self-hosted,linux,x64,meatgrinder`. Empty (default) => the hosted `ubuntu-26.04`
 # runner (no change for existing consumers). Routed into `runs-on` via
 # resolve-toolchain's `runner-json` output; the resolve-toolchain and
 # dependency-review jobs always stay on the hosted default (#1173).
 DEVKIT_CI_RUNNER=
+
+# Absolute path for the direnv-mode dev-shell gcroot profile on the runner host.
+# Empty (default) => `$RUNNER_TEMP/devkit-dev-profile`, wiped with the job — the
+# right place on a hosted runner, since the machine goes too. An EPHEMERAL
+# self-hosted runner inverts that: RUNNER_TEMP is wiped between jobs while the
+# /nix/store persists, so nothing roots the dev-shell closure and the host's
+# nix.gc collects the one every CI run needs. Point this at a persistent,
+# runner-writable directory OUTSIDE the runner's `_work` tree, e.g.
+# `/var/lib/devkit/gcroots/dev-profile`. Runner slots on the same host share it
+# (concurrent `nix develop --profile` realisations take the profile lock and
+# converge); it must be a local persistent directory, not a per-job tmpfs.
+# Consumed by the ci.yml lanes DEVKIT_CI_RUNNER can move onto that host (#1601).
+DEVKIT_DEV_PROFILE_PATH=
 
 # Branch the scaffolded sync-issues job commits to. Empty (default) resolves to
 # the workflow-model default — `dev` (gitflow) / `main` (trunk) — unchanged for
@@ -70,26 +83,118 @@ DEVKIT_SYNC_TARGET=
 # cannot take inputs (#1228).
 DEVKIT_SYNC_SCHEDULE=
 
+# GitHub deployment environment the scaffolded jobs that MINT THE COMMIT APP
+# TOKEN are bound to. Empty (default) => no binding at all, rendered exactly as
+# today for every existing consumer. Set it to the name of an environment whose
+# ENVIRONMENT SECRETS hold COMMIT_APP_CLIENT_ID / COMMIT_APP_PRIVATE_KEY (e.g.
+# `commit-app`) and the scaffold renders `environment: '<name>'` on those jobs and
+# no other, so the pair stops being an org/repo secret that a workflow job on ANY
+# branch can read — the commit App usually holds a branch-protection bypass, so
+# that surface let any write-access account push a branch, mint the token and
+# write straight past the default branch's protection (#1710).
+# Create the environment BEFORE upgrading: a bound job whose environment does not
+# exist AUTO-CREATES an unprotected one. Give it a deployment branch policy
+# naming the refs these workflows legitimately run from — `main` and `release/*`,
+# plus `dev` under the gitflow model, which is where prepare-release /
+# prepare-hotfix are dispatched from — and NO required reviewers, which would
+# inject a second approval into the single-approval release train. Branch
+# policies match ref NAMES, so pair it with a ruleset restricting who may create
+# `release/*` refs. prepare-release-extension.yml is yours (seeded, never
+# regenerated): if your extension mints the token, add `environment:` there
+# yourself.
+# Realized at scaffold time (an anchored insert per job, plus a `required: false`
+# flip of release-core.yml's two workflow_call COMMIT_APP_* declarations — an
+# environment secret cannot be delivered through the caller's `secrets: inherit`);
+# written back only for a non-empty value. Strict name charset
+# ([A-Za-z0-9._-], no leading `-`/`.`, <= 255 chars), guarded loudly; the rendered
+# scalar is single-quoted, so a name like `true` or `0755` stays a string.
+DEVKIT_COMMIT_APP_ENVIRONMENT=
+
 # Scaffold feature groups this repo opts OUT of — a comma-separated,
 # whitespace-tolerant subset of: release, renovate, sync-issues, scanning,
-# gh-templates, skills, worktree, devkit-upgrade. Empty (default) => every group is scaffolded
-# (no change for existing consumers). A disabled group is never shipped, and a
-# copy left by a prior scaffold is pruned on upgrade; clearing the key re-ships
-# it on the next `--force`. Consumer-owned extension seams
-# (release-extension.yml, prepare-release-extension.yml) and renovate.json are
+# gh-templates, skills, worktree, devkit-upgrade, actionlint. Empty (default) =>
+# every group is scaffolded (no change for existing consumers). A disabled group
+# is never shipped, and a copy left by a prior scaffold is pruned on upgrade;
+# clearing the key re-ships it on the next `--force`. `release` also covers the
+# root CHANGELOG.md — only the release workflows read it — so a release-less repo
+# stops being handed one (an existing changelog is left in place, never pruned,
+# #1651). `actionlint` covers BOTH the actionlint hook and its label config — the
+# hook alone would lint against actionlint's bare built-in label list (#1660).
+# Consumer-owned extension seams (release-extension.yml,
+# prepare-release-extension.yml), renovate.json and .github/actionlint.yaml are
 # left in place if present (never pruned). Governs scaffold SHAPE only, not the
 # flake — an unknown name aborts the scaffold loudly (#1284).
 DEVKIT_FEATURES_DISABLED=
 
-# Refs-line enforcement policy for the commit-message gate, driving BOTH the
-# validate-commit-msg pre-commit hook and CI's validate-commit-range from this
-# one key. Empty (default) resolves to `chore-optional` — every type but `chore`
+# License the scaffold ships: apache-2.0 (default) | proprietary | none. Empty
+# (= unset) resolves to `apache-2.0` — the shipped Apache-2.0 template, adding
+# it when this repo has none, unchanged for existing consumers. `proprietary`
+# renders an all-rights-reserved notice instead (written only when LICENSE is
+# absent or is still the untouched Apache scaffold copy; a hand-edited one is
+# left in place with a notice). `none` means devkit manages no LICENSE at all:
+# the file is never added, so deleting it STICKS across upgrades, and an
+# existing one is left untouched — the scaffold never deletes a license.
+# Realized at scaffold time (a copy-exclude plus a render); written back only
+# for a non-default value (#1651).
+DEVKIT_LICENSE=none
+
+# Refs-line enforcement policy for the commit-message gate, driving the
+# validate-commit-msg pre-commit hook — scaffolded AND flake-generated (read by
+# flake.nix at eval time, #1434) — and CI's validate-commit-range from this one
+# key. Empty (default) resolves to `chore-optional` — every type but `chore`
 # requires a `Refs:` line — unchanged for devkit or existing consumers.
 # `optional` never requires Refs (any approved type may omit it); `required`
 # demands Refs on every type, `chore` included. Realized at scaffold time (an
 # anchored render of the hook arg + resolve-toolchain's `refs-optional-types`
-# output); written back only for a non-default value (#1282).
+# output); written back only for a non-default value (#1282). Sugar over
+# DEVKIT_REFS_OPTIONAL_TYPES below, which WINS when both are set (#1633).
 DEVKIT_REFS_POLICY=
+
+# Approved commit types for the commit-message gate — a comma-separated
+# (whitespace-tolerant) FULL REPLACEMENT list driving the validate-commit-msg
+# hook's `--types` arg — scaffolded AND flake-generated (read by flake.nix at
+# eval time, #1434) — and CI's validate-commit-range from this one key.
+# Empty (default) resolves to the stock 11 types
+# (feat,fix,docs,chore,refactor,perf,test,ci,build,revert,style) — unchanged
+# for devkit or existing consumers. Lowercase alphanumerics only (guarded
+# loudly at scaffold time). Keep `chore` and `build` unless deliberate:
+# Renovate / devkit-upgrade bot commits use them, and dropping either fails
+# those bot PRs in commit-checks (the scaffold prints a notice). Composes with
+# DEVKIT_REFS_POLICY: `optional` mirrors THIS list. Realized at scaffold time
+# (an anchored render of the hook arg + resolve-toolchain's `commit-types`
+# output); written back only for a non-empty value (#1431).
+DEVKIT_COMMIT_TYPES=
+
+# Commit types whose `Refs:` line is OPTIONAL — a comma-separated
+# (whitespace-tolerant) FULL REPLACEMENT list driving the validate-commit-msg
+# hook's `--refs-optional-types` arg — scaffolded AND flake-generated (read by
+# flake.nix at eval time) — and CI's validate-commit-range from this one key.
+# Empty (default) falls through to DEVKIT_REFS_POLICY above, i.e. `chore` —
+# unchanged for devkit or existing consumers. Set it to exempt a NAMED set
+# instead: a repo that adds a `record` type via DEVKIT_COMMIT_TYPES for
+# deliberately issue-less commits writes `chore,record` here and keeps the
+# Refs requirement on `feat`/`fix`/everything else. Entries must be lowercase
+# alphanumerics AND a subset of the resolved DEVKIT_COMMIT_TYPES (guarded
+# loudly at scaffold time). This key WINS over DEVKIT_REFS_POLICY when both
+# are set — the narrower key decides; use `DEVKIT_REFS_POLICY=required` to
+# exempt nothing at all. Realized at scaffold time (an anchored render of the
+# hook arg + resolve-toolchain's `refs-optional-types` output); written back
+# only for a non-empty value (#1633).
+DEVKIT_REFS_OPTIONAL_TYPES=
+
+# Issue-numbered branch types for the branch guard — a comma-separated
+# (whitespace-tolerant) FULL REPLACEMENT of the `<type>/<issue>-<summary>` set,
+# driving the local no-commit-to-branch hook, the flake-generated consumer
+# surface (read by flake.nix at eval time), and CI's branch-name gate from this
+# one key. Empty (default) resolves to the stock set
+# (feature,bugfix,hotfix,release,docs,test,refactor) — unchanged for devkit or
+# existing consumers. The `chore/<summary>`, `renovate/*`, and
+# `worktree/<issue>` clauses are never knob-driven. Lowercase alphanumerics
+# only (guarded loudly at scaffold time; the scaffold prints a notice when
+# `release` is dropped). Realized at scaffold time (an anchored render of the
+# hook pattern + resolve-toolchain's `branch-types` output); written back only
+# for a non-empty value (#1432).
+DEVKIT_BRANCH_TYPES=
 
 # Auto-upgrade opt-out for the scaffolded devkit-upgrade.yml workflow. Empty
 # (default) or any value other than `false` keeps the WEEKLY schedule path
@@ -117,3 +222,21 @@ DEVKIT_UPGRADE_EXCLUDE=
 # it via resolve-toolchain's `drift-check` output, so flipping it takes effect
 # with no re-scaffold; the value round-trips across `--force` upgrades (#1295).
 DEVKIT_DRIFT_CHECK=
+
+# Project languages this repo DECLARES — a comma-separated (whitespace-tolerant)
+# subset of: python, node, rust, nix. A DECLARATION, not a detection cache. The
+# scaffold SEEDS it from the marker files it detects (pyproject.toml /
+# package.json / Cargo.toml / *.nix beyond flake.nix) and ADDS a newly detected
+# language on a later upgrade, but NEVER removes one — dropping a language is a
+# deliberate hand-edit of this line, and the scaffold prints a loud notice when a
+# declared language's marker is absent. Stickiness is the whole point: a deploy
+# that deleted a repo's entire Python project also re-ran the scaffold in the
+# same commit, so a cache would have been rewritten to empty and the `Tests`
+# check stayed green (#1466). Empty (default) => nothing declared, so a
+# language-neutral repo (and every consumer upgrading from an older devkit,
+# whose key is seeded from detection on the adoption scaffold) is unaffected.
+# Pure runtime gate — CI reads it via resolve-toolchain's `languages` output and
+# fails ONE early ci.yml step when a declared language's marker file is missing;
+# `nix` is declared but never gated (no single marker file). Written back only
+# for a non-empty value (#1478).
+DEVKIT_LANGUAGES=rust

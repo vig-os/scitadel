@@ -31,7 +31,7 @@ permissions:
 jobs:
   resolve-toolchain:
     name: Resolve toolchain
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 2
     outputs:
       mode: ${{ steps.resolve.outputs.mode }}
@@ -58,7 +58,7 @@ jobs:
   validate:
     name: Validate promote prerequisites
     needs: [resolve-toolchain]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     container:
       image: ${{ needs.resolve-toolchain.outputs.image }}
       credentials:
@@ -178,6 +178,39 @@ jobs:
           fi
           echo "✓ Draft GitHub Release exists for $PROMOTE_TAG"
 
+      - name: Verify version does not move the floating tags backwards
+        # Only where a floating ref would actually move: without floating tags
+        # nothing follows the promoted version, and a patch for an older line
+        # stays a legitimate release.
+        if: ${{ needs.resolve-toolchain.outputs.floating-tags != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.vars.outputs.version }}
+          TAG_PREFIX: ${{ needs.resolve-toolchain.outputs.tag-prefix }}
+        run: |
+          set -euo pipefail
+          # The floating major/minor tags follow whichever version promoted
+          # last (#1626). Two trains can only coexist by hand (prepare-release
+          # refuses a second one), but whichever promotes second would walk
+          # the floating tags back to an older version. The published final
+          # releases of this prefix line are exactly the versions the tags
+          # have followed, so refuse when this one is below the highest of
+          # them. The draft for $VERSION is excluded by construction.
+          RELEASES=$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate)
+          HIGHEST=$(printf '%s' "$RELEASES" \
+            | jq -r -s --arg prefix "$TAG_PREFIX" 'flatten | map(select(.draft == false and .prerelease == false) | .tag_name | select(startswith($prefix)) | ltrimstr($prefix)) | .[]' \
+            | { grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V | tail -1)
+          if [ -z "$HIGHEST" ]; then
+            echo "✓ No published final release yet; the floating tags have nothing to protect"
+            exit 0
+          fi
+          if [ "$(printf '%s\n%s\n' "$HIGHEST" "$VERSION" | sort -V | tail -1)" != "$VERSION" ]; then
+            echo "ERROR: Promoting $VERSION would move the floating tags backwards: the highest published release is ${TAG_PREFIX}${HIGHEST}"
+            echo "Promote trains in version order. If this train is stale, abandon it (just abandon-release) and re-cut the fix as the next patch of the $HIGHEST line"
+            exit 1
+          fi
+          echo "✓ $VERSION is above the highest published release ${TAG_PREFIX}${HIGHEST}; the floating tags move forward"
+
       - name: Find and verify release PR
         env:
           VERSION: ${{ steps.vars.outputs.version }}
@@ -204,7 +237,22 @@ jobs:
             echo "ERROR: PR #$PR_NUMBER is still in draft"
             exit 1
           fi
-          if [ "$REVIEW_DECISION" = "APPROVED" ]; then
+
+          # Protection-aware approval gate (#1506): assert only what the base
+          # branch actually requires. On a repo whose main ruleset requires no
+          # approving reviews (the smoke repo, solo-adoption consumers) GitHub
+          # never computes reviewDecision, so an unconditional assertion falls
+          # into the #438 fallback, counts zero approved reviews, and fails a
+          # PR the platform itself would merge. The rules endpoint sees
+          # rulesets only, not classic branch protection — a classic-protection
+          # repo skips here and degrades to the platform's own merge-time
+          # refusal (fail-late, never fail-open).
+          REQUIRED_APPROVALS=$(retry --retries 3 --backoff 5 --max-backoff 30 -- gh api \
+            "repos/${GITHUB_REPOSITORY}/rules/branches/main" \
+            | jq '[.[] | select(.type == "pull_request") | .parameters.required_approving_review_count // 0] | max // 0')
+          if [ "$REQUIRED_APPROVALS" -eq 0 ]; then
+            echo "Base branch requires no approving reviews — approval gate skipped (#1506)"
+          elif [ "$REVIEW_DECISION" = "APPROVED" ]; then
             echo "PR #$PR_NUMBER is approved"
           elif [ "$REVIEW_DECISION" = "null" ] || [ -z "$REVIEW_DECISION" ]; then
             APPROVED_COUNT=$(retry --retries 3 --backoff 5 --max-backoff 30 -- gh api \
@@ -222,19 +270,33 @@ jobs:
           fi
 
           STATUS_ROLLUP=$(echo "$PR_JSON" | jq -r '.[0].statusCheckRollup // []')
-          CI_FAILED=$(echo "$STATUS_ROLLUP" | jq '[.[] | select(.conclusion == "FAILURE" or .conclusion == "ERROR")] | length')
+
+          # Evaluate only the LATEST run of each check name (#1522), the way
+          # `gh pr checks` does: a superseded workflow run leaves its FAILURE
+          # check runs on the same head SHA and would refuse a branch that is
+          # actually green (#1516). Recency key is startedAt, not completedAt —
+          # completedAt is null while a rerun is in flight. StatusContexts key
+          # on context/createdAt and are each their own latest.
+          # Classify on a normalized verdict (#1538): CheckRuns carry
+          # `conclusion`, StatusContexts `state`, and neither has the other's
+          # field, so `.conclusion // .state` buckets both kinds without
+          # double-counting — an in-progress CheckRun still resolves to null
+          # and counts as pending.
+          LATEST_CHECKS=$(echo "$STATUS_ROLLUP" | jq '[group_by(.name // .context // "?")[] | max_by(.startedAt // .createdAt // "")]')
+
+          CI_FAILED=$(echo "$LATEST_CHECKS" | jq '[.[] | (.conclusion // .state) as $v | select($v == "FAILURE" or $v == "ERROR")] | length')
           if [ "$CI_FAILED" != "0" ]; then
             echo "ERROR: PR #$PR_NUMBER has failed CI checks"
             exit 1
           fi
 
-          CI_PENDING=$(echo "$STATUS_ROLLUP" | jq '[.[] | select(.conclusion == null or .conclusion == "" or .conclusion == "PENDING" or .conclusion == "IN_PROGRESS" or .conclusion == "QUEUED")] | length')
+          CI_PENDING=$(echo "$LATEST_CHECKS" | jq '[.[] | (.conclusion // .state) as $v | select($v == null or $v == "" or $v == "PENDING" or $v == "IN_PROGRESS" or $v == "QUEUED" or $v == "EXPECTED")] | length')
           if [ "$CI_PENDING" != "0" ]; then
             echo "ERROR: PR #$PR_NUMBER has checks still in progress"
             exit 1
           fi
 
-          CI_SUCCESS=$(echo "$STATUS_ROLLUP" | jq '[.[] | select(.conclusion == "SUCCESS")] | length')
+          CI_SUCCESS=$(echo "$LATEST_CHECKS" | jq '[.[] | (.conclusion // .state) as $v | select($v == "SUCCESS")] | length')
           if [ "$CI_SUCCESS" = "0" ]; then
             echo "ERROR: PR #$PR_NUMBER has no successful CI checks"
             exit 1
@@ -290,7 +352,7 @@ jobs:
   promote:
     name: Publish GitHub Release
     needs: [resolve-toolchain, validate]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     container:
       image: ${{ needs.resolve-toolchain.outputs.image }}
       credentials:
@@ -345,7 +407,7 @@ jobs:
   merge:
     name: Merge release PR to main
     needs: [resolve-toolchain, validate, promote]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     container:
       image: ${{ needs.resolve-toolchain.outputs.image }}
       credentials:
@@ -417,7 +479,14 @@ jobs:
             exit 1
           fi
 
-          if [ "$REVIEW_DECISION" = "APPROVED" ]; then
+          # Protection-aware approval gate (#1506) — same skip as validate;
+          # PR state can change between the jobs, so the merge copy re-checks.
+          REQUIRED_APPROVALS=$(retry --retries 3 --backoff 5 --max-backoff 30 -- gh api \
+            "repos/${GITHUB_REPOSITORY}/rules/branches/main" \
+            | jq '[.[] | select(.type == "pull_request") | .parameters.required_approving_review_count // 0] | max // 0')
+          if [ "$REQUIRED_APPROVALS" -eq 0 ]; then
+            echo "Base branch requires no approving reviews — approval gate skipped (#1506)"
+          elif [ "$REVIEW_DECISION" = "APPROVED" ]; then
             echo "PR #$PR_NUMBER is approved"
           elif [ "$REVIEW_DECISION" = "null" ] || [ -z "$REVIEW_DECISION" ]; then
             APPROVED_COUNT=$(retry --retries 3 --backoff 5 --max-backoff 30 -- gh api \
@@ -435,19 +504,33 @@ jobs:
           fi
 
           STATUS_ROLLUP=$(echo "$PR_JSON" | jq -r '.[0].statusCheckRollup // []')
-          CI_FAILED=$(echo "$STATUS_ROLLUP" | jq '[.[] | select(.conclusion == "FAILURE" or .conclusion == "ERROR")] | length')
+
+          # Evaluate only the LATEST run of each check name (#1522), the way
+          # `gh pr checks` does: a superseded workflow run leaves its FAILURE
+          # check runs on the same head SHA and would refuse a branch that is
+          # actually green (#1516). Recency key is startedAt, not completedAt —
+          # completedAt is null while a rerun is in flight. StatusContexts key
+          # on context/createdAt and are each their own latest.
+          # Classify on a normalized verdict (#1538): CheckRuns carry
+          # `conclusion`, StatusContexts `state`, and neither has the other's
+          # field, so `.conclusion // .state` buckets both kinds without
+          # double-counting — an in-progress CheckRun still resolves to null
+          # and counts as pending.
+          LATEST_CHECKS=$(echo "$STATUS_ROLLUP" | jq '[group_by(.name // .context // "?")[] | max_by(.startedAt // .createdAt // "")]')
+
+          CI_FAILED=$(echo "$LATEST_CHECKS" | jq '[.[] | (.conclusion // .state) as $v | select($v == "FAILURE" or $v == "ERROR")] | length')
           if [ "$CI_FAILED" != "0" ]; then
             echo "ERROR: PR #$PR_NUMBER has failed CI checks"
             exit 1
           fi
 
-          CI_PENDING=$(echo "$STATUS_ROLLUP" | jq '[.[] | select(.conclusion == null or .conclusion == "" or .conclusion == "PENDING" or .conclusion == "IN_PROGRESS" or .conclusion == "QUEUED")] | length')
+          CI_PENDING=$(echo "$LATEST_CHECKS" | jq '[.[] | (.conclusion // .state) as $v | select($v == null or $v == "" or $v == "PENDING" or $v == "IN_PROGRESS" or $v == "QUEUED" or $v == "EXPECTED")] | length')
           if [ "$CI_PENDING" != "0" ]; then
             echo "ERROR: PR #$PR_NUMBER has checks still in progress"
             exit 1
           fi
 
-          CI_SUCCESS=$(echo "$STATUS_ROLLUP" | jq '[.[] | select(.conclusion == "SUCCESS")] | length')
+          CI_SUCCESS=$(echo "$LATEST_CHECKS" | jq '[.[] | (.conclusion // .state) as $v | select($v == "SUCCESS")] | length')
           if [ "$CI_SUCCESS" = "0" ]; then
             echo "ERROR: PR #$PR_NUMBER has no successful CI checks"
             exit 1
@@ -475,7 +558,7 @@ jobs:
   cleanup:
     name: Cleanup git RC tags
     needs: [resolve-toolchain, validate, promote, merge]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     container:
       image: ${{ needs.resolve-toolchain.outputs.image }}
       credentials:
@@ -596,7 +679,7 @@ jobs:
     # update/delete to everyone but the RELEASE_APP, making moves app-exclusive.
     name: Move floating tags
     needs: [resolve-toolchain, validate, promote, merge]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     container:
       image: ${{ needs.resolve-toolchain.outputs.image }}
       credentials:
@@ -614,21 +697,32 @@ jobs:
       GH_REPO: ${{ github.repository }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-
-      - name: Set up devkit toolchain
-        uses: ./.github/actions/setup-devkit-toolchain
-        with:
-          mode: ${{ needs.resolve-toolchain.outputs.mode }}
-          devkit-version: ${{ needs.resolve-toolchain.outputs.image-tag }}
-
+      # Token FIRST, then check out with it. Tag pushes must authenticate as the
+      # Release App: the default github.token is not a bypass actor for the Tag
+      # ruleset, and this job deliberately keeps `contents: read` so it cannot
+      # push under the Actions identity at all. The token has to arrive through
+      # CHECKOUT — git authenticates via the credentials checkout persists as
+      # http.<host>.extraheader, and that header outranks any token embedded in
+      # a remote URL, so the previous "App token in the push URL" form was
+      # silently ignored (#1508). Do not "fix" a future 403 here by granting
+      # contents: write; that would move tag pushes to the Actions identity.
       - name: Generate release app token
         id: release_app_token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3
         with:
           client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          token: ${{ steps.release_app_token.outputs.token }}
+
+      - name: Set up devkit toolchain
+        uses: ./.github/actions/setup-devkit-toolchain
+        with:
+          mode: ${{ needs.resolve-toolchain.outputs.mode }}
+          devkit-version: ${{ needs.resolve-toolchain.outputs.image-tag }}
 
       - name: Move floating major/minor tags
         env:
@@ -642,8 +736,10 @@ jobs:
           RELEASE_TAG="${TAG_PREFIX}${VERSION}"
 
           # Resolve the commit the release tag points at. release-publish.yml
-          # creates an ANNOTATED tag, so peel it (object.type == "tag") to the
-          # underlying commit; floating tags then point straight at the commit.
+          # creates a LIGHTWEIGHT tag (a plain ref at the release commit), but
+          # releases published by older scaffolds created an ANNOTATED tag, so
+          # keep peeling it (object.type == "tag") to the underlying commit;
+          # floating tags then point straight at the commit.
           REF_JSON=$(retry --retries 3 --backoff 5 --max-backoff 30 -- \
             gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")
           TARGET_SHA=$(printf '%s' "$REF_JSON" | jq -r '.object.sha')
@@ -661,6 +757,14 @@ jobs:
           REST="${VERSION#*.}"
           MINOR="${REST%%.*}"
 
+          # `git push <sha>:<ref>` requires the commit object locally, and the
+          # checkout above is a shallow clone of the workflow head — fetch the
+          # release tag so its peeled commit is available to push. `origin`
+          # carries the Release App credentials the checkout persisted (#1508),
+          # which an unauthenticated fetch would lack on a private repo.
+          retry --retries 3 --backoff 5 --max-backoff 30 -- \
+            git fetch --no-tags --depth 1 origin "refs/tags/${RELEASE_TAG}"
+
           # Create-or-update a lightweight floating tag at the release commit,
           # idempotently (skip when it already points there). Force is required
           # because a floating tag is mutable by design (#1045).
@@ -671,28 +775,24 @@ jobs:
               echo "Floating tag ${name} already at ${TARGET_SHA}; skipping"
               return 0
             fi
-            if [ -n "$current" ]; then
-              retry --retries 3 --backoff 5 --max-backoff 30 -- \
-                gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/${name}" \
-                -f sha="$TARGET_SHA" -F force=true >/dev/null
-              echo "Moved floating tag ${name} -> ${TARGET_SHA}"
-            else
-              # First time this floating level is published: promote must
-              # CREATE the ref (POST /git/refs), not move it. The Tag ruleset
-              # denies creation to everyone but the Release App, so if the app
-              # is not an effective bypass actor for the ruleset's `creation`
-              # rule the call is refused — surfaced as the opaque "Reference
-              # does not exist" / HTTP 422 (#1157). Publish + merge already
-              # succeeded, so fail loud with actionable remediation rather than
-              # leaving the advertised `@${name}` pin silently missing.
-              if ! retry --retries 3 --backoff 5 --max-backoff 30 -- \
-                  gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
-                  -f ref="refs/tags/${name}" -f sha="$TARGET_SHA" >/dev/null; then
-                echo "::error title=Floating tag ${name} not created::Could not create floating tag '${name}' at ${TARGET_SHA} (first release of this floating level). The repo Tag ruleset restricts tag creation; if the Release App is not a bypass actor for the ruleset's 'creation' rule the POST /git/refs is denied as 'Reference does not exist' (HTTP 422). The GitHub Release is published and the release PR merged — only this floating tag is missing, which silently breaks the advertised 'uses: ...@${name}' pin. Remediate once by hand (temporarily bypass the ruleset, create refs/tags/${name} -> ${TARGET_SHA}, then revert), or grant the Release App a 'creation' bypass so future levels move automatically. See https://github.com/vig-os/devkit/blob/main/docs/MIGRATION.md#first-release-floating-tags."
-                return 1
-              fi
-              echo "Created floating tag ${name} -> ${TARGET_SHA}"
+            # Mutate the ref via `git push`, NEVER via the REST refs API:
+            # GitHub does not honor the Release App's Integration ruleset
+            # bypass on `POST /git/refs` for the `creation` rule, so the first
+            # release of every new floating level was refused as the opaque
+            # "Reference does not exist" (HTTP 422) with no rule-suite entry
+            # (#1157, #1377) — while the very same installation token pushing
+            # tags over git is bypassed fine (exactly how release-publish.yml
+            # creates the release tags). Push also unifies create and move
+            # into one branch-free path. `origin` is the App-authenticated
+            # remote (#1508). Publish + merge already succeeded, so on failure
+            # fail loud with actionable remediation rather than leaving the
+            # advertised `@${name}` pin silently missing or stale.
+            if ! retry --retries 3 --backoff 5 --max-backoff 30 -- \
+                git push --force origin "${TARGET_SHA}:refs/tags/${name}"; then
+              echo "::error title=Floating tag ${name} not moved::Could not force-push floating tag '${name}' to ${TARGET_SHA}. The GitHub Release is published and the release PR merged — only this floating tag is missing or stale, which silently breaks the advertised 'uses: ...@${name}' pin. The push authenticates as the Release App, which the repo Tag ruleset must list as a bypass actor; verify the ruleset's bypass list and the RELEASE_APP_CLIENT_ID / RELEASE_APP_PRIVATE_KEY secrets, or remediate once by hand (temporarily add an admin bypass to the ruleset, force-move refs/tags/${name} -> ${TARGET_SHA}, then revert). See https://github.com/vig-os/devkit/blob/main/docs/MIGRATION.md#first-release-floating-tags."
+              return 1
             fi
+            echo "Floating tag ${name} -> ${TARGET_SHA}"
           }
 
           IFS=',' read -ra LEVELS <<< "$FLOATING_TAGS"

@@ -48,14 +48,59 @@ repos:
       - id: yamllint
         args: ["--format", "parsable", "--strict"]
 
-  # Shellcheck
-  - repo: https://github.com/shellcheck-py/shellcheck-py
-    rev: a23f6b85d0fdd5bb9d564e2579e678033debbdff  # v0.10.0.1
+  # Shellcheck (sourced from the flake dev-shell toolchain). The shellcheck-py
+  # wheel bundles a manylinux shellcheck binary that a non-FHS userland cannot
+  # exec, and the prek/uv installer cannot build that wheel under Python 3.14 —
+  # so, like typos/pymarkdown, shellcheck runs as a language:system hook
+  # resolved from the flake. Refs vig-os/devkit#778.
+  - repo: local
     hooks:
       - id: shellcheck
         name: shellcheck
+        entry: shellcheck
+        language: system
+        types: [shell]
+        # .envrc files are direnv stdlib scripts with no shebang; exclude them
+        # from SC2148 at any path.
         args: ["-x"]
-        exclude: ^\.envrc$
+        exclude: (^|/)\.envrc$
+
+  # >>> devkit:actionlint — excised when the actionlint feature is disabled (#1660)
+  # GitHub Actions workflow linting (actionlint from the flake dev-shell
+  # toolchain, like shellcheck above — both ship in devTools, so both resolve
+  # from PATH in every mode). Lints this repo's own .github/workflows/ via
+  # actionlint's auto-discovery, with its bundled shellcheck pass over `run:`
+  # blocks enabled (#1003) so workflow scripts get the same lint as .sh files.
+  #
+  # Runner labels actionlint's built-in list does not know belong in
+  # .github/actionlint.yaml (shipped alongside this config) — declare the label
+  # there rather than loosening this hook. Refs #1660.
+  - repo: local
+    hooks:
+      - id: actionlint
+        name: actionlint (lint GitHub Actions workflows)
+        entry: actionlint
+        language: system
+        files: ^\.github/workflows/.*\.ya?ml$
+        pass_filenames: false
+  # <<< devkit:actionlint
+
+  # Composite-action shell linting (vig-utils' shellcheck-composite-actions,
+  # #1704). actionlint refuses a composite action outright (`unexpected key
+  # "runs" for "workflow" section`) and has no composite mode, so every `run:`
+  # body moved out of a workflow and into .github/actions/*/action.yml loses its
+  # shellcheck pass. This hook reproduces actionlint's own recipe over those
+  # bodies — same `${{ }}` neutralisation, same prelude, same exclude list — so
+  # the two hooks gate one lint. shellcheck itself resolves from PATH (it ships
+  # in devTools in every mode), like actionlint above.
+  - repo: local
+    hooks:
+      - id: shellcheck-composite-actions
+        name: shellcheck-composite-actions (lint composite action run bodies)
+        entry: uv run shellcheck-composite-actions
+        language: system
+        files: (^|/)\.github/actions/[^/]+/action\.ya?ml$
+        pass_filenames: true
 
   # Markdown Linting (excludes auto-generated docs)
   # pymarkdown from the flake toolchain (vigos nix/pymarkdown.nix, devkit

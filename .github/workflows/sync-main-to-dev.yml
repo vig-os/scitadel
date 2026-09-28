@@ -12,6 +12,9 @@
 #   sync  - clean up stale sync branches
 #         - merge-tree (in-memory) merge to detect conflicts
 #         - create chore/sync-main-to-dev-<run>-<attempt> branch via git push
+#         - auto-resolve conflicts confined to generated doc snapshots
+#           (docs/issues, docs/pull-requests) by committing dev's copies to the
+#           sync branch via commit-action (signed), then re-verify (#1403)
 #         - open PR; enable auto-merge when clean, or label "merge-conflict" with
 #           resolution instructions when conflicts exist
 #
@@ -48,7 +51,7 @@ permissions:
 jobs:
   resolve-toolchain:
     name: Resolve toolchain
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 2
     outputs:
       mode: ${{ steps.resolve.outputs.mode }}
@@ -73,7 +76,7 @@ jobs:
   check:
     name: Check if dev is up to date
     needs: [resolve-toolchain]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     container:
       image: ${{ needs.resolve-toolchain.outputs.image }}
       credentials:
@@ -124,7 +127,7 @@ jobs:
     name: Merge main into dev via PR
     needs: [resolve-toolchain, check]
     if: needs.check.outputs.up_to_date != 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     container:
       image: ${{ needs.resolve-toolchain.outputs.image }}
       credentials:
@@ -253,12 +256,131 @@ jobs:
             git push origin "${SYNC_BRANCH}"
           echo "Sync branch ${SYNC_BRANCH} pushed from main at ${MAIN_SHA}"
 
+      # docs/issues and docs/pull-requests snapshots are generated
+      # independently on dev (nightly sync-issues) and on the release branch
+      # (release-time sync-issues), so a release produces add/add conflicts on
+      # paths absent at the merge base (#1403). The signed-commits ruleset
+      # forbids a plain runner merge commit, so resolution is a single-parent
+      # commit-action commit that sets the sync branch's copy of each
+      # conflicted snapshot to DEV's content: with both sides identical the
+      # conflict vanishes, and dev's possibly-staler snapshot self-heals at
+      # the next nightly sync-issues run. Anything outside the snapshot dirs
+      # (or a delete/modify conflict) falls back to the manual path.
+      - name: Auto-resolve generated doc snapshot conflicts
+        if: >-
+          steps.existing-pr.outputs.count == '0'
+          && steps.recheck.outputs.up_to_date != 'true'
+          && steps.merge-check.outputs.conflict == 'true'
+        id: auto-resolve
+        run: |
+          set -euo pipefail
+          # Re-probe with --name-only to enumerate conflicted paths. Exit 1
+          # (conflict) is the expected outcome; anything else is a real error.
+          if merge_out="$(git merge-tree --write-tree --name-only origin/dev origin/main)"; then
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+            echo "Merge is clean on re-probe; nothing to auto-resolve."
+            exit 0
+          else
+            merge_rc=$?
+            if [ "${merge_rc}" -ne 1 ]; then
+              echo "::error::git merge-tree failed with exit code ${merge_rc}"
+              echo "${merge_out}"
+              exit "${merge_rc}"
+            fi
+          fi
+
+          # Output shape: line 1 = tree OID, then one conflicted path per
+          # line until the first blank line (informational messages follow).
+          mapfile -t conflicted < <(printf '%s\n' "${merge_out}" | sed -n '2,/^$/p' | sed '/^$/d' | sort -u)
+
+          if [ "${#conflicted[@]}" -eq 0 ]; then
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::merge-tree reported a conflict but no conflicted paths were parsed."
+            exit 0
+          fi
+
+          # Only generated snapshots are eligible, and only when dev still
+          # carries the path: a delete/modify conflict cannot be expressed as
+          # a working-tree file commit, so it stays on the manual path.
+          eligible=true
+          for path in "${conflicted[@]}"; do
+            case "${path}" in
+              docs/issues/*|docs/pull-requests/*) ;;
+              *)
+                echo "Conflicted path outside the snapshot allowlist: ${path}"
+                eligible=false
+                break
+                ;;
+            esac
+            if ! git cat-file -e "origin/dev:${path}" 2>/dev/null; then
+              echo "Conflicted path missing from origin/dev (delete/modify): ${path}"
+              eligible=false
+              break
+            fi
+          done
+
+          if [ "${eligible}" != "true" ]; then
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+            echo "Conflicts are not limited to dev-side doc snapshots; keeping the manual-resolution path."
+            exit 0
+          fi
+
+          # Materialize dev's side in the working tree (checked out on the
+          # sync branch). commit-action reads these files and commits them to
+          # the remote branch as a GitHub-signed single-parent commit.
+          git checkout origin/dev -- "${conflicted[@]}"
+
+          {
+            echo "file_paths<<PATHS_EOF"
+            printf '%s\n' "${conflicted[@]}"
+            echo "PATHS_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "eligible=true" >> "$GITHUB_OUTPUT"
+          echo "Auto-resolving ${#conflicted[@]} snapshot path(s) to dev's content."
+
+      - name: Commit dev-side doc snapshots
+        if: steps.auto-resolve.outputs.eligible == 'true'
+        uses: vig-os/commit-action@7ba7e1ae17547813e708d4cc6a771a09f978f724  # v0.3.3
+        env:
+          GH_TOKEN: ${{ steps.commit-app-token.outputs.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          TARGET_BRANCH: refs/heads/${{ env.SYNC_BRANCH }}
+          MAX_ATTEMPTS: "3"
+          ALLOW_EMPTY: "true"
+          COMMIT_MESSAGE: "chore: align generated doc snapshots with dev for a clean sync"
+          FILE_PATHS: ${{ steps.auto-resolve.outputs.file_paths }}
+
+      - name: Re-verify merge after auto-resolve
+        if: steps.auto-resolve.outputs.eligible == 'true'
+        id: reverify
+        run: |
+          set -euo pipefail
+          retry --retries 3 --backoff 3 --max-backoff 20 -- git fetch origin "${SYNC_BRANCH}" dev
+          if merge_out="$(git merge-tree --write-tree origin/dev "origin/${SYNC_BRANCH}" 2>&1)"; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+            echo "Auto-resolve verified: origin/dev merges cleanly into origin/${SYNC_BRANCH}."
+          else
+            merge_rc=$?
+            if [ "${merge_rc}" -eq 1 ]; then
+              echo "conflict=true" >> "$GITHUB_OUTPUT"
+              echo "::warning::Conflicts remain after auto-resolve; falling back to manual resolution."
+              echo "${merge_out}"
+            else
+              echo "::error::git merge-tree failed with exit code ${merge_rc}"
+              echo "${merge_out}"
+              exit "${merge_rc}"
+            fi
+          fi
+
       - name: Create PR
         if: steps.existing-pr.outputs.count == '0' && steps.recheck.outputs.up_to_date != 'true'
         id: create-pr
         env:
           GH_TOKEN: ${{ steps.release-app-token.outputs.token }}
-          CONFLICT: ${{ steps.merge-check.outputs.conflict }}
+          # reverify's output is '' when auto-resolve was skipped or
+          # ineligible, so this falls back to merge-check — the manual
+          # path is preserved bit-for-bit for non-snapshot conflicts.
+          CONFLICT: ${{ steps.reverify.outputs.conflict || steps.merge-check.outputs.conflict }}
         run: |
           set -euo pipefail
 
@@ -308,7 +430,7 @@ jobs:
       - name: Enable auto-merge
         if: >-
           steps.create-pr.outputs.pr_url != ''
-          && steps.merge-check.outputs.conflict != 'true'
+          && (steps.reverify.outputs.conflict || steps.merge-check.outputs.conflict) != 'true'
         env:
           GH_TOKEN: ${{ steps.release-app-token.outputs.token }}
           PR_URL: ${{ steps.create-pr.outputs.pr_url }}

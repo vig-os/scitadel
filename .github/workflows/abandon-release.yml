@@ -1,0 +1,220 @@
+# Managed by vigOS devkit — regenerated on upgrade; local edits are lost.
+# Customize in justfile.project. Bugs / missing tools: https://github.com/vig-os/devkit/issues
+
+# Abandon Release — first-class rejection path at promote time
+#
+# With the single human approval collected at promote, rejecting a release
+# happens after finalize has already burned artifacts. This workflow reverses
+# a finalized-but-unpublished release: it deletes the DRAFT GitHub Release and
+# the release tag as the Release App (Tag-protection bypass — the same
+# machinery as promote-release's RC prune), closes the release PR, and deletes
+# release/X.Y.Z. The tag carries DEVKIT_TAG_PREFIX (consumers may tag vX.Y.Z);
+# the version input and the release branch stay bare.
+#
+# Safe ONLY while the Release is a draft: publishing a release tombstones its
+# tag name permanently, so a published release is hard-refused here — fix
+# forward with the next version instead. RC artifacts (rcN tags) are NOT
+# pruned: a re-cut of the same version reclaims them at its promote.
+#
+# Every step is idempotent (absent pieces count as already-abandoned), so a
+# partially failed run can simply be re-dispatched.
+#
+# See docs/DOWNSTREAM_RELEASE.md.
+
+name: Abandon Release
+
+on:  # yamllint disable-line rule:truthy
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Semantic version to abandon (e.g., 1.2.3)'
+        required: true
+        type: string
+
+# Shares the promote lane: abandoning a version while its promote runs (or
+# vice versa) must never interleave.
+concurrency:
+  group: publish-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  resolve-toolchain:
+    name: Resolve toolchain
+    runs-on: ubuntu-26.04
+    timeout-minutes: 2
+    outputs:
+      tag-prefix: ${{ steps.resolve.outputs.tag-prefix }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          sparse-checkout: |
+            .vig-os
+            .github/actions/resolve-toolchain
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Resolve toolchain
+        id: resolve
+        uses: ./.github/actions/resolve-toolchain
+        with:
+          registry-token: ${{ secrets.GHCR_PULL_TOKEN || github.token }}
+          registry-username: ${{ github.actor }}
+
+  validate:
+    name: Validate abandon preconditions
+    needs: [resolve-toolchain]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      # Draft releases are only visible with push access, mirroring
+      # promote-release's validate job.
+      contents: write
+      pull-requests: read
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      release_id: ${{ steps.check.outputs.release_id }}
+      pr_number: ${{ steps.check.outputs.pr_number }}
+
+    steps:
+      - name: Verify draft-only precondition
+        id: check
+        env:
+          VERSION: ${{ inputs.version }}
+          TAG_PREFIX: ${{ needs.resolve-toolchain.outputs.tag-prefix }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ERROR: version '$VERSION' is not a bare semantic version (X.Y.Z)"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          # The Release/tag published by release.yml carries the prefix (#1044).
+          TAG="${TAG_PREFIX}${VERSION}"
+
+          RELEASE_JSON=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" \
+            | jq -s --arg t "$TAG" 'add // [] | map(select(.tag_name == $t)) | first // empty')
+
+          if [ -z "$RELEASE_JSON" ]; then
+            echo "No GitHub Release found for tag $TAG — treating as already deleted (idempotent)"
+            echo "release_id=" >> "$GITHUB_OUTPUT"
+          else
+            IS_DRAFT=$(printf '%s' "$RELEASE_JSON" | jq -r '.draft')
+            RELEASE_ID=$(printf '%s' "$RELEASE_JSON" | jq -r '.id')
+            if [ "$IS_DRAFT" != "true" ]; then
+              echo "ERROR: the $TAG Release is PUBLISHED — abandoning it would tombstone the tag name permanently."
+              echo "Published releases are immutable; fix forward with the next version instead (docs/DOWNSTREAM_RELEASE.md)."
+              exit 1
+            fi
+            echo "Draft Release for $TAG found (release id $RELEASE_ID)"
+            echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
+          fi
+
+          PR_NUMBER=$(gh pr list --repo "$GITHUB_REPOSITORY" \
+            --head "release/$VERSION" --base main --state open \
+            --json number --jq '.[0].number // empty')
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No open release PR from release/$VERSION — treating as already closed (idempotent)"
+          else
+            echo "Open release PR: #$PR_NUMBER"
+          fi
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+  abandon:
+    name: Delete draft release, tag, PR, and branch
+    needs: [resolve-toolchain, validate]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - name: Abandon the release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          TAG_PREFIX: ${{ needs.resolve-toolchain.outputs.tag-prefix }}
+          RELEASE_ID: ${{ needs.validate.outputs.release_id }}
+          PR_NUMBER: ${{ needs.validate.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          TAG="${TAG_PREFIX}${VERSION}"
+
+          # 1. Delete the draft Release by id — drafts cannot be resolved by
+          #    tag (`gh release delete <tag>` fails), mirroring the RC prune.
+          if [ -n "$RELEASE_ID" ]; then
+            echo "Deleting draft Release $TAG (release id $RELEASE_ID)"
+            if ! gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}"; then
+              if gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" >/dev/null 2>&1; then
+                echo "ERROR: failed to delete draft Release $TAG (release id $RELEASE_ID)"
+                exit 1
+              fi
+              echo "Release id $RELEASE_ID already absent (idempotent success after 404)"
+            fi
+          else
+            echo "No draft Release to delete"
+          fi
+
+          # 2. Delete the tag — but never a tag that still has any GitHub
+          #    Release attached (same guard as the RC prune): a surviving
+          #    release means step 1 did not truly land.
+          HAS_RELEASE=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" \
+            | jq -s -r --arg t "$TAG" 'add // [] | any(.[]; .tag_name == $t)')
+          if [ "$HAS_RELEASE" = "true" ]; then
+            echo "ERROR: a GitHub Release is still attached to tag $TAG — refusing to delete the tag"
+            exit 1
+          fi
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Deleting tag $TAG"
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}"
+          else
+            echo "Tag $TAG already absent"
+          fi
+
+          # 3. Close the release PR before deleting its head branch, so the
+          #    closure carries the audit comment.
+          if [ -n "$PR_NUMBER" ]; then
+            echo "Closing release PR #$PR_NUMBER"
+            gh pr close "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --comment "Release $VERSION abandoned via abandon-release before publication: draft Release, tag, and release branch deleted. The version number remains available for a re-cut." \
+              || echo "PR #$PR_NUMBER already closed"
+          else
+            echo "No open release PR to close"
+          fi
+
+          # 4. Delete the release branch.
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/release/${VERSION}" >/dev/null 2>&1; then
+            echo "Deleting branch release/$VERSION"
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/release/${VERSION}"
+          else
+            echo "Branch release/$VERSION already absent"
+          fi
+
+          # Verify and fail closed: nothing abandoned may survive.
+          LEFTOVERS=()
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" \
+            | jq -s -e --arg t "$TAG" 'add // [] | any(.[]; .tag_name == $t) | not' >/dev/null \
+            || LEFTOVERS+=("GitHub Release $TAG")
+          gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1 \
+            && LEFTOVERS+=("tag $TAG")
+          gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/release/${VERSION}" >/dev/null 2>&1 \
+            && LEFTOVERS+=("branch release/$VERSION")
+          if [ ${#LEFTOVERS[@]} -gt 0 ]; then
+            echo "ERROR: abandon incomplete — still present: ${LEFTOVERS[*]}"
+            exit 1
+          fi
+          echo "✓ Release $VERSION abandoned: draft Release, tag, PR, and branch are gone"

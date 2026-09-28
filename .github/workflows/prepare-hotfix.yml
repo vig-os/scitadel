@@ -1,0 +1,646 @@
+# Managed by vigOS devkit — regenerated on upgrade; local edits are lost.
+# Customize in justfile.project. Bugs / missing tools: https://github.com/vig-os/devkit/issues
+
+#
+# Prepare Hotfix Release Branch (#1621; scaffold port #1625)
+#
+# The gitflow hotfix lane: cut release/X.Y.Z directly from main so an urgent
+# fix (typically security) ships as a patch release without carrying whatever
+# dev has accumulated. The fix itself lands via a bugfix/N-* PR into the
+# release branch; the existing candidate/final/promote/abandon train
+# (release.yml, promote-release.yml, abandon-release.yml) then runs unchanged,
+# and sync-main-to-dev.yml closes the loop back to dev after promote.
+#
+# 1. Validate: version is MAJOR.MINOR.(PATCH+1) of the highest stable
+#    <prefix>X.Y.Z tag on main; no other release/* train is in flight; no
+#    colliding branch or tag; main's ## Unreleased is classified as carrying
+#    content or empty.
+# 2. Prepare: fork release/X.Y.Z at main's head, then write the
+#    ## [X.Y.Z] - TBD section on the RELEASE BRANCH (never main, never dev):
+#    freeze main's carried entries into it (prepare) when it has any, else seed
+#    it EMPTY. dev is never read, written or fast-forwarded either way.
+# 3. Extension: the same reusable prepare-release-extension.yml hook as the
+#    regular train, with the seed commit as branch_sha.
+# 4. Open the draft PR release/X.Y.Z -> main.
+# 5. Rollback: delete the partial branch. Nothing else — no dev mutation
+#    exists to undo, which is what makes this lane strictly simpler than
+#    prepare-release.yml.
+#
+# CHANGELOG flow. main's ## Unreleased may carry changes that landed on main
+# but have not shipped; a hotfix cuts from main's head, so it SHIPS them and
+# their entries belong in its own version section:
+#   main:    ## Unreleased (empty OR carrying entries)      -- untouched
+#   release: ## Unreleased (empty) + ## [X.Y.Z] - TBD, holding main's carried
+#            entries (prepare) or EMPTY for the fix PR to fill (seed)
+#   dev:     untouched; the post-promote sync PR WILL conflict on CHANGELOG.md
+#            when dev is ahead (recipe in docs/DOWNSTREAM_RELEASE.md, Hotfix lane).
+# main's ## Unreleased self-clears when the release branch merges back, so the
+# empty shape re-establishes itself after every hotfix.
+#
+# release.yml still refuses to publish while the section is empty
+# (prepare-changelog validate --version, in release-core.yml) — deliberately:
+# an empty section is acceptable at prepare-hotfix time, never at release time.
+# Carried entries therefore satisfy that gate on their own, so describing the
+# fix itself stays the fix PR's job rather than a machine check. release.yml
+# executes from the release branch's copy, i.e. main's copy for a hotfix: a
+# release-workflow change this lane needs must ride a normal train first.
+#
+# Every job that needs the devkit CLI runs on the mode-aware toolchain (#991):
+# resolve-toolchain picks the image (empty in the host modes, so the job runs
+# on the runner) and setup-devkit-toolchain provisions prepare-changelog and
+# retry. Every checkout drops the persisted git credential; all writes go
+# through App tokens over the API.
+#
+# Not scaffolded under DEVKIT_WORKFLOW=trunk, where releases already cut from
+# main (copy-excluded, the same mechanism as sync-main-to-dev.yml).
+
+name: Prepare Hotfix
+
+on:  # yamllint disable-line rule:truthy
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Patch version to prepare (must be the next patch of the latest tag on main, e.g. 1.2.4)"
+        required: true
+        type: string
+      dry-run:
+        description: "Validate without making changes"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  resolve-toolchain:
+    name: Resolve toolchain
+    runs-on: ubuntu-26.04
+    timeout-minutes: 2
+    outputs:
+      mode: ${{ steps.resolve.outputs.mode }}
+      image: ${{ steps.resolve.outputs.image }}
+      image-tag: ${{ steps.resolve.outputs.image-tag }}
+      tag-prefix: ${{ steps.resolve.outputs.tag-prefix }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          sparse-checkout: |
+            .vig-os
+            .github/actions/resolve-toolchain
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Resolve toolchain
+        id: resolve
+        uses: ./.github/actions/resolve-toolchain
+        with:
+          registry-token: ${{ secrets.GHCR_PULL_TOKEN || github.token }}
+          registry-username: ${{ github.actor }}
+
+  validate:
+    name: Validate Hotfix Preparation
+    needs: [resolve-toolchain]
+    runs-on: ubuntu-26.04
+    container:
+      image: ${{ needs.resolve-toolchain.outputs.image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GHCR_PULL_TOKEN || github.token }}
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      version: ${{ steps.vars.outputs.version }}
+      release_branch: ${{ steps.vars.outputs.release_branch }}
+      main_sha: ${{ steps.vars.outputs.main_sha }}
+      changelog_mode: ${{ steps.changelog.outputs.changelog_mode }}
+
+    steps:
+      # fetch-depth 0 brings every branch and tag along, so the checks below
+      # read remote-tracking refs and need no credential of their own.
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up devkit toolchain
+        uses: ./.github/actions/setup-devkit-toolchain
+        with:
+          mode: ${{ needs.resolve-toolchain.outputs.mode }}
+          devkit-version: ${{ needs.resolve-toolchain.outputs.image-tag }}
+
+      - name: Validate version against the latest stable tag on main
+        id: vars
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          TAG_PREFIX: ${{ needs.resolve-toolchain.outputs.tag-prefix }}
+        run: |
+          set -euo pipefail
+          VERSION="$INPUT_VERSION"
+
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "ERROR: Invalid version format '$VERSION'"
+            echo "Version must follow semantic versioning format: MAJOR.MINOR.PATCH (e.g., 1.2.4)"
+            exit 1
+          fi
+
+          # A hotfix is a patch of what main currently ships: the highest
+          # <prefix>X.Y.Z tag reachable from main, read as its bare version
+          # (consumers may publish prefixed tags, #1044). Anything else (a
+          # "hotfix minor", a patch of an older line, a skipped number) is
+          # refused.
+          LATEST_TAG=$(git tag --merged origin/main \
+            | awk -v p="$TAG_PREFIX" 'substr($0, 1, length(p)) == p { print substr($0, length(p) + 1) }' \
+            | { grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V | tail -1)
+          if [ -z "$LATEST_TAG" ]; then
+            echo "ERROR: No stable ${TAG_PREFIX}X.Y.Z tag is reachable from main; nothing to hotfix"
+            exit 1
+          fi
+          IFS=. read -r MAJOR MINOR PATCH <<< "$LATEST_TAG"
+          EXPECTED="$MAJOR.$MINOR.$((PATCH + 1))"
+          if [ "$VERSION" != "$EXPECTED" ]; then
+            echo "ERROR: Version $VERSION is not the next patch of the latest tag on main"
+            echo "  latest tag on main: ${TAG_PREFIX}${LATEST_TAG}"
+            echo "  expected hotfix version: $EXPECTED"
+            echo "A hotfix must be MAJOR.MINOR.(PATCH + 1) of what main ships; use the regular train for anything else"
+            exit 1
+          fi
+
+          MAIN_SHA=$(git rev-parse origin/main)
+          {
+            echo "version=$VERSION"
+            echo "release_branch=release/$VERSION"
+            echo "main_sha=$MAIN_SHA"
+          } >> "$GITHUB_OUTPUT"
+          echo "✓ Version validated: $VERSION (patch of ${TAG_PREFIX}${LATEST_TAG} on main @ $MAIN_SHA)"
+
+      - name: Verify no release train is in flight
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+        run: |
+          set -euo pipefail
+          RELEASE_BRANCH="release/$VERSION"
+
+          if git show-ref --verify --quiet "refs/remotes/origin/$RELEASE_BRANCH"; then
+            echo "ERROR: Release branch already exists on remote: $RELEASE_BRANCH"
+            exit 1
+          fi
+
+          # Single-train policy: a hotfix promoted while another release/* train
+          # is in flight would silently be reintroduced by that train's merge
+          # (its branch predates the fix), and the two trains would race for
+          # the floating refs. Refuse instead of relying on a cherry-pick
+          # obligation; abandon or promote the other train first.
+          IN_FLIGHT=$(git for-each-ref --format='%(refname:lstrip=3)' 'refs/remotes/origin/release/' || true)
+          if [ -n "$IN_FLIGHT" ]; then
+            echo "ERROR: Another release train is in flight; a hotfix cannot be cut alongside it:"
+            while IFS= read -r branch; do echo "  $branch"; done <<< "$IN_FLIGHT"
+            echo "Promote or abandon it first (just promote-release / just abandon-release), then retry"
+            exit 1
+          fi
+
+          echo "✓ No release train in flight; $RELEASE_BRANCH is free"
+
+      - name: Verify tag does not exist
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+          TAG_PREFIX: ${{ needs.resolve-toolchain.outputs.tag-prefix }}
+        run: |
+          set -euo pipefail
+          # The release will publish the prefixed tag name (#1044); validate
+          # that, not the bare version. Empty prefix => bare tag.
+          PUBLISH_TAG="${TAG_PREFIX}${VERSION}"
+          if git rev-parse -q --verify "refs/tags/$PUBLISH_TAG" > /dev/null; then
+            echo "ERROR: Tag $PUBLISH_TAG already exists"
+            exit 1
+          fi
+          echo "✓ Tag does not exist: $PUBLISH_TAG"
+
+      # main may carry landed-but-unshipped changes, so content here is a mode,
+      # not a refusal: a hotfix ships whatever main's head carries. `prepare`
+      # freezes those entries, `seed` writes an empty section. Both commands
+      # refuse an Unreleased section they cannot parse — loose bullets, a
+      # repeated `###` heading, nothing to freeze — so a shape neither can
+      # handle fails this step instead of losing an entry.
+      - name: Classify main's Unreleased section
+        id: changelog
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+        run: |
+          set -euo pipefail
+          if prepare-changelog validate CHANGELOG.md >/dev/null 2>&1; then
+            MODE=prepare
+            echo "main's ## Unreleased carries unshipped entries; $VERSION will freeze them"
+          else
+            MODE=seed
+            echo "nothing to freeze from main's ## Unreleased; $VERSION will be seeded empty for the fix PR"
+          fi
+          # Dry probe of the exact call the prepare job will commit (refuses a
+          # missing Unreleased, an existing [VERSION] section, or content
+          # neither command can parse); local only.
+          prepare-changelog "$MODE" "$VERSION" CHANGELOG.md
+          git checkout -- CHANGELOG.md
+          echo "changelog_mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "✓ [$VERSION] - TBD can be written on the release branch (mode: $MODE)"
+
+      - name: Summary
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+          RELEASE_BRANCH: ${{ steps.vars.outputs.release_branch }}
+          MAIN_SHA: ${{ steps.vars.outputs.main_sha }}
+          IMAGE_TAG: ${{ needs.resolve-toolchain.outputs.image-tag }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          echo "✓ All validation checks passed"
+          echo ""
+          echo "Hotfix Preparation Configuration:"
+          echo "  Version: $VERSION"
+          echo "  Release Branch: $RELEASE_BRANCH"
+          echo "  Base (main): $MAIN_SHA"
+          echo "  Image tag: $IMAGE_TAG"
+          echo "  Dry-run: $DRY_RUN"
+
+  prepare:
+    name: Prepare Hotfix Branch
+    needs: [resolve-toolchain, validate]
+    runs-on: ubuntu-26.04
+    container:
+      image: ${{ needs.resolve-toolchain.outputs.image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GHCR_PULL_TOKEN || github.token }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    if: ${{ inputs.dry-run != true }}
+    permissions:
+      contents: read          # writes go through the COMMIT_APP token
+      packages: read
+    outputs:
+      branch_sha: ${{ steps.branch-head.outputs.branch_sha }}
+
+    steps:
+      - name: Generate Commit App Token
+        id: commit-app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3
+        with:
+          client-id: ${{ secrets.COMMIT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.COMMIT_APP_PRIVATE_KEY }}
+
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Set up devkit toolchain
+        uses: ./.github/actions/setup-devkit-toolchain
+        with:
+          mode: ${{ needs.resolve-toolchain.outputs.mode }}
+          devkit-version: ${{ needs.resolve-toolchain.outputs.image-tag }}
+
+      # The branch must fork from exactly the SHA validate vetted and the
+      # checkout seeds from: a promote landing on main between the two jobs
+      # would otherwise cut the branch from content nobody validated.
+      - name: Verify main has not moved since validation
+        env:
+          GH_TOKEN: ${{ steps.commit-app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          MAIN_SHA: ${{ needs.validate.outputs.main_sha }}
+        run: |
+          set -euo pipefail
+          REMOTE_SHA=$(retry --retries 3 --backoff 5 --max-backoff 60 -- \
+            gh api "repos/$GH_REPO/git/ref/heads/main" --jq '.object.sha')
+          LOCAL_SHA=$(git rev-parse HEAD)
+          if [ "$REMOTE_SHA" != "$MAIN_SHA" ] || [ "$LOCAL_SHA" != "$MAIN_SHA" ]; then
+            echo "ERROR: main moved since validation (validated $MAIN_SHA, remote $REMOTE_SHA, checkout $LOCAL_SHA); re-run"
+            exit 1
+          fi
+          echo "✓ main still at validated SHA $MAIN_SHA"
+
+      - name: Create release branch from main
+        env:
+          GH_TOKEN: ${{ steps.commit-app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_BRANCH: ${{ needs.validate.outputs.release_branch }}
+          MAIN_SHA: ${{ needs.validate.outputs.main_sha }}
+        run: |
+          set -euo pipefail
+          echo "Creating branch $RELEASE_BRANCH from main at $MAIN_SHA..."
+          retry --retries 3 --backoff 5 --max-backoff 60 -- \
+            gh api "repos/$GH_REPO/git/refs" \
+            -f ref="refs/heads/$RELEASE_BRANCH" \
+            -f sha="$MAIN_SHA"
+          echo "✓ Release branch created on remote"
+
+      # Absorbs GitHub's ref read-after-write lag before the seed commit
+      # targets the branch.
+      - name: Verify release branch is resolvable
+        env:
+          GH_TOKEN: ${{ steps.commit-app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_BRANCH: ${{ needs.validate.outputs.release_branch }}
+        run: |
+          set -euo pipefail
+          retry --retries 10 --backoff 2 --max-backoff 30 -- \
+            gh api "repos/$GH_REPO/git/ref/heads/$RELEASE_BRANCH" --jq '.object.sha'
+          echo "✓ Release branch ref verified as resolvable"
+
+      # Same verdict validate reached, on the same main content (the SHA check
+      # above guarantees it): freeze main's carried entries or seed an empty
+      # section. Either way the write lands on the release branch below.
+      - name: Write the CHANGELOG section for the hotfix
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          CHANGELOG_MODE: ${{ needs.validate.outputs.changelog_mode }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANGELOG_MODE" = "prepare" ]; then
+            prepare-changelog prepare "$VERSION" CHANGELOG.md
+            echo "✓ main's carried ## Unreleased entries frozen into [$VERSION] - TBD (the fix PR adds its own)"
+          else
+            prepare-changelog seed "$VERSION" CHANGELOG.md
+            echo "✓ CHANGELOG seeded with an empty [$VERSION] - TBD section (the fix PR fills it)"
+          fi
+
+      - name: Commit seeded CHANGELOG to the release branch via API
+        id: seed-commit
+        uses: vig-os/commit-action@7ba7e1ae17547813e708d4cc6a771a09f978f724  # v0.3.3
+        env:
+          GH_TOKEN: ${{ steps.commit-app-token.outputs.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          TARGET_BRANCH: refs/heads/release/${{ needs.validate.outputs.version }}
+          MAX_ATTEMPTS: "3"
+          COMMIT_MESSAGE: |-
+            chore: ${{ needs.validate.outputs.changelog_mode }} changelog for hotfix ${{ needs.validate.outputs.version }}
+
+            Add the [${{ needs.validate.outputs.version }}] - TBD section on the release
+            branch cut from main: main's carried unshipped entries when it had any,
+            otherwise empty for the hotfix PR to fill.
+          FILE_PATHS: CHANGELOG.md
+
+      # A REST ref read can briefly return the pre-commit SHA (read-after-write
+      # lag); the extension must receive the seed commit as branch_sha, so
+      # assert the branch head actually advanced to it.
+      - name: Verify seed commit is the branch head
+        id: branch-head
+        env:
+          GH_TOKEN: ${{ steps.commit-app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_BRANCH: ${{ needs.validate.outputs.release_branch }}
+          SEED_SHA: ${{ steps.seed-commit.outputs.commit-sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SEED_SHA" ]; then
+            echo "ERROR: commit-action returned no commit SHA for the seed commit"
+            exit 1
+          fi
+          HEAD_SHA=""
+          for attempt in $(seq 1 8); do
+            HEAD_SHA=$(retry --retries 3 --backoff 5 --max-backoff 60 -- \
+              gh api "repos/$GH_REPO/git/ref/heads/$RELEASE_BRANCH" --jq '.object.sha')
+            if [ "$HEAD_SHA" = "$SEED_SHA" ]; then
+              break
+            fi
+            echo "$RELEASE_BRANCH still at $HEAD_SHA (attempt $attempt/8); waiting for the seed commit to propagate..."
+            sleep 5
+          done
+          if [ "$HEAD_SHA" != "$SEED_SHA" ]; then
+            echo "ERROR: $RELEASE_BRANCH head is $HEAD_SHA, expected seed commit $SEED_SHA"
+            exit 1
+          fi
+          echo "branch_sha=$SEED_SHA" >> "$GITHUB_OUTPUT"
+          echo "✓ $RELEASE_BRANCH is at seed commit $SEED_SHA"
+
+  # Same reusable hook as prepare-release.yml (#1059), same position: after the
+  # branch exists, before the draft PR opens. Every commit it makes lives on
+  # the branch the rollback job deletes.
+  extension:
+    name: Prepare Release Extension
+    needs: [validate, prepare]
+    if: ${{ inputs.dry-run != true }}
+    uses: ./.github/workflows/prepare-release-extension.yml
+    with:
+      version: ${{ needs.validate.outputs.version }}
+      release_branch: ${{ needs.validate.outputs.release_branch }}
+      branch_sha: ${{ needs.prepare.outputs.branch_sha }}
+      dry_run: ${{ inputs.dry-run }}
+    secrets: inherit
+
+  open-pr:
+    name: Open Draft Hotfix PR
+    needs: [resolve-toolchain, validate, prepare, extension]
+    runs-on: ubuntu-26.04
+    container:
+      image: ${{ needs.resolve-toolchain.outputs.image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GHCR_PULL_TOKEN || github.token }}
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    if: ${{ inputs.dry-run != true }}
+    permissions:
+      contents: read          # PR is opened via the RELEASE_APP token
+      pull-requests: write
+      packages: read
+
+    steps:
+      - name: Generate Release App Token
+        id: release-app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Set up devkit toolchain
+        uses: ./.github/actions/setup-devkit-toolchain
+        with:
+          mode: ${{ needs.resolve-toolchain.outputs.mode }}
+          devkit-version: ${{ needs.resolve-toolchain.outputs.image-tag }}
+
+      - name: Create draft PR to main
+        id: pr
+        env:
+          GH_TOKEN: ${{ steps.release-app-token.outputs.token }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          RELEASE_BRANCH: ${{ needs.validate.outputs.release_branch }}
+          MAIN_SHA: ${{ needs.validate.outputs.main_sha }}
+          CHANGELOG_MODE: ${{ needs.validate.outputs.changelog_mode }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANGELOG_MODE" = "prepare" ]; then
+            SECTION_NOTE="The \`## [$VERSION] - TBD\` section in \`CHANGELOG.md\` already holds the entries
+          \`main\` had landed but not shipped — this hotfix ships them. Land the fix via a
+          \`bugfix/<issue>-<summary>\` PR into \`$RELEASE_BRANCH\` and **describe it in that section too**:
+          the release gate only checks that the section is non-empty, which the carried entries
+          already satisfy."
+          else
+            SECTION_NOTE="The \`## [$VERSION] - TBD\` section in \`CHANGELOG.md\` is **empty by design**: land the fix
+          via a \`bugfix/<issue>-<summary>\` PR into \`$RELEASE_BRANCH\` and fill the section there.
+          The release workflow refuses to publish while it is empty."
+          fi
+
+          PR_BODY="# Hotfix $VERSION
+
+          This PR prepares hotfix release $VERSION, cut from \`main\` at \`$MAIN_SHA\` (not from \`dev\`).
+
+          $SECTION_NOTE
+
+          After promote, expect the automated \`sync-main-to-dev\` PR to conflict on \`CHANGELOG.md\`
+          when \`dev\` is ahead; the resolution recipe is in \`docs/DOWNSTREAM_RELEASE.md\` (Hotfix lane).
+          "
+
+          PR_URL=$(retry --retries 3 --backoff 5 --max-backoff 60 -- \
+            gh pr create \
+            --base main \
+            --head "$RELEASE_BRANCH" \
+            --title "chore: release $VERSION" \
+            --body "$PR_BODY" \
+            --draft)
+
+          PR_NUMBER=$(echo "$PR_URL" | grep -oE '[0-9]+$')
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+          echo "✓ Draft PR created: $PR_URL (#$PR_NUMBER)"
+
+      - name: Summary
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          RELEASE_BRANCH: ${{ needs.validate.outputs.release_branch }}
+          MAIN_SHA: ${{ needs.validate.outputs.main_sha }}
+          CHANGELOG_MODE: ${{ needs.validate.outputs.changelog_mode }}
+        run: |
+          echo "✓ Hotfix branch prepared successfully!"
+          echo ""
+          echo "Hotfix Summary:"
+          echo "  Version: $VERSION"
+          echo "  Branch: $RELEASE_BRANCH (from main @ $MAIN_SHA)"
+          echo ""
+          echo "CHANGELOG state:"
+          if [ "$CHANGELOG_MODE" = "prepare" ]; then
+            echo "  main:    ## Unreleased (carried entries)  -- untouched; clears on merge-back"
+            echo "  release: ## Unreleased (empty) + ## [$VERSION] - TBD (main's carried entries)"
+          else
+            echo "  main:    ## Unreleased (empty)  -- untouched"
+            echo "  release: ## Unreleased (empty) + ## [$VERSION] - TBD (EMPTY)"
+          fi
+          echo "  dev:     untouched"
+          echo ""
+          echo "Next steps:"
+          echo "  1. Land the fix: bugfix/<issue>-<summary> PR into $RELEASE_BRANCH, filling ## [$VERSION] - TBD"
+          echo "  2. Review the draft PR and monitor CI"
+          echo "  3. Publish candidate: just publish-candidate $VERSION"
+          echo "  4. Mark PR as ready for review (gh pr ready <PR_NUMBER>)"
+          echo "  5. Final release: just finalize-release $VERSION"
+          echo "  6. Approve the PR, then promote: just promote-release $VERSION"
+          echo "  7. Resolve the sync-main-to-dev CHANGELOG conflict (docs/DOWNSTREAM_RELEASE.md, Hotfix lane)"
+
+  # Rollback deletes the partial release branch and nothing else: the lane
+  # never mutates main or dev, and every commit the prepare/extension jobs make
+  # lives on the branch deleted here. A PR only exists once open-pr succeeded,
+  # which is not a rollback path (and deleting a head branch closes its PR).
+  rollback:
+    name: Roll Back Prepare Hotfix on Failure or Cancellation
+    needs: [resolve-toolchain, validate, prepare, extension, open-pr]
+    runs-on: ubuntu-26.04
+    container:
+      image: ${{ needs.resolve-toolchain.outputs.image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GHCR_PULL_TOKEN || github.token }}
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    # `always()` keeps the job eligible after the run itself is cancelled, and
+    # each phase guard also matches `cancelled` (#1078).
+    if: >-
+      ${{
+        always() &&
+        inputs.dry-run != true &&
+        needs.validate.result == 'success' &&
+        (
+          needs.prepare.result == 'failure' ||
+          needs.prepare.result == 'cancelled' ||
+          needs.extension.result == 'failure' ||
+          needs.extension.result == 'cancelled' ||
+          needs.open-pr.result == 'failure' ||
+          needs.open-pr.result == 'cancelled'
+        )
+      }}
+    permissions:
+      contents: read          # the delete goes through the COMMIT_APP token
+      packages: read
+
+    steps:
+      - name: Generate Commit App Token
+        id: commit-app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3
+        with:
+          client-id: ${{ secrets.COMMIT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.COMMIT_APP_PRIVATE_KEY }}
+
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Set up devkit toolchain
+        uses: ./.github/actions/setup-devkit-toolchain
+        with:
+          mode: ${{ needs.resolve-toolchain.outputs.mode }}
+          devkit-version: ${{ needs.resolve-toolchain.outputs.image-tag }}
+
+      - name: Delete partially created release branch
+        id: rollback-branch
+        env:
+          GH_TOKEN: ${{ steps.commit-app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_BRANCH: ${{ needs.validate.outputs.release_branch }}
+        run: |
+          set -euo pipefail
+          BRANCH_DELETED=false
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "w Skipping rollback: GH_TOKEN is not set; cannot safely call GitHub API"
+            exit 0
+          fi
+
+          if retry --retries 3 --backoff 5 --max-backoff 60 -- \
+            gh api "repos/$GH_REPO/git/ref/heads/$RELEASE_BRANCH" >/dev/null 2>&1; then
+            retry --retries 3 --backoff 5 --max-backoff 60 -- \
+              gh api -X DELETE "repos/$GH_REPO/git/refs/heads/$RELEASE_BRANCH"
+            BRANCH_DELETED=true
+            echo "✓ Deleted partially created release branch: $RELEASE_BRANCH"
+          else
+            echo "i Release branch not present; nothing to delete"
+          fi
+          echo "branch_deleted=$BRANCH_DELETED" >> "$GITHUB_OUTPUT"
+
+      - name: Rollback summary
+        env:
+          RELEASE_BRANCH: ${{ needs.validate.outputs.release_branch }}
+          BRANCH_DELETED: ${{ steps.rollback-branch.outputs.branch_deleted }}
+        run: |
+          echo "x Prepare hotfix failed; rollback routine completed"
+          echo "  Release branch: $RELEASE_BRANCH"
+          echo "  Branch deleted: ${BRANCH_DELETED:-false}"
+          echo "  main / dev: untouched by design"

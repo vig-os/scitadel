@@ -13,7 +13,7 @@ body:
       value: |
         Use this template for documentation changes. Important: editable
         documentation lives in `docs/templates/`. Generated files like
-        `CONTRIBUTE.md` and `README.md` must not be edited directly —
+        `CONTRIBUTING.md` and `README.md` must not be edited directly —
         run `just docs` to regenerate them after editing the template.
   - type: textarea
     id: description
@@ -44,7 +44,7 @@ body:
         Which files need to be modified? Remember: edit templates in
         `docs/templates/`, not generated files.
       placeholder: |
-        - https://github.com/vig-os/devkit/blob/main/docs/templates/CONTRIBUTE.md.j2 (source template)
+        - https://github.com/vig-os/devkit/blob/main/docs/templates/CONTRIBUTING.md.j2 (source template)
         - https://github.com/vig-os/devkit/blob/main/docs/RELEASE_CYCLE.md
     validations:
       required: true
