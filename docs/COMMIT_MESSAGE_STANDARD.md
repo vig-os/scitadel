@@ -52,6 +52,13 @@ Only the following types are allowed:
 
 Any other type (e.g. `feature`, `bugfix`, or emoji-based prefixes) is **not** allowed.
 
+Consumer repos may replace this list with a project-specific one via the
+`DEVKIT_COMMIT_TYPES` key in `.vig-os` (comma-separated; drives the hook and
+CI's `validate-commit-range` from one key — see the manifest-key table in
+[MIGRATION.md](https://github.com/vig-os/devkit/blob/main/docs/MIGRATION.md),
+[#1431](https://github.com/vig-os/devkit/issues/1431)).
+This table documents the stock defaults, which apply whenever the key is empty.
+
 ## Refs line and traceability
 
 The `Refs:` line provides mandatory traceability to issues, requirements, risks, or SOPs. Only one `Refs:` line is allowed; it must be the last non-empty line of the message.
@@ -80,6 +87,13 @@ Multiple references are comma-separated; spaces after commas are optional. Do no
 The following commit types have a relaxed `Refs:` requirement:
 
 - **`chore`** — The `Refs:` line is **optional**. Maintenance commits (e.g. dependency bumps, sync operations, tooling updates) may not relate to a specific issue. When a related issue or PR exists, including `Refs:` is still recommended.
+
+Consumer repos may name a different exempt set via the
+`DEVKIT_REFS_OPTIONAL_TYPES` key in `.vig-os` (comma-separated; drives the hook
+and CI's `validate-commit-range` from one key — see the manifest-key table in
+[MIGRATION.md](https://github.com/vig-os/devkit/blob/main/docs/MIGRATION.md),
+[#1633](https://github.com/vig-os/devkit/issues/1633)). This section documents
+the stock default, which applies whenever the key is empty.
 
 Additionally, the CI validator skips two classes of commit outright:
 

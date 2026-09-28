@@ -67,6 +67,13 @@ Example: `chore/sync-main-to-dev`, `chore/update-dependencies`
 | release  | Yes            | Release preparation, version bumps, release notes                       |
 | chore   | No             | Maintenance tasks, syncing branches, dependency updates, routine work   |
 
+The issue-numbered type set is per-repo configurable: `DEVKIT_BRANCH_TYPES` in
+`.vig-os` replaces it (e.g. adding a project-specific `record` type), steering
+the local branch guard AND CI's branch-name gate from one key — check that
+file before proposing a type outside the table. The stock issue-numbered set
+is `feature,bugfix,hotfix,release,docs,test,refactor`
+([#1432](https://github.com/vig-os/devkit/issues/1432)).
+
 ## One-off branch name only
 
 When the user only wants a branch name suggestion (no "create" or "start work"), propose the name in the format above and do not run the full workflow.

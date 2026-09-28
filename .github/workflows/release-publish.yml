@@ -28,16 +28,6 @@ on:  # yamllint disable-line rule:truthy
         description: "Release kind (candidate or final)"
         required: true
         type: string
-      git_user_name:
-        description: "Git user name for release tag operations"
-        required: false
-        default: "github-actions[bot]"
-        type: string
-      git_user_email:
-        description: "Git user email for release tag operations"
-        required: false
-        default: "41898282+github-actions[bot]@users.noreply.github.com"
-        type: string
       tag_already_exists:
         description: "Skip tag create/push when remote tag already points at finalize SHA"
         required: false
@@ -96,7 +86,7 @@ permissions:
 jobs:
   publish:
     name: Publish Release
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     # Conditional container (ADR Option A): empty image => host runner; the GHCR
     # credentials block is inert on an empty image.
     container:
@@ -160,66 +150,88 @@ jobs:
           mode: ${{ inputs.toolchain_mode }}
           devkit-version: ${{ inputs.devkit_version }}
 
-      - name: Configure git
-        env:
-          GIT_USER_NAME: ${{ inputs.git_user_name }}
-          GIT_USER_EMAIL: ${{ inputs.git_user_email }}
-        run: |
-          git config user.name "$GIT_USER_NAME"
-          git config user.email "$GIT_USER_EMAIL"
-
-      - name: Create and push tag
+      # The release tag is a LIGHTWEIGHT tag: a plain `refs/tags/<tag>` ref
+      # POSTed straight at the release commit, with no tag object behind it.
+      # `git tag -a` (what this step used to do) writes a tag object carrying a
+      # tagger identity that nothing can sign: the tag is published under a
+      # GitHub App installation token, and an App has no registrable GPG/SSH
+      # key — nor does the server-side `POST /git/tags` route sign what it
+      # stores. Every tag produced that way reported `verification.reason:
+      # "unsigned"` forever (#1378, downstream of #1370). A lightweight tag has
+      # no tagger and no payload, so there is nothing left to be unsigned, and
+      # the commit the ref resolves to is the release commit.
+      - name: Create release tag
         if: ${{ !inputs.tag_already_exists }}
         env:
+          GH_TOKEN: ${{ steps.auth.outputs.token }}
           PUBLISH_VERSION: ${{ inputs.publish_version }}
           TAG_PREFIX: ${{ inputs.tag_prefix }}
+          FINALIZE_SHA: ${{ inputs.finalize_sha }}
         run: |
           set -euo pipefail
           # Compose the actual tag name (prefix + bare publish version) (#1044).
           PUBLISH_TAG="${TAG_PREFIX}${PUBLISH_VERSION}"
-          git tag -a "$PUBLISH_TAG" -m "Release $PUBLISH_TAG"
-          if ! PUSH_OUTPUT=$(retry --retries 3 --backoff 5 --max-backoff 30 -- git push origin "$PUBLISH_TAG" 2>&1); then
-            printf '%s\n' "$PUSH_OUTPUT"
-            # A tag name whose published release was deleted under release
-            # immutability is permanently retired; pushing it is rejected with
-            # GH013 and no retry or wait can ever succeed.
-            if printf '%s' "$PUSH_OUTPUT" | grep -Eqi "GH013|creations restricted"; then
-              echo "ERROR: Tag name $PUBLISH_TAG is tombstoned by release immutability:"
-              echo "a published GitHub Release for this tag was deleted, permanently retiring the name."
-              echo "This version is burned — re-cut the content as the next patch version."
-              echo "See https://github.com/vig-os/devkit/blob/main/docs/RELEASE_CYCLE.md ('Restarting a Finalized Release — the Point of No Return')."
-              exit 1
-            fi
-            if retry --retries 3 --backoff 5 --max-backoff 30 -- git ls-remote --tags --refs origin "$PUBLISH_TAG" | grep -q "refs/tags/$PUBLISH_TAG$"; then
-              LOCAL_TAG_TARGET_SHA=$(git rev-parse "$PUBLISH_TAG^{}")
-              REMOTE_TAG_TARGET_SHA=$(retry --retries 3 --backoff 5 --max-backoff 30 -- git ls-remote --tags origin "refs/tags/$PUBLISH_TAG^{}" | awk '{print $1}')
-              if [ -z "$REMOTE_TAG_TARGET_SHA" ]; then
-                REMOTE_TAG_TARGET_SHA=$(retry --retries 3 --backoff 5 --max-backoff 30 -- git ls-remote --tags origin "refs/tags/$PUBLISH_TAG" | awk '{print $1}')
-              fi
-              if [ -z "$REMOTE_TAG_TARGET_SHA" ]; then
-                echo "ERROR: Remote tag exists but target SHA could not be resolved: $PUBLISH_TAG"
-                exit 1
-              fi
-              if [ "$REMOTE_TAG_TARGET_SHA" != "$LOCAL_TAG_TARGET_SHA" ]; then
-                echo "ERROR: Remote tag target SHA mismatch for $PUBLISH_TAG"
-                echo "Local tag target:  $LOCAL_TAG_TARGET_SHA"
-                echo "Remote tag target: $REMOTE_TAG_TARGET_SHA"
-                exit 1
-              fi
-              echo "Tag already present on origin with matching target SHA: $PUBLISH_TAG"
-            else
-              echo "ERROR: Failed to push tag $PUBLISH_TAG"
-              exit 1
-            fi
+
+          CREATE_OUTPUT=""
+          if CREATE_OUTPUT=$(retry --retries 3 --backoff 5 --max-backoff 30 -- \
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/${PUBLISH_TAG}" \
+              -f sha="$FINALIZE_SHA" 2>&1); then
+            echo "Tag created: $PUBLISH_TAG -> $FINALIZE_SHA"
+            exit 0
           fi
+          printf '%s\n' "$CREATE_OUTPUT"
+
+          # A tag name whose published release was deleted under release
+          # immutability is permanently retired; creating the ref is rejected
+          # with a repository-rule violation (HTTP 422 "creations being
+          # restricted" from the API; `GH013 ... creations restricted` over
+          # git) and no retry or wait can ever succeed.
+          if printf '%s' "$CREATE_OUTPUT" | grep -Eqi "GH013|creations?( being)? restricted"; then
+            echo "ERROR: Tag name $PUBLISH_TAG is tombstoned by release immutability:"
+            echo "a published GitHub Release for this tag was deleted, permanently retiring the name."
+            echo "This version is burned — re-cut the content as the next patch version."
+            echo "See https://github.com/vig-os/devkit/blob/main/docs/RELEASE_CYCLE.md ('Restarting a Finalized Release — the Point of No Return')."
+            exit 1
+          fi
+
+          # Creating the ref failed for another reason. The benign case is
+          # losing a race with a concurrent publish (or a response lost after
+          # the ref landed), which is only acceptable when the ref already
+          # resolves to this very commit. Peel `^{}` first so annotated tags
+          # published before this change still resolve.
+          echo "Tag ref creation did not succeed; verifying remote state:"
+          REMOTE_TAG_TARGET_SHA=$(retry --retries 3 --backoff 5 --max-backoff 30 -- git ls-remote --tags origin "refs/tags/$PUBLISH_TAG^{}" | awk '{print $1}')
+          if [ -z "$REMOTE_TAG_TARGET_SHA" ]; then
+            REMOTE_TAG_TARGET_SHA=$(retry --retries 3 --backoff 5 --max-backoff 30 -- git ls-remote --tags origin "refs/tags/$PUBLISH_TAG" | awk '{print $1}')
+          fi
+          if [ -z "$REMOTE_TAG_TARGET_SHA" ]; then
+            echo "ERROR: Failed to create tag $PUBLISH_TAG and no remote tag is present"
+            exit 1
+          fi
+          if [ "$REMOTE_TAG_TARGET_SHA" != "$FINALIZE_SHA" ]; then
+            echo "ERROR: Remote tag target SHA mismatch for $PUBLISH_TAG"
+            echo "Expected (release commit): $FINALIZE_SHA"
+            echo "Remote tag target:         $REMOTE_TAG_TARGET_SHA"
+            exit 1
+          fi
+          echo "Tag already present on origin at the release commit: $PUBLISH_TAG"
 
       - name: Extract release notes from CHANGELOG
         env:
           VERSION: ${{ inputs.version }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
         run: |
           set -euo pipefail
-          awk -v version="$VERSION" '
-            index($0, "## [" version "]") == 1 {found=1; next}
+          # A final release reads the heading `prepare-changelog finalize
+          # --tag-prefix` just wrote, which carries the prefix
+          # (`## [v1.0.0](…)`); matching the bare version found nothing there and
+          # published the fallback body (#1355). A candidate publishes before
+          # finalize runs, so its heading is still the bare `## [1.0.0] - TBD`.
+          # Accept both; with an empty prefix the two are the same string.
+          RELEASE_HEADING_TAG="${TAG_PREFIX}${VERSION}"
+          awk -v tag="$RELEASE_HEADING_TAG" -v version="$VERSION" '
+            index($0, "## [" tag "]") == 1 || index($0, "## [" version "]") == 1 {found=1; next}
             /^## \[/ && found {found=0}
             found
           ' CHANGELOG.md > /tmp/release-notes.md

@@ -1,0 +1,23 @@
+---
+# Seeded by vigOS devkit — yours to edit; upgrades never overwrite this file.
+# Bugs / missing tools: https://github.com/vig-os/devkit/issues
+
+# actionlint configuration — runner labels this repo's workflows may name (#1660).
+#
+# actionlint rejects any LITERAL `runs-on:` label missing from its built-in
+# list, and this file is the only way to teach it one. Expression forms are not
+# affected: `runs-on: ${{ fromJSON(needs.resolve-toolchain.outputs.runner-json) }}`
+# — how DEVKIT_CI_RUNNER reaches the scaffolded ci.yml — is skipped by actionlint
+# entirely, so a self-hosted runner routed that way needs no entry here.
+#
+# Keep this list MINIMAL. Every label added is a label actionlint will no longer
+# flag as a typo, so each earns its place with a reason and is deleted once that
+# reason expires.
+self-hosted-runner:
+  labels:
+    # Hosted runners actionlint's built-in list predates. actionlint 1.7.12 is
+    # the latest upstream release (2026-03-30) and the ubuntu-26.04 images
+    # shipped after it, so no pin bump recognises these. DELETE BOTH once an
+    # actionlint release knows them.
+    - ubuntu-26.04
+    - ubuntu-26.04-arm

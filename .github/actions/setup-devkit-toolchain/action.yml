@@ -49,6 +49,22 @@ inputs:
     description: Optional Cachix auth token for pushing to cachix-cache (direnv mode)
     required: false
     default: ''
+  dev-profile-path:
+    description: >-
+      Optional ABSOLUTE path for the direnv-mode dev-shell gcroot profile; empty
+      (default) => "$RUNNER_TEMP/devkit-dev-profile", i.e. today's behavior for
+      every consumer. Set it on a SELF-HOSTED runner whose /nix/store persists
+      across ephemeral jobs: RUNNER_TEMP is wiped when the job ends, so the
+      gcroot dies while the store survives and the host's nix.gc collects the
+      dev-shell closure every CI run needs. A path outside the runner's work
+      tree keeps the root alive between jobs (#1601). It must be a local
+      persistent directory, not a per-job tmpfs, and runner slots on the same
+      host are expected to SHARE it — concurrent `nix develop --profile`
+      realisations take the profile lock and converge on one generation. The
+      scaffolded ci.yml lanes source it from the DEVKIT_DEV_PROFILE_PATH
+      `.vig-os` key via resolve-toolchain, which vets the value once, up front.
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -111,7 +127,7 @@ runs:
     # the "Configure host Nix" step below (enforced by test).
     - name: Install Nix (upstream CppNix)
       if: inputs.mode == 'direnv' && steps.detect-nix.outputs.has-nix != 'true'
-      uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342  # v31.11.0
+      uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24  # v31.11.1
       with:
         extra_nix_config: |
           experimental-features = nix-command flakes
@@ -144,7 +160,7 @@ runs:
     # vig-os substituter above already warms the dev-shell.
     - name: Configure Cachix
       if: inputs.mode == 'direnv' && inputs.cachix-cache != ''
-      uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71  # v17
+      uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866  # v17
       with:
         name: ${{ inputs.cachix-cache }}
         authToken: ${{ inputs.cachix-auth-token }}
@@ -152,16 +168,67 @@ runs:
     - name: Build repo flake dev-shell and export PATH
       if: inputs.mode == 'direnv'
       shell: bash
+      # Routed through the environment, never inline `${{ }}` in `run:` — a
+      # consumer-supplied value expanded into the script is the
+      # template-injection shape the zizmor gate rejects (#1279).
+      env:
+        DEVKIT_DEV_PROFILE_PATH: ${{ inputs.dev-profile-path }}
       run: |
         set -euo pipefail
+        # Where the dev-shell gcroot lands (#1601). `--profile` is what makes
+        # the realisation below a gcroot rather than a bare `nix develop`, and
+        # under RUNNER_TEMP that root is wiped with the job. Right for a hosted
+        # runner — the machine goes too — and wrong for an ephemeral self-hosted
+        # one whose /nix/store persists: nothing roots the closure between jobs,
+        # so a routine host nix.gc discards it and the next run re-realises the
+        # whole dev-shell. `dev-profile-path` moves the root out of RUNNER_TEMP.
+        DEVKIT_DEV_PROFILE="${DEVKIT_DEV_PROFILE_PATH:-}"
+        if [ -z "$DEVKIT_DEV_PROFILE" ]; then
+          DEVKIT_DEV_PROFILE="$RUNNER_TEMP/devkit-dev-profile"
+        else
+          # Validate loudly instead of falling back: a silently job-scoped
+          # gcroot is indistinguishable from the bug this input exists to fix —
+          # CI stays green while every run pays the re-realisation.
+          case "$DEVKIT_DEV_PROFILE" in
+            /*) ;;
+            *)
+              echo "::error::setup-devkit-toolchain: dev-profile-path must be an absolute path (got '$DEVKIT_DEV_PROFILE'). A relative path resolves against the checkout, which the runner wipes between jobs."
+              exit 1
+              ;;
+          esac
+          devkit_profile_dir="$(dirname "$DEVKIT_DEV_PROFILE")"
+          if ! mkdir -p "$devkit_profile_dir" 2>/dev/null; then
+            echo "::error::setup-devkit-toolchain: cannot create the dev-profile-path parent directory '$devkit_profile_dir'. Point dev-profile-path at a persistent, runner-writable location."
+            exit 1
+          fi
+          if [ ! -w "$devkit_profile_dir" ]; then
+            echo "::error::setup-devkit-toolchain: the dev-profile-path parent directory '$devkit_profile_dir' is not writable by the runner user."
+            exit 1
+          fi
+          echo "Dev-shell gcroot profile (dev-profile-path): $DEVKIT_DEV_PROFILE"
+        fi
+
+        # Is the runner itself NixOS? In direnv mode this step runs on the
+        # runner host, so this is the host OS, and it decides two things below:
+        # whether a downloaded manylinux CPython could run here at all (#1360).
+        # `/etc/NIXOS` is the established probe — mkProjectShell's own shellHook
+        # uses it to gate LD_LIBRARY_PATH (#698). DEVKIT_NIXOS_MARKER exists
+        # SOLELY so the test harness can point the probe at a fixture path; CI
+        # never sets it, and neither should a consumer.
+        devkit_runner_is_nixos=false
+        if [ -e "${DEVKIT_NIXOS_MARKER:-/etc/NIXOS}" ]; then
+          devkit_runner_is_nixos=true
+        fi
+        echo "Runner is NixOS: $devkit_runner_is_nixos"
+
         # Build the consumer repo's own dev-shell (repo root flake) into a gcroot
         # profile — a warm Cachix pull — then prepend its nix-store bin dirs to
         # GITHUB_PATH so every following step runs as if inside `nix develop`.
         # Mirrors the devkit's setup-env action (adapted: the consumer flake at
         # the repo root, not the devkit's).
-        nix develop --profile "$RUNNER_TEMP/devkit-dev-profile" --command true
+        nix develop --profile "$DEVKIT_DEV_PROFILE" --command true
 
-        SHELL_PATH="$(nix develop --profile "$RUNNER_TEMP/devkit-dev-profile" \
+        SHELL_PATH="$(nix develop --profile "$DEVKIT_DEV_PROFILE" \
           --command bash -c 'printf "%s" "$PATH"')"
 
         # Always exclude the flake's podman (rootless podman on GitHub runners
@@ -171,20 +238,35 @@ runs:
         # manylinux CPython, not the Nix loader — the #698/#703/#729 libstdc++
         # regression. Library pkgs (python3.<ver>-<pkg>) are unaffected. On a
         # non-Python repo the Nix python stays on PATH (#1028).
+        # Not on a NixOS runner (#1360): there the exclusion is wrong by
+        # construction, since a downloaded manylinux CPython cannot execute on
+        # NixOS at all — dropping the store interpreter would leave the job with
+        # no usable Python. The Nix loader is the *only* one that works here, so
+        # the CPython stays and the uv pins below stay with it.
         STORE_BINS="$(printf '%s' "$SHELL_PATH" | tr ':' '\n' \
           | grep '^/nix/store' \
           | grep -v '/nix/store/[^/]*-podman[^/]*/bin')"
-        if [[ -f pyproject.toml ]]; then
+        if [[ -f pyproject.toml && "$devkit_runner_is_nixos" != true ]]; then
           STORE_BINS="$(printf '%s\n' "$STORE_BINS" \
             | grep -Ev '/nix/store/[^/]*-python3-[0-9][^/]*/bin')"
         fi
-        printf '%s\n' "$STORE_BINS" >> "$GITHUB_PATH"
+        # Reversed on purpose: the runner *prepends* every GITHUB_PATH line to
+        # PATH in file order, so the line written last ends up first. STORE_BINS
+        # holds the dev-shell order (highest priority first), so writing it as
+        # is handed the following steps a PATH in reverse dev-shell priority.
+        # Harmless while one tool means one store path, fatal for a stdenv
+        # toolchain: raw gcc then shadows gcc-wrapper (likewise binutils) and
+        # every C build fails with `cannot find Scrt1.o` / `cannot find -lc`
+        # while the same build is green locally under `nix develop` (#1351,
+        # vig-os/h5v#2). `tac` makes the per-line prepend rebuild the dev-shell
+        # order verbatim.
+        printf '%s\n' "$STORE_BINS" | tac >> "$GITHUB_PATH"
 
         # Forward the dev-shell's uv Python-download metadata URL (GITHUB_PATH
         # carries PATH only): `uv sync` needs it to fetch the project's pinned
         # CPython, which nixpkgs does not package. Python consumers only (#1028).
         if [[ -f pyproject.toml ]]; then
-          UV_DL_JSON_URL="$(nix develop --profile "$RUNNER_TEMP/devkit-dev-profile" \
+          UV_DL_JSON_URL="$(nix develop --profile "$DEVKIT_DEV_PROFILE" \
             --command bash -c 'printf "UV_PYTHON_DOWNLOADS_JSON_URL=%s\n" "${UV_PYTHON_DOWNLOADS_JSON_URL:-}"' \
             | grep '^UV_PYTHON_DOWNLOADS_JSON_URL=' | tail -n1 | cut -d= -f2-)"
           if [ -n "$UV_DL_JSON_URL" ]; then
@@ -210,21 +292,55 @@ runs:
         # `nix develop` stdout would also capture shellHook output (the
         # scaffolded flake echoes a banner), gluing it onto the first NUL
         # record and corrupting GITHUB_ENV (#1189).
-        nix develop --profile "$RUNNER_TEMP/devkit-dev-profile" \
+        nix develop --profile "$DEVKIT_DEV_PROFILE" \
           --command bash -c 'env -0 > "$1"' _ "$RUNNER_TEMP/devkit-devshell-env"
 
         # Denylist: shell session state (must never override the CI shell) and
         # Nix/stdenv build machinery (PATH is already handled via GITHUB_PATH).
+        # mkProjectShell's uv interpreter pins go with them: `UV_PYTHON` (a store
+        # CPython) and `UV_PYTHON_DOWNLOADS=never` are Nix-host-only by
+        # construction — a NixOS host cannot run a downloaded managed CPython —
+        # and forwarding them cancels the mitigation above, since UV_PYTHON beats
+        # PATH resolution and `never` forbids the very download the
+        # UV_PYTHON_DOWNLOADS_JSON_URL forward exists to enable. `uv sync` then
+        # built the runner venv on the Nix interpreter and every C-extension
+        # wheel died under the Nix loader with `ImportError: libstdc++.so.6:
+        # cannot open shared object file` (#698/#703/#729, #1353). Exact
+        # patterns: UV_PYTHON_DOWNLOADS_JSON_URL must still forward.
+        # On a NixOS runner both pins are instead exactly correct and are
+        # forwarded (#1360): UV_PYTHON names a store interpreter the runner can
+        # execute, and `never` stops uv preferring a managed download that could
+        # not run there. Keeping the CPython on PATH above is not sufficient on
+        # its own — uv's python-preference can still pick the download — so the
+        # two halves of the NixOS branch go together.
+        # The stdenv cc/binutils hook names (AR…STRIP) go too (#1358): stdenv
+        # sets them in EVERY dev shell as bare command names (`CC=gcc`), so
+        # every consumer shipped them to the whole CI job. Inside dev-shell
+        # context the wrapped toolchain already wins via PATH (#1351); for steps
+        # that run OUTSIDE it (setup-python + pip building a C extension) a
+        # forwarded `CC` resolves to the Nix wrapper and recreates the #1353
+        # mixed-toolchain hazard. A step that needs a specific compiler sets it
+        # in the workflow. `do[A-Z]*` (doCheck/doInstallCheck/doDist) is the
+        # symmetric partner of `dont*`; case patterns are case-sensitive, so
+        # DOCKER_*/DO_SOMETHING are untouched (a consumer var literally spelled
+        # `doSomething` would be denied — accepted).
         devkit_env_denied() {
           case "$1" in
             PATH|HOME|USER|LOGNAME|SHELL|TERM|PWD|OLDPWD|SHLVL|IFS|_) return 0 ;;
             TMPDIR|TMP|TEMP|TEMPDIR) return 0 ;;
-            NIX_*) return 0 ;;
+            UV_PYTHON|UV_PYTHON_DOWNLOADS)
+              if [ "$devkit_runner_is_nixos" = true ]; then
+                return 1
+              fi
+              return 0 ;;
+            NIX_*|IN_NIX_SHELL) return 0 ;;
             out|outputs|src|stdenv|system|builder|name|pname|version|shell|shellHook) return 0 ;;
             buildInputs|nativeBuildInputs|propagatedBuildInputs|propagatedNativeBuildInputs) return 0 ;;
-            deps*|*Phase|phases|dont*) return 0 ;;
+            deps*|*Phase|phases|dont*|do[A-Z]*) return 0 ;;
             configureFlags|cmakeFlags|mesonFlags|makeFlags|patches|strictDeps|enableParallelBuilding) return 0 ;;
             SOURCE_DATE_EPOCH|HOST_PATH|__structuredAttrs|outputHash*|preferLocalBuild|allowSubstitutes|cmakeDir) return 0 ;;
+            _PYTHON_HOST_PLATFORM|_PYTHON_SYSCONFIGDATA_NAME|DETERMINISTIC_BUILD|CONFIG_SHELL) return 0 ;;
+            AR|AS|CC|CXX|LD|NM|OBJCOPY|OBJDUMP|RANLIB|READELF|SIZE|STRINGS|STRIP) return 0 ;;
             *) return 1 ;;
           esac
         }
@@ -254,6 +370,29 @@ runs:
           fi
           if devkit_env_denied "$devkit_name"; then
             continue
+          fi
+          # PYTHONPATH: forward the consumer's own components only (#1358). The
+          # nixpkgs python setup hook fills it with store site-packages dirs, and
+          # on CI those land on the sys.path of the *downloaded* manylinux
+          # CPython — same ABI tag, importable, exactly the mixed-loader shape
+          # behind the `ImportError: libstdc++.so.6` of #1353. A blanket deny
+          # would be wrong: `export PYTHONPATH=$PWD/src` in a shellHook is the
+          # #1180 use case. So drop the /nix/store components, keep the rest, and
+          # skip the var entirely when nothing is left. PYTHONPATH only, by
+          # design — the same split-and-filter fits any other path-like var that
+          # ever shows this leak.
+          if [[ "$devkit_name" == PYTHONPATH ]]; then
+            devkit_kept=()
+            IFS=':' read -r -a devkit_parts <<< "$devkit_value"
+            for devkit_part in "${devkit_parts[@]}"; do
+              if [[ "$devkit_part" != /nix/store/* ]]; then
+                devkit_kept+=("$devkit_part")
+              fi
+            done
+            if [[ "${#devkit_kept[@]}" -eq 0 ]]; then
+              continue
+            fi
+            devkit_value="$(IFS=':'; printf '%s' "${devkit_kept[*]}")"
           fi
           # Random heredoc delimiter: multi-line and special-character values
           # survive intact and cannot break GITHUB_ENV parsing (GitHub's own
@@ -286,7 +425,7 @@ runs:
     # ── bare — host, provision the pinned toolchain with uv ───────────────────
     - name: Set up uv
       if: inputs.mode == 'bare'
-      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
+      uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
 
     - name: Install host toolchain (just, prek, vig-utils)
       if: inputs.mode == 'bare'
@@ -301,7 +440,7 @@ runs:
         fi
         # Pinned to the versions the vig-os toolchain ships; bump via Renovate or
         # alongside a devkit upgrade. vig-utils supplies the release console
-        # scripts (prepare-changelog, renovate-changelog-pr) that the image bakes
+        # scripts (prepare-changelog, synthesize-bot-changelog) that the image bakes
         # in the other modes — pinned to the same devkit version as .vig-os
         # (#993, see https://github.com/vig-os/devkit/blob/main/docs/MIGRATION.md).
         uv tool install rust-just==1.51.0

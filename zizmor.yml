@@ -6,7 +6,8 @@
 # Devkit OWNS this baseline. It suppresses the residual zizmor findings in the
 # devkit-managed workflows that cannot be fixed without changing release/CI
 # behavior for every consumer. Devkit's own CI gates the managed workflow set
-# against this file (see .github/workflows/ci.yml → "Audit managed workflows"),
+# against this file (see the "Audit managed workflows" step of
+# .github/actions/test-project, run by ci.yml's `project-flake` lane),
 # so a regression — a new finding, or a managed workflow that regains a fixed
 # finding — fails devkit CI and must be fixed or triaged here, not silently
 # baselined downstream.
@@ -28,7 +29,7 @@
 # Fixed upstream (NOT baselined — listed here as a record of what devkit fixed):
 #   - artipacked        → persist-credentials: false on read-only checkouts
 #                         (ci.yml lint/test/resolve/dependency-review, codeql.yml,
-#                         renovate-changelog-build.yml, sync-issues.yml resolve).
+#                         sync-issues.yml resolve).
 #   - template-injection → release-app token moved into step env in
 #                         sync-main-to-dev.yml.
 #
@@ -37,14 +38,13 @@
 #                         therefore rely on the persisted git credential
 #                         (ci.yml commit-checks, all release/sync branch work,
 #                         devkit-upgrade's self-upgrade branch push).
-#   - dangerous-triggers → renovate-changelog-commit.yml runs on `workflow_run`
-#                         by design (it commits the built changelog).
 #   - github-app        → create-github-app-token intentionally mints a
 #                         broadly-scoped installation token for release
 #                         orchestration; per-permission scoping would break the
 #                         multi-repo release/sync flows.
-#   - secrets-inherit   → release.yml / prepare-release.yml fan out to reusable
-#                         workflows with `secrets: inherit` by design.
+#   - secrets-inherit   → release.yml / prepare-release.yml / prepare-hotfix.yml
+#                         fan out to reusable workflows with `secrets: inherit`
+#                         by design.
 #   - unpinned-images   → `image:` is the devkit toolchain image resolved at
 #                         runtime (needs.*.outputs.image / inputs.toolchain_image);
 #                         it cannot be SHA-pinned in source.
@@ -59,31 +59,30 @@ rules:
       - release-publish.yml
       - release.yml
       - sync-main-to-dev.yml
-  dangerous-triggers:
-    ignore:
-      - renovate-changelog-commit.yml
   github-app:
     ignore:
+      - abandon-release.yml
+      - prepare-hotfix.yml
       - prepare-release.yml
       - promote-release.yml
       - release-core.yml
       - release-publish.yml
       - release.yml
-      - renovate-changelog-commit.yml
       - sync-issues.yml
       - sync-main-to-dev.yml
   secrets-inherit:
     ignore:
+      - prepare-hotfix.yml
       - prepare-release.yml
       - release.yml
   unpinned-images:
     ignore:
       - ci.yml
+      - prepare-hotfix.yml
       - prepare-release.yml
       - promote-release.yml
       - release-core.yml
       - release-publish.yml
       - release.yml
-      - renovate-changelog-build.yml
       - sync-issues.yml
       - sync-main-to-dev.yml
