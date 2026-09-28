@@ -71,19 +71,15 @@ seam, because that seam runs before the tag and the Release even exist.
 | crates.io **trusted publishing** (preferred) | On crates.io, for **each** of the 8 `scitadel-*` crates: *Settings → Trusted Publishing → Add* a GitHub publisher with owner `vig-os`, repository `scitadel`, workflow `publish-crates.yml`, environment `crates-io`. `publish-crates.yml` then mints a short-lived token per run via `rust-lang/crates-io-auth-action`; nothing expires. |
 | `CARGO_REGISTRY_TOKEN` (fallback) | Repo secret, used only when trusted publishing is not configured. crates.io tokens expire (the 0.8.0 publish failed on one), so prefer trusted publishing. |
 
-The retired release-please credentials (`RELEASE_PLEASE_TOKEN`,
-`RELEASE_BOT_APP_ID`, `RELEASE_BOT_PRIVATE_KEY`) can be deleted.
+## Migration history
 
-## First release on the train
-
-The first release after migrating has a one-time sharp edge: `promote-release.yml`
-is not yet dispatchable, because GitHub only registers a `workflow_dispatch`
-workflow that exists on the default branch, and the thing that puts it on `main`
-is the promote merge itself. Follow the **first-release manual promote runbook**
-in the devkit
-[`MIGRATION.md`](https://github.com/vig-os/devkit/blob/main/docs/MIGRATION.md)
-— run it through to the end in one go, it cannot be resumed by the workflow.
-Every subsequent release promotes normally.
+- **0.8.0** was the first release cut on the train. The train's entry points
+  had to be registered on `main` first (#214), because GitHub only dispatches
+  workflows that exist on the default branch. From then on every release
+  promotes normally.
+- The retired release-please credentials (`RELEASE_PLEASE_TOKEN`,
+  `RELEASE_BOT_APP_ID`, `RELEASE_BOT_PRIVATE_KEY`) were deleted on 2026-09-28
+  (vig-os/org-config#295).
 
 ## Plugin version pin
 
