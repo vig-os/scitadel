@@ -1135,6 +1135,13 @@ impl ServerHandler for ScitadelServer {
 #[cfg(test)]
 mod tests {
     use rmcp::ServerHandler;
+    // Port traits pulled into scope for the #232 round-trip tests
+    // below — they call save_question / save / save_results directly
+    // on the concrete Sqlite* repos, which implement them via the
+    // trait.
+    use scitadel_core::ports::{
+        PaperRepository as _, QuestionRepository as _, SearchRepository as _,
+    };
 
     /// Scope filter: a subscriber with `paper_id=None` sees every
     /// event; a paper-scoped subscriber sees only events on that
@@ -1437,6 +1444,189 @@ mod tests {
         assert!(
             tool_count >= 25,
             "expected to scan all MCP tools (~26+); only saw {tool_count} — has the macro shape changed?"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // #232 short-id → full-id round-trips.
+    //
+    // Regression contract: every ID an MCP tool *prints* — from
+    // create_question, list_questions, list_searches — must be
+    // accepted verbatim by every ID-accepting tool. Before #232 the
+    // tools printed `Id::short()` (8-char) but did exact `id = ?` DB
+    // lookups, so agents copying a printed id got `Question '<id>'
+    // not found.` from add_search_terms / save_assessment / get_papers.
+    //
+    // These tests exercise the same server surface an MCP client hits
+    // (Parameters<Request> → tool_fn), share the ENV_LOCK pattern
+    // above for SCITADEL_DB, and cover: full id, unique short prefix,
+    // ambiguous prefix, and no-such-id.
+    // ------------------------------------------------------------------
+
+    /// Seed the SCITADEL_DB env var to a fresh tempdir file so
+    /// `tools::open_db()` picks it up. Returns `(tmpdir, db_path)` —
+    /// the caller keeps `tmpdir` alive for the duration of the test.
+    /// **Caller must hold the ENV_LOCK.**
+    fn seed_env_db() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        unsafe {
+            std::env::set_var("SCITADEL_DB", &db_path);
+        }
+        // Force migrations to run before anything else touches the DB.
+        let db = scitadel_db::sqlite::Database::open(&db_path).unwrap();
+        db.migrate().unwrap();
+        (tmp, db_path)
+    }
+
+    /// Extract "Question created: <id>" → `<id>` from
+    /// `create_question_tool` output — exercises the exact contract
+    /// an agent uses to lift the id from a tool response.
+    fn parse_created_question_id(printed: &str) -> String {
+        let first = printed.lines().next().expect("first line");
+        first
+            .strip_prefix("Question created: ")
+            .expect("expected `Question created: <id>` prefix")
+            .to_string()
+    }
+
+    /// End-to-end #232: create_question → parse its printed id →
+    /// hand that same 8-char prefix (short form) AND full form to
+    /// add_search_terms + save_assessment. Both must succeed. Before
+    /// the fix, `add_search_terms(question_id="<short>")` returned
+    /// `Question '<short>' not found.` even though list_questions
+    /// had just printed that same short id.
+    #[test]
+    fn create_question_id_roundtrips_through_add_search_terms_and_save_assessment() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_tmp, db_path) = seed_env_db();
+
+        let printed = super::tools::create_question_tool("Q?", "context").unwrap();
+        let full_id = parse_created_question_id(&printed);
+        assert_eq!(
+            full_id.len(),
+            32,
+            "printed id must be the full 32-char UUID"
+        );
+        let short_id: String = full_id.chars().take(8).collect();
+
+        // Seed a paper so save_assessment has something to attach to.
+        let db = scitadel_db::sqlite::Database::open(&db_path).unwrap();
+        let mut p = scitadel_core::models::Paper::new("t");
+        p.id = scitadel_core::models::PaperId::from("paper1234567890abcdef00000000ffff");
+        let (paper_repo, _, _, _, _) = db.repositories();
+        scitadel_core::ports::PaperRepository::save(&paper_repo, &p).unwrap();
+        let paper_short: String = p.id.as_str().chars().take(8).collect();
+
+        // Short prefix — the pre-fix bug.
+        super::tools::add_search_terms_tool(&short_id, &["dark".into(), "matter".into()], None)
+            .expect("add_search_terms accepts an 8-char question prefix (#232)");
+        // Full id — always worked; guard against regressing to exact-only.
+        super::tools::add_search_terms_tool(&full_id, &["photon".into()], None)
+            .expect("add_search_terms accepts the full id");
+
+        // save_assessment: same round-trip, but with two IDs to
+        // resolve (paper + question) plus a JSON-friendly score.
+        let out = super::tools::save_assessment_tool(&paper_short, &short_id, 0.75, "solid")
+            .expect("save_assessment accepts short prefixes for paper AND question (#232)");
+        assert!(
+            out.contains("Assessment saved:"),
+            "expected success text; got: {out}"
+        );
+    }
+
+    /// Search-id round-trip for get_papers. Before #232 the id in
+    /// `list_searches` output was 8 chars but `get_papers` did an
+    /// exact `WHERE id = ?` and rejected it as `Search '<short>' not
+    /// found.`.
+    #[test]
+    fn search_id_roundtrips_through_get_papers() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_tmp, db_path) = seed_env_db();
+
+        // Seed a search + a paper + a link so get_papers has something
+        // to return. Bypasses the network-facing search_tool.
+        let db = scitadel_db::sqlite::Database::open(&db_path).unwrap();
+        let (paper_repo, search_repo, _, _, _) = db.repositories();
+        let mut search = scitadel_core::models::Search::new("q");
+        search.id = scitadel_core::models::SearchId::from("srch5678babecafebeef111122223333");
+        search.total_papers = 1;
+        search_repo.save(&search).unwrap();
+
+        let mut paper = scitadel_core::models::Paper::new("Title");
+        paper.id = scitadel_core::models::PaperId::from("pap1234567890abcdef000000ffff9999");
+        paper_repo.save(&paper).unwrap();
+        search_repo
+            .save_results(&[scitadel_core::models::SearchResult {
+                search_id: search.id.clone(),
+                paper_id: paper.id.clone(),
+                source: "pubmed".into(),
+                rank: Some(1),
+                score: Some(0.9),
+                raw_metadata: serde_json::Value::Null,
+            }])
+            .unwrap();
+
+        let short_search: String = search.id.as_str().chars().take(8).collect();
+        // Short prefix.
+        let text = super::tools::get_papers_tool(&short_search)
+            .expect("get_papers accepts a short search-id prefix (#232)");
+        assert!(text.contains("Title"), "get_papers text: {text}");
+        assert!(
+            text.contains(search.id.as_str()),
+            "get_papers echoes the FULL search id post-#232: {text}"
+        );
+
+        // Full id — regression guard for exact-only path.
+        super::tools::get_papers_tool(search.id.as_str())
+            .expect("get_papers accepts the full search id");
+    }
+
+    /// Ambiguity: two questions sharing a 6-char prefix. The
+    /// resolver must return an "ambiguous" error that names the
+    /// candidates so an agent can disambiguate on the next call.
+    #[test]
+    fn ambiguous_short_prefix_names_both_candidates() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_tmp, db_path) = seed_env_db();
+
+        // Seed two questions with a shared 6-char prefix.
+        let db = scitadel_db::sqlite::Database::open(&db_path).unwrap();
+        let (_, _, q_repo, _, _) = db.repositories();
+        let mut q1 = scitadel_core::models::ResearchQuestion::new("Q1");
+        q1.id = scitadel_core::models::QuestionId::from("dupli111122223333444455556666aaaa");
+        let mut q2 = scitadel_core::models::ResearchQuestion::new("Q2");
+        q2.id = scitadel_core::models::QuestionId::from("dupli222233334444555566667777aaaa");
+        q_repo.save_question(&q1).unwrap();
+        q_repo.save_question(&q2).unwrap();
+
+        let err = super::tools::add_search_terms_tool("dupli", &["x".into()], None)
+            .expect_err("ambiguous prefix must error");
+        assert!(err.contains("ambiguous"), "err: {err}");
+        assert!(
+            err.contains(q1.id.as_str()) && err.contains(q2.id.as_str()),
+            "ambiguity error lists both candidates so the agent can pick: {err}"
+        );
+    }
+
+    /// No-such-id: pre-#232 message shape (`Question '<id>' not
+    /// found.`) preserved so downstream consumers keep matching it.
+    #[test]
+    fn no_such_id_preserves_pre_232_error_shape() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_tmp, _db_path) = seed_env_db();
+
+        let err = super::tools::add_search_terms_tool("cafebabe", &["x".into()], None)
+            .expect_err("no such question must error");
+        assert!(
+            err.starts_with("Question 'cafebabe' not found."),
+            "unexpected error shape: {err}"
+        );
+
+        let err = super::tools::get_papers_tool("deadbeef").expect_err("no such search");
+        assert!(
+            err.starts_with("Search 'deadbeef' not found."),
+            "unexpected error shape: {err}"
         );
     }
 }

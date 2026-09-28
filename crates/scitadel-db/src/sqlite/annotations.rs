@@ -91,6 +91,28 @@ impl SqliteAnnotationRepository {
         Ok(out)
     }
 
+    /// Look up live annotations whose id starts with `prefix`, capped at
+    /// `limit`. Used by MCP ID resolvers so a copied 8-char prefix maps
+    /// to its full record. Soft-deleted rows are excluded to keep the
+    /// resolver's behaviour aligned with `get()`. See the doc-comment
+    /// on the question repo's `find_by_id_prefix` for SQL rationale.
+    pub fn find_by_id_prefix(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<Annotation>, DbError> {
+        let conn = self.db.conn()?;
+        let pattern = format!("{prefix}*");
+        let mut stmt = conn.prepare(
+            "SELECT * FROM annotations
+             WHERE id GLOB ?1 AND deleted_at IS NULL
+             ORDER BY created_at DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![pattern, limit as i64], row_to_annotation)?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
     /// All live annotations anchored to a paper (roots + replies).
     pub fn list_by_paper(&self, paper_id: &str) -> Result<Vec<Annotation>, DbError> {
         let conn = self.db.conn()?;
@@ -672,6 +694,37 @@ mod tests {
         let all = repo.list_by_paper("p1").unwrap();
         assert_eq!(all.len(), 1, "root survives; reply tombstoned out");
         assert_eq!(all[0].note, "edited offline");
+    }
+
+    #[test]
+    fn find_by_id_prefix_unique_ambiguous_and_hides_deleted() {
+        let db = fresh_db_with_paper();
+        let repo = SqliteAnnotationRepository::new(db);
+        let mut a = sample_root();
+        a.id = AnnotationId::from("aa11bb22cc33dd44ee55ff6677889900");
+        let mut b = sample_root();
+        b.id = AnnotationId::from("aa11ccffcc33dd44ee55ff6677889900");
+        let mut c = sample_root();
+        c.id = AnnotationId::from("bb99cc33cc33dd44ee55ff6677889900");
+        repo.create(&a).unwrap();
+        repo.create(&b).unwrap();
+        repo.create(&c).unwrap();
+
+        // Unique 8-char prefix.
+        let hits = repo.find_by_id_prefix("aa11bb22", 2).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id.as_str(), a.id.as_str());
+
+        // Ambiguous prefix.
+        assert_eq!(repo.find_by_id_prefix("aa11", 2).unwrap().len(), 2);
+
+        // Not found.
+        assert!(repo.find_by_id_prefix("zzzz", 2).unwrap().is_empty());
+
+        // Soft-deleted rows are excluded (matches `get()`).
+        repo.soft_delete(a.id.as_str()).unwrap();
+        let hits = repo.find_by_id_prefix("aa11bb22", 2).unwrap();
+        assert!(hits.is_empty(), "soft-deleted row should not resolve");
     }
 
     #[test]

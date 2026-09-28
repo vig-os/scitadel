@@ -15,6 +15,29 @@ impl SqliteSearchRepository {
         Self { db }
     }
 
+    /// Look up searches whose id starts with `prefix`, capped at `limit`.
+    /// Used by MCP / CLI ID resolvers so a copied `Id::short()` (8-char)
+    /// prefix maps to its full record. See the doc-comment on the
+    /// question repo's `find_by_id_prefix` for the SQL rationale.
+    pub fn find_by_id_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<Search>, CoreError> {
+        let conn = self.db.conn()?;
+        let pattern = format!("{prefix}*");
+        let mut stmt = conn
+            .prepare(
+                "SELECT * FROM searches
+                 WHERE id GLOB ?1
+                 ORDER BY created_at DESC
+                 LIMIT ?2",
+            )
+            .map_err(DbError::Sqlite)?;
+        let rows = stmt
+            .query_map(params![pattern, limit as i64], row_to_search)
+            .map_err(DbError::Sqlite)?
+            .filter_map(Result::ok)
+            .collect();
+        Ok(rows)
+    }
+
     /// Full-text search over past search queries using the `searches_fts`
     /// FTS5 index (migration 006). Returns `(Search, rank)` tuples where
     /// lower rank = more relevant (bm25 convention). Input is sanitized of
@@ -294,6 +317,32 @@ mod tests {
         let (_, repo, _) = setup();
         repo.save(&Search::new("something")).unwrap();
         assert!(repo.find_similar("()(", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn find_by_id_prefix_unique_and_ambiguous() {
+        let (_, repo, _) = setup();
+        let mut a = Search::new("qa");
+        a.id = SearchId::from("cafebabe1111222233334444555566670");
+        let mut b = Search::new("qb");
+        b.id = SearchId::from("cafebeef1111222233334444555566670");
+        let mut c = Search::new("qc");
+        c.id = SearchId::from("deadbeef1111222233334444555566670");
+        repo.save(&a).unwrap();
+        repo.save(&b).unwrap();
+        repo.save(&c).unwrap();
+
+        // Unique 8-char prefix.
+        let hits = repo.find_by_id_prefix("cafebabe", 2).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id.as_str(), a.id.as_str());
+
+        // Ambiguous prefix returns >=2, capped at LIMIT.
+        let hits = repo.find_by_id_prefix("cafe", 2).unwrap();
+        assert_eq!(hits.len(), 2);
+
+        // No match.
+        assert!(repo.find_by_id_prefix("zzzz", 2).unwrap().is_empty());
     }
 
     #[test]

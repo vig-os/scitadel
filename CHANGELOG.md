@@ -45,6 +45,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **MCP tools now accept the short IDs they print**
+  ([#232](https://github.com/vig-os/scitadel/issues/232)). Every
+  ID-accepting tool (`add_search_terms`, `save_assessment`,
+  `assess_paper`, `prepare_assessment`, `prepare_batch_assessments`,
+  `get_papers`, `export_search`, `summarize_search`, `get_paper`,
+  `read_paper`, `get_annotated_paper`, `download_paper`,
+  `get_references`, `get_citations`, `create_annotation`,
+  `create_paper_note`, `reply_annotation`, `update_annotation`,
+  `delete_annotation`, `list_annotations`, `list_unread`,
+  `mark_seen`, `mark_thread_seen`, `toggle_star`, `set_star`,
+  `rekey_paper`, plus the existing bib snapshot/verify/diff paths)
+  now resolves a full id OR a unique short prefix through a single
+  shared resolver, backed by indexed `id GLOB '<prefix>*'` lookups
+  on the DB. Before, `create_question` / `list_questions` /
+  `list_searches` printed 8-char `Id::short()` values that then
+  bounced off exact `WHERE id = ?` lookups (`Question '<short>' not
+  found.`), so an agent could not persist any assessments or search
+  terms from a copy-pasted id. `create_question`, `list_questions`,
+  `list_searches`, `get_papers`, and `prepare_batch_assessments` now
+  additionally print the full 32-char id in every row so the id an
+  agent copies works verbatim; ambiguous prefixes error with both
+  candidate ids so the caller can disambiguate.
+
 ### Security
 
 ## [0.8.0](https://github.com/vig-os/scitadel/releases/tag/0.8.0) - 2026-09-24
