@@ -11,9 +11,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **vigOS devkit scaffold upgraded 1.6.0 → 1.17.0**
+  ([#225](https://github.com/vig-os/scitadel/issues/225)). The pinned `vigos`
+  flake input moves in lockstep with `DEVKIT_VERSION`, so the dev shell and CI
+  run the 1.17.0 toolchain (`vig-utils` release scripts, `pymarkdown`, hook
+  sets) rather than 1.6.0's against a 1.17.0 scaffold.
+  - New release-train lanes: `abandon-release.yml` rejects a finalized but
+    still-draft release, and `prepare-hotfix.yml` cuts a patch from `main`
+    without carrying what `dev` has accumulated.
+  - `.vig-os` gains the knobs added since 1.6.0. `DEVKIT_LANGUAGES=rust` gates
+    CI on the declared language; `DEVKIT_LICENSE=none` stops devkit managing a
+    `LICENSE` file for this `MIT OR Apache-2.0` workspace, which carries its own
+    `LICENSE-MIT` and `LICENSE-APACHE`.
+  - `shellcheck` now runs as a `language: system` hook resolved from the flake:
+    the `shellcheck-py` wheel cannot be built under Python 3.14, which the
+    relocked toolchain provides, so the hook could no longer install at all.
+    `shellcheck` and `actionlint` are declared in the dev shell for it and for
+    the newly scaffolded `actionlint` / `shellcheck-composite-actions` hooks.
+  - Retired the `renovate-changelog` build/commit workflow pair, superseded
+    upstream by release-time changelog synthesis.
+
 ### Deprecated
 
 ### Removed
+
+- **Four orphaned devkit scaffold paths**
+  ([#225](https://github.com/vig-os/scitadel/issues/225)) — `.cursor/`
+  (superseded by `.claude/` in devkit 0.4.0), `.hadolint.yaml` (0.4.0),
+  `.github/actions/resolve-image/` (1.1.0, superseded by `resolve-toolchain`)
+  and `renovate-changelog.yml` (0.3.5). Devkit prunes a retired path only when
+  the tree predates the release that retired it, so at a 1.6.0 pin all four sat
+  past its reach and would have ridden along indefinitely.
 
 ### Fixed
 
