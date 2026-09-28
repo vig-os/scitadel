@@ -117,6 +117,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--field title` (or `--field auto`) to escape the fulltext-relevance
   noise that made classic titles surface far below topically-adjacent
   hits. The pre-#210 default (`--field any`) is unchanged.
+- **Rust toolchain pinned in `rust-toolchain.toml`**
+  ([#229](https://github.com/vig-os/scitadel/issues/229)). `just lint` failed
+  in a fresh `nix develop` while CI's Lint job passed: the flake shipped
+  `clippy 1.95` (via `pkgs.rust-bin.stable.latest`, resolved against an April
+  `rust-overlay` pin) but `crates/scitadel-mcp/src/server.rs` carries
+  `#[allow(clippy::unused_async_trait_impl)]` — a lint introduced in
+  `clippy 1.98` — and `-D warnings` promoted the resulting `unknown_lints`
+  warning to an error. A `rust-toolchain.toml` at the repo root now pins
+  `channel = "1.98.1"` and is the single source of truth for both the flake
+  (`rust-bin.fromRustupToolchainFile`, shared by the dev shell and
+  `packages.default`) and every repo-owned CI workflow (rustup on the runner
+  reads the file automatically). Local and CI clippy can never diverge
+  again; bump the file in a dedicated PR — see
+  [`docs/RELEASING.md`](docs/RELEASING.md#rust-toolchain-bumps).
 
 ### Security
 
