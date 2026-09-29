@@ -90,6 +90,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the newly scaffolded `actionlint` / `shellcheck-composite-actions` hooks.
   - Retired the `renovate-changelog` build/commit workflow pair, superseded
     upstream by release-time changelog synthesis.
+- **Renovate manages the Rust dependencies**
+  ([#240](https://github.com/vig-os/scitadel/issues/240)). `renovate.json`
+  now enables `["github-actions", "cargo"]`, so Renovate opens update and
+  vulnerability PRs for the Cargo workspace and its lock file maintenance
+  covers `Cargo.lock`. The previous list named `uv`, which is not a Renovate
+  manager and failed `renovate-config-validator --strict`, plus `pep621` and
+  `npm`, which match no file in this repo. Renovate reads its config from
+  `main`, so this takes effect with the next release.
 
 ### Deprecated
 
