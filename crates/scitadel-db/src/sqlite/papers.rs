@@ -49,6 +49,34 @@ impl SqlitePaperRepository {
         &self.db
     }
 
+    /// Look up papers whose id starts with `prefix`, capped at `limit`.
+    /// Used by MCP / CLI ID resolvers so a copied `Id::short()` (8-char)
+    /// prefix maps to its full record. See the doc-comment on the
+    /// question repo's `find_by_id_prefix` for the SQL rationale.
+    pub fn find_by_id_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<Paper>, CoreError> {
+        // Defensive gate — see the doc-comment on
+        // `SqliteQuestionRepository::find_by_id_prefix`.
+        if !super::is_valid_id_prefix(prefix) {
+            return Ok(Vec::new());
+        }
+        let conn = self.db.conn()?;
+        let pattern = format!("{prefix}*");
+        let mut stmt = conn
+            .prepare(
+                "SELECT * FROM papers
+                 WHERE id GLOB ?1
+                 ORDER BY created_at DESC
+                 LIMIT ?2",
+            )
+            .map_err(DbError::Sqlite)?;
+        let rows = stmt
+            .query_map(params![pattern, limit as i64], row_to_paper)
+            .map_err(DbError::Sqlite)?
+            .filter_map(Result::ok)
+            .collect();
+        Ok(rows)
+    }
+
     /// If a paper with the same DOI already exists, return a clone with the existing ID
     /// so the upsert merges into the existing row instead of violating the DOI unique index.
     fn resolve_doi_conflict(
@@ -530,6 +558,32 @@ mod tests {
 
         let loaded = repo.get(paper.id.as_str()).unwrap().unwrap();
         assert_eq!(loaded.title, "Test Paper");
+    }
+
+    #[test]
+    fn find_by_id_prefix_unique_and_ambiguous() {
+        let (_, repo) = setup();
+        let mut a = Paper::new("A");
+        a.id = PaperId::from("aabbccdd11112222333344445555666a");
+        let mut b = Paper::new("B");
+        b.id = PaperId::from("aabbeeff11112222333344445555666a");
+        let mut c = Paper::new("C");
+        c.id = PaperId::from("ccbbeeff11112222333344445555666a");
+        repo.save(&a).unwrap();
+        repo.save(&b).unwrap();
+        repo.save(&c).unwrap();
+
+        // Unique 8-char prefix.
+        let hits = repo.find_by_id_prefix("aabbccdd", 2).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id.as_str(), a.id.as_str());
+
+        // Ambiguous prefix returns >=2, capped at LIMIT.
+        let hits = repo.find_by_id_prefix("aabb", 2).unwrap();
+        assert_eq!(hits.len(), 2);
+
+        // No match.
+        assert!(repo.find_by_id_prefix("zzzz", 2).unwrap().is_empty());
     }
 
     #[test]

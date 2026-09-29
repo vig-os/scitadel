@@ -14,6 +14,54 @@ impl SqliteQuestionRepository {
     pub fn new(db: Database) -> Self {
         Self { db }
     }
+
+    /// Look up questions whose id starts with `prefix`, capped at `limit`.
+    /// Used by MCP / CLI ID resolvers so a copied `Id::short()` (8-char)
+    /// prefix maps to its full record. `GLOB` is index-friendly on
+    /// SQLite (BINARY collation, unlike default `LIKE`), so the scan
+    /// is a range hit on the PK. Callers typically pass `limit=2` —
+    /// enough to distinguish unique / ambiguous / not-found.
+    pub fn find_by_id_prefix(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<ResearchQuestion>, CoreError> {
+        // Defensive gate — never let raw input into the GLOB pattern.
+        // MCP / CLI already validate before calling, but a future
+        // caller that forgets would otherwise silently match `*` and
+        // resolve to whatever row happens to be first. See
+        // `is_valid_id_prefix` for the char-set rationale.
+        if !super::is_valid_id_prefix(prefix) {
+            return Ok(Vec::new());
+        }
+        let conn = self.db.conn()?;
+        let pattern = format!("{prefix}*");
+        let mut stmt = conn
+            .prepare(
+                "SELECT * FROM research_questions
+                 WHERE id GLOB ?1
+                 ORDER BY created_at DESC
+                 LIMIT ?2",
+            )
+            .map_err(DbError::Sqlite)?;
+        let rows = stmt
+            .query_map(params![pattern, limit as i64], |row| {
+                let id: String = row.get("id")?;
+                let created_at: String = row.get("created_at")?;
+                let updated_at: String = row.get("updated_at")?;
+                Ok(ResearchQuestion {
+                    id: QuestionId::from(id),
+                    text: row.get("text")?,
+                    description: row.get("description")?,
+                    created_at: super::parse_rfc3339_or_now(&created_at),
+                    updated_at: super::parse_rfc3339_or_now(&updated_at),
+                })
+            })
+            .map_err(DbError::Sqlite)?
+            .filter_map(Result::ok)
+            .collect();
+        Ok(rows)
+    }
 }
 
 impl QuestionRepository for SqliteQuestionRepository {
@@ -145,6 +193,40 @@ mod tests {
 
         let all = repo.list_questions().unwrap();
         assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn find_by_id_prefix_unique_and_ambiguous() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        let repo = SqliteQuestionRepository::new(db);
+
+        let mut q1 = ResearchQuestion::new("Q1");
+        q1.id = QuestionId::from("aaaa1111bbbbccccddddeeeeffff0000");
+        repo.save_question(&q1).unwrap();
+        let mut q2 = ResearchQuestion::new("Q2");
+        q2.id = QuestionId::from("aaaa2222bbbbccccddddeeeeffff0000");
+        repo.save_question(&q2).unwrap();
+        let mut q3 = ResearchQuestion::new("Q3");
+        q3.id = QuestionId::from("bbbb3333bbbbccccddddeeeeffff0000");
+        repo.save_question(&q3).unwrap();
+
+        // Unique 8-char prefix (Id::short() shape).
+        let hits = repo.find_by_id_prefix("aaaa1111", 2).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id.as_str(), q1.id.as_str());
+
+        // Ambiguous prefix hits ≥2, capped at LIMIT.
+        let hits = repo.find_by_id_prefix("aaaa", 2).unwrap();
+        assert_eq!(hits.len(), 2);
+
+        // No match.
+        assert!(repo.find_by_id_prefix("zzzz", 2).unwrap().is_empty());
+
+        // Full id acts as a prefix of itself.
+        let hits = repo.find_by_id_prefix(q3.id.as_str(), 2).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id.as_str(), q3.id.as_str());
     }
 
     #[test]
