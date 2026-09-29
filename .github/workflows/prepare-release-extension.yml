@@ -88,8 +88,12 @@ jobs:
           ref: ${{ inputs.release_branch }}
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Toolchain pinned in rust-toolchain.toml (#229); rustup on the runner
+      # honours the file automatically.
+      - name: Install pinned Rust toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - run: rustup show active-toolchain && rustc --version
 
       - name: Install cargo-edit
         run: cargo install cargo-edit --locked

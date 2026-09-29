@@ -10,15 +10,25 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Every job resolves the Rust toolchain from the repo-root
+  # `rust-toolchain.toml` (#229) via the rustup that GitHub's runner images
+  # already ship: `rustup show active-toolchain || rustup toolchain install`
+  # reads the file, installs the pinned channel + components on first run, and
+  # rustup's per-directory override then routes every subsequent `cargo` /
+  # `rustc` call to that toolchain. The dtolnay action doesn't auto-detect the
+  # file (it errors on missing `toolchain:` input), so raw rustup is the
+  # single-source-of-truth path — nothing here hardcodes 1.98.1. `rustup show
+  # active-toolchain` prints the resolved channel into the log so a drift is
+  # visible at a glance.
   lint:
     name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - name: Install pinned Rust toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - run: rustup show active-toolchain && rustc --version && cargo clippy --version
       - run: cargo fmt --check
       - run: cargo clippy --workspace -- -D warnings
 
@@ -30,8 +40,10 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned Rust toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - run: rustup show active-toolchain && rustc --version
       - run: cargo test --workspace
 
   contract-tests:
@@ -40,6 +52,8 @@ jobs:
     if: github.event_name == 'schedule'
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned Rust toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - run: rustup show active-toolchain && rustc --version
       - run: cargo test --workspace --features contract-tests

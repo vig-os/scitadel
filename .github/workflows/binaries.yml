@@ -78,11 +78,19 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      # Toolchain channel + components come from repo-root rust-toolchain.toml
+      # (#229): the pre-installed rustup on the runner honours the file
+      # automatically. `rustup target add` still runs after the channel
+      # install so the matrix's per-target cross-toolchain (notably
+      # x86_64-apple-darwin, cross-built from macos-latest Apple Silicon) is
+      # attached to the pinned rustc — no hardcoded version.
+      - name: Install pinned Rust toolchain (from rust-toolchain.toml)
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add "${{ matrix.target }}"
 
       - uses: Swatinem/rust-cache@v2
+      - run: rustup show active-toolchain && rustc --version && rustup target list --installed
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }} -p scitadel-cli

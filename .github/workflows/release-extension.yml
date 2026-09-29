@@ -22,8 +22,10 @@
 # Both checks run for candidates as well as finals: an RC is the cheapest place
 # to learn that the workspace has stopped being publishable.
 #
-# Toolchain: this seam provisions the Rust toolchain directly
-# (dtolnay/rust-toolchain, as rust-ci.yml and binaries.yml do) rather than the
+# Toolchain: this seam provisions the Rust toolchain directly via the runner
+# image's pre-installed rustup honouring `rust-toolchain.toml` at the repo
+# root, the same way rust-ci.yml and binaries.yml do (see #229) rather than
+# the
 # devkit dev-shell composite. The repo-owned flake carries the full interactive
 # dev shell (vhs, chromium, asciinema); building it here would cost far more than
 # the checks themselves. The workflow_call inputs contract below is fixed —
@@ -80,7 +82,11 @@ jobs:
       # No build cache: this runs once per release, and restoring a cache
       # before building checked-out code is a cache-poisoning vector (CodeQL
       # actions/cache-poisoning/poisonable-step).
-      - uses: dtolnay/rust-toolchain@stable
+      # Toolchain pinned in rust-toolchain.toml (#229); the runner's
+      # pre-installed rustup honours the file automatically.
+      - name: Install pinned Rust toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - run: rustup show active-toolchain && rustc --version
 
       - name: Check every crate has publishable metadata
         # cargo-manifest-level check that each workspace crate carries the
