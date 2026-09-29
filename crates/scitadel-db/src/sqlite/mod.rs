@@ -59,6 +59,38 @@ pub(crate) fn parse_rfc3339_or_now(s: &str) -> chrono::DateTime<chrono::Utc> {
         .map_or_else(|_| chrono::Utc::now(), |dt| dt.with_timezone(&chrono::Utc))
 }
 
+/// Minimum length below which we refuse to treat a string as a plausible
+/// id prefix. `Id::short()` prints 8 chars; anything shorter than 4 is
+/// too likely to sweep in the whole table or an unrelated record. Chosen
+/// as half of `short()` so callers who typed the first half of what
+/// they read still resolve.
+pub const MIN_ID_PREFIX_LEN: usize = 4;
+
+/// True when `s` looks like something an MCP / CLI resolver should
+/// hand off to the `id GLOB '{s}*'` prefix scan. The DB layer's
+/// `find_by_id_prefix` fns and `scitadel_mcp::tools::resolve_id_prefix`
+/// both gate on this so raw user input can never sneak GLOB
+/// metacharacters into the pattern — an empty string would GLOB to
+/// `*` (match everything and silently resolve to any single row in a
+/// one-row table), and `*`, `?`, `[`, `]` are GLOB wildcards that
+/// would let arbitrary inputs like `question_id="a?"` match unrelated
+/// records. Also enforces `MIN_ID_PREFIX_LEN` so a 1-3 char accidental
+/// input can't collide with a hex prefix that happens to fit.
+///
+/// The allowed character set is ASCII alphanumeric plus `-`, which
+/// covers every id shape the workspace emits:
+/// - 32-char lowercase-hex `Uuid::simple()` for questions / searches
+///   / assessments / annotations / (default) papers,
+/// - `W\d+` OpenAlex ids that overwrite `paper.id` in `work_to_paper`,
+/// - test fixtures like `p-1`, `p-e2e`.
+#[must_use]
+pub fn is_valid_id_prefix(s: &str) -> bool {
+    if s.len() < MIN_ID_PREFIX_LEN {
+        return false;
+    }
+    s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
 /// Database connection pool with migration support.
 #[derive(Clone)]
 pub struct Database {
@@ -210,6 +242,54 @@ mod tests {
     use super::*;
     use scitadel_core::models::Paper;
     use scitadel_core::ports::PaperRepository;
+
+    /// #232 review blocker: raw user input must never sneak GLOB
+    /// metacharacters or "match anything" shapes into the prefix
+    /// scan. `is_valid_id_prefix` is the single truth-source that
+    /// every `find_by_id_prefix` gates on defensively, and that
+    /// `scitadel_mcp::tools::resolve_id_prefix` gates on primarily.
+    #[test]
+    fn is_valid_id_prefix_rejects_empty_and_glob_metachars_and_short() {
+        // Empty → would GLOB to `*` and match everything.
+        assert!(!is_valid_id_prefix(""));
+        // GLOB metacharacters would let hostile inputs sweep unrelated rows.
+        for hostile in ["*", "?", "[abc", "abc*", "a?", "a?bc", "abc]", "[a]"] {
+            assert!(!is_valid_id_prefix(hostile), "{hostile} must be rejected");
+        }
+        // Below MIN_ID_PREFIX_LEN → too collision-prone to be a real id.
+        for short in ["a", "ab", "abc", "p-1"] {
+            assert!(
+                !is_valid_id_prefix(short),
+                "{short} is shorter than MIN_ID_PREFIX_LEN and must be rejected"
+            );
+        }
+        // Whitespace, quotes, SQL/GLOB adjacent bytes all rejected.
+        for junk in ["    ", "  a ", "abc ", "abc'", "abc%", "abc_x"] {
+            assert!(!is_valid_id_prefix(junk), "{junk:?} must be rejected");
+        }
+    }
+
+    /// Every real id shape emitted by the workspace must pass so the
+    /// gate never blocks a legitimate copy-pasted id. Enumerates the
+    /// three known families: UUID `simple()` hex (questions / searches
+    /// / assessments / annotations / default papers), OpenAlex short
+    /// ids (`W\d+`) that overwrite `paper.id`, and dashed test
+    /// fixtures.
+    #[test]
+    fn is_valid_id_prefix_accepts_every_real_id_shape() {
+        // 4-char short prefix (min length) up to full 32-char UUID.
+        for id in [
+            "cafe",
+            "cafebabe",
+            "cafebabe1234",
+            "cafebabe12345678abcd1234ef567890",
+            "W2741809807",
+            "p-e2e",
+            "p-1234-x",
+        ] {
+            assert!(is_valid_id_prefix(id), "{id} should be accepted");
+        }
+    }
 
     /// Two `Database` instances pointing at the same file simulate the
     /// 2-pane workflow: TUI process holds one, `scitadel mcp` process

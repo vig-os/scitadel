@@ -36,11 +36,8 @@ pub async fn search_tool(
 
     if let Some(ref qid) = question_id {
         let db = open_db()?;
+        let question = resolve_question_id(&db, qid)?;
         let (_, _, q_repo, _, _) = db.repositories();
-        let question = q_repo
-            .get_question(qid)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("Question '{qid}' not found."))?;
 
         parameters.insert(
             "question_id".into(),
@@ -54,7 +51,7 @@ pub async fn search_tool(
             if terms.is_empty() {
                 return Err(format!(
                     "No search terms linked to question '{}'.",
-                    question.id.short()
+                    question.id.as_str()
                 ));
             }
             query = Some(
@@ -166,6 +163,11 @@ pub fn list_searches_tool(limit: i64) -> Result<String, String> {
         return Ok("No search history found.".into());
     }
 
+    // #232: emit the full search_id (not just `Id::short()`) so an
+    // agent that pastes an id from this listing into `get_papers` /
+    // `export_search` / `prepare_batch_assessments` succeeds without
+    // needing prefix resolution — the fallback for typed prefixes
+    // still exists via resolve_search_id.
     let lines: Vec<String> = searches
         .iter()
         .map(|s| {
@@ -187,7 +189,7 @@ pub fn list_searches_tool(limit: i64) -> Result<String, String> {
             };
             format!(
                 "{}  {}  \"{}\"  {} papers  {}/{} sources ok{failed_note}",
-                s.id.short(),
+                s.id.as_str(),
                 s.created_at.format("%Y-%m-%d %H:%M"),
                 s.query,
                 s.total_papers,
@@ -202,12 +204,8 @@ pub fn list_searches_tool(limit: i64) -> Result<String, String> {
 
 pub fn get_papers_tool(search_id: &str) -> Result<String, String> {
     let db = open_db()?;
+    let search = resolve_search_id(&db, search_id)?;
     let (paper_repo, search_repo, _, _, _) = db.repositories();
-
-    let search = search_repo
-        .get(search_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Search '{search_id}' not found."))?;
 
     let results = search_repo
         .get_results(search.id.as_str())
@@ -220,9 +218,12 @@ pub fn get_papers_tool(search_id: &str) -> Result<String, String> {
         .filter_map(|id| paper_repo.get(id).ok().flatten())
         .collect();
 
+    // #232: emit full IDs so an agent can paste them back into
+    // `get_paper` / `assess_paper` / `save_assessment` without
+    // depending on the prefix-resolver fallback.
     let mut out = vec![format!(
         "Search: {} — \"{}\" — {} papers\n",
-        search.id.short(),
+        search.id.as_str(),
         search.query,
         papers.len()
     )];
@@ -251,7 +252,7 @@ pub fn get_papers_tool(search_id: &str) -> Result<String, String> {
             p.year.map_or_else(|| "N/A".into(), |y| y.to_string()),
             p.journal.as_deref().unwrap_or("N/A"),
             p.doi.as_deref().unwrap_or("N/A"),
-            p.id.short(),
+            p.id.as_str(),
             abstract_preview
         ));
     }
@@ -261,24 +262,14 @@ pub fn get_papers_tool(search_id: &str) -> Result<String, String> {
 
 pub fn get_paper_tool(paper_id: &str) -> Result<String, String> {
     let db = open_db()?;
-    let (paper_repo, _, _, _, _) = db.repositories();
-
-    let paper = paper_repo
-        .get(paper_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Paper '{paper_id}' not found."))?;
-
+    let paper = resolve_paper_id(&db, paper_id)?;
     serde_json::to_string_pretty(&paper).map_err(|e| e.to_string())
 }
 
 pub fn export_search_tool(search_id: &str, format: &str) -> Result<String, String> {
     let db = open_db()?;
+    let search = resolve_search_id(&db, search_id)?;
     let (paper_repo, search_repo, _, _, _) = db.repositories();
-
-    let search = search_repo
-        .get(search_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Search '{search_id}' not found."))?;
 
     let results = search_repo
         .get_results(search.id.as_str())
@@ -315,9 +306,13 @@ pub fn create_question_tool(text: &str, description: &str) -> Result<String, Str
     question.description = description.to_string();
     q_repo.save_question(&question).map_err(|e| e.to_string())?;
 
+    // #232: return the FULL question_id — the previous `Id::short()`
+    // (8-char) print silently forced agents to pass a partial that
+    // exact-match lookups in add_search_terms / save_assessment /
+    // search rejected as "Question '<short>' not found."
     Ok(format!(
         "Question created: {}\nText: {text}",
-        question.id.short()
+        question.id.as_str()
     ))
 }
 
@@ -330,12 +325,14 @@ pub fn list_questions_tool() -> Result<String, String> {
         return Ok("No research questions found.".into());
     }
 
+    // #232: full id in every row so the id an agent copies works
+    // verbatim in every ID-accepting tool.
     let lines: Vec<String> = questions
         .iter()
         .map(|q| {
             format!(
                 "{}  {}  \"{}\"",
-                q.id.short(),
+                q.id.as_str(),
                 q.created_at.format("%Y-%m-%d %H:%M"),
                 q.text
             )
@@ -351,12 +348,8 @@ pub fn add_search_terms_tool(
     query_string: Option<&str>,
 ) -> Result<String, String> {
     let db = open_db()?;
+    let question = resolve_question_id(&db, question_id)?;
     let (_, _, q_repo, _, _) = db.repositories();
-
-    let question = q_repo
-        .get_question(question_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Question '{question_id}' not found."))?;
 
     let query_str = match query_string {
         Some(s) if !s.is_empty() => s.to_string(),
@@ -370,7 +363,7 @@ pub fn add_search_terms_tool(
 
     Ok(format!(
         "Search terms added to question {}: {:?}",
-        question.id.short(),
+        question.id.as_str(),
         terms
     ))
 }
@@ -384,17 +377,9 @@ pub fn assess_paper_tool(
     model: Option<&str>,
 ) -> Result<String, String> {
     let db = open_db()?;
-    let (paper_repo, _, q_repo, a_repo, _) = db.repositories();
-
-    let paper = paper_repo
-        .get(paper_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Paper '{paper_id}' not found."))?;
-
-    let question = q_repo
-        .get_question(question_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Question '{question_id}' not found."))?;
+    let paper = resolve_paper_id(&db, paper_id)?;
+    let question = resolve_question_id(&db, question_id)?;
+    let (_, _, _, a_repo, _) = db.repositories();
 
     let mut assessment = Assessment::new(paper.id.clone(), question.id.clone(), score);
     assessment.reasoning = reasoning.to_string();
@@ -405,7 +390,7 @@ pub fn assess_paper_tool(
 
     Ok(format!(
         "Assessment saved: {}\nPaper: {}\nQuestion: {}\nScore: {score:.2}\nReasoning: {}",
-        assessment.id.short(),
+        assessment.id.as_str(),
         &paper.title[..paper.title.len().min(60)],
         &question.text[..question.text.len().min(60)],
         &reasoning[..reasoning.len().min(200)]
@@ -464,20 +449,14 @@ pub fn get_assessments_tool(
 /// LLM can evaluate the paper directly, then call `save_assessment` with the result.
 pub fn prepare_assessment_tool(paper_id: &str, question_id: &str) -> Result<String, String> {
     let db = open_db()?;
-    let (paper_repo, _, q_repo, _, _) = db.repositories();
-
-    let paper = paper_repo
-        .get(paper_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Paper '{paper_id}' not found."))?;
-
-    let question = q_repo
-        .get_question(question_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Question '{question_id}' not found."))?;
+    let paper = resolve_paper_id(&db, paper_id)?;
+    let question = resolve_question_id(&db, question_id)?;
 
     let user_prompt = build_user_prompt(&paper, &question);
 
+    // Emit the resolved FULL ids in the follow-up instruction so the
+    // caller's `save_assessment` call is guaranteed to hit exact-match
+    // even if the tool caller originally passed an 8-char prefix.
     Ok(format!(
         "=== SCORING RUBRIC ===\n\
          {SCORING_SYSTEM_PROMPT}\n\n\
@@ -485,10 +464,12 @@ pub fn prepare_assessment_tool(paper_id: &str, question_id: &str) -> Result<Stri
          {user_prompt}\n\n\
          === INSTRUCTIONS ===\n\
          Evaluate this paper using the rubric above. Then call `save_assessment` with:\n\
-         - paper_id: \"{paper_id}\"\n\
-         - question_id: \"{question_id}\"\n\
+         - paper_id: \"{}\"\n\
+         - question_id: \"{}\"\n\
          - score: <your 0.0-1.0 score>\n\
-         - reasoning: <your 1-3 sentence reasoning>"
+         - reasoning: <your 1-3 sentence reasoning>",
+        paper.id.as_str(),
+        question.id.as_str()
     ))
 }
 
@@ -507,17 +488,9 @@ pub fn save_assessment_tool(
     }
 
     let db = open_db()?;
-    let (paper_repo, _, q_repo, a_repo, _) = db.repositories();
-
-    let paper = paper_repo
-        .get(paper_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Paper '{paper_id}' not found."))?;
-
-    let question = q_repo
-        .get_question(question_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Question '{question_id}' not found."))?;
+    let paper = resolve_paper_id(&db, paper_id)?;
+    let question = resolve_question_id(&db, question_id)?;
+    let (_, _, _, a_repo, _) = db.repositories();
 
     let mut assessment = Assessment::new(paper.id.clone(), question.id.clone(), score);
     assessment.reasoning = reasoning.to_string();
@@ -528,7 +501,7 @@ pub fn save_assessment_tool(
 
     Ok(format!(
         "Assessment saved: {}\nPaper: {}\nQuestion: {}\nScore: {score:.2}\nAssessor: mcp-native\nReasoning: {}",
-        assessment.id.short(),
+        assessment.id.as_str(),
         &paper.title[..paper.title.len().min(60)],
         &question.text[..question.text.len().min(60)],
         &reasoning[..reasoning.len().min(200)]
@@ -551,11 +524,7 @@ pub async fn download_paper_tool(
 
     let result = if let Some(pid) = paper_id {
         let db = open_db()?;
-        let (paper_repo, _, _, _, _) = db.repositories();
-        let paper = paper_repo
-            .get(pid)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("paper not found: {pid}"))?;
+        let paper = resolve_paper_id(&db, pid)?;
         downloader
             .download_paper(&paper, &out_dir)
             .await
@@ -598,11 +567,13 @@ pub async fn read_paper_tool(
 ) -> Result<String, String> {
     let config = load_config();
     let db = open_db()?;
+    let paper = resolve_paper_id(&db, paper_id)?;
     let (paper_repo, _, _, _, _) = db.repositories();
-    let paper = paper_repo
-        .get(paper_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("paper not found: {paper_id}"))?;
+    // Rebind `paper_id` to the resolved FULL id so downstream cache
+    // writes hit the row regardless of whether the caller passed a
+    // prefix. Prior code UPDATE-ed with the raw (potentially short)
+    // arg, which silently no-op'd against the PK.
+    let paper_id = paper.id.as_str();
 
     // Cache hit: skip the (slow) PDF extract if the text was already
     // persisted on a previous call. Same envelope as the cold path.
@@ -736,7 +707,7 @@ pub async fn get_references_tool(paper_id: &str) -> Result<String, String> {
         })
         .collect();
     let payload = serde_json::json!({
-        "source_paper_id": paper_id,
+        "source_paper_id": stored.source_paper_id,
         "count": stored.papers.len(),
         "references": entries,
     });
@@ -763,7 +734,7 @@ pub async fn get_citations_tool(paper_id: &str, limit: Option<usize>) -> Result<
         })
         .collect();
     let payload = serde_json::json!({
-        "source_paper_id": paper_id,
+        "source_paper_id": stored.source_paper_id,
         "count": stored.papers.len(),
         "citations": entries,
     });
@@ -771,18 +742,18 @@ pub async fn get_citations_tool(paper_id: &str, limit: Option<usize>) -> Result<
 }
 
 struct CitationFetchOutcome {
+    /// The resolved paper id (never a prefix). Callers surface this
+    /// in their JSON payload so the caller sees the canonical id.
+    source_paper_id: String,
     papers: Vec<scitadel_core::models::Paper>,
 }
 
 async fn fetch_and_store_references(paper_id: &str) -> Result<CitationFetchOutcome, String> {
     let config = load_config();
     let db = open_db()?;
+    let source_paper = resolve_paper_id(&db, paper_id)?;
     let (paper_repo, _, _, _, citation_repo) = db.repositories();
-
-    let source_paper = paper_repo
-        .get(paper_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Paper '{paper_id}' not found."))?;
+    let paper_id = source_paper.id.as_str().to_string();
     let source_openalex = source_paper.openalex_id.clone().ok_or_else(|| {
         format!("Paper '{paper_id}' has no openalex_id; reference fetch needs it.")
     })?;
@@ -808,7 +779,7 @@ async fn fetch_and_store_references(paper_id: &str) -> Result<CitationFetchOutco
         &paper_repo,
         &citation_repo,
         &adapter,
-        paper_id,
+        paper_id.as_str(),
         &referenced_ids,
         scitadel_core::models::CitationDirection::References,
     )
@@ -821,12 +792,9 @@ async fn fetch_and_store_citations(
 ) -> Result<CitationFetchOutcome, String> {
     let config = load_config();
     let db = open_db()?;
+    let source_paper = resolve_paper_id(&db, paper_id)?;
     let (paper_repo, _, _, _, citation_repo) = db.repositories();
-
-    let source_paper = paper_repo
-        .get(paper_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Paper '{paper_id}' not found."))?;
+    let paper_id = source_paper.id.as_str().to_string();
     let source_openalex = source_paper.openalex_id.clone().ok_or_else(|| {
         format!("Paper '{paper_id}' has no openalex_id; citation fetch needs it.")
     })?;
@@ -859,7 +827,7 @@ async fn fetch_and_store_citations(
     let mut edges = Vec::with_capacity(citing_ids.len());
     for cid in &citing_ids {
         edges.push(scitadel_core::models::Citation {
-            source_paper_id: scitadel_core::models::PaperId::from(paper_id),
+            source_paper_id: scitadel_core::models::PaperId::from(paper_id.as_str()),
             target_paper_id: scitadel_core::models::PaperId::from(cid.clone()),
             direction: scitadel_core::models::CitationDirection::CitedBy,
             discovered_by: "openalex".into(),
@@ -868,7 +836,10 @@ async fn fetch_and_store_citations(
         });
     }
     citation_repo.save_many(&edges).map_err(|e| e.to_string())?;
-    Ok(CitationFetchOutcome { papers })
+    Ok(CitationFetchOutcome {
+        source_paper_id: paper_id,
+        papers,
+    })
 }
 
 async fn materialise_and_link(
@@ -880,7 +851,10 @@ async fn materialise_and_link(
     direction: scitadel_core::models::CitationDirection,
 ) -> Result<CitationFetchOutcome, String> {
     if target_openalex_ids.is_empty() {
-        return Ok(CitationFetchOutcome { papers: Vec::new() });
+        return Ok(CitationFetchOutcome {
+            source_paper_id: source_paper_id.to_string(),
+            papers: Vec::new(),
+        });
     }
     // Batch-fetch metadata in chunks of 50 (OpenAlex `openalex_id:`
     // filter cap).
@@ -911,7 +885,10 @@ async fn materialise_and_link(
     }
     citation_repo.save_many(&edges).map_err(|e| e.to_string())?;
 
-    Ok(CitationFetchOutcome { papers: all_papers })
+    Ok(CitationFetchOutcome {
+        source_paper_id: source_paper_id.to_string(),
+        papers: all_papers,
+    })
 }
 
 fn html_to_text(html: &str) -> String {
@@ -947,17 +924,9 @@ pub fn prepare_batch_assessments_tool(
     question_id: &str,
 ) -> Result<String, String> {
     let db = open_db()?;
-    let (paper_repo, search_repo, q_repo, _, _) = db.repositories();
-
-    let search = search_repo
-        .get(search_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Search '{search_id}' not found."))?;
-
-    let question = q_repo
-        .get_question(question_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Question '{question_id}' not found."))?;
+    let search = resolve_search_id(&db, search_id)?;
+    let question = resolve_question_id(&db, question_id)?;
+    let (paper_repo, search_repo, _, _, _) = db.repositories();
 
     let results = search_repo
         .get_results(search.id.as_str())
@@ -973,7 +942,7 @@ pub fn prepare_batch_assessments_tool(
     if papers.is_empty() {
         return Ok(format!(
             "No papers found for search '{}'.",
-            search.id.short()
+            search.id.as_str()
         ));
     }
 
@@ -1030,9 +999,10 @@ pub fn prepare_batch_assessments_tool(
          Evaluate each paper above against the research question using the rubric.\n\
          For each paper, call `save_assessment` with:\n\
          - paper_id: <the paper's ID>\n\
-         - question_id: \"{question_id}\"\n\
+         - question_id: \"{}\"\n\
          - score: <your 0.0-1.0 score>\n\
-         - reasoning: <your 1-3 sentence reasoning>"
+         - reasoning: <your 1-3 sentence reasoning>",
+        question.id.as_str()
     ));
 
     Ok(out.join("\n"))
@@ -1046,8 +1016,16 @@ pub fn mark_seen_tool(annotation_ids: Vec<String>, reader: &str) -> Result<Strin
     if reader.trim().is_empty() {
         return Err("reader is required".into());
     }
-    let refs: Vec<&str> = annotation_ids.iter().map(String::as_str).collect();
     let db = open_db()?;
+    // #232: resolve every id (short prefix or full) up front so the
+    // downstream write hits the canonical PKs. An unresolvable id
+    // aborts the whole call — partial mark-seen would leave the
+    // caller unable to tell which succeeded.
+    let resolved: Vec<String> = annotation_ids
+        .iter()
+        .map(|id| resolve_annotation_id(&db, id).map(|a| a.id.as_str().to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let refs: Vec<&str> = resolved.iter().map(String::as_str).collect();
     let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
     repo.mark_seen(&refs, reader).map_err(|e| e.to_string())?;
     Ok(format!(
@@ -1062,10 +1040,14 @@ pub fn mark_thread_seen_tool(root_id: &str, reader: &str) -> Result<String, Stri
         return Err("reader is required".into());
     }
     let db = open_db()?;
+    let root = resolve_annotation_id(&db, root_id)?;
     let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
-    repo.mark_thread_seen(root_id, reader)
+    repo.mark_thread_seen(root.id.as_str(), reader)
         .map_err(|e| e.to_string())?;
-    Ok(format!("Thread {root_id} marked seen for '{reader}'."))
+    Ok(format!(
+        "Thread {} marked seen for '{reader}'.",
+        root.id.as_str()
+    ))
 }
 
 /// List annotations `reader` hasn't seen since the last modification.
@@ -1076,9 +1058,12 @@ pub fn list_unread_tool(reader: &str, paper_id: Option<&str>) -> Result<String, 
         return Err("reader is required".into());
     }
     let db = open_db()?;
+    let resolved_pid = paper_id
+        .map(|pid| resolve_paper_id(&db, pid).map(|p| p.id.as_str().to_string()))
+        .transpose()?;
     let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
     let rows = repo
-        .list_unread(reader, paper_id)
+        .list_unread(reader, resolved_pid.as_deref())
         .map_err(|e| e.to_string())?;
 
     let entries: Vec<serde_json::Value> = rows
@@ -1123,6 +1108,12 @@ pub fn create_annotation_tool(
         return Err("author is required (pass an identity string)".into());
     }
     let db = open_db()?;
+    // Resolve paper_id (and question_id, if any) — both accept an id
+    // or a unique prefix per #232.
+    let paper = resolve_paper_id(&db, paper_id)?;
+    let resolved_qid = question_id
+        .map(|qid| resolve_question_id(&db, qid).map(|q| q.id))
+        .transpose()?;
     let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
 
     let anchor = scitadel_core::models::Anchor {
@@ -1134,13 +1125,13 @@ pub fn create_annotation_tool(
     };
 
     let mut ann = scitadel_core::models::Annotation::new_root(
-        scitadel_core::models::PaperId::from(paper_id),
+        paper.id.clone(),
         author.to_string(),
         note.to_string(),
         anchor,
     );
-    if let Some(qid) = question_id {
-        ann.question_id = Some(scitadel_core::models::QuestionId::from(qid));
+    if let Some(qid) = resolved_qid {
+        ann.question_id = Some(qid);
     }
     if let Some(c) = color {
         ann.color = Some(c.to_string());
@@ -1157,7 +1148,7 @@ pub fn create_annotation_tool(
     tracing::info!(
         op = "create_annotation",
         annotation_id = ann.id.as_str(),
-        paper_id = paper_id,
+        paper_id = paper.id.as_str(),
         author = author,
         "annotation write (trust-on-first-use)"
     );
@@ -1171,18 +1162,15 @@ pub fn reply_annotation_tool(parent_id: &str, note: &str, author: &str) -> Resul
         return Err("author is required".into());
     }
     let db = open_db()?;
+    let parent = resolve_annotation_id(&db, parent_id)?;
     let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
-    let parent = repo
-        .get(parent_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Annotation '{parent_id}' not found."))?;
     let reply =
         scitadel_core::models::Annotation::new_reply(&parent, author.to_string(), note.to_string());
     repo.create(&reply).map_err(|e| e.to_string())?;
     tracing::info!(
         op = "reply_annotation",
         annotation_id = reply.id.as_str(),
-        parent_id = parent_id,
+        parent_id = parent.id.as_str(),
         author = author,
         "annotation write (trust-on-first-use)"
     );
@@ -1201,31 +1189,23 @@ pub fn create_paper_note_tool(paper_id: &str, note: &str, author: &str) -> Resul
         return Err("note is required".into());
     }
     let db = open_db()?;
-    // Verify the paper exists. Without this, a typo in `paper_id`
-    // would create a dangling note with no UI surface to find it
-    // again — a bigger footfun than a clean error here.
-    {
-        let (paper_repo, _, _, _, _) = db.repositories();
-        if scitadel_core::ports::PaperRepository::get(&paper_repo, paper_id)
-            .map_err(|e| e.to_string())?
-            .is_none()
-        {
-            return Err(format!("Paper '{paper_id}' not found."));
-        }
-    }
+    // Verify the paper exists — a typo in `paper_id` would otherwise
+    // create a dangling note with no UI surface to find it again.
+    // Also resolves 8-char prefixes to their full id (#232).
+    let paper = resolve_paper_id(&db, paper_id)?;
     let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
 
     let ann = scitadel_core::models::Annotation::new_root(
-        scitadel_core::models::PaperId::from(paper_id),
+        paper.id.clone(),
         author.to_string(),
         note.to_string(),
-        scitadel_core::models::paper_note_anchor(paper_id),
+        scitadel_core::models::paper_note_anchor(paper.id.as_str()),
     );
     repo.create(&ann).map_err(|e| e.to_string())?;
     tracing::info!(
         op = "create_paper_note",
         annotation_id = ann.id.as_str(),
-        paper_id = paper_id,
+        paper_id = paper.id.as_str(),
         author = author,
         "annotation write (trust-on-first-use)"
     );
@@ -1240,24 +1220,22 @@ pub fn update_annotation_tool(
     tags: Option<Vec<String>>,
 ) -> Result<String, String> {
     let db = open_db()?;
+    let existing = resolve_annotation_id(&db, id)?;
+    let full_id = existing.id.as_str().to_string();
     let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
-    let existing = repo
-        .get(id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Annotation '{id}' not found."))?;
     let original_author = existing.author.clone();
     let new_note = note.unwrap_or(&existing.note);
     let new_color = color.or(existing.color.as_deref());
     let new_tags = tags.unwrap_or(existing.tags);
-    repo.update_note(id, new_note, new_color, &new_tags)
+    repo.update_note(&full_id, new_note, new_color, &new_tags)
         .map_err(|e| e.to_string())?;
     tracing::info!(
         op = "update_annotation",
-        annotation_id = id,
+        annotation_id = full_id.as_str(),
         author = original_author.as_str(),
         "annotation write (trust-on-first-use)"
     );
-    Ok(format!("Annotation {id} updated."))
+    Ok(format!("Annotation {full_id} updated."))
 }
 
 /// Resolve the `paper_id` an annotation is anchored to. Used by the
@@ -1267,25 +1245,31 @@ pub fn update_annotation_tool(
 /// existed) — the server logs a warning and skips the emit. (#185)
 pub fn lookup_annotation_paper_id(id: &str) -> Result<Option<String>, String> {
     let db = open_db()?;
-    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
-    Ok(repo
-        .get(id)
-        .map_err(|e| e.to_string())?
-        .map(|a| a.paper_id.as_str().to_string()))
+    // Accept a full id or a unique short prefix (#232) so this stays
+    // symmetric with `reply_annotation` / `update_annotation` etc.
+    match resolve_annotation_id(&db, id) {
+        Ok(a) => Ok(Some(a.paper_id.as_str().to_string())),
+        Err(e) => {
+            tracing::debug!(id, error = %e, "lookup_annotation_paper_id: not resolved");
+            Ok(None)
+        }
+    }
 }
 
 /// Soft-delete an annotation. Keeps the row so threads are preserved;
 /// `list_annotations` hides it.
 pub fn delete_annotation_tool(id: &str) -> Result<String, String> {
     let db = open_db()?;
+    let existing = resolve_annotation_id(&db, id)?;
+    let full_id = existing.id.as_str().to_string();
     let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
-    repo.soft_delete(id).map_err(|e| e.to_string())?;
+    repo.soft_delete(&full_id).map_err(|e| e.to_string())?;
     tracing::info!(
         op = "delete_annotation",
-        annotation_id = id,
+        annotation_id = full_id.as_str(),
         "annotation write (trust-on-first-use)"
     );
-    Ok(format!("Annotation {id} deleted (soft)."))
+    Ok(format!("Annotation {full_id} deleted (soft)."))
 }
 
 /// List annotations filtered by paper / question / author. Returns a
@@ -1296,11 +1280,12 @@ pub fn list_annotations_tool(
     author: Option<&str>,
 ) -> Result<String, String> {
     let db = open_db()?;
-    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
-    let rows = match paper_id {
-        Some(pid) => repo.list_by_paper(pid).map_err(|e| e.to_string())?,
+    let full_pid = match paper_id {
+        Some(pid) => resolve_paper_id(&db, pid)?.id.as_str().to_string(),
         None => return Err("paper_id is required for now (cross-paper lists come later)".into()),
     };
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+    let rows = repo.list_by_paper(&full_pid).map_err(|e| e.to_string())?;
     let filtered: Vec<_> = rows
         .into_iter()
         .filter(|a| author.is_none_or(|want| a.author == want))
@@ -1413,13 +1398,9 @@ fn build_annotations_json(
 }
 
 fn build_annotated_paper(db: &Database, paper_id: &str) -> Result<String, String> {
-    let (paper_repo, _, _, _, _) = db.repositories();
-    let paper = paper_repo
-        .get(paper_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Paper '{paper_id}' not found."))?;
+    let paper = resolve_paper_id(db, paper_id)?;
 
-    let (entries, source_version) = build_annotations_json(db, paper_id)?;
+    let (entries, source_version) = build_annotations_json(db, paper.id.as_str())?;
 
     let response = serde_json::json!({
         "paper": {
@@ -1489,12 +1470,8 @@ pub fn summarize_search_tool(
     let abstract_char_limit = abstract_char_limit.unwrap_or(500);
 
     let db = open_db()?;
+    let search = resolve_search_id(&db, search_id)?;
     let (paper_repo, search_repo, _, _, _) = db.repositories();
-
-    let search = search_repo
-        .get(search_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Search '{search_id}' not found."))?;
 
     let results = search_repo
         .get_results(search.id.as_str())
@@ -1695,18 +1672,20 @@ pub fn toggle_star_tool(paper_id: &str, reader: &str) -> Result<String, String> 
         return Err("reader is required (pass an identity string)".into());
     }
     let db = open_db()?;
+    let paper = resolve_paper_id(&db, paper_id)?;
+    let full_pid = paper.id.as_str();
     let repo = scitadel_db::sqlite::SqlitePaperStateRepository::new(db);
     let starred = repo
-        .toggle_starred(paper_id, reader)
+        .toggle_starred(full_pid, reader)
         .map_err(|e| e.to_string())?;
     tracing::info!(
         op = "toggle_star",
-        paper_id,
+        paper_id = full_pid,
         reader,
         starred,
         "star write (trust-on-first-use)"
     );
-    Ok(serde_json::json!({ "paper_id": paper_id, "starred": starred }).to_string())
+    Ok(serde_json::json!({ "paper_id": full_pid, "starred": starred }).to_string())
 }
 
 /// Idempotent "ensure starred state" — sets `starred` to the requested
@@ -1716,10 +1695,12 @@ pub fn set_star_tool(paper_id: &str, starred: bool, reader: &str) -> Result<Stri
         return Err("reader is required".into());
     }
     let db = open_db()?;
+    let paper = resolve_paper_id(&db, paper_id)?;
+    let full_pid = paper.id.as_str().to_string();
     let repo = scitadel_db::sqlite::SqlitePaperStateRepository::new(db);
-    let existing = repo.get(paper_id, reader).map_err(|e| e.to_string())?;
+    let existing = repo.get(&full_pid, reader).map_err(|e| e.to_string())?;
     let new_state = scitadel_db::sqlite::PaperState {
-        paper_id: paper_id.into(),
+        paper_id: full_pid.clone(),
         reader: reader.into(),
         starred,
         to_read: existing.as_ref().is_some_and(|s| s.to_read),
@@ -1728,12 +1709,12 @@ pub fn set_star_tool(paper_id: &str, starred: bool, reader: &str) -> Result<Stri
     repo.set(&new_state).map_err(|e| e.to_string())?;
     tracing::info!(
         op = "set_star",
-        paper_id,
+        paper_id = full_pid.as_str(),
         reader,
         starred,
         "star write (trust-on-first-use)"
     );
-    Ok(serde_json::json!({ "paper_id": paper_id, "starred": starred }).to_string())
+    Ok(serde_json::json!({ "paper_id": full_pid, "starred": starred }).to_string())
 }
 
 /// List all paper IDs `reader` has starred. Returns a JSON array of
@@ -1847,10 +1828,12 @@ pub fn rekey_paper_tool(
     use scitadel_db::sqlite::{SqlitePaperAliasRepository, SqlitePaperRepository};
 
     let db = open_db()?;
+    let paper = resolve_paper_id(&db, paper_id)?;
+    let full_pid = paper.id.as_str().to_string();
     let papers = SqlitePaperRepository::new(db.clone());
     let aliases = SqlitePaperAliasRepository::new(db);
 
-    match rekey_paper(&papers, &aliases, paper_id, explicit_key, reader) {
+    match rekey_paper(&papers, &aliases, &full_pid, explicit_key, reader) {
         Ok(out) => serde_json::to_string_pretty(&serde_json::json!({
             "paper_id": out.paper_id,
             "old_key": out.old_key,
@@ -1879,29 +1862,113 @@ fn sidecar_path_for(bib: &std::path::Path) -> std::path::PathBuf {
     std::path::PathBuf::from(s)
 }
 
-fn resolve_question_id(
+/// Shared prefix-resolver skeleton behind every `resolve_*_id` in this
+/// module (#232). Tries an exact lookup first (fast path — a full id
+/// hits the PK index), then falls back to an indexed prefix scan
+/// capped at 2 rows (enough to distinguish unique / ambiguous /
+/// not-found without loading the whole table). Error strings are
+/// deliberately compact so the MCP client sees `Question '<id>' not
+/// found.` / `Question prefix '<id>' is ambiguous — matches: <full>,
+/// <full>` (single quote + entity name matches the pre-#232 format
+/// the tools already emitted).
+///
+/// `entity` should be capitalised for user-facing errors (e.g.
+/// `"Question"`, `"Search"`).
+fn resolve_id_prefix<T, GetFn, PrefixFn>(
+    entity: &str,
+    id_or_prefix: &str,
+    get_exact: GetFn,
+    find_prefix: PrefixFn,
+    id_of: impl Fn(&T) -> &str,
+) -> Result<T, String>
+where
+    GetFn: FnOnce(&str) -> Result<Option<T>, String>,
+    PrefixFn: FnOnce(&str, usize) -> Result<Vec<T>, String>,
+{
+    if let Some(hit) = get_exact(id_or_prefix)? {
+        return Ok(hit);
+    }
+    // Validation gate — never let raw input into the `id GLOB
+    // '{prefix}*'` scan. Empty → `*` matches everything (a one-row
+    // table would silently resolve to that row); `*`, `?`, `[`, `]`
+    // are GLOB metacharacters that would let inputs like `"a?"`
+    // match unrelated records. A 1-3 char accidental input can't be
+    // a plausible id either. Report as not-found so the message
+    // shape agents / consumers match on stays constant. See
+    // `scitadel_db::sqlite::is_valid_id_prefix` for the full
+    // rationale + char-set. Defensively re-checked in each DB
+    // `find_by_id_prefix` so a future direct caller can't skip it.
+    if !scitadel_db::sqlite::is_valid_id_prefix(id_or_prefix) {
+        return Err(format!("{entity} '{id_or_prefix}' not found."));
+    }
+    let matches = find_prefix(id_or_prefix, 2)?;
+    match matches.len() {
+        0 => Err(format!("{entity} '{id_or_prefix}' not found.")),
+        1 => Ok(matches.into_iter().next().expect("len == 1")),
+        _ => {
+            let ids: Vec<String> = matches.iter().map(|m| id_of(m).to_string()).collect();
+            Err(format!(
+                "{entity} prefix '{id_or_prefix}' is ambiguous — matches: {}",
+                ids.join(", ")
+            ))
+        }
+    }
+}
+
+pub(crate) fn resolve_question_id(
     db: &Database,
-    question_prefix: &str,
+    id_or_prefix: &str,
 ) -> Result<scitadel_core::models::ResearchQuestion, String> {
     let (_, _, q_repo, _, _) = db.repositories();
-    if let Some(q) = q_repo
-        .get_question(question_prefix)
-        .map_err(|e| e.to_string())?
-    {
-        return Ok(q);
-    }
-    let questions = q_repo.list_questions().map_err(|e| e.to_string())?;
-    let matches: Vec<_> = questions
-        .iter()
-        .filter(|q| q.id.as_str().starts_with(question_prefix))
-        .collect();
-    match matches.len() {
-        0 => Err(format!("no question matching '{question_prefix}'")),
-        1 => Ok(matches[0].clone()),
-        n => Err(format!(
-            "ambiguous question prefix '{question_prefix}' — {n} matches"
-        )),
-    }
+    resolve_id_prefix(
+        "Question",
+        id_or_prefix,
+        |id| q_repo.get_question(id).map_err(|e| e.to_string()),
+        |p, n| q_repo.find_by_id_prefix(p, n).map_err(|e| e.to_string()),
+        |q| q.id.as_str(),
+    )
+}
+
+pub(crate) fn resolve_search_id(
+    db: &Database,
+    id_or_prefix: &str,
+) -> Result<scitadel_core::models::Search, String> {
+    let (_, s_repo, _, _, _) = db.repositories();
+    resolve_id_prefix(
+        "Search",
+        id_or_prefix,
+        |id| s_repo.get(id).map_err(|e| e.to_string()),
+        |p, n| s_repo.find_by_id_prefix(p, n).map_err(|e| e.to_string()),
+        |s| s.id.as_str(),
+    )
+}
+
+pub(crate) fn resolve_paper_id(
+    db: &Database,
+    id_or_prefix: &str,
+) -> Result<scitadel_core::models::Paper, String> {
+    let (p_repo, _, _, _, _) = db.repositories();
+    resolve_id_prefix(
+        "Paper",
+        id_or_prefix,
+        |id| p_repo.get(id).map_err(|e| e.to_string()),
+        |p, n| p_repo.find_by_id_prefix(p, n).map_err(|e| e.to_string()),
+        |p| p.id.as_str(),
+    )
+}
+
+pub(crate) fn resolve_annotation_id(
+    db: &Database,
+    id_or_prefix: &str,
+) -> Result<scitadel_core::models::Annotation, String> {
+    let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db.clone());
+    resolve_id_prefix(
+        "Annotation",
+        id_or_prefix,
+        |id| repo.get(id).map_err(|e| e.to_string()),
+        |p, n| repo.find_by_id_prefix(p, n).map_err(|e| e.to_string()),
+        |a| a.id.as_str(),
+    )
 }
 
 /// Render the shortlist's `.bib` reusing `export_bibtex_with_tags` so
