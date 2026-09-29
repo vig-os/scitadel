@@ -255,6 +255,10 @@ impl OpenAlexAdapter {
     /// - `SearchField::Auto` — title-first, broad-fallback: if title
     ///   returns fewer than `max_results`, the tail is padded from the
     ///   broad path, deduplicated by OpenAlex work id (title hits win).
+    ///   A title-leg failure (any HTTP error) also falls through to the
+    ///   broad leg — the intent of `Auto` is "cannot lose", so a syntax
+    ///   quirk in the title filter must not blank a valid federated
+    ///   search.
     pub async fn search_field(
         &self,
         query: &str,
@@ -273,7 +277,7 @@ impl OpenAlexAdapter {
                 Ok(candidates_from(&data))
             }
             SearchField::Title => {
-                let filter = format!("title.search:{query}");
+                let filter = format!("title.search:{}", title_filter_value(query));
                 let data = self
                     .fetch_from(
                         &self.base_url,
@@ -285,29 +289,48 @@ impl OpenAlexAdapter {
             SearchField::Auto => {
                 // Title first — the whole point of #210 is that an exact
                 // title reliably surfaces its target here.
-                let filter = format!("title.search:{query}");
-                let title_data = self
+                let filter = format!("title.search:{}", title_filter_value(query));
+                let title_result = self
                     .fetch_from(
                         &self.base_url,
                         &[("filter", filter.as_str()), ("per_page", per_page.as_str())],
                     )
-                    .await?;
-                let mut merged = candidates_from(&title_data);
+                    .await;
+                let mut merged = match title_result {
+                    Ok(data) => candidates_from(&data),
+                    Err(e) => {
+                        // The point of `Auto` is "cannot lose" — a
+                        // title-leg 400/429/timeout falls through to the
+                        // broad leg rather than blanking the search.
+                        // (#210 review) Logged so it stays diagnosable.
+                        tracing::warn!(
+                            error = %e,
+                            "openalex title.search leg failed under Auto; falling through to broad search=",
+                        );
+                        Vec::new()
+                    }
+                };
                 if merged.len() >= max_results {
                     return Ok(merged);
                 }
                 // Fall back to broad fulltext for the remainder. A
                 // failure of the fallback leg does not cancel the title
                 // hits we already have — a broad-fetch 429 is worse than
-                // a shorter list.
-                let broad = self
+                // a shorter list. But if title also produced nothing,
+                // surface the broad-leg error so the search-run record
+                // has a real reason for "0 candidates" rather than a
+                // silent Ok(vec![]).
+                let broad_result = self
                     .fetch_from(
                         &self.base_url,
                         &[("search", query), ("per_page", per_page.as_str())],
                     )
-                    .await
-                    .map(|d| candidates_from(&d))
-                    .unwrap_or_default();
+                    .await;
+                let broad = match broad_result {
+                    Ok(d) => candidates_from(&d),
+                    Err(e) if merged.is_empty() => return Err(e),
+                    Err(_) => Vec::new(),
+                };
                 let mut seen: std::collections::HashSet<String> = merged
                     .iter()
                     .filter_map(|c| c.openalex_id.clone())
@@ -426,6 +449,34 @@ impl SourceAdapter for OpenAlexAdapter {
         self.search_field(query, max_results, self.default_field)
             .await
     }
+}
+
+/// Neutralise OpenAlex filter-syntax metachars in a `title.search:`
+/// value so a title with a comma or a pipe survives the round trip
+/// (#210 review). Documented + probe-verified metachars:
+///
+/// - `,` — filter separator; unescaped comma returns HTTP 400
+///   "A filter value contains an unescaped comma".
+/// - `|` — OR (`Bootstrap|jackknife` silently becomes
+///   `Bootstrap OR jackknife`).
+/// - `!` — NOT (a `!` starting any token silently negates it, per
+///   probe: `Bootstrap !jackknife` → `Bootstrap AND NOT jackknife`).
+/// - `"` — phrase boundary (unbalanced quotes fragment the value).
+///
+/// Each is replaced with a space; runs of whitespace are collapsed and
+/// the value is trimmed. Nothing else is touched, so meaningful title
+/// characters (`:` `;` `(` `)` `-` `.` etc.) pass through verbatim —
+/// probes confirm the API tokenises them cleanly.
+#[must_use]
+pub fn title_filter_value(query: &str) -> String {
+    let sanitised: String = query
+        .chars()
+        .map(|c| match c {
+            ',' | '|' | '!' | '"' => ' ',
+            _ => c,
+        })
+        .collect();
+    sanitised.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Decode a `/works` response into ranked candidates. Shared between
@@ -784,6 +835,59 @@ mod tests {
         for f in [SearchField::Any, SearchField::Title, SearchField::Auto] {
             assert_eq!(SearchField::parse(f.as_str()).unwrap(), f);
         }
+    }
+
+    #[test]
+    fn title_filter_value_replaces_filter_metachars_with_spaces() {
+        // The whole point of the helper: comma-bearing titles must
+        // survive as searchable text, not blow up with HTTP 400.
+        assert_eq!(
+            title_filter_value("Bootstrap methods, another look at the jackknife"),
+            "Bootstrap methods another look at the jackknife"
+        );
+        assert_eq!(
+            title_filter_value("Bootstrap|jackknife"),
+            "Bootstrap jackknife"
+        );
+        assert_eq!(
+            title_filter_value("Bootstrap !jackknife"),
+            "Bootstrap jackknife"
+        );
+        assert_eq!(
+            title_filter_value(r#"Estimating "Dimension" of a Model"#),
+            "Estimating Dimension of a Model"
+        );
+    }
+
+    #[test]
+    fn title_filter_value_preserves_ordinary_title_punctuation() {
+        // Probe evidence: `:` `;` `(` `)` `-` `.` all pass the API
+        // tokeniser cleanly, so the helper must not eat them.
+        let input = "Controlling the false discovery rate: a practical (and powerful) approach";
+        assert_eq!(title_filter_value(input), input);
+        assert_eq!(
+            title_filter_value("A method; sub-title 2.0"),
+            "A method; sub-title 2.0"
+        );
+    }
+
+    #[test]
+    fn title_filter_value_collapses_and_trims_whitespace() {
+        // Metachar substitution leaves double spaces where a `,` was
+        // preceded by a space (e.g. `"a, b"` → `"a  b"`); the collapser
+        // gives us clean single-spaced output so the emitted filter is
+        // stable and human-readable in logs.
+        assert_eq!(title_filter_value("a,   b|c , d"), "a b c d");
+        assert_eq!(
+            title_filter_value("   leading and trailing   "),
+            "leading and trailing"
+        );
+    }
+
+    #[test]
+    fn title_filter_value_handles_empty_and_metachar_only_inputs() {
+        assert_eq!(title_filter_value(""), "");
+        assert_eq!(title_filter_value(",|!\""), "");
     }
 
     #[test]

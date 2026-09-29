@@ -34,10 +34,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `assess` can address it by id; `--no-save` prints only. When a row
     with the DOI already exists, its id is preserved so annotations
     keep resolving.
-  - Wire-level tests: `openalex_http.rs` gains eight wiremock cases
-    covering the title endpoint, the auto merge/dedup, the DOI hit /
-    URL-prefixed / 404 / 500 / malformed paths. Plus five new unit
-    tests for `SearchField` parsing / defaulting.
+  - Title-filter values are sanitised before the wire:
+    `title_filter_value` replaces OpenAlex filter metachars — `,` (a
+    literal comma returns HTTP 400 "A filter value contains an
+    unescaped comma"), `|` (silent OR), `!` (silent NOT), `"` (phrase
+    boundary) — with spaces and collapses whitespace, so titles like
+    *Bootstrap methods, another look at the jackknife* survive. Other
+    title punctuation (`:` `;` `(` `)` `-` `.`) passes through — probe
+    evidence in the doc comment.
+  - `Auto` is fault-tolerant: a title-leg error (400 / 429 / timeout)
+    falls through to the broad leg so a syntax quirk in one filter
+    can't blank a valid federated search. When both legs fail, the
+    broad error is surfaced so the search-run record carries a real
+    reason instead of a silent zero-result.
+  - Wire-level tests: `openalex_http.rs` gains twelve wiremock cases
+    covering the title endpoint, the auto merge/dedup, auto's
+    title-leg-error fall-through and both-legs-fail propagation, the
+    comma/pipe/bang/quote sanitiser, the DOI hit / URL-prefixed / 404
+    / 500 / malformed paths. Plus nine new unit tests for
+    `SearchField` parsing / defaulting and `title_filter_value`.
 
 ### Changed
 

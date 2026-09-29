@@ -449,6 +449,130 @@ async fn fetch_paper_by_doi_rejects_a_malformed_doi_before_the_wire() {
 }
 
 #[tokio::test]
+async fn title_search_sanitises_openalex_filter_metachars_before_the_wire() {
+    // Regression for the #210 review blocker: OpenAlex's `filter=` syntax
+    // treats `,` as filter separator (HTTP 400 unescaped), `|` as OR,
+    // `!` as NOT and `"` as phrase boundary. Any of those in a title
+    // must reach the wire as a space so the value stays a searchable
+    // string. Live probe (2026-09): raw comma → HTTP 400
+    // "A filter value contains an unescaped comma"; sanitised value →
+    // HTTP 200 with Efron 1979 at rank 1.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/works"))
+        // The value the mock asserts is the SANITISED one — no comma,
+        // no pipe, no bang, no quote.
+        .and(query_param(
+            "filter",
+            "title.search:Bootstrap methods another look at the jackknife",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(works_page(&[
+            "Bootstrap Methods: Another Look at the Jackknife",
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let results = adapter(&server)
+        .search_field(
+            "Bootstrap methods, another look at the jackknife",
+            5,
+            SearchField::Title,
+        )
+        .await
+        .expect("comma-bearing title must not blow up");
+    assert_eq!(results.len(), 1);
+}
+
+#[tokio::test]
+async fn title_search_sanitises_pipe_bang_and_quote_before_the_wire() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/works"))
+        .and(query_param("filter", "title.search:foo bar baz qux"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(works_page(&["Ok"])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let results = adapter(&server)
+        .search_field(r#"foo|bar !baz "qux""#, 5, SearchField::Title)
+        .await
+        .expect("metachar-only query must still hit the wire cleanly");
+    assert_eq!(results.len(), 1);
+}
+
+#[tokio::test]
+async fn auto_search_falls_through_to_broad_when_title_leg_errors() {
+    // Review requirement (#210): "cannot lose" — a title-leg failure
+    // must not blank a valid federated search. This models the 400 the
+    // wire returned before the sanitiser landed, and any future
+    // API-side syntax quirk we can't anticipate.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/works"))
+        .and(query_param(
+            "filter",
+            "title.search:Bootstrap methods another look at the jackknife",
+        ))
+        .respond_with(ResponseTemplate::new(400).set_body_string(
+            r#"{"error":"Invalid request","message":"synthetic upstream failure for test"}"#,
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/works"))
+        .and(query_param(
+            "search",
+            "Bootstrap methods, another look at the jackknife",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(works_page(&["Broad hit"])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let results = adapter(&server)
+        .search_field(
+            "Bootstrap methods, another look at the jackknife",
+            5,
+            SearchField::Auto,
+        )
+        .await
+        .expect("Auto must survive a title-leg error");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].title, "Broad hit");
+}
+
+#[tokio::test]
+async fn auto_search_propagates_error_when_both_legs_fail() {
+    // The other side of the fault-tolerance coin: if title AND broad
+    // both fail, the search-run record must carry a real error rather
+    // than a silent Ok(vec![]).
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/works"))
+        .and(query_param("filter", "title.search:q"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("title fail"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/works"))
+        .and(query_param("search", "q"))
+        .respond_with(ResponseTemplate::new(429).set_body_raw(BUDGET_EXHAUSTED, "application/json"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let err = adapter(&server)
+        .search_field("q", 5, SearchField::Auto)
+        .await
+        .expect_err("both legs failing must surface, not silently pass");
+    assert!(err.to_string().contains("429"), "{err}");
+}
+
+#[tokio::test]
 async fn fetch_paper_by_doi_surfaces_a_500_as_an_error() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
