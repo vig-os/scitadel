@@ -3,5 +3,5 @@
   "extends": [
     "github>vig-os/scitadel//.github/renovate-default"
   ],
-  "enabledManagers": ["github-actions", "pep621", "uv", "npm"]
+  "enabledManagers": ["github-actions", "cargo"]
 }
