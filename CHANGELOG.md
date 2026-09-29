@@ -56,6 +56,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Devkit governance hooks adopted; `core.hooksPath` wired on shell entry**
+  ([#228](https://github.com/vig-os/scitadel/issues/228)). The five hooks the
+  1.17.0 template ships that had been missing since #207 are now in
+  `.pre-commit-config.yaml` — `validate-commit-msg` (Conventional Commit +
+  `Refs:` gate), `check-agent-identity` (rejects blocklisted author or
+  committer identities), `prepare-commit-msg-strip-trailers` (removes
+  `Co-authored-by:` / `Assisted-by:` / `Generated-by:` trailers) and
+  `nixfmt` (this repo owns `flake.nix`); `just-fmt` stays retired for the
+  same reason as #207, verified on 1.17.0's shipped justfile. `flake.nix`
+  now sets `core.hooksPath = .githooks` on shell entry (main worktree only,
+  mirroring devkit's `mkProjectShell` `githooksPathHook`), fixing that the
+  repo uses `pkgs.mkShell` directly and never inherited that fragment — the
+  commit-side gates were present, believed active, and silently inert until
+  now. `pkgs.nixfmt` joins the dev shell for the new hook, and `flake.nix`
+  is now nixfmt-clean.
 - **vigOS devkit scaffold upgraded 1.6.0 → 1.17.0**
   ([#225](https://github.com/vig-os/scitadel/issues/225)). The pinned `vigos`
   flake input moves in lockstep with `DEVKIT_VERSION`, so the dev shell and CI
