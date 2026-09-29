@@ -9,6 +9,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **OpenAlex title-aware search + DOI → metadata lookup**
+  ([#210](https://github.com/vig-os/scitadel/issues/210)). Two additions
+  aimed at citation-verification workloads that were forced to leave
+  scitadel for `curl`.
+  - `scitadel search --field <mode>` and MCP `search { field }` route
+    OpenAlex through `filter=title.search:` (`title`), or a title-first
+    broad-fallback merge (`auto`), instead of the pre-#210 broad
+    `search=` (`any`, still the default so existing users see no
+    change). Live probes recorded on the branch: for the exact title
+    *Estimating the Dimension of a Model* the broad path scans 4.07M
+    hits; `title.search:` narrows to 474 and pins the Schwarz-1978
+    target at rank 1. Only the OpenAlex leg of a federated search sees
+    the flag; other sources are untouched. When non-default, the mode
+    is written into the persisted search `parameters` so `history` /
+    `find_similar_searches` reflect how it was run.
+  - `scitadel resolve-doi <doi>` (CLI) and `resolve_doi` (MCP) resolve
+    a DOI to a full `Paper` via OpenAlex `/works/doi:<doi>`. DOIs are
+    validated + canonicalised in scitadel-core before the request —
+    malformed input never hits the wire. A well-formed DOI OpenAlex
+    doesn't know about becomes a clear "not found" (Ok(None) at the
+    adapter, non-zero exit at the CLI, structured error at the tool).
+    Persists the resolved paper by default so `show` / `download` /
+    `assess` can address it by id; `--no-save` prints only. When a row
+    with the DOI already exists, its id is preserved so annotations
+    keep resolving.
+  - Title-filter values are sanitised before the wire:
+    `title_filter_value` replaces OpenAlex filter metachars — `,` (a
+    literal comma returns HTTP 400 "A filter value contains an
+    unescaped comma"), `|` (silent OR), `!` (silent NOT), `"` (phrase
+    boundary) — with spaces and collapses whitespace, so titles like
+    *Bootstrap methods, another look at the jackknife* survive. Other
+    title punctuation (`:` `;` `(` `)` `-` `.`) passes through — probe
+    evidence in the doc comment.
+  - `Auto` is fault-tolerant: a title-leg error (400 / 429 / timeout)
+    falls through to the broad leg so a syntax quirk in one filter
+    can't blank a valid federated search. When both legs fail, the
+    broad error is surfaced so the search-run record carries a real
+    reason instead of a silent zero-result.
+  - Wire-level tests: `openalex_http.rs` gains twelve wiremock cases
+    covering the title endpoint, the auto merge/dedup, auto's
+    title-leg-error fall-through and both-legs-fail propagation, the
+    comma/pipe/bang/quote sanitiser, the DOI hit / URL-prefixed / 404
+    / 500 / malformed paths. Plus nine new unit tests for
+    `SearchField` parsing / defaulting and `title_filter_value`.
+
 ### Changed
 
 - **vigOS devkit scaffold upgraded 1.6.0 → 1.17.0**
@@ -67,6 +112,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   additionally print the full 32-char id in every row so the id an
   agent copies works verbatim; ambiguous prefixes error with both
   candidate ids so the caller can disambiguate.
+- **OpenAlex "exact title returns nothing relevant"**
+  ([#210](https://github.com/vig-os/scitadel/issues/210)). Route with
+  `--field title` (or `--field auto`) to escape the fulltext-relevance
+  noise that made classic titles surface far below topically-adjacent
+  hits. The pre-#210 default (`--field any`) is unchanged.
 
 ### Security
 

@@ -48,6 +48,12 @@ enum Commands {
         /// Research question ID — auto-builds query from linked terms
         #[arg(short, long)]
         question: Option<String>,
+        /// OpenAlex relevance mode: `any` (broad fulltext — default,
+        /// pre-#210 behaviour), `title` (`filter=title.search:` — best
+        /// for exact titles), `auto` (title first, broad fills tail).
+        /// Non-OpenAlex sources ignore this flag.
+        #[arg(long, default_value = "any", value_parser = ["any", "title", "auto"])]
+        field: String,
     },
     /// Show past search runs
     History {
@@ -107,6 +113,24 @@ enum Commands {
         /// Output directory (default: .scitadel/papers/)
         #[arg(short, long)]
         output_dir: Option<PathBuf>,
+    },
+    /// Resolve a DOI to full metadata via OpenAlex (#210).
+    ///
+    /// Prints the resolved paper (title, authors, year, journal, DOI,
+    /// OpenAlex id) and, unless `--no-save`, persists it in the DB so
+    /// downstream `show` / `download` / `assess` commands can address
+    /// it by id. Errors on a malformed DOI without hitting the wire;
+    /// exits with a clear "not found" message on a valid DOI OpenAlex
+    /// doesn't know about.
+    ResolveDoi {
+        /// DOI to resolve (bare `10.…/…` or `https://doi.org/…`)
+        doi: String,
+        /// Print the raw OpenAlex JSON envelope instead of the summary
+        #[arg(long)]
+        json: bool,
+        /// Do not persist the resolved paper to the DB (print only)
+        #[arg(long)]
+        no_save: bool,
     },
     /// Manage source credentials (keychain storage)
     Auth {
@@ -360,7 +384,8 @@ async fn main() -> Result<()> {
             sources,
             max_results,
             question,
-        } => commands::search(query, sources, max_results, question).await,
+            field,
+        } => commands::search(query, sources, max_results, question, &field).await,
         Commands::History { limit } => commands::history(limit),
         Commands::Show { id } => commands::show(&id),
         Commands::Export {
@@ -386,6 +411,9 @@ async fn main() -> Result<()> {
             AuthCommands::Status => commands::auth_status(),
         },
         Commands::Download { doi, output_dir } => commands::download(&doi, output_dir).await,
+        Commands::ResolveDoi { doi, json, no_save } => {
+            commands::resolve_doi(&doi, json, no_save).await
+        }
         Commands::Mcp => commands::mcp().await,
         Commands::Tui { theme, list_themes } => {
             if list_themes {

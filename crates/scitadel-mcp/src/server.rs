@@ -51,6 +51,23 @@ pub struct SearchRequest {
     pub max_results: usize,
     /// Optional research question ID to link the search
     pub question_id: Option<String>,
+    /// OpenAlex relevance mode (#210). `any` (default, pre-#210 broad
+    /// `search=`), `title` (`filter=title.search:` — best for exact
+    /// titles like "Estimating the Dimension of a Model"), `auto`
+    /// (title first, broad fills the tail). Other sources ignore this.
+    #[serde(default)]
+    pub field: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ResolveDoiRequest {
+    /// DOI to resolve (bare `10.…/…` or full `https://doi.org/…` URL).
+    pub doi: String,
+    /// If true, persist the resolved paper to the DB (default true)
+    /// so the follow-on flow (`get_paper`, `download_paper`, etc.) can
+    /// address it by id.
+    #[serde(default)]
+    pub save: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -472,7 +489,7 @@ impl Default for ScitadelServer {
 #[tool_router(router = tool_router)]
 impl ScitadelServer {
     #[tool(
-        description = "Search scientific literature across multiple sources. Returns: JSON with search_id, query, per-source outcomes, total counts, and a `summary` text field for human readers. Emits MCP progress notifications (start + done) when the caller supplies a `progressToken` in `_meta` (#58)."
+        description = "Search scientific literature across multiple sources. Returns: JSON with search_id, query, per-source outcomes, total counts, and a `summary` text field for human readers. Emits MCP progress notifications (start + done) when the caller supplies a `progressToken` in `_meta` (#58). Optional `field` (OpenAlex only, #210): `any` (default, broad fulltext), `title` (exact-title match — use when your query is a paper's title), `auto` (title first, broad fills tail)."
     )]
     async fn search(
         &self,
@@ -497,8 +514,14 @@ impl ScitadelServer {
             ),
         )
         .await;
-        let result =
-            tools::search_tool(req.query, req.sources, req.max_results, req.question_id).await;
+        let result = tools::search_tool(
+            req.query,
+            req.sources,
+            req.max_results,
+            req.question_id,
+            req.field.as_deref(),
+        )
+        .await;
         let done_msg = match &result {
             Ok(_) => "search complete".to_string(),
             Err(e) => format!("search failed: {e}"),
@@ -512,6 +535,16 @@ impl ScitadelServer {
         )
         .await;
         result
+    }
+
+    #[tool(
+        description = "Resolve a DOI to full paper metadata via OpenAlex `/works/doi:<doi>` (#210). Use this before trusting a DOI attached to a citation — a plausible-looking DOI can point at the wrong paper (mis-attributed reference, off-by-one article number). Returns: JSON `{paper, saved}` — the resolved Paper record (title, authors, year, journal, doi, openalex_id), and whether it was persisted. Errors: malformed DOI is rejected without an HTTP round trip; a well-formed DOI OpenAlex doesn't know about returns a clear \"not found\". Optional `save` (default true) persists the paper to the DB so `get_paper`, `download_paper` etc. can address it by id."
+    )]
+    async fn resolve_doi(
+        &self,
+        Parameters(req): Parameters<ResolveDoiRequest>,
+    ) -> Result<String, String> {
+        tools::resolve_doi_tool(&req.doi, req.save.unwrap_or(true)).await
     }
 
     #[tool(

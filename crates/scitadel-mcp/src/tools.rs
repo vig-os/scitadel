@@ -27,9 +27,13 @@ pub async fn search_tool(
     sources: String,
     max_results: usize,
     question_id: Option<String>,
+    field: Option<&str>,
 ) -> Result<String, String> {
     let config = load_config();
     let source_list: Vec<String> = sources.split(',').map(|s| s.trim().to_string()).collect();
+
+    let openalex_field = scitadel_adapters::SearchField::parse(field.unwrap_or(""))
+        .map_err(|e| format!("field: {e}"))?;
 
     let mut query = if query.is_empty() { None } else { Some(query) };
     let mut parameters = serde_json::Map::new();
@@ -67,7 +71,7 @@ pub async fn search_tool(
 
     let query = query.ok_or("Provide a query or question_id with linked search terms.")?;
 
-    let adapters = scitadel_adapters::build_adapters_full(
+    let adapters = scitadel_adapters::build_adapters_with_field(
         &source_list,
         &config.pubmed.api_key,
         &config.openalex.auth(),
@@ -75,11 +79,35 @@ pub async fn search_tool(
         &config.lens.api_key,
         &config.epo.consumer_key,
         &config.epo.consumer_secret,
+        openalex_field,
     )
     .map_err(|e| e.to_string())?;
 
     let (mut search_record, candidates) =
         scitadel_core::services::orchestrator::run_search(&query, &adapters, max_results, 3).await;
+
+    if openalex_field != scitadel_adapters::SearchField::default() {
+        parameters.insert(
+            "openalex_field".into(),
+            serde_json::Value::String(openalex_field.as_str().to_string()),
+        );
+    }
+
+    // Fold linked question_id + `openalex_field` (when non-default) into
+    // the persisted search record so `history` shows how it was run and
+    // `find_similar_searches` can key off the same signal (#210).
+    if !parameters.is_empty() {
+        search_record.parameters = serde_json::Value::Object({
+            let mut p: serde_json::Map<String, serde_json::Value> =
+                if let serde_json::Value::Object(m) = search_record.parameters {
+                    m
+                } else {
+                    serde_json::Map::new()
+                };
+            p.extend(parameters);
+            p
+        });
+    }
 
     let (papers, mut search_results) =
         scitadel_core::services::dedup::deduplicate(&candidates, 0.85);
@@ -150,6 +178,48 @@ pub async fn search_tool(
     });
 
     serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())
+}
+
+/// Resolve a DOI to full paper metadata via OpenAlex `/works/doi:<doi>`
+/// (#210). Returns a JSON envelope `{paper, saved}`. When `save` is true
+/// (the default), the resolved paper is persisted so downstream tools
+/// (`get_paper`, `download_paper`, `assess_paper`) can address it by id;
+/// if a row with this DOI already exists, its id is preserved so
+/// annotations / search links keep resolving.
+pub async fn resolve_doi_tool(doi: &str, save: bool) -> Result<String, String> {
+    use scitadel_core::ports::PaperRepository as _;
+
+    let config = load_config();
+    let adapter = scitadel_adapters::openalex::OpenAlexAdapter::new(config.openalex.auth(), 30.0);
+
+    let paper = adapter
+        .fetch_paper_by_doi(doi)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no OpenAlex record for DOI {doi}"))?;
+
+    let (saved, final_paper) = if save {
+        let db = open_db()?;
+        let (paper_repo, _, _, _, _) = db.repositories();
+        let existing = paper
+            .doi
+            .as_deref()
+            .and_then(|d| paper_repo.find_by_doi(d).ok().flatten());
+        let mut p = paper.clone();
+        if let Some(existing_id) = existing.map(|e| e.id) {
+            p.id = existing_id;
+        }
+        paper_repo.save(&p).map_err(|e| e.to_string())?;
+        (true, p)
+    } else {
+        (false, paper)
+    };
+
+    let response = serde_json::json!({
+        "paper": final_paper,
+        "saved": saved,
+    });
+    serde_json::to_string_pretty(&response).map_err(|e| e.to_string())
 }
 
 pub fn list_searches_tool(limit: i64) -> Result<String, String> {

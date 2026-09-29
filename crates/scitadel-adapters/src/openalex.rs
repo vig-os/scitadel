@@ -3,10 +3,63 @@ use reqwest::Client;
 
 use scitadel_core::config::OpenAlexAuth;
 use scitadel_core::error::CoreError;
-use scitadel_core::models::CandidatePaper;
+use scitadel_core::models::{CandidatePaper, Paper, normalize_doi, validate_doi};
 use scitadel_core::ports::SourceAdapter;
 
 pub const OPENALEX_API_URL: &str = "https://api.openalex.org/works";
+
+/// Which OpenAlex field a search should target (#210).
+///
+/// OpenAlex's broad `search=` param is fulltext relevance: it drowns
+/// exact-title queries in topically-adjacent noise (issue's Schwarz-1978
+/// / bootstrap / FISTA repros). `filter=title.search:` scores against
+/// the title only, so an exact title reliably surfaces its target near
+/// the top. Neither is universally better — a topic query wants the
+/// broad path, an exact title wants the narrow one — so this enum is
+/// what the CLI flag and MCP param carry through to the adapter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SearchField {
+    /// `search=` — broad fulltext relevance. The pre-#210 default; kept
+    /// as the default here so existing callers see no change.
+    #[default]
+    Any,
+    /// `filter=title.search:` — title-only relevance. Preferred when the
+    /// query is a paper's title.
+    Title,
+    /// Title-first with a broad fallback: if `filter=title.search:` runs
+    /// dry, or returns fewer than `max_results`, the broad `search=` fills
+    /// the tail. The union is de-duplicated by OpenAlex work id, order
+    /// preserved (title hits first). This is the "cannot lose", "search
+    /// still finds topics" mode.
+    Auto,
+}
+
+impl SearchField {
+    /// Parse a CLI/MCP field string. Case-insensitive; `""` means default.
+    ///
+    /// Returns the parsed variant or the offending input for a clear
+    /// error message on the boundary.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "any" | "broad" | "all" | "search" | "fulltext" => Ok(Self::Any),
+            "title" => Ok(Self::Title),
+            "auto" => Ok(Self::Auto),
+            other => Err(format!(
+                "unknown search field '{other}'; valid: any | title | auto"
+            )),
+        }
+    }
+
+    /// Machine-readable name (round-trips through `parse`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::Title => "title",
+            Self::Auto => "auto",
+        }
+    }
+}
 
 /// Longest error body excerpt echoed back to the user. Enough for
 /// OpenAlex's "Insufficient budget…" text without dumping a whole page.
@@ -16,6 +69,11 @@ pub struct OpenAlexAdapter {
     auth: OpenAlexAuth,
     timeout: f64,
     base_url: String,
+    /// Which OpenAlex relevance mode the trait-level `search()` uses.
+    /// Defaults to `Any` (the pre-#210 broad `search=`); the federated
+    /// orchestrator honours whatever the CLI/MCP caller passed via
+    /// `with_default_field` on adapter construction.
+    default_field: SearchField,
 }
 
 /// Build the query string for an OpenAlex request.
@@ -76,6 +134,7 @@ impl OpenAlexAdapter {
             auth,
             timeout,
             base_url: OPENALEX_API_URL.to_string(),
+            default_field: SearchField::default(),
         }
     }
 
@@ -84,6 +143,15 @@ impl OpenAlexAdapter {
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    /// Set the relevance mode this adapter's `SourceAdapter::search`
+    /// impl uses under the federated orchestrator (#210). Builders pass
+    /// the value the CLI flag / MCP `field` param resolved to.
+    #[must_use]
+    pub fn with_default_field(mut self, field: SearchField) -> Self {
+        self.default_field = field;
         self
     }
 
@@ -154,6 +222,134 @@ impl OpenAlexAdapter {
             .and_then(|r| r.as_array())
             .cloned()
             .unwrap_or_default())
+    }
+
+    /// Resolve a DOI to a `Paper` via OpenAlex's `/works/doi:<doi>`
+    /// endpoint (#210). Returns `Ok(None)` for a well-formed DOI that
+    /// OpenAlex doesn't know about (HTTP 404); any other failure is
+    /// surfaced verbatim so the caller can report a real error.
+    ///
+    /// The DOI is validated + canonicalised (URL prefix stripped, case
+    /// lowered) before the request — a malformed DOI never touches the
+    /// wire.
+    pub async fn fetch_paper_by_doi(&self, doi: &str) -> Result<Option<Paper>, CoreError> {
+        if !validate_doi(doi) {
+            return Err(CoreError::Adapter(
+                "openalex".into(),
+                format!("invalid DOI: {doi}"),
+            ));
+        }
+        let canonical = normalize_doi(doi);
+        let url = format!("{}/doi:{canonical}", self.base_url);
+        match self.fetch_from(&url, &[]).await {
+            Ok(work) => Ok(Some(work_to_paper(&work))),
+            Err(CoreError::Adapter(_, msg)) if msg.starts_with("HTTP 404") => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Search OpenAlex with an explicit relevance mode (#210).
+    ///
+    /// - `SearchField::Any` — the legacy `search=` (fulltext) path.
+    /// - `SearchField::Title` — `filter=title.search:` for titles.
+    /// - `SearchField::Auto` — title-first, broad-fallback: if title
+    ///   returns fewer than `max_results`, the tail is padded from the
+    ///   broad path, deduplicated by OpenAlex work id (title hits win).
+    ///   A title-leg failure (any HTTP error) also falls through to the
+    ///   broad leg — the intent of `Auto` is "cannot lose", so a syntax
+    ///   quirk in the title filter must not blank a valid federated
+    ///   search.
+    pub async fn search_field(
+        &self,
+        query: &str,
+        max_results: usize,
+        field: SearchField,
+    ) -> Result<Vec<CandidatePaper>, CoreError> {
+        let per_page = max_results.to_string();
+        match field {
+            SearchField::Any => {
+                let data = self
+                    .fetch_from(
+                        &self.base_url,
+                        &[("search", query), ("per_page", per_page.as_str())],
+                    )
+                    .await?;
+                Ok(candidates_from(&data))
+            }
+            SearchField::Title => {
+                let filter = format!("title.search:{}", title_filter_value(query));
+                let data = self
+                    .fetch_from(
+                        &self.base_url,
+                        &[("filter", filter.as_str()), ("per_page", per_page.as_str())],
+                    )
+                    .await?;
+                Ok(candidates_from(&data))
+            }
+            SearchField::Auto => {
+                // Title first — the whole point of #210 is that an exact
+                // title reliably surfaces its target here.
+                let filter = format!("title.search:{}", title_filter_value(query));
+                let title_result = self
+                    .fetch_from(
+                        &self.base_url,
+                        &[("filter", filter.as_str()), ("per_page", per_page.as_str())],
+                    )
+                    .await;
+                let mut merged = match title_result {
+                    Ok(data) => candidates_from(&data),
+                    Err(e) => {
+                        // The point of `Auto` is "cannot lose" — a
+                        // title-leg 400/429/timeout falls through to the
+                        // broad leg rather than blanking the search.
+                        // (#210 review) Logged so it stays diagnosable.
+                        tracing::warn!(
+                            error = %e,
+                            "openalex title.search leg failed under Auto; falling through to broad search=",
+                        );
+                        Vec::new()
+                    }
+                };
+                if merged.len() >= max_results {
+                    return Ok(merged);
+                }
+                // Fall back to broad fulltext for the remainder. A
+                // failure of the fallback leg does not cancel the title
+                // hits we already have — a broad-fetch 429 is worse than
+                // a shorter list. But if title also produced nothing,
+                // surface the broad-leg error so the search-run record
+                // has a real reason for "0 candidates" rather than a
+                // silent Ok(vec![]).
+                let broad_result = self
+                    .fetch_from(
+                        &self.base_url,
+                        &[("search", query), ("per_page", per_page.as_str())],
+                    )
+                    .await;
+                let broad = match broad_result {
+                    Ok(d) => candidates_from(&d),
+                    Err(e) if merged.is_empty() => return Err(e),
+                    Err(_) => Vec::new(),
+                };
+                let mut seen: std::collections::HashSet<String> = merged
+                    .iter()
+                    .filter_map(|c| c.openalex_id.clone())
+                    .collect();
+                for mut c in broad {
+                    if merged.len() >= max_results {
+                        break;
+                    }
+                    if let Some(ref oa) = c.openalex_id
+                        && !seen.insert(oa.clone())
+                    {
+                        continue;
+                    }
+                    c.rank = Some((merged.len() as i32) + 1);
+                    merged.push(c);
+                }
+                Ok(merged)
+            }
+        }
     }
 
     /// Single HTTP path for every OpenAlex call, so the credentials and
@@ -246,28 +442,57 @@ impl SourceAdapter for OpenAlexAdapter {
         query: &str,
         max_results: usize,
     ) -> Result<Vec<CandidatePaper>, CoreError> {
-        let per_page = max_results.to_string();
-        let data = self
-            .fetch_from(
-                &self.base_url,
-                &[("search", query), ("per_page", per_page.as_str())],
-            )
-            .await?;
-
-        let works = data
-            .get("results")
-            .and_then(|r| r.as_array())
-            .cloned()
-            .unwrap_or_default();
-
-        let candidates = works
-            .iter()
-            .enumerate()
-            .map(|(i, work)| work_to_candidate(work, (i + 1) as i32))
-            .collect();
-
-        Ok(candidates)
+        // The trait method honours whatever field mode the builder
+        // configured — the default is `Any` (pre-#210 broad `search=`)
+        // so unchanged call sites see no behaviour change. Callers that
+        // need a per-call override still have `search_field` directly.
+        self.search_field(query, max_results, self.default_field)
+            .await
     }
+}
+
+/// Neutralise OpenAlex filter-syntax metachars in a `title.search:`
+/// value so a title with a comma or a pipe survives the round trip
+/// (#210 review). Documented + probe-verified metachars:
+///
+/// - `,` — filter separator; unescaped comma returns HTTP 400
+///   "A filter value contains an unescaped comma".
+/// - `|` — OR (`Bootstrap|jackknife` silently becomes
+///   `Bootstrap OR jackknife`).
+/// - `!` — NOT (a `!` starting any token silently negates it, per
+///   probe: `Bootstrap !jackknife` → `Bootstrap AND NOT jackknife`).
+/// - `"` — phrase boundary (unbalanced quotes fragment the value).
+///
+/// Each is replaced with a space; runs of whitespace are collapsed and
+/// the value is trimmed. Nothing else is touched, so meaningful title
+/// characters (`:` `;` `(` `)` `-` `.` etc.) pass through verbatim —
+/// probes confirm the API tokenises them cleanly.
+#[must_use]
+pub fn title_filter_value(query: &str) -> String {
+    let sanitised: String = query
+        .chars()
+        .map(|c| match c {
+            ',' | '|' | '!' | '"' => ' ',
+            _ => c,
+        })
+        .collect();
+    sanitised.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Decode a `/works` response into ranked candidates. Shared between
+/// every `SearchField::*` branch so the parsing / rank-assignment logic
+/// lives in one place.
+fn candidates_from(data: &serde_json::Value) -> Vec<CandidatePaper> {
+    let works = data
+        .get("results")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    works
+        .iter()
+        .enumerate()
+        .map(|(i, work)| work_to_candidate(work, (i + 1) as i32))
+        .collect()
 }
 
 fn work_to_candidate(work: &serde_json::Value, rank: i32) -> CandidatePaper {
@@ -568,5 +793,118 @@ mod tests {
         assert_eq!(paper.title, "Foundational paper");
         assert_eq!(paper.year, Some(2017));
         assert_eq!(paper.doi.as_deref(), Some("10.5555/foo"));
+    }
+
+    #[test]
+    fn search_field_parse_accepts_the_documented_aliases() {
+        // The CLI flag / MCP param values users will actually type.
+        for s in [
+            "any", "Any", "ANY", "broad", "all", "search", "fulltext", "",
+        ] {
+            assert_eq!(SearchField::parse(s).unwrap(), SearchField::Any, "{s:?}");
+        }
+        for s in ["title", "Title", "TITLE"] {
+            assert_eq!(SearchField::parse(s).unwrap(), SearchField::Title, "{s:?}");
+        }
+        for s in ["auto", "Auto"] {
+            assert_eq!(SearchField::parse(s).unwrap(), SearchField::Auto, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn search_field_parse_rejects_unknown_with_a_readable_message() {
+        let err = SearchField::parse("abstract").unwrap_err();
+        assert!(err.contains("abstract"), "{err}");
+        assert!(err.contains("title"), "{err}"); // valid options listed
+        assert!(err.contains("any"), "{err}");
+        assert!(err.contains("auto"), "{err}");
+    }
+
+    #[test]
+    fn search_field_default_is_any_so_pre_210_callers_see_no_change() {
+        // The federated orchestrator hits the SourceAdapter trait, which
+        // routes through `search_field(_, _, SearchField::Any)` — the
+        // pre-#210 broad path. This test is the guard rail for that
+        // choice: if someone flips the default to Title/Auto, they must
+        // also update the docs and the MCP tool description.
+        assert_eq!(SearchField::default(), SearchField::Any);
+    }
+
+    #[test]
+    fn search_field_as_str_round_trips_through_parse() {
+        for f in [SearchField::Any, SearchField::Title, SearchField::Auto] {
+            assert_eq!(SearchField::parse(f.as_str()).unwrap(), f);
+        }
+    }
+
+    #[test]
+    fn title_filter_value_replaces_filter_metachars_with_spaces() {
+        // The whole point of the helper: comma-bearing titles must
+        // survive as searchable text, not blow up with HTTP 400.
+        assert_eq!(
+            title_filter_value("Bootstrap methods, another look at the jackknife"),
+            "Bootstrap methods another look at the jackknife"
+        );
+        assert_eq!(
+            title_filter_value("Bootstrap|jackknife"),
+            "Bootstrap jackknife"
+        );
+        assert_eq!(
+            title_filter_value("Bootstrap !jackknife"),
+            "Bootstrap jackknife"
+        );
+        assert_eq!(
+            title_filter_value(r#"Estimating "Dimension" of a Model"#),
+            "Estimating Dimension of a Model"
+        );
+    }
+
+    #[test]
+    fn title_filter_value_preserves_ordinary_title_punctuation() {
+        // Probe evidence: `:` `;` `(` `)` `-` `.` all pass the API
+        // tokeniser cleanly, so the helper must not eat them.
+        let input = "Controlling the false discovery rate: a practical (and powerful) approach";
+        assert_eq!(title_filter_value(input), input);
+        assert_eq!(
+            title_filter_value("A method; sub-title 2.0"),
+            "A method; sub-title 2.0"
+        );
+    }
+
+    #[test]
+    fn title_filter_value_collapses_and_trims_whitespace() {
+        // Metachar substitution leaves double spaces where a `,` was
+        // preceded by a space (e.g. `"a, b"` → `"a  b"`); the collapser
+        // gives us clean single-spaced output so the emitted filter is
+        // stable and human-readable in logs.
+        assert_eq!(title_filter_value("a,   b|c , d"), "a b c d");
+        assert_eq!(
+            title_filter_value("   leading and trailing   "),
+            "leading and trailing"
+        );
+    }
+
+    #[test]
+    fn title_filter_value_handles_empty_and_metachar_only_inputs() {
+        assert_eq!(title_filter_value(""), "");
+        assert_eq!(title_filter_value(",|!\""), "");
+    }
+
+    #[test]
+    fn candidates_from_reads_the_results_array() {
+        // Guards against a rename of `results` in the API surface: an
+        // adapter that silently returns [] on a schema drift is the
+        // exact class of failure #212 was about.
+        let data = serde_json::json!({
+            "results": [
+                {"id": "https://openalex.org/W1", "title": "A", "publication_year": 2020},
+                {"id": "https://openalex.org/W2", "title": "B", "publication_year": 2021},
+            ]
+        });
+        let cs = candidates_from(&data);
+        assert_eq!(cs.len(), 2);
+        assert_eq!(cs[0].openalex_id.as_deref(), Some("W1"));
+        assert_eq!(cs[0].rank, Some(1));
+        assert_eq!(cs[1].rank, Some(2));
     }
 }

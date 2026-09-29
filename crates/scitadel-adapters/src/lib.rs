@@ -11,6 +11,8 @@ pub mod pubmed;
 use scitadel_core::config::OpenAlexAuth;
 use scitadel_core::ports::SourceAdapter;
 
+pub use openalex::SearchField;
+
 /// Build adapter instances from source names.
 pub fn build_adapters(
     sources: &[String],
@@ -20,7 +22,9 @@ pub fn build_adapters(
     build_adapters_full(sources, pubmed_api_key, openalex, "", "", "", "")
 }
 
-/// Build adapter instances with all credential options.
+/// Build adapter instances with all credential options. Keeps the
+/// legacy signature: the OpenAlex adapter uses its default relevance
+/// mode (`SearchField::Any` — pre-#210 broad `search=`).
 pub fn build_adapters_full(
     sources: &[String],
     pubmed_api_key: &str,
@@ -29,6 +33,32 @@ pub fn build_adapters_full(
     lens_token: &str,
     epo_key: &str,
     epo_secret: &str,
+) -> Result<Vec<Box<dyn SourceAdapter>>, error::AdapterError> {
+    build_adapters_with_field(
+        sources,
+        pubmed_api_key,
+        openalex,
+        patentsview_key,
+        lens_token,
+        epo_key,
+        epo_secret,
+        SearchField::default(),
+    )
+}
+
+/// Same as `build_adapters_full` but lets the caller pick the OpenAlex
+/// relevance mode (#210). Non-OpenAlex adapters are unaffected — their
+/// search shapes don't map cleanly onto a single "field" knob.
+#[allow(clippy::too_many_arguments)]
+pub fn build_adapters_with_field(
+    sources: &[String],
+    pubmed_api_key: &str,
+    openalex: &OpenAlexAuth,
+    patentsview_key: &str,
+    lens_token: &str,
+    epo_key: &str,
+    epo_secret: &str,
+    openalex_field: SearchField,
 ) -> Result<Vec<Box<dyn SourceAdapter>>, error::AdapterError> {
     let mut adapters: Vec<Box<dyn SourceAdapter>> = Vec::new();
 
@@ -44,10 +74,10 @@ pub fn build_adapters_full(
                 adapters.push(Box::new(arxiv::ArxivAdapter::new(30.0)));
             }
             "openalex" => {
-                adapters.push(Box::new(openalex::OpenAlexAdapter::new(
-                    openalex.clone(),
-                    30.0,
-                )));
+                adapters.push(Box::new(
+                    openalex::OpenAlexAdapter::new(openalex.clone(), 30.0)
+                        .with_default_field(openalex_field),
+                ));
             }
             "inspire" => {
                 adapters.push(Box::new(inspire::InspireAdapter::new(30.0)));

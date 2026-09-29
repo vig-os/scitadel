@@ -93,6 +93,10 @@ scitadel auth status
 # Run a federated search
 scitadel search "PET tracer development" -s pubmed,arxiv,openalex,inspire -n 20
 
+# Verifying a citation? Address the paper by DOI or title (#210):
+scitadel resolve-doi 10.1214/aos/1176344136
+scitadel search "Estimating the Dimension of a Model" -s openalex --field title -n 5
+
 # View past searches / show a paper / export
 scitadel history
 scitadel show <paper-or-search-id>
@@ -229,7 +233,7 @@ scitadel mcp
 
 **40+ MCP tools** spanning the full pipeline:
 
-- **Search & retrieval**: `search`, `list_searches`, `get_papers`, `get_paper`, `get_annotated_paper`, `find_similar_searches`, `summarize_search`, `download_paper`, `read_paper`, `list_sources`
+- **Search & retrieval**: `search` (with `field: any|title|auto` for OpenAlex title-mode, #210), `resolve_doi` (DOI → metadata via OpenAlex, #210), `list_searches`, `get_papers`, `get_paper`, `get_annotated_paper`, `find_similar_searches`, `summarize_search`, `download_paper`, `read_paper`, `list_sources`
 - **Research questions**: `create_question`, `list_questions`, `add_search_terms`, `get_rubric`
 - **Scoring**: `prepare_assessment`, `prepare_batch_assessments`, `assess_paper`, `save_assessment`, `get_assessments`
 - **Annotations** (#49): `create_annotation`, `reply_annotation`, `update_annotation`, `delete_annotation`, `list_annotations`, `mark_seen`, `mark_thread_seen`, `list_unread`
@@ -284,6 +288,7 @@ scitadel snowball <search-id>          Run citation chaining from a search
 scitadel tui                           Launch the interactive TUI
 scitadel mcp                           Start the MCP server (stdio)
 scitadel download <doi>                Fetch PDF (Unpaywall) or publisher HTML
+scitadel resolve-doi <doi>             Resolve DOI to full metadata via OpenAlex (#210)
 scitadel auth login <source>           Store credentials in the OS secret store
 scitadel auth status                   Show the credential backend and what is configured
 scitadel init                          Initialize the database
@@ -295,7 +300,23 @@ scitadel init                          Initialize the database
 -q, --question     Research question ID (auto-builds query from linked terms)
 -s, --sources      Comma-separated sources (default: pubmed,arxiv,openalex,inspire)
 -n, --max-results  Maximum results per source (default: 50)
+    --field        OpenAlex relevance: any (default, broad fulltext),
+                   title (filter=title.search: — best for exact titles),
+                   auto (title first, broad fills tail). Non-OpenAlex
+                   sources ignore this flag. (#210)
 ```
+
+### Resolve-DOI options
+
+```
+--json      Print the raw OpenAlex JSON envelope instead of a summary
+--no-save   Do not persist the resolved paper to the DB (print only)
+```
+
+Reject-fast on malformed DOIs (validation happens before the HTTP call);
+a well-formed DOI OpenAlex doesn't know about exits non-zero with a
+clear "not found". By default the resolved paper is persisted so
+`scitadel show`, `download`, and `assess` can address it by id.
 
 ### Export options
 
