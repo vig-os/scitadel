@@ -17,12 +17,23 @@
     vigos.url = "github:vig-os/devkit/1.17.0";
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay, vigos }:
-    flake-utils.lib.eachDefaultSystem (system:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      flake-utils,
+      rust-overlay,
+      vigos,
+    }:
+    flake-utils.lib.eachDefaultSystem (
+      system:
       let
         pkgs = import nixpkgs {
           inherit system;
-          overlays = [ rust-overlay.overlays.default vigos.overlays.default ];
+          overlays = [
+            rust-overlay.overlays.default
+            vigos.overlays.default
+          ];
         };
 
         # Single source of truth: rust-toolchain.toml pins the channel and
@@ -30,8 +41,7 @@
         # local `just lint` and CI's clippy job can never diverge again (#229).
         # rust-overlay must be current enough to know the pinned channel — bump
         # its input with `nix flake update rust-overlay` after bumping the file.
-        rustToolchain =
-          pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+        rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 
         # Build the `scitadel` binary with the pinned toolchain (edition 2024
         # needs rustc >= 1.85, which the stable rust-overlay provides).
@@ -72,59 +82,67 @@
         };
 
         devShells.default = pkgs.mkShell {
-          packages = with pkgs; [
-            # Rust
-            rustToolchain
-            pkg-config
-            openssl
-            sqlite
+          packages =
+            with pkgs;
+            [
+              # Rust
+              rustToolchain
+              pkg-config
+              openssl
+              sqlite
 
-            # Cargo extras
-            cargo-deny
-            cargo-watch
-            cargo-nextest
-            cargo-edit
+              # Cargo extras
+              cargo-deny
+              cargo-watch
+              cargo-nextest
+              cargo-edit
 
-            # Build/runtime
-            just
+              # Build/runtime
+              just
 
-            # TUI / terminal debugging
-            vhs
-            charm-freeze
-            asciinema
+              # TUI / terminal debugging
+              vhs
+              charm-freeze
+              asciinema
 
-            # Git / CI
-            git
-            gh
-            # devkit >= 0.4.0 runs the hooks through `prek`; the `pre-commit`
-            # binary is gone from the image and the .githooks shims call `prek`.
-            prek
-            # typos runs as a language:system hook (the upstream pre-commit repo
-            # ships a generic-linux binary that NixOS hosts cannot exec).
-            typos
-            # shellcheck runs as a language:system hook for the same reason
-            # (vig-os/devkit#778): the shellcheck-py wheel bundles a manylinux
-            # binary a non-FHS userland cannot exec, and uv cannot build that
-            # wheel under Python 3.14 at all.
-            shellcheck
-            # actionlint backs the hook devkit 1.16.0 added (#1660); its bundled
-            # shellcheck pass over `run:` blocks resolves shellcheck from PATH.
-            actionlint
-            # devkit CI toolchain (from the vigos overlay): ci.yml's
-            # commit-checks job runs `uv run validate-commit-range` and
-            # `uv run check-pr-agent-fingerprints`, and in direnv mode it
-            # resolves both off this dev-shell's PATH.
-            uv
-            vig-utils
-          ]
-          # pymarkdown CLI packaged by devkit (nix/pymarkdown.nix, #1170) so the
-          # markdown hook runs language:system from PATH — the upstream
-          # pre-commit repo's pyjson5 native extension cannot load on bare CI
-          # host runners (libstdc++.so.6). Imported from the pinned vigos input;
-          # not exported as a flake package at 1.6.0.
-          ++ [
-            (import "${vigos}/nix/pymarkdown.nix" pkgs)
-          ];
+              # Git / CI
+              git
+              gh
+              # devkit >= 0.4.0 runs the hooks through `prek`; the `pre-commit`
+              # binary is gone from the image and the .githooks shims call `prek`.
+              prek
+              # typos runs as a language:system hook (the upstream pre-commit repo
+              # ships a generic-linux binary that NixOS hosts cannot exec).
+              typos
+              # shellcheck runs as a language:system hook for the same reason
+              # (vig-os/devkit#778): the shellcheck-py wheel bundles a manylinux
+              # binary a non-FHS userland cannot exec, and uv cannot build that
+              # wheel under Python 3.14 at all.
+              shellcheck
+              # actionlint backs the hook devkit 1.16.0 added (#1660); its bundled
+              # shellcheck pass over `run:` blocks resolves shellcheck from PATH.
+              actionlint
+              # nixfmt backs the pre-commit `nixfmt` hook devkit 1.17.0 ships
+              # (#228). This repo owns flake.nix, so the hook has real work to
+              # do; the binary is here on PATH so the language:system hook
+              # resolves identically in every mode. (nixfmt-rfc-style is an
+              # alias for nixfmt in current nixpkgs — use the canonical name.)
+              nixfmt
+              # devkit CI toolchain (from the vigos overlay): ci.yml's
+              # commit-checks job runs `uv run validate-commit-range` and
+              # `uv run check-pr-agent-fingerprints`, and in direnv mode it
+              # resolves both off this dev-shell's PATH.
+              uv
+              vig-utils
+            ]
+            # pymarkdown CLI packaged by devkit (nix/pymarkdown.nix, #1170) so the
+            # markdown hook runs language:system from PATH — the upstream
+            # pre-commit repo's pyjson5 native extension cannot load on bare CI
+            # host runners (libstdc++.so.6). Imported from the pinned vigos input;
+            # not exported as a flake package at 1.6.0.
+            ++ [
+              (import "${vigos}/nix/pymarkdown.nix" pkgs)
+            ];
 
           shellHook = ''
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -140,9 +158,39 @@
             # PATH-order-proof; the action forwards shellHook env to CI (#1180).
             export CC=${pkgs.stdenv.cc}/bin/cc
             export CXX=${pkgs.stdenv.cc}/bin/c++
+
+            # Wire `.githooks/` as the git hooks entry point on shell entry, so
+            # a fresh direnv / `nix develop` session actually runs the tracked
+            # commit-msg + pre-commit shims. Devkit's `mkProjectShell` normally
+            # supplies this fragment (vig-os/devkit#1112) but this repo uses
+            # `pkgs.mkShell` directly and never inherited it — every commit gate
+            # here has been present, believed active, and silently inert (#228).
+            #
+            # Guards mirror devkit's `githooksPathHook` exactly so the two never
+            # fight over the same setting:
+            #   * `.githooks/` must exist at the git toplevel (only a
+            #     scaffold-shaped repo is touched).
+            #   * MAIN worktree only (git-dir == git-common-dir) — a linked
+            #     worktree is owned by `just worktree-start`, which leaves
+            #     core.hooksPath alone (#1463); setting it here inside a linked
+            #     worktree would clobber the shared config for every other
+            #     checkout.
+            #   * only when the value differs from `.githooks` — idempotent.
+            #
+            # Refs: vig-os/devkit#1112, vig-os/devkit#1463.
+            if _gitTop=$(${pkgs.gitMinimal}/bin/git rev-parse --show-toplevel 2>/dev/null) \
+              && [ -d "$_gitTop/.githooks" ] \
+              && [ "$(${pkgs.gitMinimal}/bin/git rev-parse --absolute-git-dir 2>/dev/null)" \
+                 = "$(${pkgs.gitMinimal}/bin/git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" ] \
+              && [ "$(${pkgs.gitMinimal}/bin/git -C "$_gitTop" config --get core.hooksPath 2>/dev/null)" != ".githooks" ]; then
+              ${pkgs.gitMinimal}/bin/git -C "$_gitTop" config core.hooksPath .githooks
+              echo "  hooks  core.hooksPath -> .githooks"
+            fi
+            unset _gitTop
           '';
         };
 
         formatter = pkgs.nixpkgs-fmt;
-      });
+      }
+    );
 }

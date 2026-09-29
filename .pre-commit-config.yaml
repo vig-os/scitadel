@@ -117,15 +117,19 @@ repos:
         args: ["-c", ".pymarkdown", "fix"]
         exclude: ^(README\.md|CONTRIBUTE\.md|TESTING\.md)
 
-  # Justfile formatting — retired in #207 (devkit 1.6.0 migration).
-  # `just --fmt` only ever formats the ROOT justfile, and that file is now
-  # devkit-managed: it is not `just --fmt` stable, so the hook rewrote it on
-  # every run, which both loses the managed content and trips CI's
-  # scaffold-drift gate. Pointing it at `justfile.project` instead is no better
-  # — `just --fmt` reflows multi-line recipe comment blocks (it treats only the
-  # last comment line as the doc comment), mangling the comments this repo
-  # relies on. Nothing is lost: with `pass_filenames: false` and no
-  # `--justfile`, the hook never touched `justfile.project` anyway.
+  # Justfile formatting — retired in #207 (devkit 1.6.0 migration), still
+  # retired at devkit 1.17.0 (rechecked in #228). `just --fmt` only ever
+  # formats the ROOT justfile, and that file is devkit-managed: it is not
+  # `just --fmt` stable at 1.17.0 either (verified by running `just --fmt
+  # --unstable` in a fresh nix develop — it reflows the comment blocks around
+  # `set shell` and around `with-native-libs`, both of which land in the
+  # managed banner and trip the Scaffold Drift gate). Pointing it at
+  # `justfile.project` instead is no better — `just --fmt` reflows multi-line
+  # recipe comment blocks (it treats only the last comment line as the doc
+  # comment), mangling the comments this repo relies on. Nothing is lost: with
+  # `pass_filenames: false` and no `--justfile`, the hook never touched
+  # `justfile.project` anyway. Revisit when devkit's shipped justfile becomes
+  # `just --fmt` stable upstream.
 
   # Rust formatting (fast — under 1s on a warm cache). Clippy is
   # NOT a pre-commit hook because it's too slow for every commit;
@@ -139,6 +143,68 @@ repos:
         language: system
         files: \.rs$
         pass_filenames: false
+
+  # Nix formatting (nixfmt-rfc-style from the flake dev-shell toolchain). This
+  # repo owns flake.nix, so nixfmt actually has real work to do — devkit ships
+  # the hook (1.17.0 template) but consumers that don't own any .nix skip it.
+  # Ships in the flake dev-shell packages so this language:system hook entry
+  # resolves from PATH. Refs #228.
+  - repo: local
+    hooks:
+      - id: nixfmt
+        name: nixfmt (format/check nix files)
+        entry: nixfmt --check
+        language: system
+        files: \.nix$
+        types: [file]
+
+  # AI agent identity: strip trailers before commit-msg. Runs in the
+  # prepare-commit-msg stage (via .githooks/prepare-commit-msg), so any
+  # `Co-authored-by:` / `Assisted-by:` / `Generated-by: <agent>` line an
+  # agent inserted gets removed before validate-commit-msg or the CI
+  # blocklist ever see the message. Refs vig-os/devkit#163, #228.
+  - repo: local
+    hooks:
+      - id: prepare-commit-msg-strip-trailers
+        name: strip agent trailers from commit message
+        entry: uv run prepare-commit-msg-strip-trailers
+        language: system
+        stages: [prepare-commit-msg]
+        pass_filenames: true
+
+  # AI agent identity: reject author/committer identities on the blocklist
+  # (.github/agent-blocklist.toml). Matches the CI `commit-checks` gate so a
+  # blocklisted identity fails locally at commit time, not only after push.
+  # Refs vig-os/devkit#163, #228.
+  - repo: local
+    hooks:
+      - id: check-agent-identity
+        name: check agent identity
+        entry: uv run check-agent-identity
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+
+  # Commit message validation (Conventional Commits + Refs: gate). Runs in the
+  # commit-msg stage (via .githooks/commit-msg), so a message with a
+  # non-conventional subject or a missing `Refs: #<n>` fails locally — the
+  # devkit CI `validate-commit-range` job still catches anything that slips
+  # through but the local hook makes it a fast typing error, not a push round
+  # trip. Types + refs-optional-types mirror devkit 1.17.0's defaults resolved
+  # from .vig-os (DEVKIT_COMMIT_TYPES / DEVKIT_REFS_OPTIONAL_TYPES both empty).
+  # Refs vig-os/devkit#163, #228.
+  - repo: local
+    hooks:
+      - id: validate-commit-msg
+        name: validate commit message
+        entry: uv run validate-commit-msg
+        language: system
+        stages: [commit-msg]
+        args: [
+          "--types", "feat,fix,docs,chore,refactor,perf,test,ci,build,revert,style",
+          "--refs-optional-types", "chore",
+          "--blocked-patterns", ".github/agent-blocklist.toml",
+        ]
 
   # Typo Linting (typos sourced from the flake dev-shell, like the devkit
   # template). The upstream hook installs a generic-linux binary that a NixOS
