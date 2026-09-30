@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-09-23T16:43:44Z
-updated: 2026-09-23T16:43:44Z
+updated: 2026-09-29T22:49:17Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/211
-comments: 0
+comments: 1
 labels: none
 assignees: none
 milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-09-24T11:57:14.628Z
+synced: 2026-09-30T07:41:27.509Z
 ---
 
 # [Issue 211]: [idea: non-generative relevance scoring — calibrated/reranker scores for ordering, generation only for the shortlist](https://github.com/vig-os/scitadel/issues/211)
@@ -119,4 +119,15 @@ cost and determinism alone. If it doesn't, the issue closes with a number
 attached.
 
 Refs #25 (current LLM relevance scoring), #56 (`get_rubric`), #60 (`AgentBackend`).
+
+---
+
+# [Comment #1]() by [gerchowl]()
+
+_Posted on September 29, 2026 at 10:49 PM_
+
+Concrete follow-on: #246 picks the model family and adds a full-text stage.
+- Jev (hosted) or Kev (open weights, same `/v1/systemone` API) scores the question against each abstract first.
+- The shortlist's full text is then scored in chunks, and each paper gets a "candlestick" of chunk relevance.
+- The generative model then reads only the top-scoring passages.
 

@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-09-28T23:14:14Z
-updated: 2026-09-28T23:14:14Z
+updated: 2026-09-30T00:07:24Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/234
-comments: 0
+comments: 1
 labels: feature, effort:large, priority:high
 assignees: none
 milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-09-29T07:39:23.323Z
+synced: 2026-09-30T07:41:26.150Z
 ---
 
 # [Issue 234]: [feature: corpus acquisition: per-work artefact manifest (full text + SI + structured tables), Europe PMC/JATS + OSTI routes, batch acquire with coverage report and grouped action list](https://github.com/vig-os/scitadel/issues/234)
@@ -193,4 +193,12 @@ The identifier is `{doi | pmcid | osti_id | isbn | report_number | url}`. Works 
 ## Changelog Category
 
 Added
+
+---
+
+# [Comment #1]() by [gerchowl]()
+
+_Posted on September 30, 2026 at 12:07 AM_
+
+Step 1 (the joint design for #230 + #234) is spiked in #247: a work/artefact data model, one status vocabulary, the route ladder, a persistent pacer, and the credential and browser-session (CDP) isolation boundary. Nothing gets implemented until #247's decisions are settled.
 

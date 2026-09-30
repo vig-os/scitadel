@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-09-28T12:35:29Z
-updated: 2026-09-28T23:14:28Z
+updated: 2026-09-30T00:07:22Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/230
-comments: 1
+comments: 2
 labels: feature, effort:large, priority:high
 assignees: none
 milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-09-29T07:39:24.390Z
+synced: 2026-09-30T07:41:26.587Z
 ---
 
 # [Issue 230]: [feature: credentialed + human-assisted paywall access (TDM tokens, session broker, live TUI queue, agent-drivable)](https://github.com/vig-os/scitadel/issues/230)
@@ -219,4 +219,12 @@ already working and would mostly be ported, not invented.*
 _Posted on September 28, 2026 at 11:14 PM_
 
 Companion issue: #234 covers everything around this access ladder: the per-work artefact manifest (full text + SI + structured tables), Europe PMC/JATS and OSTI routes, SI harvesting, per-artefact provenance/licence, batch `acquire`/`coverage`, and the grouped `action_list` (meant to merge with `auth_pending()` here). Both should share one route ladder and one artefact store.
+
+---
+
+# [Comment #2]() by [gerchowl]()
+
+_Posted on September 30, 2026 at 12:07 AM_
+
+Step 1 (the joint design for #230 + #234) is spiked in #247: a work/artefact data model, one status vocabulary, the route ladder, a persistent pacer, and the credential and browser-session (CDP) isolation boundary. Nothing gets implemented until #247's decisions are settled.
 

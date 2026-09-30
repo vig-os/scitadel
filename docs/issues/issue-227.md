@@ -1,19 +1,19 @@
 ---
 type: issue
-state: open
+state: closed
 created: 2026-09-28T12:13:25Z
-updated: 2026-09-28T23:16:45Z
+updated: 2026-09-29T08:28:37Z
 author: c-vigo
 author_url: https://github.com/c-vigo
 url: https://github.com/vig-os/scitadel/issues/227
-comments: 1
+comments: 2
 labels: chore, effort:small, priority:medium, area:ci
 assignees: none
 milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-09-29T07:39:25.535Z
+synced: 2026-09-30T07:41:27.036Z
 ---
 
 # [Issue 227]: [chore(ci): require the devkit ci.yml checks in the main and dev rulesets](https://github.com/vig-os/scitadel/issues/227)
@@ -82,4 +82,16 @@ Tracking note: scitadel's rulesets and merge settings are declared in vig-os/org
 For reference, `CI Summary`, `Commit Messages` and `Scaffold Drift` all reported and passed on the App-authored release PR (#222) and sync PR (#223), as well as on human PRs. Requiring them won't strand the automated flows.
 
 One thing worth knowing until #301 applies: `main` is squash-only again (the 09-24 apply reverted the merge-commit toggle), so a `promote-release` run today would fail at `gh pr merge --merge`. Don't cut the next release before #301 is applied.
+
+---
+
+# [Comment #2]() by [c-vigo]()
+
+_Posted on September 29, 2026 at 08:28 AM_
+
+Superseded by vig-os/org-config#294 (ADR-0008), which moved scitadel's rulesets under org-config and applied them on 2026-09-29:
+
+- `Main protection` and `Dev protection` now require `CI Summary` (integration-pinned to GitHub Actions, strict on main), replacing the old `main protection` / `dev protection` rulesets 15240992 / 15240993, which were deleted. `CI Summary` already depends on `Scaffold Drift`, `Commit Messages`, `Lint & Format` and `Tests`, so all five gate merges now.
+- Keeping `Test (macos-latest)` and `Lint` (clippy) as extra required checks was considered and rejected: exact-name matching breaks silently on a job or matrix rename, and it puts per-repo CI layout into org config. The requirement moved to vig-os/devkit#1761: a mechanism for a consumer to feed extra jobs into the managed `CI Summary`. Until that ships, clippy and the macOS leg run but do not gate.
+- The dead `contract-tests` job found on the way is tracked in #239.
 
