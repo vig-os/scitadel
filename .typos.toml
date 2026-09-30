@@ -39,3 +39,6 @@ UPDAT = "UPDAT"
 # DOTA — the chelator (e.g. "DOTA lutetium"), a real search term in the
 # OpenAlex adapter tests (#212), not a misspelling of "data"
 DOTA = "DOTA"
+# `vor` — Crossref/Unpaywall "version of record" content-version value
+# (vor|am|tdm|stm-asf), used throughout the acquisition model (ADR-007)
+vor = "vor"
