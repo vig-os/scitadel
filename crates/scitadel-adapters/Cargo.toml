@@ -11,10 +11,6 @@ categories.workspace = true
 description = "Source adapters (PubMed, arXiv, OpenAlex, INSPIRE, EPO, PatentsView, Lens) and the paper download chain for scitadel."
 readme = "../../README.md"
 
-[features]
-default = []
-contract-tests = []
-
 [dependencies]
 scitadel-core = { path = "../scitadel-core", version = "0.8.0" } # x-release-please-version
 reqwest = { workspace = true }
