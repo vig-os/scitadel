@@ -2889,12 +2889,16 @@ name = "scitadel-adapters"
 version = "0.8.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "insta",
  "quick-xml",
  "reqwest",
+ "rusqlite",
  "scitadel-core",
+ "scitadel-db",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

@@ -289,6 +289,9 @@ scitadel tui                           Launch the interactive TUI
 scitadel mcp                           Start the MCP server (stdio)
 scitadel download <doi>                Fetch PDF (Unpaywall) or publisher HTML
 scitadel resolve-doi <doi>             Resolve DOI to full metadata via OpenAlex (#210)
+scitadel import-flat --paper <id> --root <dir>
+                                      Import a flat/legacy file tree (fulltext.pdf,
+                                      si/, tables/, figures/) as artefacts (#252)
 scitadel auth login <source>           Store credentials in the OS secret store
 scitadel auth status                   Show the credential backend and what is configured
 scitadel init                          Initialize the database

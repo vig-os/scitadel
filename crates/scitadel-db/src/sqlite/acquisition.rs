@@ -29,6 +29,12 @@
 //! re-derives the same ids and the same hash, finds the blob already in
 //! place, and writes nothing — it does not even rewrite file bodies.
 //!
+//! The blob store, the file hashing and the artefact id all live in
+//! [`sqlite::blobs`] and [`sqlite::artefacts`], shared with the
+//! flat-layout importer in `scitadel_adapters::import_flat`, so the two
+//! writers cannot derive two different ids or two different store paths
+//! for the same bytes.
+//!
 //! ## The decision tables
 //!
 //! `kind` comes from the file extension, lowercased. The legacy writer
@@ -87,36 +93,22 @@
 //! a library moves, so we record where the file *was*), and `retrieved_at`
 //! from `last_attempt_at`, else `created_at`, else now.
 
-use std::collections::HashSet;
-use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use chrono::{DateTime, Utc};
-use rusqlite::params;
-use rusqlite::{Connection, TransactionBehavior};
-use sha2::{Digest, Sha256};
+use rusqlite::Connection;
 
 use crate::error::DbError;
 use crate::sqlite::Database;
+use crate::sqlite::artefacts::{
+    ACCESS_BASIS_MANUAL, ArtefactWrite, BlobWrite, FULLTEXT_LOCATOR, VERSION_UNKNOWN, WriteMode,
+    distinct_blob_count, fulltext_kind, write_artefacts,
+};
+use crate::sqlite::blobs::{blob_rel_path, file_extension, hash_file, library_root, store_blob};
 
 /// Route recorded on every row this module writes — one of the sentinel
 /// values ADR-007 allows alongside `RouteId`s on `artefacts.route`.
-const ROUTE_LEGACY: &str = "legacy";
-
-/// ADR-007 §1 "Legacy data": every legacy artefact gets
-/// `access_basis = 'manual'` — no machine vouched for these bytes.
-const ACCESS_BASIS_MANUAL: &str = "manual";
-
-/// A legacy file has no recorded version, so we record `unknown` rather
-/// than claim `vor`.
-const VERSION_UNKNOWN: &str = "unknown";
-
-/// Blob store layout, ADR-007 §1 "Storage".
-const BLOB_DIR: &str = "blobs";
-const BLOB_TMP_DIR: &str = ".tmp";
-
-/// The ADR's `locator` for a full-text artefact: `''`.
-const FULLTEXT_LOCATOR: &str = "";
+pub const ROUTE_LEGACY: &str = "legacy";
 
 /// Copy legacy `papers.local_path` files into the blob store and record
 /// them as `artefacts` + `blobs` under `library_root` (the absolute
@@ -154,52 +146,11 @@ pub fn backfill_legacy_artefacts(
         }
     }
 
-    // Phase 2 — `blobs` before `artefacts`: `artefacts.sha256` is a
-    // foreign key into it.
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    for plan in &plans {
-        if let Some(blob) = &plan.blob {
-            tx.execute(
-                "INSERT OR IGNORE INTO blobs (sha256, bytes, mime, rel_path, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    blob.sha256,
-                    blob.bytes,
-                    blob.mime,
-                    blob.rel_path,
-                    blob.created_at
-                ],
-            )?;
-        }
-        tx.execute(
-            "INSERT OR IGNORE INTO artefacts
-                 (id, paper_id, kind, version, locator, sha256, format, access_status,
-                  route, access_basis, imported_from, retrieved_at, missing_on_disk)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            params![
-                plan.id,
-                plan.paper_id,
-                plan.kind,
-                VERSION_UNKNOWN,
-                FULLTEXT_LOCATOR,
-                plan.blob.as_ref().map(|b| b.sha256.as_str()),
-                plan.format,
-                plan.access_status,
-                ROUTE_LEGACY,
-                ACCESS_BASIS_MANUAL,
-                plan.imported_from,
-                plan.retrieved_at,
-                i64::from(plan.missing_on_disk),
-            ],
-        )?;
-    }
-    tx.commit()?;
+    // Phase 2 — one short transaction: `blobs` before `artefacts`,
+    // because `artefacts.sha256` is a foreign key into it.
+    write_artefacts(conn, &plans, WriteMode::IgnoreExisting)?;
 
-    let distinct_blobs = plans
-        .iter()
-        .filter_map(|p| p.blob.as_ref().map(|b| b.sha256.as_str()))
-        .collect::<HashSet<_>>()
-        .len();
+    let distinct_blobs = distinct_blob_count(plans.iter());
     let missing = plans.iter().filter(|p| p.missing_on_disk).count();
     tracing::debug!(
         legacy_papers = legacy.len(),
@@ -230,24 +181,6 @@ impl Database {
             Some(root) => backfill_legacy_artefacts(&mut conn, &root),
         }
     }
-}
-
-/// The library root: the absolute parent directory of the DB file.
-/// `None` for an in-memory database, whose `PRAGMA database_list` file
-/// is the empty string.
-fn library_root(conn: &Connection) -> Result<Option<PathBuf>, DbError> {
-    let file: Option<String> = conn
-        .query_row(
-            "SELECT file FROM pragma_database_list WHERE name = 'main'",
-            [],
-            |row| row.get(0),
-        )
-        .ok();
-    let Some(file) = file.filter(|f| !f.is_empty()) else {
-        return Ok(None);
-    };
-    let absolute = std::fs::canonicalize(&file).unwrap_or_else(|_| PathBuf::from(&file));
-    Ok(absolute.parent().map(Path::to_path_buf))
 }
 
 /// Read every paper that has a legacy file recorded, with only the
@@ -287,29 +220,6 @@ struct LegacyRow {
     created_at: String,
 }
 
-/// A `blobs` row to `INSERT OR IGNORE`.
-struct BlobRow {
-    sha256: String,
-    bytes: i64,
-    mime: &'static str,
-    rel_path: String,
-    created_at: String,
-}
-
-/// An `artefacts` row to `INSERT OR IGNORE`. Its blob, when present, is
-/// written first — `artefacts.sha256` references it.
-struct ArtefactPlan {
-    id: String,
-    paper_id: String,
-    kind: &'static str,
-    format: &'static str,
-    access_status: &'static str,
-    imported_from: String,
-    retrieved_at: String,
-    blob: Option<BlobRow>,
-    missing_on_disk: bool,
-}
-
 /// Plan the artefact for one legacy paper, hashing and copying its file
 /// into the blob store.
 ///
@@ -319,14 +229,14 @@ fn plan_legacy_artefact(
     row: &LegacyRow,
     library_root: &Path,
     now: DateTime<Utc>,
-) -> Option<ArtefactPlan> {
+) -> Option<ArtefactWrite> {
     let recorded = row.local_path.trim();
     if recorded.is_empty() {
         return None;
     }
 
-    let ext = extension(recorded);
-    let Some((kind, format, mime)) = classify_extension(&ext) else {
+    let ext = file_extension(recorded);
+    let Some(kind) = fulltext_kind(&ext) else {
         tracing::warn!(
             paper_id = %row.paper_id,
             path = %recorded,
@@ -352,10 +262,10 @@ fn plan_legacy_artefact(
     let (blob, missing_on_disk) = match hash_file(&absolute) {
         Ok((sha256, bytes)) => {
             let rel_path = blob_rel_path(&sha256, &ext);
-            let blob = BlobRow {
+            let blob = BlobWrite {
                 sha256,
                 bytes,
-                mime,
+                mime: kind.mime.to_string(),
                 rel_path,
                 created_at: now.to_rfc3339(),
             };
@@ -390,45 +300,26 @@ fn plan_legacy_artefact(
         }
     };
 
-    Some(ArtefactPlan {
-        id: artefact_id(&row.paper_id, kind, VERSION_UNKNOWN, FULLTEXT_LOCATOR),
+    Some(ArtefactWrite {
+        // Derived, not generated: see `artefacts::artefact_id`.
+        id: String::new(),
         paper_id: row.paper_id.clone(),
-        kind,
-        format,
-        access_status: access_status_for(row.download_status.as_deref()),
-        imported_from: absolute.to_string_lossy().into_owned(),
+        kind: kind.kind.to_string(),
+        version: VERSION_UNKNOWN.to_string(),
+        locator: FULLTEXT_LOCATOR.to_string(),
+        format: Some(kind.format.to_string()),
+        access_status: access_status_for(row.download_status.as_deref()).to_string(),
+        route: ROUTE_LEGACY.to_string(),
+        access_basis: ACCESS_BASIS_MANUAL.to_string(),
+        label: None,
+        caption: None,
+        source_url: None,
+        sha256: blob.as_ref().map(|b| b.sha256.clone()),
+        imported_from: Some(absolute.to_string_lossy().into_owned()),
         retrieved_at: retrieved_at(row, now),
         blob,
         missing_on_disk,
     })
-}
-
-/// `(kind, format, mime)` for a legacy file extension, or `None` when
-/// that extension is not a full-text kind. See the module table.
-fn classify_extension(ext: &str) -> Option<(&'static str, &'static str, &'static str)> {
-    match ext {
-        "pdf" => Some(("fulltext_pdf", "pdf", "application/pdf")),
-        "html" | "htm" | "xhtml" => Some(("fulltext_html", "html", "text/html")),
-        "nxml" | "jats" => Some(("fulltext_xml", "jats", "application/xml")),
-        "xml" => Some(("fulltext_xml", "xml", "application/xml")),
-        _ => None,
-    }
-}
-
-/// The lowercased extension of `path`, without the dot. Non-alphanumeric
-/// bytes are dropped so a hostile `local_path` cannot escape the blob
-/// store directory via the name it is stored under.
-fn extension(path: &str) -> String {
-    Path::new(path)
-        .extension()
-        .map(|ext| {
-            ext.to_string_lossy()
-                .chars()
-                .filter(char::is_ascii_alphanumeric)
-                .collect::<String>()
-                .to_lowercase()
-        })
-        .unwrap_or_default()
 }
 
 /// Conservative mapping from the legacy `download_status` to
@@ -470,115 +361,14 @@ fn parse_legacy_timestamp(raw: &str) -> Option<DateTime<Utc>> {
         .map(|naive| naive.and_utc())
 }
 
-/// SHA-256 (hex) and byte length of a file, read in chunks so a large
-/// legacy PDF never has to fit in memory.
-fn hash_file(path: &Path) -> Result<(String, i64), DbError> {
-    use std::io::Read;
-
-    let mut file = std::fs::File::open(path).map_err(|e| io_error("open", path, &e))?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0_u8; 64 * 1024];
-    let mut bytes = 0_i64;
-    loop {
-        let read = file
-            .read(&mut buf)
-            .map_err(|e| io_error("read", path, &e))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buf[..read]);
-        bytes += read as i64;
-    }
-    Ok((hex_digest(hasher.finalize().as_slice()), bytes))
-}
-
-/// Copy `src` into `<library_root>/blobs/<first 2 hex>/<sha256>.<ext>`
-/// and return that store-relative path. The copy is staged in
-/// `blobs/.tmp/` — same filesystem, so the rename into place is atomic —
-/// and skipped entirely when the destination already exists, which is
-/// what makes a re-run cheap.
-fn store_blob(src: &Path, sha256: &str, ext: &str, library_root: &Path) -> Result<(), DbError> {
-    let dest = library_root.join(blob_rel_path(sha256, ext));
-    if dest.exists() {
-        // Content-addressed: same digest, same bytes.
-        return Ok(());
-    }
-
-    let store = library_root.join(BLOB_DIR);
-    let staging = store
-        .join(BLOB_TMP_DIR)
-        .join(format!("{sha256}.{}.tmp", std::process::id()));
-    if let Some(dir) = staging.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| io_error("create blob tmp dir", dir, &e))?;
-    }
-    if let Some(dir) = dest.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| io_error("create blob dir", dir, &e))?;
-    }
-    std::fs::copy(src, &staging)
-        .map_err(|e| io_error("copy legacy file into blob store", src, &e))?;
-
-    match std::fs::rename(&staging, &dest) {
-        Ok(()) => Ok(()),
-        // Another process may have won the race with identical bytes.
-        Err(_) if dest.exists() => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&staging);
-            Err(io_error("place blob in store", &dest, &e))
-        }
-    }
-}
-
-/// Where a blob lives, relative to the library root — ADR-007 §1
-/// "Storage": `<root>/blobs/<first 2 hex>/<sha256>.<ext>`.
-fn blob_rel_path(sha256: &str, ext: &str) -> String {
-    if ext.is_empty() {
-        format!("{BLOB_DIR}/{}/{sha256}", &sha256[..2])
-    } else {
-        format!("{BLOB_DIR}/{}/{sha256}.{ext}", &sha256[..2])
-    }
-}
-
-/// Deterministic artefact id: the first 16 bytes of SHA-256 over a
-/// length-framed `paper_id | kind | version | locator`, rendered as 32
-/// lowercase hex — the same id shape the workspace already uses for
-/// papers, questions and searches.
-///
-/// Deterministic rather than a fresh `uuid::Uuid::new_v4()` because
-/// idempotence should not depend on the UNIQUE index alone: the same
-/// legacy row must derive the same id on every run and on every machine,
-/// so a re-run after an interrupted transaction cannot leave a row whose
-/// id differs from the one a later run would compute. The domain prefix
-/// keeps these digests from ever colliding with another sha256-derived
-/// hex id in the database, and the length framing keeps `("ab", "c")`
-/// from colliding with `("a", "bc")`.
-fn artefact_id(paper_id: &str, kind: &str, version: &str, locator: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"scitadel/artefact-id/v1");
-    for part in [paper_id, kind, version, locator] {
-        hasher.update((part.len() as u64).to_be_bytes());
-        hasher.update(part.as_bytes());
-    }
-    hex_digest(&hasher.finalize()[..16])
-}
-
-/// Lowercase hex of `bytes`.
-fn hex_digest(bytes: &[u8]) -> String {
-    let mut hex = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
-}
-
-/// File-system trouble as a `DbError::Migration`, naming the path that
-/// caused it.
-fn io_error(what: &str, path: &Path, e: &std::io::Error) -> DbError {
-    DbError::Migration(format!("{what} {}: {e}", path.display()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    use rusqlite::params;
+
+    use crate::sqlite::artefacts::artefact_id;
     use tempfile::TempDir;
 
     /// A fixed RFC 3339 creation stamp, so the `retrieved_at` fallback

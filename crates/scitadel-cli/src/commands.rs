@@ -1705,6 +1705,79 @@ pub fn bib_diff(
     Ok(exit)
 }
 
+/// `scitadel import-flat --paper <id> --root <dir>` — import a flat /
+/// legacy directory tree of files as `artefacts` rows (ADR-007 §1
+/// "Legacy data").
+///
+/// The paper is addressed by id prefix, like every other CLI command, so
+/// the operator can paste the 8 characters `show` prints. Prints what was
+/// recorded per kind, names anything it refused or could not place, and
+/// exits non-zero when a path escaped the tree — a silent partial import
+/// of a library is exactly the outcome worth making loud.
+pub fn import_flat(paper: &str, root: &std::path::Path) -> Result<()> {
+    use scitadel_adapters::import_flat::import_flat_tree;
+    use scitadel_core::ports::PaperRepository as _;
+
+    let db = open_db()?;
+    let (paper_repo, _, _, _, _) = db.repositories();
+
+    let resolved_id = {
+        let all = paper_repo.list_all(10_000, 0)?;
+        let matches: Vec<&scitadel_core::models::Paper> = all
+            .iter()
+            .filter(|p| p.id.as_str().starts_with(paper))
+            .collect();
+        match matches.len() {
+            0 => bail!("no paper matches id prefix '{paper}'"),
+            1 => matches[0].id.as_str().to_string(),
+            n => bail!("ambiguous paper id prefix '{paper}' — matches {n} records"),
+        }
+    };
+    let paper_row = paper_repo
+        .get(&resolved_id)?
+        .ok_or_else(|| anyhow::anyhow!("paper '{resolved_id}' not found"))?;
+
+    let report = import_flat_tree(&db, &paper_row, root).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    println!(
+        "Imported {} artefact(s) for {} from {}",
+        report.total(),
+        paper_row.id.short(),
+        report.paper_dir.display()
+    );
+    for (kind, n) in &report.counts {
+        println!("  {kind:<16} {n}");
+    }
+    println!("  {:<16} {}", "blobs", report.blobs);
+    if !report.gaps.is_empty() {
+        println!("\n  Not present in this tree (recorded as wanted, not held):");
+        for gap in &report.gaps {
+            println!(
+                "  + {} → drop the file at {}",
+                gap.kind,
+                gap.drop_path.display()
+            );
+        }
+    }
+    if !report.unrecognised.is_empty() {
+        println!("\n  Left in place (no artefacts.kind fits):");
+        for path in &report.unrecognised {
+            println!("  - {}", path.display());
+        }
+    }
+    if !report.refused.is_empty() {
+        println!("\n  Refused (resolves outside the imported tree):");
+        for path in &report.refused {
+            println!("  - {}", path.display());
+        }
+        bail!(
+            "{} path(s) escaped the imported tree and were not imported",
+            report.refused.len()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod bib_diff_tests {
     //! Unit tests for the CLI's `bib diff` plumbing. The pure-logic

@@ -2,6 +2,7 @@ pub mod arxiv;
 pub mod download;
 pub mod epo;
 pub mod error;
+pub mod import_flat;
 pub mod inspire;
 pub mod lens;
 pub mod openalex;

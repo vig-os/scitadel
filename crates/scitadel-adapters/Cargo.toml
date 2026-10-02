@@ -13,6 +13,8 @@ readme = "../../README.md"
 
 [dependencies]
 scitadel-core = { path = "../scitadel-core", version = "0.8.0" } # x-release-please-version
+scitadel-db = { path = "../scitadel-db", version = "0.8.0" } # x-release-please-version # ADR-007 §1: artefact + blob writes for the flat-layout importer
+chrono = { workspace = true }
 reqwest = { workspace = true }
 quick-xml = { workspace = true }
 serde = { workspace = true }
@@ -23,6 +25,10 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# The importer's tests assert on `artefacts` rows directly; the library
+# code itself never names rusqlite (that stays behind scitadel-db).
+rusqlite = { workspace = true }
+tempfile = { workspace = true }
 wiremock = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 insta = { workspace = true }
