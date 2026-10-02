@@ -58,6 +58,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Credentials
 keyring = { version = "3", features = ["apple-native", "sync-secret-service"] }
 rpassword = "7"
+zeroize = "1"
+
+# macOS Keychain, called directly instead of through the `security` CLI. The
+# CLI takes the password as an argv value (`-w <password>`), so any local user
+# can read it with `ps`; Apple's SecurityTool source shows there is no stdin
+# prompt to fall back on, so the CLI cannot avoid argv. #248.
+security-framework = "3"
 
 # CLI
 clap = { version = "4", features = ["derive"] }

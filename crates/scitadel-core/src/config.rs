@@ -329,6 +329,7 @@ pub fn load_config() -> Config {
         "SCITADEL_PUBMED_API_KEY",
         &config.pubmed.api_key,
     )
+    .map(crate::credentials::Secret::into_string)
     .unwrap_or_default();
 
     // Untangle the pre-0.8 layout (email stored under `api_key`) before
@@ -340,6 +341,7 @@ pub fn load_config() -> Config {
         "SCITADEL_OPENALEX_EMAIL",
         &config.openalex.email,
     )
+    .map(crate::credentials::Secret::into_string)
     .unwrap_or_default();
 
     config.openalex.api_key = resolve(
@@ -347,6 +349,7 @@ pub fn load_config() -> Config {
         "SCITADEL_OPENALEX_API_KEY",
         &config.openalex.api_key,
     )
+    .map(crate::credentials::Secret::into_string)
     .unwrap_or_default();
 
     config.patentsview.api_key = resolve(
@@ -354,6 +357,7 @@ pub fn load_config() -> Config {
         "SCITADEL_PATENTSVIEW_KEY",
         &config.patentsview.api_key,
     )
+    .map(crate::credentials::Secret::into_string)
     .unwrap_or_default();
 
     config.lens.api_key = resolve(
@@ -361,6 +365,7 @@ pub fn load_config() -> Config {
         "SCITADEL_LENS_TOKEN",
         &config.lens.api_key,
     )
+    .map(crate::credentials::Secret::into_string)
     .unwrap_or_default();
 
     config.epo.consumer_key = resolve(
@@ -368,6 +373,7 @@ pub fn load_config() -> Config {
         "SCITADEL_EPO_KEY",
         &config.epo.consumer_key,
     )
+    .map(crate::credentials::Secret::into_string)
     .unwrap_or_default();
 
     config.epo.consumer_secret = resolve(
@@ -375,6 +381,7 @@ pub fn load_config() -> Config {
         "SCITADEL_EPO_SECRET",
         &config.epo.consumer_secret,
     )
+    .map(crate::credentials::Secret::into_string)
     .unwrap_or_default();
 
     // Chat config from env (no keychain needed)
