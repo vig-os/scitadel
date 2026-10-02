@@ -2,7 +2,10 @@ use std::collections::HashMap;
 
 use tracing::warn;
 
-use crate::models::{CandidatePaper, Paper, SearchId, SearchResult, normalize_doi, validate_doi};
+use crate::models::{
+    CandidatePaper, Paper, SearchId, SearchResult, normalize_doi, validate_doi,
+    validate_doi_detailed,
+};
 
 /// Normalize title for fuzzy matching: lowercase, strip punctuation/whitespace.
 fn normalize_title(title: &str) -> String {
@@ -93,22 +96,29 @@ pub fn deduplicate(
     for candidate in candidates {
         let mut matched_idx = None;
 
-        // Validate and normalize DOI before using it for matching
-        let valid_doi = candidate.doi.as_deref().and_then(|doi| {
-            if validate_doi(doi) {
-                Some(normalize_doi(doi))
-            } else {
-                if !doi.is_empty() {
-                    warn!(
-                        source = %candidate.source,
-                        title = %candidate.title,
-                        doi = %doi,
-                        "rejecting malformed DOI from candidate"
-                    );
+        // Validate and normalize DOI before using it for matching. The
+        // detailed form gives the reason, which goes in the log so a
+        // truncated or repository-URL DOI is traceable to its source rather
+        // than vanishing (#262). The canonical form comes back from the same
+        // call, so a candidate can never be keyed on the raw string.
+        let valid_doi = candidate
+            .doi
+            .as_deref()
+            .and_then(|doi| match validate_doi_detailed(doi) {
+                Ok(canonical) => Some(canonical),
+                Err(reason) => {
+                    if !doi.is_empty() {
+                        warn!(
+                            source = %candidate.source,
+                            title = %candidate.title,
+                            doi = %doi,
+                            reason = %reason,
+                            "rejecting DOI from candidate"
+                        );
+                    }
+                    None
                 }
-                None
-            }
-        });
+            });
 
         // 1. DOI exact match
         if let Some(ref doi) = valid_doi
