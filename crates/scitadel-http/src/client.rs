@@ -15,7 +15,7 @@
 //! 3. **Buckets are platforms, not hosts** — see [`crate::policy`].
 
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use reqwest::StatusCode;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -68,12 +68,39 @@ impl PacedClient {
         Ok(Self::new(Self::default_transport()?, pacer, policy))
     }
 
+    /// [`Self::new_default`], with a per-request timeout.
+    ///
+    /// Without one, a publisher that accepts a connection and then stops
+    /// writing holds the fetch open indefinitely — which, for an acquisition
+    /// chain that walks four routes per work, is the difference between a
+    /// stuck campaign and a slow one. The timeout is on the transport because
+    /// that is the only place reqwest can enforce it, and this crate is the
+    /// only crate allowed to name `reqwest::Client` (ADR-007 §3), so a caller
+    /// that needs one must ask for it here rather than build a bare client
+    /// beside this one.
+    pub fn with_timeout(
+        timeout: Duration,
+        pacer: Arc<dyn Pacer>,
+        policy: BucketPolicyTable,
+    ) -> Result<Self> {
+        Ok(Self::new(Self::transport(Some(timeout))?, pacer, policy))
+    }
+
     /// The transport `PacedClient` expects: redirects disabled, because
     /// following them is this type's job.
     pub fn default_transport() -> Result<reqwest::Client> {
-        reqwest::Client::builder()
+        Self::transport(None)
+    }
+
+    /// The transport contract, with an optional per-request timeout.
+    fn transport(timeout: Option<Duration>) -> Result<reqwest::Client> {
+        let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent(concat!("scitadel-http/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("scitadel-http/", env!("CARGO_PKG_VERSION")));
+        if let Some(timeout) = timeout {
+            builder = builder.timeout(timeout);
+        }
+        builder
             .build()
             .map_err(|source| FetchError::ClientBuild { source })
     }
@@ -1068,6 +1095,60 @@ mod tests {
             "the transport must hand 3xx back to PacedClient"
         );
         assert_eq!(server.received_requests().await.expect("recorded").len(), 1);
+    }
+
+    /// A publisher that accepts the connection and then goes quiet must not hold
+    /// a fetch open forever. `new_default` has no timeout, so this asserts
+    /// the *capability* callers need, and that a timeout arrives as a
+    /// transport failure rather than as a publisher verdict.
+    #[tokio::test]
+    async fn a_request_timeout_is_enforced_and_reads_as_a_transport_error() {
+        // A listener that accepts and then never writes: the shape of a
+        // publisher that stops answering mid-handshake. A wiremock delay
+        // would not do — it eventually answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let stalled = format!("http://{}/slow", listener.local_addr().expect("an addr"));
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket); // never written to, never dropped
+            }
+        });
+
+        let impatient = PacedClient::with_timeout(
+            Duration::from_millis(80),
+            FakePacer::new(),
+            BucketPolicyTable::new(),
+        )
+        .expect("transport builds");
+        let err = impatient
+            .get(url(&stalled), PaceTier::Oa, SafeHeaders::unauthenticated())
+            .await
+            .expect_err("a publisher that never answers must not hang the chain");
+        assert!(matches!(err, FetchError::Transport { .. }), "{err:?}");
+        assert!(
+            !err.is_rate_limited(),
+            "our own timeout is not the publisher's"
+        );
+        assert!(err.to_string().contains("/slow"), "{err}");
+
+        // A generous timeout on the same stalled socket still waits, which is
+        // what proves the 80 ms above was the timeout firing rather than a
+        // connection that was refused.
+        let patient = PacedClient::with_timeout(
+            Duration::from_millis(400),
+            FakePacer::new(),
+            BucketPolicyTable::new(),
+        )
+        .expect("transport builds");
+        let started = Instant::now();
+        let err = patient
+            .get(url(&stalled), PaceTier::Oa, SafeHeaders::unauthenticated())
+            .await
+            .expect_err("400ms is not enough for a socket that never writes");
+        assert!(started.elapsed() >= Duration::from_millis(350), "{err:?}");
     }
 
     /// The policy table in force is the one the client was built with.
