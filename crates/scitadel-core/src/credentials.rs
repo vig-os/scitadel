@@ -828,11 +828,25 @@ mod tests {
 
     #[test]
     fn unrecognised_env_override_falls_back_to_detection() {
-        assert_eq!(
-            select_backend(Some("nonsense"), true),
-            Backend::SecretService
-        );
-        assert_eq!(select_backend(Some(""), false), Backend::File);
+        // What detection returns is platform-dependent: the Keychain is the
+        // macOS default whether or not a Secret Service answers. Asserting
+        // the Linux answer unconditionally failed on the macos runner.
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                select_backend(Some("nonsense"), true),
+                Backend::MacosKeychain
+            );
+            assert_eq!(select_backend(Some(""), false), Backend::MacosKeychain);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(
+                select_backend(Some("nonsense"), true),
+                Backend::SecretService
+            );
+            assert_eq!(select_backend(Some(""), false), Backend::File);
+        }
     }
 
     #[test]
