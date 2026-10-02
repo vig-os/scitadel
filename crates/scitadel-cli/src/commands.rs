@@ -1205,7 +1205,8 @@ pub fn auth_login(source: &str) -> Result<()> {
             bail!("{} is required for '{source}'", key.label);
         }
 
-        credentials::store(key.store_key, &value).map_err(|e| anyhow::anyhow!("{e}"))?;
+        credentials::store(key.store_key, &credentials::Secret::new(&value))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         println!("  Stored: {}", key.store_key);
     }
 
