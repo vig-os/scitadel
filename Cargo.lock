@@ -2954,6 +2954,7 @@ dependencies = [
 name = "scitadel-db"
 version = "0.8.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "insta",
  "r2d2",
@@ -2961,9 +2962,11 @@ dependencies = [
  "rusqlite",
  "scitadel-core",
  "serde_json",
+ "sha2",
  "strsim",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
  "uuid",
 ]
@@ -2983,6 +2986,19 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "uuid",
+]
+
+[[package]]
+name = "scitadel-http"
+version = "0.8.0"
+dependencies = [
+ "async-trait",
+ "reqwest",
+ "scitadel-core",
+ "thiserror 2.0.18",
+ "tokio",
+ "url",
+ "wiremock",
 ]
 
 [[package]]

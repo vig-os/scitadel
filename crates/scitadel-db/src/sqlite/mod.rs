@@ -1,7 +1,9 @@
+mod acquisition;
 mod annotations;
 mod assessments;
 mod citations;
 mod migrations;
+mod pacer;
 mod paper_aliases;
 mod paper_state;
 mod paper_tags;
@@ -11,11 +13,13 @@ mod searches;
 mod shortlist;
 mod tui_state;
 
+pub use acquisition::backfill_legacy_artefacts;
 pub use annotations::{SqliteAnnotationRepository, resolve_anchor};
 
 pub use assessments::SqliteAssessmentRepository;
 pub use citations::SqliteCitationRepository;
 pub use migrations::run_migrations;
+pub use pacer::{PolicyLookup, SqlitePacer};
 pub use paper_aliases::{SOURCE_BIBTEX_IMPORT, SOURCE_REKEY, SqlitePaperAliasRepository};
 pub use paper_state::{PaperState, SqlitePaperStateRepository};
 pub use paper_tags::{SqlitePaperTagRepository, TAG_SOURCE_BIBTEX_IMPORT};
@@ -143,16 +147,25 @@ impl Database {
     }
 
     /// Run all pending migrations, then backfill any paper rows that
-    /// lack a stable `bibtex_key` (#132). The backfill is idempotent —
-    /// on every subsequent call it's a no-op because every paper
-    /// already has a key. Papers gain keys via `save`/`save_many`
-    /// thereafter, keeping this migrate-call the only place that
-    /// needs to know about the assignment algorithm.
+    /// lack a stable `bibtex_key` (#132) and any legacy
+    /// `local_path` files that predate the `artefacts` table (ADR-007
+    /// §1 "Legacy data"). Both backfills are idempotent — on every
+    /// subsequent call they are no-ops, because every paper already has
+    /// a key and every legacy file already has an artefact row keyed by
+    /// `UNIQUE (paper_id, kind, version, locator)`. Papers gain keys via
+    /// `save`/`save_many` thereafter, keeping this migrate-call the only
+    /// place that needs to know about the assignment algorithm.
+    ///
+    /// The artefact backfill runs after `run_migrations` commits, so an
+    /// upgrade from a pre-013 library needs no separate command: hashing
+    /// and copying legacy files happens with no write lock held, and the
+    /// rows land in one short transaction (see `sqlite::acquisition`).
     pub fn migrate(&self) -> Result<(), DbError> {
         let conn = self.pool.get()?;
         run_migrations(&conn)?;
         drop(conn);
         self.backfill_bibtex_keys()?;
+        self.backfill_acquisition_artefacts()?;
         Ok(())
     }
 
