@@ -312,8 +312,14 @@ pub struct DownloadPaperRequest {
     pub paper_id: Option<String>,
     /// DOI (used only if paper_id is not provided)
     pub doi: Option<String>,
-    /// Output directory (optional, defaults to .scitadel/papers/)
-    pub output_dir: Option<String>,
+    // No output directory, deliberately (#249). An agent-supplied
+    // destination let any caller — including a prompt-injected one —
+    // choose where attacker-influenced bytes land (publisher HTML, or
+    // whatever a DOI resolves to): `~/.config/autostart`, a repo's
+    // `.githooks/`, a shell rc directory. Downloads always land under the
+    // configured `papers_dir`, and the filename is derived from the
+    // paper's own identifiers rather than from the request. A human who
+    // wants a different directory still has `scitadel download --output-dir`.
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1021,12 +1027,7 @@ impl ScitadelServer {
             format!("downloading {target}"),
         )
         .await;
-        let result = tools::download_paper_tool(
-            req.paper_id.as_deref(),
-            req.doi.as_deref(),
-            req.output_dir.as_deref(),
-        )
-        .await;
+        let result = tools::download_paper_tool(req.paper_id.as_deref(), req.doi.as_deref()).await;
         let done_msg = match &result {
             Ok(_) => "download complete".to_string(),
             Err(e) => format!("download failed: {e}"),
@@ -1179,6 +1180,67 @@ mod tests {
     /// Scope filter: a subscriber with `paper_id=None` sees every
     /// event; a paper-scoped subscriber sees only events on that
     /// paper. (#185)
+    /// #249: the agent-facing schema must not offer a destination at all.
+    ///
+    /// This is the contract an LLM actually reads, so it is the place the
+    /// field has to be gone — tightening the Rust function signature alone
+    /// would not stop a caller from asking, and would leave the tool
+    /// description implying the capability exists.
+    #[test]
+    fn download_paper_schema_offers_no_output_directory() {
+        let schema = schemars::schema_for!(super::DownloadPaperRequest);
+        let json = serde_json::to_string(&schema).unwrap();
+
+        assert!(
+            !json.contains("output_dir"),
+            "output_dir is back in the MCP schema: {json}"
+        );
+        assert!(
+            !json.contains("outputDir"),
+            "a camelCase alias slipped into the MCP schema: {json}"
+        );
+
+        // The properties that remain are exactly the two identifiers, so a
+        // future field cannot quietly reintroduce a path.
+        let props = schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("schema must carry a properties object");
+        let names: Vec<&str> = props.keys().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            vec!["doi", "paper_id"],
+            "unexpected download_paper request fields: {names:?}"
+        );
+    }
+
+    /// #249: a caller that still sends `output_dir` — an older agent, a
+    /// cached tool description, or a prompt injection trying the old shape —
+    /// gets it ignored rather than obeyed. The download still goes to
+    /// `papers_dir`, so the injected path is never used.
+    #[test]
+    fn download_paper_request_ignores_a_supplied_output_dir() {
+        let payload = serde_json::json!({
+            "doi": "10.1038/s41586-020-2649-2",
+            "output_dir": "/home/victim/.config/autostart",
+        });
+        let req: super::DownloadPaperRequest = serde_json::from_value(payload).unwrap();
+
+        // Parsing succeeds (no `deny_unknown_fields` anywhere in this
+        // crate, so extra keys are tolerated for forward compatibility)...
+        assert_eq!(req.doi.as_deref(), Some("10.1038/s41586-020-2649-2"));
+        assert!(req.paper_id.is_none());
+
+        // ...and the destination is not carried anywhere on the struct, so
+        // the tool body has nothing to forward. This is the assertion that
+        // actually matters: there is no field to leak.
+        let echoed = format!("{req:?}");
+        assert!(
+            !echoed.contains("autostart"),
+            "the injected path is still reachable from the parsed request: {echoed}"
+        );
+    }
+
     #[test]
     fn event_matches_scope_filter() {
         assert!(super::event_matches_scope(None, "p-a"));
