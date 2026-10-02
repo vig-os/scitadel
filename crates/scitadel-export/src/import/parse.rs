@@ -197,16 +197,17 @@ fn extract_raw(e: &biblatex::Entry, field: &str) -> Option<String> {
     e.fields.get(field).map(|chunks| chunks.format_verbatim())
 }
 
-/// Normalize a DOI for matching. Lowercase + strip the two common
-/// URL/CURIE prefixes that `.bib` files carry.
+/// Normalize a DOI for matching.
+///
+/// Delegates to [`scitadel_core::models::normalize_doi`] rather than keeping a
+/// second copy (#261). The two implementations had non-overlapping prefix
+/// sets — this one handled the `doi:` CURIE that `.bib` files carry but not
+/// `dx.doi.org`, the core one the reverse — so a `10.1234/x` keyed off a
+/// resolver URL and the same DOI keyed off a CURIE did not converge, and any
+/// consumer assuming one canonical form inherited the split. One normalizer
+/// handles all six prefix forms.
 pub fn normalize_doi(raw: &str) -> String {
-    let trimmed = raw.trim();
-    let no_proto = trimmed
-        .strip_prefix("https://doi.org/")
-        .or_else(|| trimmed.strip_prefix("http://doi.org/"))
-        .or_else(|| trimmed.strip_prefix("doi:"))
-        .unwrap_or(trimmed);
-    no_proto.to_lowercase()
+    scitadel_core::models::normalize_doi(raw)
 }
 
 #[cfg(test)]
