@@ -581,13 +581,18 @@ pub fn save_assessment_tool(
 /// Download a paper. If `paper_id` is provided, uses the full multi-source chain
 /// (arxiv → openalex → doi/Unpaywall → publisher) against the stored Paper record.
 /// Otherwise falls back to DOI-only.
+///
+/// The destination is always the configured `papers_dir` and the filename is
+/// derived from the paper's own identifiers. No caller — including a
+/// prompt-injected agent — can steer where the bytes land (#249). The human
+/// CLI still exposes `scitadel download --output-dir`, where the destination
+/// comes from a person who can also see what they are downloading.
 pub async fn download_paper_tool(
     paper_id: Option<&str>,
     doi: Option<&str>,
-    output_dir: Option<&str>,
 ) -> Result<String, String> {
     let config = load_config();
-    let out_dir = output_dir.map_or_else(|| config.papers_dir(), std::path::PathBuf::from);
+    let out_dir = config.papers_dir();
 
     let downloader =
         scitadel_adapters::download::PaperDownloader::new(config.openalex.auth(), 60.0);
