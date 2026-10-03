@@ -558,23 +558,70 @@ fn sort_candidates(candidates: &mut [Candidate]) {
 
 /// True when `path` — canonicalised — is `root` or lives under it.
 ///
-/// Both sides must already be canonical: a path containing `..` is
-/// resolved first, which is what stops `tables/../../secrets.csv` from
-/// being read. `Path::starts_with` compares whole components, so
-/// `/lib/papers/other` never passes for a child of `/lib/papers/this`.
+/// Is `path` inside `root`, after resolving both the same way?
 ///
-/// Canonicalising only `path` is a bug that looks like it works: on macOS
-/// `tempfile::tempdir()` hands back `/var/folders/...`, which is a symlink to
-/// `/private/var/folders/...`. A file inside it canonicalises to the
-/// `/private/var` form, which does not `starts_with` the un-canonicalised
-/// root — so every legitimate file was refused, and the refusal reads like a
-/// security decision rather than a path-alias artefact. Comparing
-/// canonical-to-canonical makes the answer independent of how the caller came
-/// by `root`.
+/// The subtlety is that "resolve a path" has no single right answer here, and
+/// picking different answers for the two sides is a bug that reads like a
+/// security decision:
+///
+/// - Canonicalising only `path` fails on macOS, where
+///   `tempfile::tempdir()` returns `/var/folders/...` — a symlink to
+///   `/private/var/folders/...`. A file inside canonicalises to the
+///   `/private/var` form and fails `starts_with` the root as the caller passed
+///   it, so every legitimate file was refused.
+/// - Canonicalising the root but falling back to a lexical path is worse,
+///   because it fires on *innocent* input: a **dangling symlink** inside the
+///   tree — a figure reference whose bytes were never fetched, which the
+///   importer is meant to record rather than refuse — cannot canonicalise at
+///   all. Two coordinate systems, so it can never match.
+///
+/// So both sides go through [`resolve_best_effort`]: canonicalise the deepest
+/// ancestor that *does* resolve, then re-append the components below it.
+/// A dangling `/root/table-1.csv` resolves to `/root/table-1.csv` and is
+/// accepted; `/root/link -> /etc/passwd` resolves to `/etc/passwd` and is
+/// refused, because the symlink is followed before the comparison rather than
+/// after it. `Path::starts_with` compares whole components, so
+/// `/lib/papers/other` never passes for a child of `/lib/papers/this`.
 fn within_root(root: &Path, path: &Path) -> bool {
-    let resolved_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| lexical_normalise(path));
+    let resolved_root = resolve_best_effort(root);
+    let resolved = resolve_best_effort(path);
     resolved == resolved_root || resolved.starts_with(&resolved_root)
+}
+
+/// Canonicalise as much of `path` as exists, then re-attach the rest.
+///
+/// `canonicalize` is all-or-nothing: it fails outright on a dangling symlink,
+/// a path with a missing component, or a path whose parent is unreadable.
+/// Those are exactly the cases the importer must still reason about, so this
+/// walks up to the deepest ancestor that resolves and rebuilds downwards.
+/// The `..` in a path are resolved by the ancestor's own canonicalisation, so
+/// `tables/../../secrets.csv` cannot slip through.
+fn resolve_best_effort(path: &Path) -> PathBuf {
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return resolved;
+    }
+
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path;
+
+    while let Some(parent) = cursor.parent() {
+        let Some(name) = cursor.file_name().map(std::ffi::OsStr::to_os_string) else {
+            break;
+        };
+        tail.push(name);
+        cursor = parent;
+
+        if let Ok(mut resolved) = std::fs::canonicalize(cursor) {
+            for part in tail.iter().rev() {
+                resolved.push(part);
+            }
+            return resolved;
+        }
+    }
+
+    // Nothing along the chain resolved — fall back to a lexical reading,
+    // which still resolves `..` and is the conservative answer.
+    lexical_normalise(path)
 }
 
 /// Resolve `.` and `..` in a path without touching the file system.
@@ -1040,6 +1087,38 @@ mod symlink_containment_tests {
         assert!(
             !within_root(&via_link, &outside),
             "canonicalising the root must not turn a real escape into an accept"
+        );
+    }
+
+    /// The mirror bug, in the combination that makes it platform-independent:
+    /// a root reached through a symlink (so its two forms differ) *and* a
+    /// dangling symlink inside it (so the path cannot canonicalise).
+    ///
+    /// Before the fix the root was canonicalised to `/real` while the path
+    /// fell back to its lexical `/link` spelling, so the two were compared in
+    /// different coordinate systems and a dangling reference was reported as
+    /// an escape attempt. Recording such a reference is exactly what the
+    /// importer is for.
+    #[test]
+    fn a_dangling_reference_inside_a_symlinked_root_is_not_an_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let via_link = dir.path().join("link-to-real");
+        std::os::unix::fs::symlink(&real, &via_link).unwrap();
+
+        let never_written = dir.path().join("never-written.csv");
+        let dangling = real.join("table-1.csv");
+        std::os::unix::fs::symlink(&never_written, &dangling).unwrap();
+        assert!(!dangling.exists(), "the reference must actually dangle");
+
+        assert!(
+            std::fs::canonicalize(&dangling).is_err(),
+            "precondition: the path cannot be canonicalised"
+        );
+        assert!(
+            within_root(&via_link, &dangling),
+            "a dangling reference inside the root is content, not an escape"
         );
     }
 }
