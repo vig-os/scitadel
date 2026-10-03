@@ -154,7 +154,13 @@ jobs:
             echo "::endgroup::"
             sleep 20  # index propagation
           }
-          for crate in scitadel-core scitadel-db scitadel-adapters \
+          # ADR-007 §3 publish order: core, http, db, adapters, … The
+          # order matters because each crate is published against the
+          # version of the one before it, and `scitadel-adapters` grew a
+          # `scitadel-http` dependency in S1 — the download chain moved onto
+          # `PacedClient` — so `scitadel-http` has to reach crates.io first
+          # or the adapters publish fails on an unresolvable dependency.
+          for crate in scitadel-core scitadel-http scitadel-db scitadel-adapters \
                        scitadel-scoring scitadel-export \
                        scitadel-mcp scitadel-tui scitadel-cli; do
             publish_one "$crate"

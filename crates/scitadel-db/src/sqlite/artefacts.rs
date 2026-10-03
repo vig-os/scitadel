@@ -10,8 +10,8 @@
 //! The UNIQUE key is `UNIQUE (paper_id, kind, version, locator)` and the
 //! `id` is derived from exactly that key (see [`artefact_id`]), so a
 //! second run over the same inputs hits the same rows. What differs is
-//! *conflict handling*, because the two callers mean different things by
-//! "run it again":
+//! *conflict handling*, because the three callers mean different things
+//! by "run it again":
 //!
 //! - [`WriteMode::IgnoreExisting`] — [`crate::sqlite::backfill_legacy_artefacts`].
 //!   A legacy row is a fact about what was true when the library was
@@ -22,11 +22,17 @@
 //!   explicit command). If a file's bytes changed between runs the row
 //!   follows them; if nothing changed the update is skipped entirely, so
 //!   a no-op re-run touches no row and no timestamp.
+//! - [`WriteMode::Refetch`] — [`record_download`], a fresh fetch through
+//!   one named route. The row follows the route as well as the bytes,
+//!   which `Reconcile` deliberately does not: a re-download that
+//!   succeeds through arXiv where the first attempt fell through to the
+//!   publisher must not keep claiming `publisher`.
 
 use std::collections::HashSet;
 
 use rusqlite::params;
 use rusqlite::{Connection, TransactionBehavior};
+use scitadel_core::models::{AccessStatus, DownloadStatus, RouteId};
 use sha2::{Digest, Sha256};
 
 use crate::error::DbError;
@@ -120,6 +126,17 @@ pub enum WriteMode {
     /// Update the existing row **only** where a value actually
     /// differs, so an unchanged re-run rewrites nothing at all.
     Reconcile,
+    /// A fresh fetch through a named route: the row follows the
+    /// `route`, the `access_basis` that route establishes, the bytes and
+    /// the retrieval time.
+    ///
+    /// Distinct from [`Self::Reconcile`] in two ways, both load-bearing.
+    /// `route` is in the updated set, because a ladder walk can reach the
+    /// same work through a different step on a second attempt and the row
+    /// must say which one actually served it. And `retrieved_at` is in the
+    /// `WHERE` gate, because these bytes *were* fetched again — unlike a
+    /// re-scanned file tree, where "unchanged" really does mean unchanged.
+    Refetch,
 }
 
 /// A `blobs` row to `INSERT OR IGNORE`.
@@ -153,6 +170,14 @@ pub struct ArtefactWrite {
     pub label: Option<String>,
     pub caption: Option<String>,
     pub source_url: Option<String>,
+    /// A publisher label we can name, or `None` when the DOI's registrant
+    /// prefix is not in the table. Never a guess (#261).
+    pub publisher: Option<String>,
+    /// Why `publisher` is what it is — see migration 014. `Some` only
+    /// when we could *not* name one, and then only ever the verbatim
+    /// `RouteVerdict::PublisherUnknown` note, never a claim about TDM
+    /// route availability.
+    pub publisher_note: Option<String>,
     pub imported_from: Option<String>,
     pub retrieved_at: String,
     /// The path is recorded but we hold no usable bytes for it.
@@ -214,11 +239,29 @@ pub fn write_artefacts(
     if rows.is_empty() {
         return Ok(0);
     }
-    let statement = artefacts_insert(mode);
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let written = write_artefacts_in(&tx, rows, mode)?;
+    tx.commit()?;
+    Ok(written)
+}
+
+/// [`write_artefacts`], on a connection or transaction the **caller** owns.
+///
+/// This is the half that can join somebody else's transaction, which
+/// [`record_download`] needs: the artefact row and the legacy
+/// `papers` columns are one atomic fact, so they cannot each open their
+/// own. `&Connection` rather than a trait object because
+/// `rusqlite::Transaction` derefs to `Connection`, so the same call
+/// serves both and there is no second code path to keep in step.
+pub fn write_artefacts_in(
+    conn: &Connection,
+    rows: &[ArtefactWrite],
+    mode: WriteMode,
+) -> Result<usize, DbError> {
+    let statement = artefacts_insert(mode);
     for row in rows {
         if let Some(blob) = &row.blob {
-            tx.execute(
+            conn.execute(
                 "INSERT OR IGNORE INTO blobs (sha256, bytes, mime, rel_path, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
@@ -230,7 +273,7 @@ pub fn write_artefacts(
                 ],
             )?;
         }
-        tx.execute(
+        conn.execute(
             &statement,
             params![
                 if row.id.is_empty() {
@@ -250,13 +293,14 @@ pub fn write_artefacts(
                 row.label,
                 row.caption,
                 row.source_url,
+                row.publisher,
+                row.publisher_note,
                 row.imported_from,
                 row.retrieved_at,
                 i64::from(row.missing_on_disk),
             ],
         )?;
     }
-    tx.commit()?;
     Ok(rows.len())
 }
 
@@ -268,11 +312,26 @@ pub fn write_artefacts(
 /// make "changed nothing" untestable. `sha256`, `format` and
 /// `missing_on_disk` move together, so a replaced file is recorded as
 /// the new bytes rather than kept beside its old hash.
+///
+/// `Refetch` moves `route` and `access_basis` too, because these bytes
+/// arrived through a named route that established a basis, and a row
+/// left claiming the previous route's answer would misreport where the
+/// bytes came from and what may be done with them.
+///
+/// It also clears `imported_from`, which is the one field a fetch must
+/// take away rather than set: a re-download that collides with a
+/// backfilled or flat-imported row (same paper, kind, version and
+/// locator) would otherwise keep citing the *old* file's absolute path
+/// beside bytes fetched from somewhere else entirely. `label` and
+/// `caption` are deliberately left alone — they belong to the
+/// `si`/`table`/`figure` slots, which no fetch writes today, and nulling
+/// them would destroy a caption the fetch knows nothing about.
 fn artefacts_insert(mode: WriteMode) -> String {
-    let values = "(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)";
+    let values =
+        "(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)";
     let columns = "(id, paper_id, kind, version, locator, sha256, format, access_status,
-                   route, access_basis, label, caption, source_url, imported_from,
-                   retrieved_at, missing_on_disk)";
+                   route, access_basis, label, caption, source_url, publisher,
+                   publisher_note, imported_from, retrieved_at, missing_on_disk)";
     match mode {
         WriteMode::IgnoreExisting => {
             format!("INSERT OR IGNORE INTO artefacts {columns} VALUES {values}")
@@ -297,7 +356,191 @@ fn artefacts_insert(mode: WriteMode) -> String {
                 OR artefacts.retrieved_at IS NOT excluded.retrieved_at
                 OR artefacts.missing_on_disk IS NOT excluded.missing_on_disk"
         ),
+        WriteMode::Refetch => format!(
+            "INSERT INTO artefacts {columns} VALUES {values}
+             ON CONFLICT (paper_id, kind, version, locator) DO UPDATE SET
+               sha256 = excluded.sha256,
+               format = excluded.format,
+               access_status = excluded.access_status,
+               route = excluded.route,
+               access_basis = excluded.access_basis,
+               source_url = excluded.source_url,
+               publisher = excluded.publisher,
+               publisher_note = excluded.publisher_note,
+               imported_from = excluded.imported_from,
+               retrieved_at = excluded.retrieved_at
+             WHERE artefacts.sha256 IS NOT excluded.sha256
+                OR artefacts.format IS NOT excluded.format
+                OR artefacts.access_status IS NOT excluded.access_status
+                OR artefacts.route IS NOT excluded.route
+                OR artefacts.access_basis IS NOT excluded.access_basis
+                OR artefacts.source_url IS NOT excluded.source_url
+                OR artefacts.publisher IS NOT excluded.publisher
+                OR artefacts.publisher_note IS NOT excluded.publisher_note
+                OR artefacts.imported_from IS NOT excluded.imported_from
+                OR artefacts.retrieved_at IS NOT excluded.retrieved_at"
+        ),
     }
+}
+
+/// One completed download, ready to be recorded against a work.
+///
+/// Everything the caller *decided* is here; everything the schema
+/// *derives* is not. `kind`, `format` and `mime` come from `ext` through
+/// [`fulltext_kind`], and `version` / `access_basis` come from
+/// [`RouteId`] — so no caller can pair a route with another route's
+/// licence answer, which is the drift #261 exists to stop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadWrite {
+    /// The work these bytes belong to. Must already be a `papers` row.
+    pub paper_id: String,
+    /// Which ladder step served them (ADR-007 §3).
+    pub route: RouteId,
+    /// File extension of what we stored: `pdf`, `html`, `xml`…
+    pub ext: String,
+    pub access_status: AccessStatus,
+    /// The URL the bytes came from, after redirects.
+    pub source_url: Option<String>,
+    /// A publisher we can name, or `None`.
+    pub publisher: Option<String>,
+    /// Why `publisher` is empty — see [`ArtefactWrite::publisher_note`].
+    pub publisher_note: Option<String>,
+    /// RFC 3339 UTC: when these bytes were fetched.
+    pub retrieved_at: String,
+    /// The content-addressed copy. `None` means the caller could not put
+    /// the bytes in the store, which is a reason to refuse the whole
+    /// write rather than to record a row pointing at nothing.
+    pub blob: Option<BlobWrite>,
+    /// The legacy `papers.local_path`: the compatibility copy under
+    /// `papers_dir` that `find_cached_file` and `read_paper` still read.
+    pub local_path: String,
+    /// The legacy `papers.download_status`.
+    pub download_status: DownloadStatus,
+}
+
+/// Record one completed download, dual-writing ADR-007 §1's two shapes in
+/// a **single** `BEGIN IMMEDIATE`: the `blobs` row, the `artefacts` row,
+/// and the three legacy `papers` columns.
+///
+/// One transaction, not three, because the two shapes are one fact. A
+/// `papers` row saying "downloaded" beside an `artefacts` table that has
+/// never heard of the file is the exact divergence ADR-007 §1 exists to
+/// end — and S1 keeps writing both precisely so `find_cached_file` and
+/// `read_paper` do not break before S2 moves them.
+///
+/// `INSERT OR IGNORE` on `blobs` is deliberate even though the artefact
+/// row is an upsert: the blob store is content-addressed, so an existing
+/// row is by definition the same bytes, and rewriting its `created_at`
+/// would break the backfill's "a second run changes nothing" guarantee.
+/// The `artefacts` row itself uses [`WriteMode::Refetch`], because a
+/// re-download *did* happen: it must move `route`, `sha256` and
+/// `retrieved_at`.
+///
+/// # Errors
+///
+/// `DbError` if anything about the write fails. Three refusals in
+/// particular:
+///
+/// - a route with no `artefact_version()` or no `access_basis()`. Both
+///   columns are `NOT NULL`, and "this route establishes no basis" must
+///   not become a guess — a hard error keeps the caller from inventing
+///   one;
+/// - an extension outside the `kind` vocabulary, for the same reason
+///   `fulltext_kind` exists: filing a `.docx` as `fulltext_html` would
+///   make coverage claim a full text we cannot read;
+/// - a `paper_id` with no `papers` row. With `PRAGMA foreign_keys` on —
+///   which every connection out of [`crate::sqlite::Database`] has — the
+///   artefacts insert is what refuses, and the error names the foreign
+///   key. The explicit `updated != 1` check below exists for a bare
+///   connection without the pragma, where the same mistake would
+///   otherwise be a silently skipped legacy write.
+///
+/// The caller propagates all of them: **a download that cannot be
+/// recorded is not a completed download.**
+pub fn record_download(conn: &mut Connection, write: &DownloadWrite) -> Result<(), DbError> {
+    let kind = fulltext_kind(&write.ext).ok_or_else(|| {
+        DbError::Migration(format!(
+            "{:?} is not a full-text kind, so a download of it cannot be recorded as an artefact",
+            write.ext
+        ))
+    })?;
+    // `version` and `access_basis` are both NOT NULL, and both are route
+    // *answers* rather than defaults: a route that establishes neither is
+    // a pseudo-route, and a pseudo-route has no bytes to record.
+    let version = write.route.artefact_version().ok_or_else(|| {
+        DbError::Migration(format!(
+            "route {} establishes no artefact version — it is a pseudo-route that never fetches",
+            write.route.label()
+        ))
+    })?;
+    let access_basis = write.route.access_basis().ok_or_else(|| {
+        DbError::Migration(format!(
+            "route {} establishes no access basis; access_basis is NOT NULL and \
+             \"we did not look\" must not be recorded as a guess",
+            write.route.label()
+        ))
+    })?;
+    let blob = write.blob.clone().ok_or_else(|| {
+        DbError::Migration(format!(
+            "no blob recorded for the {} download of {}",
+            write.route.label(),
+            write.paper_id
+        ))
+    })?;
+
+    let row = ArtefactWrite {
+        // Derived, not generated: see [`artefact_id`].
+        id: String::new(),
+        paper_id: write.paper_id.clone(),
+        kind: kind.kind.to_string(),
+        version: version.to_string(),
+        locator: FULLTEXT_LOCATOR.to_string(),
+        sha256: Some(blob.sha256.clone()),
+        format: Some(kind.format.to_string()),
+        access_status: write.access_status.label().to_string(),
+        route: write.route.label().to_string(),
+        access_basis: access_basis.to_string(),
+        label: None,
+        caption: None,
+        source_url: write.source_url.clone(),
+        publisher: write.publisher.clone(),
+        publisher_note: write.publisher_note.clone(),
+        imported_from: None,
+        retrieved_at: write.retrieved_at.clone(),
+        missing_on_disk: false,
+        blob: Some(blob),
+    };
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // blobs, then artefacts: artefacts.sha256 is a foreign key into blobs.
+    write_artefacts_in(&tx, std::slice::from_ref(&row), WriteMode::Refetch)?;
+    // The legacy shape, same statement batch, same transaction. One
+    // timestamp for `last_attempt_at` and `updated_at`, which is what
+    // `SqlitePaperRepository::update_download_state` has always written.
+    let updated = tx.execute(
+        "UPDATE papers SET local_path = ?1, download_status = ?2,
+                          last_attempt_at = ?3, updated_at = ?3
+         WHERE id = ?4",
+        params![
+            write.local_path,
+            write.download_status.as_str(),
+            write.retrieved_at,
+            write.paper_id
+        ],
+    )?;
+    if updated != 1 {
+        // Unreachable while `PRAGMA foreign_keys` is on — the artefacts
+        // insert above would already have refused. Checked anyway, because
+        // a silently-skipped legacy write is the divergence this whole
+        // function exists to make impossible, and the message is the one
+        // thing a caller can act on.
+        return Err(DbError::Migration(format!(
+            "no papers row for {}, so the legacy columns could not be dual-written",
+            write.paper_id
+        )));
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 /// Upsert `acquisition_state` rows, returning how many were written.
@@ -403,6 +646,8 @@ mod tests {
             label: None,
             caption: None,
             source_url: None,
+            publisher: None,
+            publisher_note: None,
             imported_from: Some("/tmp/x.pdf".into()),
             retrieved_at: "2026-01-01T00:00:00+00:00".into(),
             missing_on_disk: false,
@@ -437,21 +682,44 @@ mod tests {
         (dir, db)
     }
 
-    fn artefacts_of(db: &Database) -> Vec<(String, String, Option<String>, String)> {
+    /// One artefact row as a named tuple, so the tests above can say which
+    /// column they mean.
+    #[derive(Debug, PartialEq, Eq)]
+    struct ArtefactRow {
+        kind: String,
+        locator: String,
+        sha256: Option<String>,
+        retrieved_at: String,
+        route: String,
+        access_basis: String,
+        version: String,
+        format: Option<String>,
+        access_status: String,
+        imported_from: Option<String>,
+    }
+
+    fn artefacts_of(db: &Database) -> Vec<ArtefactRow> {
         let conn = db.conn().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT kind, locator, sha256, retrieved_at FROM artefacts
-                 ORDER BY kind, locator",
+                "SELECT kind, locator, sha256, retrieved_at, route, access_basis, version,
+                        format, access_status, imported_from
+                 FROM artefacts ORDER BY kind, locator",
             )
             .unwrap();
         stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Option<String>>(2)?,
-                r.get::<_, String>(3)?,
-            ))
+            Ok(ArtefactRow {
+                kind: r.get(0)?,
+                locator: r.get(1)?,
+                sha256: r.get(2)?,
+                retrieved_at: r.get(3)?,
+                route: r.get(4)?,
+                access_basis: r.get(5)?,
+                version: r.get(6)?,
+                format: r.get(7)?,
+                access_status: r.get(8)?,
+                imported_from: r.get(9)?,
+            })
         })
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
@@ -488,7 +756,11 @@ mod tests {
 
         let rows = artefacts_of(&db);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].2.as_deref(), Some("aaa"), "the first write wins");
+        assert_eq!(
+            rows[0].sha256.as_deref(),
+            Some("aaa"),
+            "the first write wins"
+        );
     }
 
     /// Reconcile follows a changed file, but an unchanged re-run leaves
@@ -523,8 +795,11 @@ mod tests {
         )
         .unwrap();
         let after = artefacts_of(&db);
-        assert_eq!(after[0].2.as_deref(), Some("bbb"));
-        assert_eq!(after[0].1, first[0].1, "locator is the stable key");
+        assert_eq!(after[0].sha256.as_deref(), Some("bbb"));
+        assert_eq!(
+            after[0].locator, first[0].locator,
+            "locator is the stable key"
+        );
     }
 
     /// `retrieved_at` is *when the content was retrieved*, not when the
@@ -544,7 +819,281 @@ mod tests {
         let mut later = row("fulltext_pdf", "", "aaa");
         later.retrieved_at = "2027-06-06T06:06:06+00:00".into();
         write_artefacts(&mut conn, &[later], WriteMode::Reconcile).unwrap();
-        assert_eq!(artefacts_of(&db)[0].3, "2027-06-06T06:06:06+00:00");
+        assert_eq!(
+            artefacts_of(&db)[0].retrieved_at,
+            "2027-06-06T06:06:06+00:00"
+        );
+    }
+
+    // ---------- record_download: the dual write ----------
+
+    /// A download of `route` for `p-1`, with one content digest.
+    fn download(route: RouteId, sha: &str, retrieved_at: &str) -> DownloadWrite {
+        DownloadWrite {
+            paper_id: "p-1".into(),
+            route,
+            ext: "pdf".into(),
+            access_status: AccessStatus::FullText,
+            source_url: Some("https://example.org/paper.pdf".into()),
+            publisher: Some("nature".into()),
+            publisher_note: None,
+            retrieved_at: retrieved_at.into(),
+            blob: Some(BlobWrite {
+                sha256: sha.into(),
+                bytes: 4,
+                mime: "application/pdf".into(),
+                rel_path: format!("blobs/{}/{sha}.pdf", &sha[..2]),
+                created_at: retrieved_at.into(),
+            }),
+            local_path: "/library/papers/p-1.pdf".into(),
+            download_status: DownloadStatus::Downloaded,
+        }
+    }
+
+    fn legacy_of(db: &Database) -> (Option<String>, Option<String>, Option<String>) {
+        let conn = db.conn().unwrap();
+        conn.query_row(
+            "SELECT local_path, download_status, last_attempt_at FROM papers WHERE id = 'p-1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    /// ADR-007 §1 "Legacy data": one transaction writes the artefact row
+    /// *and* the legacy columns, from the route's own answers. Both shapes
+    /// have to be present or S2 has nothing to migrate to and the TUI's
+    /// state column has nothing to read.
+    #[test]
+    fn a_download_records_the_artefact_and_the_legacy_columns_together() {
+        let (_dir, db) = open();
+        let mut conn = db.conn().unwrap();
+        record_download(
+            &mut conn,
+            &download(RouteId::Arxiv, "aaa", "2026-01-01T00:00:00+00:00"),
+        )
+        .unwrap();
+
+        let rows = artefacts_of(&db);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].kind, "fulltext_pdf");
+        assert_eq!(rows[0].format.as_deref(), Some("pdf"));
+        assert_eq!(rows[0].route, "arxiv");
+        assert_eq!(
+            rows[0].access_basis, "oa_license",
+            "the basis comes from the route, not from the caller"
+        );
+        assert_eq!(rows[0].version, "preprint");
+        assert_eq!(rows[0].access_status, "full_text");
+        assert_eq!(rows[0].sha256.as_deref(), Some("aaa"));
+        assert_eq!(rows[0].imported_from, None, "a fetch imports nothing");
+
+        let (local_path, status, attempted) = legacy_of(&db);
+        assert_eq!(
+            local_path.as_deref(),
+            Some("/library/papers/p-1.pdf"),
+            "the compatibility copy is still recorded"
+        );
+        assert_eq!(status.as_deref(), Some("downloaded"));
+        assert_eq!(
+            attempted.as_deref(),
+            Some("2026-01-01T00:00:00+00:00"),
+            "one stamp for the whole write"
+        );
+
+        let blobs: i64 = {
+            let conn = db.conn().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(blobs, 1);
+    }
+
+    /// A re-download *did* happen, so the row follows the new route rather
+    /// than keeping the old answer beside new bytes. `Reconcile` would not
+    /// do this: it deliberately leaves `route` alone, because a re-scanned
+    /// file tree never changes provenance.
+    #[test]
+    fn a_re_download_moves_the_row_to_the_route_that_served_it() {
+        let (_dir, db) = open();
+        let mut conn = db.conn().unwrap();
+        // Unpaywall -> Publisher: both `unknown` (so they share the UNIQUE
+        // key), and they establish *different* access bases, so this moves
+        // the route and the licence answer together.
+        record_download(
+            &mut conn,
+            &download(RouteId::Unpaywall, "aaa", "2026-01-01T00:00:00+00:00"),
+        )
+        .unwrap();
+        assert_eq!(artefacts_of(&db)[0].route, "unpaywall");
+
+        record_download(
+            &mut conn,
+            &download(RouteId::Publisher, "bbb", "2027-06-06T06:06:06+00:00"),
+        )
+        .unwrap();
+
+        let rows = artefacts_of(&db);
+        assert_eq!(rows.len(), 1, "same (paper, kind, version, locator)");
+        assert_eq!(rows[0].route, "publisher", "the route moves with the bytes");
+        assert_eq!(
+            rows[0].access_basis, "subscription_read",
+            "and so does the basis that route established"
+        );
+        assert_eq!(rows[0].sha256.as_deref(), Some("bbb"));
+        assert_eq!(rows[0].retrieved_at, "2027-06-06T06:06:06+00:00");
+    }
+
+    /// A download that collides with a row the backfill or the flat
+    /// importer left behind takes the row over — and takes its
+    /// `imported_from` with it. Citing the old file's absolute path beside
+    /// bytes fetched from a publisher would be a provenance lie, and
+    /// absolute paths break when a library moves anyway.
+    #[test]
+    fn a_download_over_an_imported_row_takes_its_provenance_with_it() {
+        let (_dir, db) = open();
+        let mut conn = db.conn().unwrap();
+        // A backfilled legacy row: `unknown` version, manual basis, and an
+        // absolute `imported_from` — exactly what `write_artefacts` in
+        // `IgnoreExisting` leaves behind.
+        write_artefacts(
+            &mut conn,
+            &[row("fulltext_pdf", FULLTEXT_LOCATOR, "aaa")],
+            WriteMode::IgnoreExisting,
+        )
+        .unwrap();
+        assert_eq!(
+            artefacts_of(&db)[0].imported_from.as_deref(),
+            Some("/tmp/x.pdf"),
+            "the import recorded where the file was"
+        );
+
+        record_download(
+            &mut conn,
+            &download(RouteId::Unpaywall, "bbb", "2026-01-01T00:00:00+00:00"),
+        )
+        .unwrap();
+
+        let rows = artefacts_of(&db);
+        assert_eq!(rows.len(), 1, "same (paper, kind, version, locator)");
+        assert_eq!(rows[0].route, "unpaywall");
+        assert_eq!(
+            rows[0].imported_from, None,
+            "the fetched row cites no imported path"
+        );
+    }
+
+    /// `version` is part of the UNIQUE key, so a re-download that *changes*
+    /// the version is a **second** artefact rather than an update — which is
+    /// the point: an arXiv preprint and a publisher's version of record are
+    /// two different things we hold, and neither may be overwritten by the
+    /// other.
+    #[test]
+    fn a_re_download_that_changes_the_version_adds_an_artefact() {
+        let (_dir, db) = open();
+        let mut conn = db.conn().unwrap();
+        record_download(
+            &mut conn,
+            &download(RouteId::Unpaywall, "aaa", "2026-01-01T00:00:00+00:00"),
+        )
+        .unwrap();
+        record_download(
+            &mut conn,
+            &download(RouteId::Arxiv, "bbb", "2027-06-06T06:06:06+00:00"),
+        )
+        .unwrap();
+
+        let mut rows = artefacts_of(&db);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        rows.sort_by(|a, b| a.version.cmp(&b.version));
+        assert_eq!(rows[0].version, "preprint");
+        assert_eq!(rows[1].version, "unknown");
+        let blobs: i64 = {
+            let conn = db.conn().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(blobs, 2, "two byte sequences, two blobs");
+    }
+
+    /// `version` and `access_basis` are `NOT NULL`, and neither is a
+    /// defaultable value: "this route establishes no basis" has no
+    /// spelling. A pseudo-route (no version) and a discovery route (no
+    /// basis) therefore have to be refused rather than defaulted.
+    #[test]
+    fn a_route_that_establishes_nothing_is_refused_not_defaulted() {
+        let (_dir, db) = open();
+        let mut conn = db.conn().unwrap();
+
+        // A pseudo-route: `never_fetches()` is true, so no version exists.
+        let err = record_download(
+            &mut conn,
+            &download(RouteId::Legacy, "aaa", "2026-01-01T00:00:00+00:00"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("legacy"), "{err}");
+
+        // A discovery route: it answers "where do the bytes live", not
+        // "may we keep them", so `access_basis()` is `None`.
+        let err = record_download(
+            &mut conn,
+            &download(RouteId::Crossref, "aaa", "2026-01-01T00:00:00+00:00"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("access_basis"), "{err}");
+
+        assert!(
+            artefacts_of(&db).is_empty(),
+            "a refused write leaves nothing behind"
+        );
+    }
+
+    /// `artefacts.kind` is a closed vocabulary, so an extension outside it
+    /// gets no row rather than a reclassified one.
+    #[test]
+    fn an_extension_outside_the_kind_vocabulary_is_refused() {
+        let (_dir, db) = open();
+        let mut conn = db.conn().unwrap();
+        let mut write = download(RouteId::Arxiv, "aaa", "2026-01-01T00:00:00+00:00");
+        write.ext = "docx".into();
+        let err = record_download(&mut conn, &write).unwrap_err();
+        assert!(err.to_string().contains("docx"), "{err}");
+        assert!(artefacts_of(&db).is_empty());
+    }
+
+    /// A work that is not in `papers` cannot be recorded — the two shapes
+    /// are one atomic fact, so there is no such thing as "the artefact row
+    /// but not the legacy columns".
+    #[test]
+    fn a_download_for_a_work_that_does_not_exist_records_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("scitadel.db")).unwrap();
+        db.migrate().unwrap();
+        let mut conn = db.conn().unwrap();
+
+        // `PRAGMA foreign_keys` is on, so the artefacts insert itself is
+        // what refuses — the `updated != 1` check behind it is defence in
+        // depth for a connection without the pragma. Either way the answer
+        // is the same, and the message names the constraint rather than the
+        // paper.
+        let err = record_download(
+            &mut conn,
+            &download(RouteId::Arxiv, "aaa", "2026-01-01T00:00:00+00:00"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("foreign key"),
+            "{err}"
+        );
+
+        let artefacts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM artefacts", [], |r| r.get(0))
+            .unwrap();
+        let blobs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(artefacts, 0, "no partial artefact row");
+        assert_eq!(blobs, 0, "and the blobs row rolled back with it");
     }
 
     /// Two tables coexist only because `locator` differs.
@@ -566,7 +1115,7 @@ mod tests {
         let rows = artefacts_of(&db);
         assert_eq!(rows.len(), 2);
         assert_eq!(
-            rows.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(),
+            rows.iter().map(|r| r.locator.as_str()).collect::<Vec<_>>(),
             vec!["table-1", "table-2"]
         );
     }

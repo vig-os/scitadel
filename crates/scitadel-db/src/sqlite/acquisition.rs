@@ -315,6 +315,10 @@ fn plan_legacy_artefact(
         caption: None,
         source_url: None,
         sha256: blob.as_ref().map(|b| b.sha256.clone()),
+        // A legacy file records where the bytes came from, not who
+        // published them: the file predates any route we could name.
+        publisher: None,
+        publisher_note: None,
         imported_from: Some(absolute.to_string_lossy().into_owned()),
         retrieved_at: retrieved_at(row, now),
         blob,

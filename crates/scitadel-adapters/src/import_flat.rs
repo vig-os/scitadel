@@ -845,6 +845,10 @@ fn plan(
         label: (!full_text).then(|| candidate.label.clone()),
         caption: candidate.caption.clone(),
         source_url: None,
+        // A flat-layout tree records where the file *was*, not who
+        // published the work: no route looked, so no publisher is named.
+        publisher: None,
+        publisher_note: None,
         imported_from: Some(candidate.path.to_string_lossy().into_owned()),
         retrieved_at: modified_at(&candidate.path).unwrap_or(now).to_rfc3339(),
         missing_on_disk: false,

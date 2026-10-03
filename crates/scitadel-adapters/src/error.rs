@@ -29,6 +29,20 @@ pub enum AdapterError {
     #[error("I/O error: {0}")]
     Io(String),
 
+    /// A paced fetch that failed outright (ADR-007 §4). Kept typed rather
+    /// than flattened into [`Self::Network`] because `needs_login`,
+    /// `is_rate_limited` and `retry_at_ms` are decisions a caller makes on
+    /// the *variant*, and collapsing them loses exactly the distinctions the
+    /// `FetchError` split exists for.
+    #[error("paced fetch failed: {0}")]
+    Paced(#[from] scitadel_http::FetchError),
+
+    /// The dual-write of a completed download did not land. Propagated, not
+    /// logged: a download the library has no row for is not a completed
+    /// download.
+    #[error("database error: {0}")]
+    Db(#[from] scitadel_db::error::DbError),
+
     #[error("{0}")]
     Other(String),
 }

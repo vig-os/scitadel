@@ -2896,6 +2896,7 @@ dependencies = [
  "rusqlite",
  "scitadel-core",
  "scitadel-db",
+ "scitadel-http",
  "serde",
  "serde_json",
  "tempfile",

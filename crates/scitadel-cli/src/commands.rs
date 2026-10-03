@@ -841,8 +841,14 @@ pub async fn download(doi: &str, output_dir: Option<PathBuf>) -> Result<()> {
     let config = load_config();
     let out_dir = output_dir.unwrap_or_else(|| config.papers_dir());
 
+    // Opened up front so the downloader paces against the same SQLite
+    // ledger the rest of scitadel uses — two in-memory ledgers is the
+    // twice-the-traffic failure ADR-007 §4 exists to prevent.
+    let db = scitadel_db::sqlite::Database::open(&config.db_path)
+        .context("open database for the pacing ledger")?;
     let downloader =
-        scitadel_adapters::download::PaperDownloader::new(config.openalex.auth(), 60.0);
+        scitadel_adapters::download::PaperDownloader::new(db, config.openalex.auth(), 60.0)
+            .context("build the downloader")?;
 
     println!("Downloading paper: {doi}");
     println!("  Output dir: {}", out_dir.display());
@@ -856,7 +862,7 @@ pub async fn download(doi: &str, output_dir: Option<PathBuf>) -> Result<()> {
     let result = result.context("download failed")?;
 
     println!("  Format: {}", result.format);
-    println!("  Source: {}", result.source);
+    println!("  Source: {}", result.source());
     println!("  Access: {}", result.access);
     println!("  Size:   {} bytes", result.bytes);
     println!("  Saved:  {}", result.path.display());

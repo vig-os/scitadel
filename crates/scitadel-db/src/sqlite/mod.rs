@@ -22,10 +22,10 @@ pub use annotations::{SqliteAnnotationRepository, resolve_anchor};
 /// `acquisition_state` writers. Shared by the legacy backfill and the
 /// flat-layout importer (`scitadel_adapters::import_flat`).
 pub use artefacts::{
-    ACCESS_BASIS_MANUAL, ArtefactWrite, BlobWrite, FULLTEXT_LOCATOR, FulltextKind,
+    ACCESS_BASIS_MANUAL, ArtefactWrite, BlobWrite, DownloadWrite, FULLTEXT_LOCATOR, FulltextKind,
     ROUTE_IMPORT_FLAT, StateWrite, VERSION_UNKNOWN, WriteMode, artefact_id,
-    delete_acquisition_states_at, fulltext_kind, has_fulltext_artefact, write_acquisition_states,
-    write_artefacts,
+    delete_acquisition_states_at, fulltext_kind, has_fulltext_artefact, record_download,
+    write_acquisition_states, write_artefacts, write_artefacts_in,
 };
 pub use assessments::SqliteAssessmentRepository;
 /// ADR-007 §1 "Storage": the content-addressed blob store.
@@ -262,6 +262,18 @@ impl Database {
     ) -> Result<usize, DbError> {
         let mut conn = self.pool.get()?;
         artefacts::write_artefacts(&mut conn, rows, mode)
+    }
+
+    /// ADR-007 §1 "Legacy data": record one completed download, writing
+    /// the `artefacts` row and the legacy `papers` columns in a single
+    /// transaction. See [`record_download`].
+    ///
+    /// A method for the same reason as [`Self::write_artefacts`]: the
+    /// download chain lives outside this crate and must not need a direct
+    /// `rusqlite` dependency to record what it fetched.
+    pub fn record_download(&self, write: &DownloadWrite) -> Result<(), DbError> {
+        let mut conn = self.pool.get()?;
+        artefacts::record_download(&mut conn, write)
     }
 
     /// ADR-007 §1: record one wanted-but-absent artefact. See

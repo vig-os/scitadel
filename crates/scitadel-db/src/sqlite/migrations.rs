@@ -15,6 +15,7 @@ const MIGRATION_010: &str = include_str!("../../migrations/010_shortlists.sql");
 const MIGRATION_011: &str = include_str!("../../migrations/011_paper_aliases.sql");
 const MIGRATION_012: &str = include_str!("../../migrations/012_paper_tags.sql");
 const MIGRATION_013: &str = include_str!("../../migrations/013_acquisition.sql");
+const MIGRATION_014: &str = include_str!("../../migrations/014_publisher_note.sql");
 
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, MIGRATION_001),
@@ -30,6 +31,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (11, MIGRATION_011),
     (12, MIGRATION_012),
     (13, MIGRATION_013),
+    (14, MIGRATION_014),
 ];
 
 /// Run all pending migrations, skipping already-applied ones.

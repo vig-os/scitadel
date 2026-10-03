@@ -13,7 +13,8 @@ readme = "../../README.md"
 
 [dependencies]
 scitadel-core = { path = "../scitadel-core", version = "0.8.0" } # x-release-please-version
-scitadel-db = { path = "../scitadel-db", version = "0.8.0" } # x-release-please-version # ADR-007 §1: artefact + blob writes for the flat-layout importer
+scitadel-db = { path = "../scitadel-db", version = "0.8.0" } # x-release-please-version # ADR-007 §1: artefact + blob writes for the flat-layout importer and the download chain's dual-write
+scitadel-http = { path = "../scitadel-http", version = "0.8.0" } # x-release-please-version # ADR-007 §3: PacedClient is the only way a request leaves the process
 chrono = { workspace = true }
 reqwest = { workspace = true }
 quick-xml = { workspace = true }
