@@ -457,6 +457,26 @@ pub struct DownloadWrite {
 ///
 /// The caller propagates all of them: **a download that cannot be
 /// recorded is not a completed download.**
+///
+/// ## The want-list is retracted in the same transaction (#260)
+///
+/// ADR-007 §1 states the invariant this transaction upholds:
+/// `acquisition_state` records only what we want and have not got. So when a
+/// download closes a gap, the gap goes — in this transaction, or a reader
+/// between the two writes would see a work that is both held and wanted, and
+/// `coverage` would report a full text we are already holding.
+///
+/// The delete is scoped twice over, because two writers share this table and
+/// only one of them writes a gap with no `drop_path`:
+///
+/// - `kind = 'fulltext'` and `locator = ''` — the full-text want, whatever
+///   serialisation the fetch turned out to be. SI, table and figure wants are
+///   not closed by a full-text download.
+/// - `drop_path IS NULL` — the acquisition ladder's signature. The flat
+///   importer's gap rows always carry the path a human should drop the file
+///   at, and are retracted by
+///   [`delete_acquisition_states_at`] with that exact path; this statement
+///   must not take them back on the ladder's behalf.
 pub fn record_download(conn: &mut Connection, write: &DownloadWrite) -> Result<(), DbError> {
     let kind = fulltext_kind(&write.ext).ok_or_else(|| {
         DbError::Migration(format!(
@@ -514,6 +534,14 @@ pub fn record_download(conn: &mut Connection, write: &DownloadWrite) -> Result<(
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     // blobs, then artefacts: artefacts.sha256 is a foreign key into blobs.
     write_artefacts_in(&tx, std::slice::from_ref(&row), WriteMode::Refetch)?;
+    // The full-text want this download just satisfied, retracted in the same
+    // transaction — see the docs above for the two clauses that keep the
+    // statement off the flat importer's rows.
+    tx.execute(
+        "DELETE FROM acquisition_state
+         WHERE paper_id = ?1 AND kind = 'fulltext' AND locator = '' AND drop_path IS NULL",
+        params![write.paper_id],
+    )?;
     // The legacy shape, same statement batch, same transaction. One
     // timestamp for `last_attempt_at` and `updated_at`, which is what
     // `SqlitePaperRepository::update_download_state` has always written.
@@ -1168,6 +1196,81 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM acquisition_state", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    /// #260: the acquisition ladder records a gap when a walk ends without
+    /// bytes, so a *later* successful download has to take it back — in the
+    /// same transaction, or a reader in between sees a work that is both held
+    /// and wanted, which is the divergence `acquisition_state` exists to
+    /// prevent.
+    ///
+    /// The three rows are the three ways this table gets written, and only the
+    /// first is the ladder's to retract: the importer's row carries a
+    /// `drop_path` (it is closed by that file arriving, not by a fetch), and
+    /// the SI want is a different `kind` that a full-text download does not
+    /// satisfy.
+    #[test]
+    fn a_download_retracts_the_full_text_want_it_satisfied() {
+        let (_dir, db) = open();
+        let mut conn = db.conn().unwrap();
+        for (kind, locator, drop_path) in [
+            ("fulltext", "", None),
+            ("fulltext", "", Some("/lib/papers/stem/fulltext.pdf")),
+            ("si", "table-1", None),
+        ] {
+            write_acquisition_states(
+                &mut conn,
+                &[StateWrite {
+                    paper_id: "p-1".into(),
+                    kind: kind.into(),
+                    locator: locator.into(),
+                    wanted_version: "vor".into(),
+                    status: "unavailable".into(),
+                    reason: Some("every route that could be tried refused".into()),
+                    hint_url: Some("https://doi.org/10.1038/s41586-020-2649-2".into()),
+                    drop_path: drop_path.map(str::to_string),
+                    updated_at: "2026-01-01T00:00:00+00:00".into(),
+                }],
+            )
+            .unwrap();
+        }
+
+        record_download(
+            &mut conn,
+            &download(RouteId::Biorxiv, "aaa", "2026-01-01T00:00:00+00:00"),
+        )
+        .unwrap();
+
+        let remaining: Vec<(String, String, Option<String>)> = {
+            let conn = db.conn().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT kind, locator, drop_path FROM acquisition_state ORDER BY kind, drop_path")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            remaining,
+            vec![
+                // The importer's row is left alone: it is closed by a file
+                // arriving at its drop_path, not by this fetch.
+                (
+                    "fulltext".to_string(),
+                    String::new(),
+                    Some("/lib/papers/stem/fulltext.pdf".to_string())
+                ),
+                // And an SI want is not satisfied by a full text.
+                ("si".to_string(), "table-1".to_string(), None),
+            ],
+            "only the ladder's own full-text want is retracted"
+        );
+        assert_eq!(
+            artefacts_of(&db).len(),
+            1,
+            "and the artefact that satisfied it is recorded"
+        );
     }
 
     #[test]

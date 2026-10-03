@@ -1,8 +1,29 @@
 //! The paper download chain, on `Route` + `PacedClient` (ADR-007 §3, S1).
 //!
-//! Four ladder steps in a fixed order — arXiv → OpenAlex → Unpaywall →
-//! publisher HTML — then the paper record's own `url` as a last resort.
-//! Two things changed shape in S1; the outputs did not.
+//! Six ladder steps in a fixed order — arXiv id → **preprint transform** →
+//! OpenAlex → Unpaywall → publisher HTML — then the paper record's own `url`
+//! as a last resort. Two things changed shape in S1; the outputs did not.
+//!
+//! ## The preprint leg runs before every index leg (#260)
+//!
+//! The step between arXiv and OpenAlex is not a search. For a `10.1101` or
+//! `10.48550` DOI it is a pure function of the DOI, in
+//! [`crate::preprint`], and it needs no index, no credential and no search —
+//! which is the point, because the run that opened #260 missed three of three
+//! bioRxiv preprints for exactly the opposite reason: OpenAlex's
+//! `best_oa_location.pdf_url` was null and the paper was declared
+//! unreachable by a publisher that serves it openly. It is charged
+//! [`PaceTier::Oa`] like any other OA host and records
+//! [`RouteId::Biorxiv`] or [`RouteId::Arxiv`].
+//!
+//! ## "No route tried" is not "no access" (#260)
+//!
+//! A walk that ends without bytes records an `acquisition_state` row, and the
+//! status is derived from *what the legs actually concluded* rather than from
+//! the fact that the walk ended. The distinction is the whole semantic fix:
+//! an index that answers "I have no location for this" is not evidence that
+//! the work is unobtainable, and a paper whose only leg was refused at the
+//! DOI gate has not been looked for at all. See `Ladder` below.
 //!
 //! ## Every fetch is paced, and one work is one work
 //!
@@ -83,8 +104,8 @@ use scitadel_core::models::{
 use scitadel_core::ports::{Bucket, PaceTier, Pacer};
 use scitadel_core::publisher::{PublisherVerdict, RouteVerdict, classify_publisher};
 use scitadel_db::sqlite::{
-    BlobWrite, Database, DownloadWrite, SqlitePacer, blob_rel_path, fulltext_kind, hash_file,
-    store_blob,
+    BlobWrite, Database, DownloadWrite, FULLTEXT_LOCATOR, SqlitePacer, StateWrite, blob_rel_path,
+    fulltext_kind, hash_file, store_blob,
 };
 use scitadel_http::{
     BucketPolicyTable, FetchError, PacedClient, PacedResponse, SafeHeaders, WorkScope,
@@ -92,6 +113,7 @@ use scitadel_http::{
 
 use crate::error::AdapterError;
 use crate::openalex::OPENALEX_API_URL;
+use crate::preprint::{self, PreprintBases};
 
 /// The format of a downloaded paper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,12 +268,18 @@ pub fn detect_access_status(html: &str) -> AccessStatus {
     }
 }
 
-/// The four services the ladder talks to.
+/// The services the ladder talks to.
 ///
-/// A value rather than four `const`s so a test can point the whole chain
+/// A value rather than several `const`s so a test can point the whole chain
 /// at one `wiremock` server. The defaults are byte-for-byte the URLs this
 /// chain has always used, which is what keeps "the same outputs as today"
 /// true of the request lines as well as of the printed lines.
+///
+/// `arxiv_pdf` serves two different legs — the record's own `arxiv_id`
+/// (which appends `.pdf`, the shape that chain has always sent) and the
+/// `10.48550` DOI transform (which does not, because that is the URL that
+/// was verified). One base, two paths, and the difference lives in
+/// [`crate::preprint`] where it belongs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Endpoints {
     /// Base of `GET {base}/{doi}?email=…`.
@@ -260,6 +288,9 @@ pub struct Endpoints {
     pub doi_resolver: String,
     /// Base of `GET {base}/{id}.pdf`.
     pub arxiv_pdf: String,
+    /// Base of `GET {base}/<doi>v<n>.full.pdf` — bioRxiv, which serves **both**
+    /// `10.1101` prefixes (#260).
+    pub biorxiv_content: String,
     /// Base of `GET {base}/{openalex_id}?mailto=…&api_key=…`.
     pub openalex_api: String,
 }
@@ -270,6 +301,7 @@ impl Default for Endpoints {
             unpaywall_api: "https://api.unpaywall.org/v2".to_string(),
             doi_resolver: "https://doi.org".to_string(),
             arxiv_pdf: "https://arxiv.org/pdf".to_string(),
+            biorxiv_content: PreprintBases::default().biorxiv_content,
             openalex_api: OPENALEX_API_URL.to_string(),
         }
     }
@@ -383,7 +415,9 @@ impl PaperDownloader {
     /// Nothing is dual-written here: there is no `Paper` row to write
     /// against, and inventing one is not this function's job. The CLI's
     /// `persist_cli_download_outcome` still records the outcome against
-    /// whatever row the DOI resolves to, exactly as before.
+    /// whatever row the DOI resolves to, exactly as before. For the same
+    /// reason there is no `acquisition_state` row either: the gap table is
+    /// keyed by `paper_id`.
     pub async fn download(
         &self,
         doi: &str,
@@ -401,6 +435,21 @@ impl PaperDownloader {
 
         let work = WorkScope::new();
 
+        // The same transform, in the same place relative to the index legs,
+        // for the same reason as in `download_paper`: `scitadel download <doi>`
+        // is a user-facing way to ask for exactly the DOIs in #260, and
+        // sending those to Unpaywall first is what reported them unreachable.
+        let stem = doi_to_filename(&normalized);
+        match self
+            .try_preprint(&work, &normalized, &stem, output_dir)
+            .await
+        {
+            Ok(fetched) => return self.finish(None, fetched).await,
+            Err(e) => {
+                tracing::info!(doi = %normalized, error = %e, "preprint transform failed, falling back to Unpaywall");
+            }
+        }
+
         match self.try_unpaywall(&work, &normalized, output_dir).await {
             Ok(fetched) => return self.finish(None, fetched).await,
             Err(e) => {
@@ -408,25 +457,42 @@ impl PaperDownloader {
             }
         }
 
+        // The DOI-only path has no `papers` row to record a gap against, so
+        // the leg error is simply propagated — exactly the error this
+        // function returned before #260.
         let fetched = self
             .download_publisher_html(&work, &normalized, output_dir)
-            .await?;
+            .await
+            .map_err(LegError::into_adapter)?;
         self.finish(None, fetched).await
     }
 
     /// Download a paper using every identifier available on the `Paper` record.
     ///
-    /// Priority — unchanged, and the whole point of a dual-write:
+    /// Priority — the four original steps, with the preprint transform spliced
+    /// in ahead of every index lookup (#260):
     /// 1. `arxiv_id` → direct arXiv PDF (no API call, always OA)
-    /// 2. `openalex_id` → OpenAlex `/works` API for `best_oa_location.pdf_url`
-    /// 3. `doi` → Unpaywall (existing path)
-    /// 4. `url` → download the landing page as HTML (last resort)
+    /// 2. `doi` → the preprint transform, when the DOI belongs to a preprint
+    ///    server we have a verified rule for (also no API call, always OA)
+    /// 3. `openalex_id` → OpenAlex `/works` API for `best_oa_location.pdf_url`
+    /// 4. `doi` → Unpaywall (existing path)
+    /// 5. `url` → download the landing page as HTML (last resort)
+    ///
+    /// Step 2 sits ahead of step 3 because it needs no index at all: a
+    /// preprint is free by construction, so asking an index where it might be
+    /// free is the wrong first question for it — and an index that answers
+    /// "no location" must never become the verdict, which is what #260 was.
     ///
     /// # Errors
     ///
     /// `AdapterError::NotFound` when the record offers nothing to try;
     /// otherwise whichever error stopped the walk, **including a failure to
     /// record a download that succeeded** — see the module docs.
+    ///
+    /// A walk that ends without bytes also records an `acquisition_state` row
+    /// whose status is derived from what the legs concluded, so "nothing was
+    /// tried" is never reported as "nothing is available". That record is
+    /// best-effort and never masks the error the caller is about to receive.
     pub async fn download_paper(
         &self,
         paper: &Paper,
@@ -440,68 +506,177 @@ impl PaperDownloader {
         })?;
 
         let stem = file_stem_for(paper);
-        // One scope for the whole walk: four legs of one work are one work
-        // to the publisher, so the `Work` permit is charged once per bucket
-        // and not once per leg.
+        // One scope for the whole walk: every leg of one work is one work to
+        // the publisher, so the `Work` permit is charged once per bucket and
+        // not once per leg.
         let work = WorkScope::new();
+        // What the legs concluded, for the `acquisition_state` row this walk
+        // writes if it ends without bytes (#260). See `Ladder` below.
+        let mut ladder = Ladder::default();
+
+        // The DOI gate, hoisted above every leg that reads it, so the preprint
+        // leg is gated by the same authority (#262) as the index legs instead
+        // of by a second opinion of its own. The *set* of DOIs that reach the
+        // wire is unchanged; what is new is that a rejection says why, and
+        // that it is recorded as a route that was refused before it could be
+        // tried rather than as a route that came back empty.
+        let doi = match paper.doi.as_deref().filter(|s| !s.trim().is_empty()) {
+            Some(raw) => match validate_doi_detailed(raw) {
+                Ok(normalized) => Some(normalized),
+                Err(reason) => {
+                    tracing::info!(
+                        doi = %raw,
+                        reason = %reason,
+                        "DOI rejected before any fetch; skipping the preprint, Unpaywall \
+                         and publisher legs (the paper's own URL is still tried)"
+                    );
+                    for leg in [Leg::Preprint, Leg::Unpaywall, Leg::Publisher] {
+                        ladder.gate(
+                            leg,
+                            format!("the DOI was rejected before any fetch: {reason}"),
+                        );
+                    }
+                    None
+                }
+            },
+            None => None,
+        };
 
         if let Some(id) = paper.arxiv_id.as_deref().filter(|s| !s.is_empty()) {
             match self.try_arxiv(&work, id, &stem, output_dir).await {
                 Ok(fetched) => return self.finish(Some(paper), fetched).await,
-                Err(e) => tracing::info!(arxiv_id = %id, error = %e, "arxiv fallback failed"),
+                Err(e) => {
+                    tracing::info!(arxiv_id = %id, error = %e, "arxiv fallback failed");
+                    ladder.record(Leg::ArxivId, e.outcome);
+                }
             }
+        } else {
+            ladder.skip(Leg::ArxivId, "the record carries no arxiv_id");
+        }
+
+        // Ahead of every index leg (#260): where a preprint's full text lives
+        // is a function of its DOI, so there is nothing to look up.
+        if let Some(normalized) = doi.as_deref() {
+            match self
+                .try_preprint(&work, normalized, &stem, output_dir)
+                .await
+            {
+                Ok(fetched) => return self.finish(Some(paper), fetched).await,
+                Err(e) => {
+                    tracing::info!(doi = %normalized, error = %e, "preprint transform failed");
+                    ladder.record(Leg::Preprint, e.outcome);
+                }
+            }
+        } else {
+            ladder.skip(Leg::Preprint, "the record carries no usable doi");
         }
 
         if let Some(id) = paper.openalex_id.as_deref().filter(|s| !s.is_empty()) {
             match self.try_openalex(&work, id, &stem, output_dir).await {
                 Ok(fetched) => return self.finish(Some(paper), fetched).await,
-                Err(e) => tracing::info!(openalex_id = %id, error = %e, "openalex fallback failed"),
+                Err(e) => {
+                    tracing::info!(openalex_id = %id, error = %e, "openalex fallback failed");
+                    ladder.record(Leg::OpenAlex, e.outcome);
+                }
             }
+        } else {
+            ladder.skip(Leg::OpenAlex, "the record carries no openalex_id");
         }
 
-        // The DOI gate. `validate_doi_detailed` is the same check
-        // `validate_doi` performs, so the *set* of DOIs that reach the wire
-        // is unchanged; what is new is that a rejection says why (#262).
-        if let Some(raw) = paper.doi.as_deref().filter(|s| !s.trim().is_empty()) {
-            match validate_doi_detailed(raw) {
-                Ok(normalized) => {
-                    match self.try_unpaywall(&work, &normalized, output_dir).await {
-                        Ok(fetched) => return self.finish(Some(paper), fetched).await,
-                        Err(e) => {
-                            tracing::info!(doi = %normalized, error = %e, "unpaywall fallback failed");
-                        }
-                    }
-                    match self
-                        .download_publisher_html(&work, &normalized, output_dir)
-                        .await
-                    {
-                        Ok(fetched) => return self.finish(Some(paper), fetched).await,
-                        Err(e) => {
-                            tracing::info!(doi = %normalized, error = %e, "publisher html fallback failed");
-                        }
-                    }
-                }
-                Err(reason) => {
-                    tracing::info!(
-                        doi = %raw,
-                        reason = %reason,
-                        "DOI rejected before any fetch; skipping the Unpaywall and \
-                         publisher legs (the paper's own URL is still tried)"
-                    );
+        if let Some(normalized) = doi.as_deref() {
+            match self.try_unpaywall(&work, normalized, output_dir).await {
+                Ok(fetched) => return self.finish(Some(paper), fetched).await,
+                Err(e) => {
+                    tracing::info!(doi = %normalized, error = %e, "unpaywall fallback failed");
+                    ladder.record(Leg::Unpaywall, e.outcome);
                 }
             }
+            match self
+                .download_publisher_html(&work, normalized, output_dir)
+                .await
+            {
+                Ok(fetched) => return self.finish(Some(paper), fetched).await,
+                Err(e) => {
+                    tracing::info!(doi = %normalized, error = %e, "publisher html fallback failed");
+                    ladder.record(Leg::Publisher, e.outcome);
+                }
+            }
+        } else {
+            // Recorded in walk order, so the reason enumerates every leg the
+            // walk considered — including the two it could not even start.
+            ladder.skip(Leg::Unpaywall, "the record carries no usable doi");
+            ladder.skip(Leg::Publisher, "the record carries no usable doi");
         }
 
         if let Some(url) = paper.url.as_deref().filter(|s| !s.is_empty()) {
-            let fetched = self
+            match self
                 .download_url_as_html(&work, url, &stem, output_dir)
-                .await?;
-            return self.finish(Some(paper), fetched).await;
+                .await
+            {
+                Ok(fetched) => return self.finish(Some(paper), fetched).await,
+                Err(e) => {
+                    // The same error this walk has always returned for a
+                    // failing last resort. The state row is extra
+                    // information about *why*, not a substitute for it, so it
+                    // is written first and can never replace this.
+                    let (error, outcome) = e.into_parts();
+                    ladder.record(Leg::ManualUrl, outcome);
+                    self.record_gap(paper, &ladder);
+                    return Err(error);
+                }
+            }
         }
+        ladder.skip(Leg::ManualUrl, "the record carries no url");
 
+        self.record_gap(paper, &ladder);
         Err(AdapterError::NotFound(
             "no arxiv_id, openalex_id, doi, or url to try".into(),
         ))
+    }
+
+    /// Record what the walk concluded as an `acquisition_state` gap.
+    ///
+    /// Best-effort by design, and the reason is worth stating: this row is
+    /// *about a failure*, so it must never become the failure the caller sees.
+    /// A work that is not in `papers` (a hand-built `Paper`, an MCP agent
+    /// racing a delete) makes the foreign key refuse, and the walk's own
+    /// error is the one worth returning. So a failure here is logged and
+    /// dropped, where a failure in [`Self::finish`] propagates — that one is
+    /// about a download that *succeeded*, which is a different thing.
+    fn record_gap(&self, paper: &Paper, ladder: &Ladder) {
+        let row = StateWrite {
+            paper_id: paper.id.as_str().to_string(),
+            kind: GAP_FULLTEXT_KIND.to_string(),
+            locator: FULLTEXT_LOCATOR.to_string(),
+            wanted_version: WANTED_VERSION_VOR.to_string(),
+            status: ladder.status().to_string(),
+            reason: Some(ladder.reason()),
+            hint_url: self.doi_hint_url(paper),
+            // Deliberately `None`: there is no file for a human to drop here.
+            // That absence is also what distinguishes this row from the flat
+            // importer's, which is retracted by its exact `drop_path`.
+            drop_path: None,
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        if let Err(e) = self.db.upsert_acquisition_state(&row) {
+            tracing::warn!(
+                paper_id = %paper.id,
+                status = %row.status,
+                error = %e,
+                "could not record the acquisition gap for this work; the walk's own \
+                 outcome is unaffected"
+            );
+        }
+    }
+
+    /// The DOI resolver page for this work, as the `hint_url` a human should
+    /// be pointed at — the one URL that is canonical for a paper whatever
+    /// route the ladder took or failed to take.
+    fn doi_hint_url(&self, paper: &Paper) -> Option<String> {
+        let raw = paper.doi.as_deref().filter(|s| !s.trim().is_empty())?;
+        validate_doi_detailed(raw)
+            .ok()
+            .map(|doi| self.endpoints.doi_url(&doi))
     }
 
     /// Write the legacy copy, store the blob, and dual-write the rows.
@@ -634,17 +809,137 @@ impl PaperDownloader {
         raw_url: &str,
         tier: PaceTier,
         what: &str,
-    ) -> Result<PacedResponse, AdapterError> {
+    ) -> Result<PacedResponse, LegError> {
         let url = Url::parse(raw_url).map_err(|e| {
             // Deliberately not echoing `raw_url`: the OpenAlex leg's URL
             // carries the API key as a query parameter, and an error string
             // is a log line.
-            AdapterError::Other(format!("could not build a request URL: {e}"))
+            LegError::gated(AdapterError::Other(format!(
+                "could not build a request URL: {e}"
+            )))
         })?;
         self.client
             .get_in_work(work, url, tier, SafeHeaders::unauthenticated())
             .await
             .map_err(|e| fetch_failure(what, e))
+    }
+
+    /// Try the DOI's deterministic preprint transform (#260).
+    ///
+    /// Ahead of every index leg, and for a reason that is about *access*
+    /// rather than about ordering: a preprint server serves its postings
+    /// openly and always has, so the ladder's first question about a `10.1101`
+    /// or `10.48550` DOI is not "where might this be free?" — which is what
+    /// OpenAlex was asked, and which answered null for every preprint in the
+    /// corpus that opened the issue — but "where does this DOI certainly
+    /// live?", which is a function of the DOI.
+    ///
+    /// Each candidate is charged [`PaceTier::Oa`] like any other OA host and
+    /// records the route that served it, so an artefact from this leg carries
+    /// `RouteId::Biorxiv` (or `Arxiv`) and inherits `version = 'preprint'` and
+    /// `access_basis = 'oa_license'` from the route rather than from a guess
+    /// made here.
+    ///
+    /// # Errors
+    ///
+    /// [`LegError`], with the *last* candidate's outcome when every candidate
+    /// missed: the un-versioned bioRxiv URL is the more permissive of the two,
+    /// so its verdict is the one that describes the leg as a whole.
+    async fn try_preprint(
+        &self,
+        work: &WorkScope,
+        doi: &str,
+        stem: &str,
+        output_dir: &Path,
+    ) -> Result<Fetched, LegError> {
+        let candidates = preprint::preprint_candidates_at(&self.preprint_bases(), doi);
+        let mut last: Option<LegError> = None;
+        for candidate in candidates {
+            match self
+                .preprint_candidate(work, &candidate, stem, output_dir)
+                .await
+            {
+                Ok(fetched) => {
+                    tracing::info!(
+                        doi = %doi,
+                        url = %candidate.url,
+                        route = candidate.route.label(),
+                        note = candidate.note,
+                        "preprint transform served the PDF with no index lookup"
+                    );
+                    return Ok(fetched);
+                }
+                Err(e) => {
+                    tracing::info!(
+                        doi = %doi,
+                        url = %candidate.url,
+                        error = %e,
+                        "preprint candidate missed"
+                    );
+                    last = Some(e);
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            LegError::skipped(preprint::no_transform_reason(doi).unwrap_or(NO_PREPRINT_ROUTE))
+        }))
+    }
+
+    /// Fetch one preprint candidate and classify what came back.
+    async fn preprint_candidate(
+        &self,
+        work: &WorkScope,
+        candidate: &preprint::PreprintCandidate,
+        stem: &str,
+        output_dir: &Path,
+    ) -> Result<Fetched, LegError> {
+        let url = &candidate.url;
+        let response = self
+            .get(work, url, PaceTier::Oa, candidate.route.label())
+            .await?;
+        // The arXiv transform carries no `.pdf` extension, so the URL cannot
+        // decide the format on its own — the same rule the OpenAlex leg
+        // already applies, shared rather than re-derived.
+        let is_pdf = looks_like_pdf(url, response.content_type());
+        // Read the URL off before `bytes()` consumes the response: this is the
+        // post-redirect URL, which is where the bytes actually live.
+        let source_url = response.url.to_string();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| fetch_failure("failed to read preprint bytes", e))?;
+
+        let (ext, format, access) = if is_pdf {
+            (PDF_EXT, DownloadFormat::Pdf, AccessStatus::FullText)
+        } else {
+            (HTML_EXT, DownloadFormat::Html, classify_html(&bytes))
+        };
+
+        Ok(Fetched {
+            reference: candidate.url.clone(),
+            path: output_dir.join(format!("{stem}.{ext}")),
+            bytes,
+            ext,
+            format,
+            access,
+            // A preprint server serves preprints: the route says so, and the
+            // `preprint` version claim comes from the route rather than from a
+            // judgement made here.
+            route: candidate.route,
+            source_url,
+            // The PDF we asked for, which is also the posting's canonical
+            // page — a human handed this URL sees the preprint.
+            publisher_url: Some(candidate.url.clone()),
+        })
+    }
+
+    /// The servers the preprint transforms are built against, taken from this
+    /// downloader's endpoints so one rule serves production and tests alike.
+    fn preprint_bases(&self) -> PreprintBases {
+        PreprintBases {
+            biorxiv_content: self.endpoints.biorxiv_content.clone(),
+            arxiv_pdf: self.endpoints.arxiv_pdf.clone(),
+        }
     }
 
     /// Query Unpaywall for an open-access PDF URL and download it.
@@ -653,7 +948,7 @@ impl PaperDownloader {
         work: &WorkScope,
         doi: &str,
         output_dir: &Path,
-    ) -> Result<Fetched, AdapterError> {
+    ) -> Result<Fetched, LegError> {
         // The polite-pool email is always present, even empty — that is the
         // request line this chain has always sent.
         let url = self.endpoints.unpaywall_url(doi, &self.openalex.email);
@@ -663,15 +958,25 @@ impl PaperDownloader {
             .text()
             .await
             .map_err(|e| fetch_failure("Unpaywall JSON parse failed", e))?;
-        let body: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| AdapterError::Parse(format!("Unpaywall JSON parse failed: {e}")))?;
+        let body: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+            LegError::inconclusive(AdapterError::Parse(format!(
+                "Unpaywall JSON parse failed: {e}"
+            )))
+        })?;
 
         let pdf_url = body
             .get("best_oa_location")
             .and_then(|loc| loc.get("url_for_pdf"))
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| {
-                AdapterError::NotFound("no open-access PDF found via Unpaywall".into())
+                // An index that answers "no location" is **not** evidence that
+                // the work is unobtainable. That single null field is what made
+                // #260 report three free preprints as unreachable, so this
+                // outcome is classified separately from a refusal and can never
+                // become a `no access` verdict.
+                LegError::no_location(AdapterError::NotFound(
+                    "no open-access PDF found via Unpaywall".into(),
+                ))
             })?;
 
         tracing::info!(doi = %doi, pdf_url = %pdf_url, "found OA PDF via Unpaywall");
@@ -702,7 +1007,7 @@ impl PaperDownloader {
         work: &WorkScope,
         doi: &str,
         output_dir: &Path,
-    ) -> Result<Fetched, AdapterError> {
+    ) -> Result<Fetched, LegError> {
         let doi_url = self.endpoints.doi_url(doi);
 
         let (bytes, source_url) = self
@@ -733,7 +1038,7 @@ impl PaperDownloader {
         arxiv_id: &str,
         stem: &str,
         output_dir: &Path,
-    ) -> Result<Fetched, AdapterError> {
+    ) -> Result<Fetched, LegError> {
         let (bytes, source_url) = self
             .download_body(
                 work,
@@ -763,15 +1068,19 @@ impl PaperDownloader {
         openalex_id: &str,
         stem: &str,
         output_dir: &Path,
-    ) -> Result<Fetched, AdapterError> {
+    ) -> Result<Fetched, LegError> {
         let id = openalex_id.trim_start_matches("https://openalex.org/");
         // Same credential pair as the search path: an unauthenticated
         // lookup is billed against the shared per-IP budget and starts
         // 429-ing once it's spent (#212). `Url`'s own encoder replaces the
         // hand-rolled `?{k}={v}` splicing, so the two parameters are sent
         // with the same names in the same order as before.
-        let mut api_url = Url::parse(&format!("{}/{id}", self.endpoints.openalex_api))
-            .map_err(|e| AdapterError::Other(format!("could not build the OpenAlex URL: {e}")))?;
+        let mut api_url =
+            Url::parse(&format!("{}/{id}", self.endpoints.openalex_api)).map_err(|e| {
+                LegError::gated(AdapterError::Other(format!(
+                    "could not build the OpenAlex URL: {e}"
+                )))
+            })?;
         {
             let mut query = api_url.query_pairs_mut();
             if !self.openalex.email.is_empty() {
@@ -788,8 +1097,11 @@ impl PaperDownloader {
             .text()
             .await
             .map_err(|e| fetch_failure("OpenAlex JSON parse failed", e))?;
-        let body: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| AdapterError::Parse(format!("OpenAlex JSON parse failed: {e}")))?;
+        let body: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+            LegError::inconclusive(AdapterError::Parse(format!(
+                "OpenAlex JSON parse failed: {e}"
+            )))
+        })?;
 
         let pdf_url = body
             .get("best_oa_location")
@@ -800,14 +1112,18 @@ impl PaperDownloader {
                     .and_then(|oa| oa.get("oa_url"))
                     .and_then(serde_json::Value::as_str)
             })
-            .ok_or_else(|| AdapterError::NotFound("OpenAlex reports no OA location".into()))?;
+            // As with Unpaywall: a null `pdf_url` is a fact about OpenAlex's
+            // index, not about the work's accessibility. It must never become
+            // the verdict (#260).
+            .ok_or_else(|| {
+                LegError::no_location(AdapterError::NotFound(
+                    "OpenAlex reports no OA location".into(),
+                ))
+            })?;
 
         // Metadata API to find it, OA host to serve it: two tiers, one route.
         let response = self.get(work, pdf_url, PaceTier::Oa, "OA URL").await?;
-        let is_pdf = pdf_url.to_lowercase().ends_with(".pdf")
-            || response
-                .content_type()
-                .is_some_and(|ct| ct.contains("application/pdf"));
+        let is_pdf = looks_like_pdf(pdf_url, response.content_type());
         // Read the URL off before `bytes()` consumes the response: this is
         // the post-redirect URL, which is where the bytes actually live.
         let source_url = response.url.to_string();
@@ -842,7 +1158,7 @@ impl PaperDownloader {
         url: &str,
         stem: &str,
         output_dir: &Path,
-    ) -> Result<Fetched, AdapterError> {
+    ) -> Result<Fetched, LegError> {
         let (bytes, source_url) = self.download_body(work, url, PaceTier::Oa, "URL").await?;
 
         let access = classify_html(&bytes);
@@ -871,7 +1187,7 @@ impl PaperDownloader {
         url: &str,
         tier: PaceTier,
         what: &str,
-    ) -> Result<(Vec<u8>, String), AdapterError> {
+    ) -> Result<(Vec<u8>, String), LegError> {
         let response = self.get(work, url, tier, what).await?;
         let source_url = response.url.to_string();
         let bytes = response
@@ -906,7 +1222,7 @@ struct Fetched {
     path: PathBuf,
 }
 
-/// The two full-text serialisations these four legs have ever stored.
+/// The two full-text serialisations these legs have ever stored.
 ///
 /// `fulltext_kind` turns each into the `kind` / `format` / `mime` triple on
 /// the way into the database, so there is one authority for what a `.pdf`
@@ -914,6 +1230,325 @@ struct Fetched {
 /// why it never has to decide what to do about a `.docx`.
 const PDF_EXT: &str = "pdf";
 const HTML_EXT: &str = "html";
+
+/// The `acquisition_state.kind` the ladder records its gap against.
+///
+/// The want is "a full text", not "a PDF": a work satisfied by an HTML
+/// landing page with its abstract has not had its full text obtained, and the
+/// gap must survive that. The serialisation belongs on the artefact row, which
+/// is where `kind = 'fulltext_pdf'` already lives.
+const GAP_FULLTEXT_KIND: &str = "fulltext";
+
+/// `acquisition_state.wanted_version` for a ladder gap.
+///
+/// The version of record, matching ADR-007 §2's default and what the flat
+/// importer records: a ladder gap is a gap against the published article,
+/// even when the only thing we could find was a preprint.
+const WANTED_VERSION_VOR: &str = "vor";
+
+/// The reason recorded when a DOI belongs to no preprint server this module
+/// has a rule for.
+const NO_PREPRINT_ROUTE: &str = "the DOI belongs to no preprint server with a verified route";
+
+/// One step of the ladder, named for a report rather than for a call site.
+///
+/// The reason this is an enum and not a `&'static str` per log line: the
+/// `acquisition_state.reason` this walk writes has to enumerate the routes it
+/// considered, and a set of hand-written strings cannot be counted on to stay
+/// in step with the walk that produces them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Leg {
+    /// The record's own `arxiv_id`, fetched directly.
+    ArxivId,
+    /// The DOI's preprint transform (#260).
+    Preprint,
+    /// OpenAlex `/works/{id}`.
+    OpenAlex,
+    /// Unpaywall `/v2/{doi}` and the PDF it resolves to.
+    Unpaywall,
+    /// The publisher page the DOI resolver lands on.
+    Publisher,
+    /// The paper record's own `url`.
+    ManualUrl,
+}
+
+impl Leg {
+    /// How the leg is named in the recorded reason.
+    fn name(self) -> &'static str {
+        match self {
+            Self::ArxivId => "arxiv id",
+            Self::Preprint => "preprint transform",
+            Self::OpenAlex => "openalex",
+            Self::Unpaywall => "unpaywall",
+            Self::Publisher => "doi.org publisher page",
+            Self::ManualUrl => "record url",
+        }
+    }
+}
+
+/// What one leg of the ladder concluded.
+///
+/// The classification is the whole of #260's semantic fix, so each variant
+/// answers a *different* question. The two that must never be confused are
+/// [`Self::NoLocation`] — an index that answered and named nothing, which is
+/// a fact about the index — and [`Self::Refused`] — a place that was asked and
+/// said no. Reading the first as the second is what reported three free
+/// bioRxiv preprints as unreachable, and it is why a walk cannot derive its
+/// status from the fact that it ended without bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LegOutcome {
+    /// No route applied to this work: no identifier to try, or a DOI no
+    /// verified transform claims. Contributes nothing either way — there was
+    /// nothing to evaluate.
+    Skipped { why: String },
+    /// A route applied and was refused before it could be tried: a DOI
+    /// rejected at the gate, a candidate URL that would not parse. The route
+    /// exists and is unevaluated, so no verdict may rest on it.
+    Gated { why: String },
+    /// Asked, and the place refused: a 4xx that is not 408 or 429.
+    Refused { status: u16 },
+    /// Asked, and the route had nothing to give: an index answered 200 and
+    /// named no OA location. **Not** evidence about access.
+    NoLocation { detail: String },
+    /// Asked, and we could not find out: transport failure, pacing refusal, a
+    /// login redirect, a 5xx, an unparseable body.
+    Inconclusive { detail: String },
+}
+
+impl LegOutcome {
+    /// Did this leg put something on the wire?
+    fn was_attempted(&self) -> bool {
+        matches!(
+            self,
+            Self::Refused { .. } | Self::NoLocation { .. } | Self::Inconclusive { .. }
+        )
+    }
+
+    /// Did the place itself say no?
+    fn was_refused(&self) -> bool {
+        matches!(self, Self::Refused { .. })
+    }
+
+    /// The clause this outcome contributes to the recorded reason.
+    fn clause(&self) -> String {
+        match self {
+            Self::Skipped { why } => format!("not applicable: {why}"),
+            Self::Gated { why } => format!("refused before it could be tried: {why}"),
+            Self::Refused { status } => format!("refused with HTTP {status}"),
+            Self::NoLocation { detail } => {
+                // Spelled out because this is the sentence a reader most needs
+                // to be told is *not* a verdict about the work.
+                format!("named no location ({detail}) — not evidence that the work is unavailable")
+            }
+            Self::Inconclusive { detail } => format!("could not be resolved: {detail}"),
+        }
+    }
+}
+
+/// A failed leg, carrying both the error the walk has always returned and the
+/// classification the ladder records.
+///
+/// Deliberately *not* a replacement for [`AdapterError`]: the caller of
+/// `download_paper` gets exactly the error it got before #260, because this
+/// slice must not change what a caller sees — only what the library records
+/// about the walk.
+#[derive(Debug)]
+struct LegError {
+    error: AdapterError,
+    outcome: LegOutcome,
+}
+
+impl LegError {
+    /// A place that was asked and said no.
+    fn refused(status: u16, message: String) -> Self {
+        Self {
+            error: AdapterError::Network(message),
+            outcome: LegOutcome::Refused { status },
+        }
+    }
+
+    /// A route that answered and had nothing to give.
+    fn no_location(error: AdapterError) -> Self {
+        Self {
+            outcome: LegOutcome::NoLocation {
+                detail: error.to_string(),
+            },
+            error,
+        }
+    }
+
+    /// A failure that says nothing about access either way.
+    fn inconclusive(error: AdapterError) -> Self {
+        Self {
+            outcome: LegOutcome::Inconclusive {
+                detail: error.to_string(),
+            },
+            error,
+        }
+    }
+
+    /// A route that existed and was refused before it could be tried.
+    fn gated(error: AdapterError) -> Self {
+        Self {
+            outcome: LegOutcome::Gated {
+                why: error.to_string(),
+            },
+            error,
+        }
+    }
+
+    /// No route applied — recorded for the preprint leg's absent transform,
+    /// and named rather than left as a bare `true`.
+    fn skipped(why: &'static str) -> Self {
+        Self {
+            error: AdapterError::NotFound(why.to_string()),
+            outcome: LegOutcome::Skipped {
+                why: why.to_string(),
+            },
+        }
+    }
+
+    /// The error the walk has always returned for this failure.
+    fn into_adapter(self) -> AdapterError {
+        self.error
+    }
+
+    /// The error and the outcome, without cloning either — used by the
+    /// last-resort leg, whose failure is both recorded and returned.
+    fn into_parts(self) -> (AdapterError, LegOutcome) {
+        (self.error, self.outcome)
+    }
+}
+
+impl std::fmt::Display for LegError {
+    /// Renders exactly what the walk has always logged for this failure.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, f)
+    }
+}
+
+/// What the walk tried, and what each leg concluded.
+///
+/// The input to the `acquisition_state.status` this walk records, and the
+/// reason #260's coverage claim could not be honest without it. The status is
+/// derived here — as a pure function of the outcomes, so it is testable
+/// without a database or a network — and the reason enumerates every leg in
+/// walk order, because "which routes were attempted" is the other half of the
+/// acceptance criterion.
+///
+/// ## The derivation, and why these three values
+///
+/// From ADR-007 §2's table, without a migration:
+///
+/// - **`pending`** ("never tried", picked up again by `acquire`) when nothing
+///   was put on the wire for this work, *or* when a route existed and was
+///   refused at the gate. This is the "no route tried" case of the issue's
+///   third item, and it is the value the walk used to be unable to
+///   distinguish from a wall. A gate is `pending` rather than `error` because
+///   a malformed DOI is not a transient failure: retrying it unchanged
+///   achieves nothing, and this row's action group is where a human who fixes
+///   the DOI belongs.
+/// - **`unavailable`** only when at least one leg was attempted and *every*
+///   attempted leg was refused by the place itself. That is the one case in
+///   which "there is no such full text here" is supported by evidence rather
+///   than by exhaustion.
+/// - **`error`** ("transient failure", retry with backoff) when legs were
+///   attempted but at least one of them could not give a yes or a no — a
+///   transport failure, a 5xx, a pacing refusal, or an index that named no
+///   location. Deliberately **not** `unavailable`: an incomplete index is the
+///   documented failure of #260, so it must not be able to produce that
+///   verdict. Deliberately not `needs_ill` either — that is the ADR's "no
+///   route exists", and this ladder evaluates only six of the routes, so
+///   claiming it would be #261's overclaim in a new place.
+///   Deliberately not `rate_limited`, which is a statement about a *bucket*,
+///   while this row is a statement about a work.
+#[derive(Debug, Default)]
+struct Ladder {
+    attempts: Vec<(Leg, LegOutcome)>,
+}
+
+impl Ladder {
+    /// Record a leg that failed, with the classification its error carries.
+    fn record(&mut self, leg: Leg, outcome: LegOutcome) {
+        self.attempts.push((leg, outcome));
+    }
+
+    /// Record a leg that did not apply to this work at all.
+    fn skip(&mut self, leg: Leg, why: &str) {
+        self.record(
+            leg,
+            LegOutcome::Skipped {
+                why: why.to_string(),
+            },
+        );
+    }
+
+    /// Record a route that was refused before it could be tried.
+    fn gate(&mut self, leg: Leg, why: String) {
+        self.record(leg, LegOutcome::Gated { why });
+    }
+
+    /// The `acquisition_state.status` these outcomes support.
+    fn status(&self) -> &'static str {
+        let attempted: Vec<&LegOutcome> = self
+            .attempts
+            .iter()
+            .map(|(_, outcome)| outcome)
+            .filter(|outcome| outcome.was_attempted())
+            .collect();
+
+        if attempted.is_empty() || self.any_gated() {
+            // Nothing was put on the wire for this work, or a route that applied
+            // to it was refused before it could be tried. Both are "never
+            // tried" in ADR-007 §2's sense — including the second, because a
+            // malformed DOI is not transient: retrying it unchanged achieves
+            // nothing, and `pending`'s action group ("picked up again by
+            // `acquire`") is where a human who fixes the DOI belongs.
+            STATUS_PENDING
+        } else if attempted.iter().all(|outcome| outcome.was_refused()) {
+            // Every route we could evaluate was asked, and every one refused.
+            STATUS_UNAVAILABLE
+        } else {
+            // We asked, and at least one answer was not a no. Retryable, and
+            // emphatically not a verdict about the work.
+            STATUS_ERROR
+        }
+    }
+
+    /// Was any applicable route refused before it could be tried?
+    fn any_gated(&self) -> bool {
+        self.attempts
+            .iter()
+            .any(|(_, outcome)| matches!(outcome, LegOutcome::Gated { .. }))
+    }
+
+    /// Which routes were attempted, and what each one said — the other half
+    /// of the acceptance criterion, and the column a human reads to decide
+    /// whether to go and look for the paper themselves.
+    fn reason(&self) -> String {
+        if self.attempts.is_empty() {
+            return "no full text obtained; no route applied to this work".to_string();
+        }
+        let clauses: Vec<String> = self
+            .attempts
+            .iter()
+            .map(|(leg, outcome)| format!("{} {}", leg.name(), outcome.clause()))
+            .collect();
+        format!(
+            "no full text obtained; the walk considered {} route(s). {}",
+            self.attempts.len(),
+            clauses.join("; ")
+        )
+    }
+}
+
+/// `acquisition_state.status`: the work is wanted and has not been got, and
+/// nothing has established that it cannot be.
+const STATUS_PENDING: &str = "pending";
+/// `acquisition_state.status`: every route that could be evaluated refused.
+const STATUS_UNAVAILABLE: &str = "unavailable";
+/// `acquisition_state.status`: a route was tried and could not be resolved.
+const STATUS_ERROR: &str = "error";
 
 /// Write the legacy `papers/<stem>.<ext>` copy.
 ///
@@ -960,7 +1595,21 @@ fn publisher_columns(doi: Option<&str>) -> (Option<String>, Option<String>) {
     }
 }
 
-/// Map a paced fetch failure to the message this chain has always logged.
+/// Does this response look like a PDF?
+///
+/// One rule for the two legs that fetch a URL whose extension cannot always
+/// be trusted: the arXiv DOI transform (`/pdf/2301.00001`, no extension) and
+/// the OpenAlex-resolved URL (whatever an index pointed at). The
+/// `fulltext_kind` derived from the extension is what makes the row's `kind`
+/// honest, so getting this wrong files an HTML stub as a PDF — and it is
+/// shared rather than re-derived per leg for exactly that reason.
+fn looks_like_pdf(url: &str, content_type: Option<&str>) -> bool {
+    url.to_lowercase().ends_with(".pdf")
+        || content_type.is_some_and(|ct| ct.contains("application/pdf"))
+}
+
+/// Map a paced fetch failure to the message this chain has always logged, and
+/// to the outcome the ladder records against it (#260).
 ///
 /// The `Status` / `RateLimited` arms carry the status code and **nothing
 /// else**. `FetchError`'s `Display` includes the request URL, and the
@@ -969,13 +1618,40 @@ fn publisher_columns(doi: Option<&str>) -> (Option<String>, Option<String>) {
 /// tracks the real fix) into "the key is in every log line". The transport
 /// arm keeps the URL, which is where `reqwest` has always put it and where
 /// it earns its keep: an unreachable host.
-fn fetch_failure(what: &str, error: FetchError) -> AdapterError {
+///
+/// The classification is done **here**, while the typed error is in hand, and
+/// not later by re-reading the message: a 404 and a connection failure produce
+/// nearly the same sentence, and the difference between "this server will not
+/// serve it" and "we could not find out" is the entire content of the status
+/// this walk records.
+fn fetch_failure(what: &str, error: FetchError) -> LegError {
     match error {
-        FetchError::Status { code, .. } | FetchError::RateLimited { code, .. } => {
-            AdapterError::Network(format!("{what} returned status {code}"))
+        FetchError::Status { code, .. } if is_refusal(code) => {
+            LegError::refused(code, format!("{what} returned status {code}"))
         }
-        other => AdapterError::Network(format!("{what}: {other}")),
+        FetchError::Status { code, .. } | FetchError::RateLimited { code, .. } => {
+            LegError::inconclusive(AdapterError::Network(format!(
+                "{what} returned status {code}"
+            )))
+        }
+        // A login redirect says a route exists that needs a human's session,
+        // not that the work is unobtainable, so it is inconclusive here: the
+        // tier-4 leg has not been taken. Same for a pacing refusal, which is
+        // our own budget rather than the publisher's answer.
+        other => LegError::inconclusive(AdapterError::Network(format!("{what}: {other}"))),
     }
+}
+
+/// Is this HTTP status a refusal — "this server will not serve this to us"?
+///
+/// 4xx is the client's answer and is decisive about *that* place: 403 is an
+/// access decision, 404 and 410 are a statement that it is not there. The two
+/// exceptions are 408 (the server gave up waiting, which says nothing about
+/// access) and 429 (the publisher asked us to slow down, which is the opposite
+/// of a verdict). Everything 5xx is a failure on the server's side, and
+/// nothing there is evidence about whether a human could read the paper.
+fn is_refusal(code: u16) -> bool {
+    (400..500).contains(&code) && !matches!(code, 408 | 429)
 }
 
 /// The bare arXiv identifier inside whatever form we were handed.
@@ -1177,6 +1853,7 @@ mod tests {
                     unpaywall_api: format!("{base}/v2"),
                     doi_resolver: format!("{base}/doi"),
                     arxiv_pdf: format!("{base}/pdf"),
+                    biorxiv_content: format!("{base}/content"),
                     openalex_api: format!("{base}/works"),
                 },
             )
@@ -1210,6 +1887,67 @@ mod tests {
                 .iter()
                 .map(|r| r.url.to_string())
                 .collect()
+        }
+
+        /// Only the requests whose URL contains `needle` — how a test says
+        /// "this leg was never called" without counting unrelated traffic.
+        async fn requests_to(&self, needle: &str) -> Vec<String> {
+            self.requests()
+                .await
+                .into_iter()
+                .filter(|url| url.contains(needle))
+                .collect()
+        }
+
+        /// Mount a PDF the way a real server serves one: with the
+        /// `Content-Type` header that decides `format` when the URL itself
+        /// cannot (the arXiv transform has no file extension).
+        async fn serve_pdf(&self, route: &str) {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/pdf")
+                        .set_body_bytes(PDF_BYTES.to_vec()),
+                )
+                .mount(&self.server)
+                .await;
+        }
+
+        /// Mount a 404 for a path, so a leg misses without the walk stopping.
+        async fn miss(&self, route: &str) {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&self.server)
+                .await;
+        }
+
+        /// The `acquisition_state` rows for a work, as
+        /// `(status, reason, hint_url, drop_path)`.
+        fn states(&self, paper_id: &str) -> Vec<StateRow> {
+            let conn = self.db.conn().expect("conn");
+            let mut stmt = conn
+                .prepare(
+                    "SELECT kind, locator, wanted_version, status, reason, hint_url, drop_path
+                     FROM acquisition_state WHERE paper_id = ?1
+                     ORDER BY kind, locator",
+                )
+                .expect("prepare");
+            stmt.query_map([paper_id], |r| {
+                Ok(StateRow {
+                    kind: r.get(0)?,
+                    locator: r.get(1)?,
+                    wanted_version: r.get(2)?,
+                    status: r.get(3)?,
+                    reason: r.get(4)?,
+                    hint_url: r.get(5)?,
+                    drop_path: r.get(6)?,
+                })
+            })
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("rows")
         }
 
         fn artefact(&self, paper_id: &str) -> Option<ArtefactRow> {
@@ -1308,8 +2046,26 @@ mod tests {
         retrieved_at: String,
     }
 
+    /// One `acquisition_state` row as the ladder wrote it (#260).
+    #[derive(Debug)]
+    struct StateRow {
+        kind: String,
+        locator: String,
+        wanted_version: String,
+        status: String,
+        reason: Option<String>,
+        hint_url: Option<String>,
+        drop_path: Option<String>,
+    }
+
     fn unpaywall_json(pdf_url: &str) -> String {
         format!(r#"{{"best_oa_location":{{"url_for_pdf":"{pdf_url}"}}}}"#)
+    }
+
+    /// An index that answered and named no OA location — the response shape
+    /// that made #260 report three free preprints as unreachable.
+    fn openalex_json_without_a_location() -> String {
+        r#"{"id":"W1","best_oa_location":null,"open_access":{"is_oa":false}}"#.to_string()
     }
 
     #[test]
@@ -1889,5 +2645,617 @@ mod tests {
             Some(format!("{}/doi/10.99999/some.suffix.12345", fx.server.uri()).as_str()),
             "a paywall result points the human at the DOI, not a CDN"
         );
+    }
+
+    // =====================================================================
+    // #260: the preprint leg, and an honest verdict when it misses.
+    //
+    // The corpus that opened the issue reported three bioRxiv preprints as
+    // unreachable. Each was free, each was served by `biorxiv.org`, and the
+    // only reason the ladder said otherwise was that it had no preprint route
+    // and asked an index instead.
+    // =====================================================================
+
+    /// The acceptance criterion, verbatim: a preprint DOI is obtained **with no
+    /// network index lookup**. The work carries an `openalex_id` precisely so
+    /// that "no OpenAlex request was made" is a statement about the *order* of
+    /// the ladder and not about the record happening to lack the identifier.
+    ///
+    /// It also pins the two things that make the transform worth having: the
+    /// versioned bioRxiv URL is the one that was tried first, and the route
+    /// recorded on the artefact is the server that served it — with the
+    /// `preprint` version and `oa_license` basis the route implies, which the
+    /// database derives rather than this code guessing.
+    #[tokio::test]
+    async fn a_preprint_doi_is_fetched_before_the_openalex_leg() {
+        let fx = Fixture::new().await;
+        fx.serve_pdf("/content/10.1101/2025.06.14.659707v1.full.pdf")
+            .await;
+        // Mounted, and must never be called.
+        fx.serve(
+            "/works/W123",
+            r#"{"best_oa_location":{"pdf_url":"http://example.invalid/never.pdf"}}"#,
+        )
+        .await;
+        fx.serve("/v2/10.1101/2025.06.14.659707", unpaywall_json("{}"))
+            .await;
+        let paper = save(
+            &fx,
+            "p-preprint",
+            Some("10.1101/2025.06.14.659707"),
+            None,
+            Some("W123"),
+            None,
+        );
+
+        let result = fx
+            .downloader()
+            .download_paper(&paper, &fx.papers_dir())
+            .await
+            .expect("the preprint transform should serve the PDF");
+
+        assert_eq!(result.route, RouteId::Biorxiv);
+        assert_eq!(result.format, DownloadFormat::Pdf);
+        assert_eq!(result.access, AccessStatus::FullText);
+        assert!(
+            fx.requests_to("/works/W123").await.is_empty(),
+            "the preprint leg needs no index, so OpenAlex must not be asked: {:?}",
+            fx.requests().await
+        );
+        assert!(
+            fx.requests_to("/v2/10.1101").await.is_empty(),
+            "nor Unpaywall: {:?}",
+            fx.requests().await
+        );
+        assert_eq!(
+            fx.requests().await.len(),
+            1,
+            "one request, one hop: {:?}",
+            fx.requests().await
+        );
+
+        let row = fx.artefact("p-preprint").expect("an artefact row");
+        assert_eq!(
+            row.route, "biorxiv",
+            "the serving route is recorded, not guessed"
+        );
+        assert_eq!(
+            row.version, "preprint",
+            "a bioRxiv PDF is a preprint by construction, and the route says so"
+        );
+        assert_eq!(
+            row.access_basis, "oa_license",
+            "a preprint server serves material free to read by construction"
+        );
+        assert_eq!(row.kind, "fulltext_pdf");
+        assert_eq!(row.publisher.as_deref(), Some("biorxiv"));
+        assert_eq!(
+            row.source_url.as_deref(),
+            Some(
+                format!(
+                    "{}/content/10.1101/2025.06.14.659707v1.full.pdf",
+                    fx.server.uri()
+                )
+                .as_str()
+            ),
+            "the bytes came from the verified transform URL"
+        );
+        assert_eq!(fx.legacy("p-preprint").1.as_deref(), Some("downloaded"));
+        assert!(
+            fx.states("p-preprint").is_empty(),
+            "a work that was obtained records no gap: {:?}",
+            fx.states("p-preprint")
+        );
+        // One Request permit, at the OA tier: a preprint server is an OA host.
+        let requests = fx.pacer.spending(Cost::Request);
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0].tier, PaceTier::Oa);
+    }
+
+    /// A DOI the preprint leg cannot serve must cost the walk a fall-through,
+    /// not the work a verdict. Both verified bioRxiv candidates 404 here, and
+    /// the Unpaywall leg then finds the PDF — which is the shape of a preprint
+    /// whose `v1` path has moved on.
+    ///
+    /// The discriminating assertions are the two 404s (both candidates were
+    /// really tried, in order) and the absence of any `unavailable` row: a
+    /// ladder that treated a preprint miss as a wall would stop here.
+    #[tokio::test]
+    async fn an_unavailable_preprint_falls_through_rather_than_being_reported_unreachable() {
+        let fx = Fixture::new().await;
+        fx.miss("/content/10.1101/2025.06.14.659707v1.full.pdf")
+            .await;
+        fx.miss("/content/10.1101/2025.06.14.659707.full.pdf").await;
+        fx.serve_unpaywall_pdf("10.1101/2025.06.14.659707").await;
+        let paper = save(
+            &fx,
+            "p-preprint-fallthrough",
+            Some("10.1101/2025.06.14.659707"),
+            None,
+            None,
+            None,
+        );
+
+        let result = fx
+            .downloader()
+            .download_paper(&paper, &fx.papers_dir())
+            .await
+            .expect("the Unpaywall leg serves it after the preprint leg misses");
+
+        assert_eq!(
+            result.route,
+            RouteId::Unpaywall,
+            "a preprint miss is a fall-through, not a terminal verdict"
+        );
+        assert_eq!(
+            fx.artefact("p-preprint-fallthrough")
+                .expect("an artefact row")
+                .route,
+            "unpaywall"
+        );
+
+        // Both candidates were tried, and in the order the module documents.
+        let requests = fx.requests().await;
+        let versioned = requests
+            .iter()
+            .position(|u| u.contains("2025.06.14.659707v1.full.pdf"))
+            .expect("the versioned candidate was tried");
+        let unversioned = requests
+            .iter()
+            .position(|u| u.contains("2025.06.14.659707.full.pdf"))
+            .expect("the un-versioned candidate was tried");
+        let unpaywall = requests
+            .iter()
+            .position(|u| u.contains("/v2/10.1101"))
+            .expect("the index leg ran after the preprint leg");
+        assert!(
+            versioned < unversioned && unversioned < unpaywall,
+            "expected v1, then the un-versioned URL, then the index: {requests:?}"
+        );
+
+        let states = fx.states("p-preprint-fallthrough");
+        assert!(
+            !states.iter().any(|s| s.status == "unavailable"),
+            "a preprint that missed one route is not an unobtainable work: {states:?}"
+        );
+        assert!(
+            states.is_empty(),
+            "a work that was obtained records no gap at all: {states:?}"
+        );
+    }
+
+    /// **"Unreachable" must never be reachable-by-download**, part one: a work
+    /// whose only route was refused at the gate has not been looked for at
+    /// all, and says so.
+    ///
+    /// `pending` is ADR-007 §2's own word for "never tried" and its action-list
+    /// group is empty, so a gated work is picked up again by `acquire` instead
+    /// of being handed to a human as an unobtainable one. The reason has to
+    /// name the routes that were *not* tried and why — the other half of the
+    /// acceptance criterion.
+    #[tokio::test]
+    async fn a_work_whose_doi_was_gated_is_pending_with_the_reason_recorded() {
+        let fx = Fixture::new().await;
+        // The exact shape from #262's audit: an Elsevier compact DOI truncated
+        // at its parenthesis.
+        let paper = save(
+            &fx,
+            "p-gated",
+            Some("10.1016/0003-2670(93"),
+            None,
+            None,
+            None,
+        );
+
+        let err = fx
+            .downloader()
+            .download_paper(&paper, &fx.papers_dir())
+            .await
+            .expect_err("a DOI with nothing else to try cannot succeed");
+        assert!(
+            matches!(err, AdapterError::NotFound(_)),
+            "the walk's own error is unchanged by this slice: {err}"
+        );
+        assert_eq!(
+            fx.requests().await,
+            Vec::<String>::new(),
+            "a rejected DOI is never fetched"
+        );
+
+        let states = fx.states("p-gated");
+        assert_eq!(states.len(), 1, "one want, one row: {states:?}");
+        let state = &states[0];
+        assert_eq!(
+            state.status, "pending",
+            "nothing was tried, so nothing may be called unavailable"
+        );
+        assert_eq!(state.kind, "fulltext");
+        assert_eq!(state.locator, "");
+        assert_eq!(state.wanted_version, "vor");
+        assert_eq!(
+            state.drop_path, None,
+            "there is no file for a human to drop: the bytes belong to a server"
+        );
+        let reason = state.reason.as_deref().expect("a reason is recorded");
+        assert!(
+            reason.contains("refused before it could be tried"),
+            "the reason names the gate: {reason}"
+        );
+        assert!(
+            reason.contains("unbalanced bracket"),
+            "the gate's own reason is carried through, not summarised away: {reason}"
+        );
+        for leg in ["preprint transform", "unpaywall", "doi.org publisher page"] {
+            assert!(
+                reason.contains(leg),
+                "the reason must name every route considered, including {leg}: {reason}"
+            );
+        }
+        assert_eq!(
+            state.hint_url.as_deref(),
+            None,
+            "a rejected DOI has no canonical page to point a human at"
+        );
+    }
+
+    /// **"Unreachable" must never be reachable-by-download**, part two: the
+    /// index-empty case, which is the documented failure of #260.
+    ///
+    /// The preprint leg 404s (a DOI that is not on bioRxiv after all), OpenAlex
+    /// answers 200 with `best_oa_location: null`, Unpaywall answers 200 with
+    /// no `url_for_pdf`, and doi.org 404s. Two of those four legs *named no
+    /// location*, which is a fact about two indexes and about nothing else —
+    /// so the verdict cannot be `unavailable`, however complete the list of
+    /// legs looks. It is `error`: retryable, and honest about having asked.
+    #[tokio::test]
+    async fn an_index_that_named_no_location_is_never_reported_as_no_access() {
+        let fx = Fixture::new().await;
+        fx.miss("/content/10.1101/2024.11.19.624167v1.full.pdf")
+            .await;
+        fx.miss("/content/10.1101/2024.11.19.624167.full.pdf").await;
+        fx.serve("/works/W123", openalex_json_without_a_location())
+            .await;
+        fx.serve("/v2/10.1101/2024.11.19.624167", "{}").await;
+        fx.miss("/doi/10.1101/2024.11.19.624167").await;
+        let paper = save(
+            &fx,
+            "p-no-location",
+            Some("10.1101/2024.11.19.624167"),
+            None,
+            Some("W123"),
+            None,
+        );
+
+        fx.downloader()
+            .download_paper(&paper, &fx.papers_dir())
+            .await
+            .expect_err("nothing served the work");
+
+        let states = fx.states("p-no-location");
+        assert_eq!(states.len(), 1, "{states:?}");
+        let state = &states[0];
+        assert_ne!(
+            state.status, "unavailable",
+            "two indices that named nothing are not evidence about access"
+        );
+        assert_eq!(
+            state.status, "error",
+            "routes were tried and could not be resolved — retryable"
+        );
+        let reason = state.reason.as_deref().expect("a reason is recorded");
+        for leg in [
+            "preprint transform",
+            "openalex",
+            "unpaywall",
+            "doi.org publisher page",
+            "record url",
+        ] {
+            assert!(reason.contains(leg), "the reason names {leg}: {reason}");
+        }
+        assert!(
+            reason.contains("not evidence that the work is unavailable"),
+            "the index's silence must say what it is: {reason}"
+        );
+        assert!(
+            reason.contains("not applicable"),
+            "a leg with nothing to try is reported as such, not as a refusal: {reason}"
+        );
+        assert_eq!(
+            state.hint_url.as_deref(),
+            Some(format!("{}/doi/10.1101/2024.11.19.624167", fx.server.uri()).as_str()),
+            "a human is pointed at the DOI, which is canonical for the work"
+        );
+    }
+
+    /// `unavailable` is reachable, and only when every route that could be
+    /// evaluated refused. A walk where each leg answers 403 or 404 is the one
+    /// case in which "there is no such full text here" is evidence rather than
+    /// exhaustion — so the status derivation is pinned as a pure function,
+    /// where every branch can be read at once.
+    #[test]
+    fn only_a_walk_whose_every_evaluated_route_refused_is_unavailable() {
+        let mut ladder = Ladder::default();
+        ladder.record(Leg::Preprint, LegOutcome::Refused { status: 404 });
+        ladder.record(Leg::Unpaywall, LegOutcome::Refused { status: 403 });
+        ladder.record(Leg::Publisher, LegOutcome::Refused { status: 404 });
+        ladder.skip(Leg::ArxivId, "the record carries no arxiv_id");
+        ladder.skip(Leg::ManualUrl, "the record carries no url");
+        assert_eq!(
+            ladder.status(),
+            "unavailable",
+            "every route with something to try refused, and a leg with nothing to \
+             try is not a route that could have served it"
+        );
+
+        // One unanswered leg is enough to withhold the verdict.
+        for outcome in [
+            LegOutcome::NoLocation {
+                detail: "no OA location".into(),
+            },
+            LegOutcome::Inconclusive {
+                detail: "connection failed".into(),
+            },
+        ] {
+            let mut ladder = Ladder::default();
+            ladder.record(Leg::Preprint, LegOutcome::Refused { status: 404 });
+            ladder.record(Leg::Unpaywall, outcome.clone());
+            assert_ne!(
+                ladder.status(),
+                "unavailable",
+                "{outcome:?} is not a refusal, so no-access is not established"
+            );
+        }
+
+        // A gated route exists and is unevaluated, which is also enough to
+        // withhold it: a work we declined to look up has not been found absent.
+        let mut gated = Ladder::default();
+        gated.record(Leg::Preprint, LegOutcome::Refused { status: 404 });
+        gated.gate(
+            Leg::Publisher,
+            "the DOI was rejected before any fetch".to_string(),
+        );
+        assert_eq!(
+            gated.status(),
+            "pending",
+            "an unevaluated route blocks the no-access verdict, and `pending` is \
+             the ADR's word for a route that was never tried"
+        );
+
+        // And the empty walk, which is the "no route tried" case in its purest
+        // form: nothing was asked of anybody.
+        let mut nothing = Ladder::default();
+        nothing.skip(Leg::ArxivId, "the record carries no arxiv_id");
+        nothing.skip(Leg::Preprint, NO_PREPRINT_ROUTE);
+        nothing.skip(Leg::OpenAlex, "the record carries no openalex_id");
+        nothing.skip(Leg::Unpaywall, "the record carries no doi");
+        nothing.skip(Leg::ManualUrl, "the record carries no url");
+        assert_eq!(nothing.status(), "pending");
+        let reason = nothing.reason();
+        assert!(
+            reason.contains("not applicable") && !reason.contains("refused with HTTP"),
+            "five routes, none of them applicable, and none of them asked: {reason}"
+        );
+        // And the degenerate case, where no leg was even considered.
+        assert!(
+            Ladder::default().reason().contains("no route applied"),
+            "an empty walk says so rather than naming nothing"
+        );
+    }
+
+    /// The arXiv half of the same criterion, and the half where the transform
+    /// is subtler: the DOI's suffix is `arXiv.2301.00001` and the server wants
+    /// `/pdf/2301.00001`, so a leg that forgot to strip the prefix would send
+    /// the 406 URL and fall through. The work carries **no** `arxiv_id`, so the
+    /// only route that can serve it here is the DOI transform.
+    #[tokio::test]
+    async fn an_arxiv_doi_is_fetched_from_the_stripped_url_with_no_index_lookup() {
+        let fx = Fixture::new().await;
+        // The verified URL: no `.pdf` suffix, no `arxiv.` prefix.
+        fx.serve_pdf("/pdf/2301.00001").await;
+        let paper = save(
+            &fx,
+            "p-arxiv-doi",
+            Some("10.48550/arXiv.2301.00001"),
+            None,
+            Some("W123"),
+            None,
+        );
+
+        let result = fx
+            .downloader()
+            .download_paper(&paper, &fx.papers_dir())
+            .await
+            .expect("the arXiv transform should serve the PDF");
+
+        assert_eq!(result.route, RouteId::Arxiv);
+        assert_eq!(result.format, DownloadFormat::Pdf);
+        assert_eq!(
+            fx.requests().await.len(),
+            1,
+            "one request, to the verified URL, and nothing else: {:?}",
+            fx.requests().await
+        );
+        // Asserted on the path rather than the whole URL: wiremock records
+        // what arrived, so the authority is `localhost` with the default port
+        // dropped, while `server.uri()` is the port the client dialled.
+        assert_eq!(
+            fx.requests_to("/pdf/2301.00001").await.len(),
+            1,
+            "and it is the stripped URL, not the 406 one: {:?}",
+            fx.requests().await
+        );
+        let row = fx.artefact("p-arxiv-doi").expect("an artefact row");
+        assert_eq!(row.route, "arxiv");
+        assert_eq!(row.version, "preprint");
+        assert_eq!(row.access_basis, "oa_license");
+        assert_eq!(row.publisher.as_deref(), Some("arxiv"));
+    }
+
+    /// The third branch of the acceptance criterion: a preprint DOI for which
+    /// **no verified transform exists** has to *say so*. ChemRxiv is that
+    /// branch, and the sentence has to reach the row a human reads — otherwise
+    /// the honest answer ("I have no rule for this server") is lost and the
+    /// work looks like a publisher problem.
+    ///
+    /// So: no candidate, the documented reason recorded verbatim, the walk
+    /// falling through to the index legs, and a status that is not a verdict
+    /// about the work.
+    #[tokio::test]
+    async fn a_chemrxiv_doi_records_why_it_has_no_preprint_route() {
+        let fx = Fixture::new().await;
+        fx.serve("/works/W123", openalex_json_without_a_location())
+            .await;
+        fx.serve("/v2/10.26434/chemrxiv.2024.01.01.123456.v1", "{}")
+            .await;
+        fx.miss("/doi/10.26434/chemrxiv.2024.01.01.123456.v1").await;
+        let doi = "10.26434/chemrxiv.2024.01.01.123456.v1";
+        let paper = save(&fx, "p-chemrxiv", Some(doi), None, Some("W123"), None);
+
+        fx.downloader()
+            .download_paper(&paper, &fx.papers_dir())
+            .await
+            .expect_err("nothing served the work");
+
+        // No URL was proposed for ChemRxiv, so nothing was requested from one.
+        // No URL was proposed for ChemRxiv, so nothing was requested from the
+        // path shape a preprint transform uses. (The DOI itself appears in the
+        // index legs' URLs, so the assertion is about the path, not the DOI.)
+        assert!(
+            fx.requests_to("/content/").await.is_empty(),
+            "an unverified transform must not put a guessed URL on the wire: {:?}",
+            fx.requests().await
+        );
+        let states = fx.states("p-chemrxiv");
+        assert_eq!(states.len(), 1, "{states:?}");
+        let state = &states[0];
+        assert_ne!(
+            state.status, "unavailable",
+            "a missing rule is a gap in our coverage, not a verdict on the work"
+        );
+        let reason = state.reason.as_deref().expect("a reason is recorded");
+        assert!(
+            reason.contains("engage"),
+            "the recorded reason is the documented obstacle: {reason}"
+        );
+        assert!(
+            reason.contains("ChemRxiv"),
+            "and it names the server: {reason}"
+        );
+        // The index legs still ran, which is the "or says which it tried" half.
+        assert!(!fx.requests_to("/works/W123").await.is_empty());
+        assert!(!fx.requests_to("/v2/10.26434").await.is_empty());
+    }
+
+    /// The DOI-only entry point (`scitadel download <doi>`) gets the same
+    /// transform in the same position. It is a user-facing way to ask for
+    /// precisely the DOIs in #260, and it has no `Paper` — so the assertions
+    /// are about the request line and the returned route, and the file is the
+    /// legacy copy `finish(None, …)` has always written.
+    #[tokio::test]
+    async fn the_doi_only_path_also_tries_the_preprint_transform_first() {
+        let fx = Fixture::new().await;
+        fx.serve_pdf("/content/10.1101/2025.06.14.659707v1.full.pdf")
+            .await;
+        let out_dir = fx.papers_dir();
+
+        let result = fx
+            .downloader()
+            .download("https://doi.org/10.1101/2025.06.14.659707", &out_dir)
+            .await
+            .expect("the preprint transform should serve the PDF");
+
+        assert_eq!(result.route, RouteId::Biorxiv);
+        assert_eq!(result.format, DownloadFormat::Pdf);
+        assert!(
+            fx.requests_to("/v2/").await.is_empty(),
+            "no index lookup for a DOI that determines its own location: {:?}",
+            fx.requests().await
+        );
+        assert_eq!(fx.requests().await.len(), 1, "{:?}", fx.requests().await);
+        assert!(
+            result.path.exists(),
+            "the DOI-only path still writes its legacy copy: {}",
+            result.path.display()
+        );
+        assert_eq!(
+            std::fs::read(&result.path).expect("read back"),
+            PDF_BYTES,
+            "and it is the bytes the server served"
+        );
+    }
+
+    /// The other end of the "no route tried" case: a work with **no**
+    /// identifiers at all. Every leg is inapplicable, nothing was put on the
+    /// wire, and the row has to say so rather than reporting an absence that
+    /// was never looked for — while leaving the work `pending`, so `acquire`
+    /// picks it up again rather than a human being asked for a document that
+    /// nobody has looked for yet.
+    ///
+    /// The reason enumerating *every* leg is the other half of the acceptance
+    /// criterion, and it is asserted leg by leg: a leg that is silently absent
+    /// from the record is indistinguishable from one that was tried and
+    /// refused, which is the ambiguity this whole section exists to remove.
+    #[tokio::test]
+    async fn a_work_with_no_identifiers_is_pending_and_names_every_leg() {
+        let fx = Fixture::new().await;
+        let paper = save(&fx, "p-nothing", None, None, None, None);
+
+        let err = fx
+            .downloader()
+            .download_paper(&paper, &fx.papers_dir())
+            .await
+            .expect_err("a work with no identifier cannot be fetched");
+        assert!(
+            matches!(err, AdapterError::NotFound(_)),
+            "the walk's own error is unchanged: {err}"
+        );
+        assert_eq!(
+            fx.requests().await,
+            Vec::<String>::new(),
+            "nothing to try means nothing is sent"
+        );
+        assert!(
+            fx.pacer.grants().is_empty(),
+            "and no permit is spent: {:?}",
+            fx.pacer.grants()
+        );
+
+        let states = fx.states("p-nothing");
+        assert_eq!(states.len(), 1, "{states:?}");
+        let state = &states[0];
+        assert_eq!(state.status, "pending");
+        let reason = state.reason.as_deref().expect("a reason is recorded");
+        for leg in [
+            "arxiv id",
+            "preprint transform",
+            "openalex",
+            "unpaywall",
+            "doi.org publisher page",
+            "record url",
+        ] {
+            assert!(reason.contains(leg), "the reason names {leg}: {reason}");
+        }
+        assert!(
+            !reason.contains("refused with HTTP"),
+            "nothing was asked of anybody: {reason}"
+        );
+        assert_eq!(
+            state.hint_url, None,
+            "no DOI, so no canonical page to point a human at"
+        );
+    }
+
+    /// A 408 or a 429 is the publisher asking for patience, not refusing, and
+    /// a 5xx is a failure on their side. Neither may be laundered into a
+    /// no-access verdict by the shared message they produce.
+    #[test]
+    fn a_timeout_a_rate_limit_and_a_server_error_are_not_refusals() {
+        assert!(is_refusal(403), "403 is an access decision");
+        assert!(is_refusal(404), "404 is a statement that it is not there");
+        assert!(is_refusal(410));
+        for code in [408, 429, 500, 502, 503, 504] {
+            assert!(!is_refusal(code), "HTTP {code} is not a refusal");
+        }
+        assert!(!is_refusal(200));
     }
 }
