@@ -164,7 +164,7 @@ enum Commands {
         #[arg(short, long)]
         question: String,
         /// Max chaining depth (1-3)
-        #[arg(short, long, default_value = "1")]
+        #[arg(long, default_value = "1")]
         depth: i32,
         /// Min relevance score to expand
         #[arg(long, default_value = "0.6")]
@@ -173,8 +173,25 @@ enum Commands {
         #[arg(long, default_value = "both", value_parser = ["references", "cited_by", "both"])]
         direction: String,
         /// Model for scoring
-        #[arg(short, long, default_value = "claude-sonnet-4-6")]
+        #[arg(long, default_value = "claude-sonnet-4-6")]
         model: String,
+    },
+    /// Import a flat / legacy directory tree of files as `artefacts`
+    /// (ADR-007 §1 "Legacy data"). Reads the layout raid and older
+    /// scitadel versions wrote — `fulltext.pdf`, `si/`, `tables/`,
+    /// `figures/` — under a work's directory, copies each file into the
+    /// content-addressed blob store, and records where every file came
+    /// from. Idempotent: re-running an unchanged tree writes nothing.
+    ///
+    /// `--root` accepts either the work's own directory or a library
+    /// root containing `papers/<paper-stem>/`.
+    ImportFlat {
+        /// Paper id (full id or unambiguous prefix)
+        #[arg(long)]
+        paper: String,
+        /// The flat-layout directory to import
+        #[arg(long)]
+        root: PathBuf,
     },
 }
 
@@ -507,5 +524,6 @@ async fn main() -> Result<()> {
             direction,
             model,
         } => commands::snowball(&search_id, &question, depth, threshold, &direction, &model),
+        Commands::ImportFlat { paper, root } => commands::import_flat(&paper, &root),
     }
 }

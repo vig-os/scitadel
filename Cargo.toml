@@ -8,6 +8,7 @@ members = [
     "crates/scitadel-export",
     "crates/scitadel-cli",
     "crates/scitadel-mcp",
+    "crates/scitadel-http",
     "crates/scitadel-tui",
 ]
 

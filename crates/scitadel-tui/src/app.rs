@@ -1007,6 +1007,7 @@ impl App {
             self.task_tx.clone(),
             paper,
             self.openalex.clone(),
+            self.data.db.clone(),
             self.papers_dir.clone(),
         );
     }

@@ -14,6 +14,8 @@ const MIGRATION_009: &str = include_str!("../../migrations/009_bibtex_keys.sql")
 const MIGRATION_010: &str = include_str!("../../migrations/010_shortlists.sql");
 const MIGRATION_011: &str = include_str!("../../migrations/011_paper_aliases.sql");
 const MIGRATION_012: &str = include_str!("../../migrations/012_paper_tags.sql");
+const MIGRATION_013: &str = include_str!("../../migrations/013_acquisition.sql");
+const MIGRATION_014: &str = include_str!("../../migrations/014_publisher_note.sql");
 
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, MIGRATION_001),
@@ -28,6 +30,8 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (10, MIGRATION_010),
     (11, MIGRATION_011),
     (12, MIGRATION_012),
+    (13, MIGRATION_013),
+    (14, MIGRATION_014),
 ];
 
 /// Run all pending migrations, skipping already-applied ones.
@@ -314,6 +318,18 @@ mod tests {
         assert!(tables.contains(&"searches_fts".to_string()));
         assert!(tables.contains(&"paper_aliases".to_string()));
         assert!(tables.contains(&"paper_tags".to_string()));
+        // ADR-007 §1: every work artefact, the want-list behind coverage,
+        // and the pacer ledger hang off these. A rename here would be
+        // invisible to the rest of the suite until acquisition runs.
+        assert!(tables.contains(&"blobs".to_string()));
+        assert!(tables.contains(&"artefacts".to_string()));
+        assert!(tables.contains(&"acquisition_state".to_string()));
+        assert!(tables.contains(&"acquisition_attempts".to_string()));
+        assert!(tables.contains(&"acquisition_leases".to_string()));
+        assert!(tables.contains(&"paper_identity_checks".to_string()));
+        assert!(tables.contains(&"pacer_buckets".to_string()));
+        assert!(tables.contains(&"pacer_grants".to_string()));
+        assert!(tables.contains(&"tdm_authorisations".to_string()));
         assert!(tables.contains(&"schema_version".to_string()));
     }
 }

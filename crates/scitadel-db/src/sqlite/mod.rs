@@ -1,7 +1,11 @@
+mod acquisition;
 mod annotations;
+mod artefacts;
 mod assessments;
+mod blobs;
 mod citations;
 mod migrations;
+mod pacer;
 mod paper_aliases;
 mod paper_state;
 mod paper_tags;
@@ -11,11 +15,24 @@ mod searches;
 mod shortlist;
 mod tui_state;
 
+pub use acquisition::{ROUTE_LEGACY, backfill_legacy_artefacts};
 pub use annotations::{SqliteAnnotationRepository, resolve_anchor};
 
+/// ADR-007 §1: the deterministic artefact id and the `artefacts` /
+/// `acquisition_state` writers. Shared by the legacy backfill and the
+/// flat-layout importer (`scitadel_adapters::import_flat`).
+pub use artefacts::{
+    ACCESS_BASIS_MANUAL, ArtefactWrite, BlobWrite, DownloadWrite, FULLTEXT_LOCATOR, FulltextKind,
+    ROUTE_IMPORT_FLAT, StateWrite, VERSION_UNKNOWN, WriteMode, artefact_id,
+    delete_acquisition_states_at, fulltext_kind, has_fulltext_artefact, record_download,
+    write_acquisition_states, write_artefacts, write_artefacts_in,
+};
 pub use assessments::SqliteAssessmentRepository;
+/// ADR-007 §1 "Storage": the content-addressed blob store.
+pub use blobs::{blob_rel_path, file_extension, hash_file, library_root, store_blob};
 pub use citations::SqliteCitationRepository;
 pub use migrations::run_migrations;
+pub use pacer::{PolicyLookup, SqlitePacer};
 pub use paper_aliases::{SOURCE_BIBTEX_IMPORT, SOURCE_REKEY, SqlitePaperAliasRepository};
 pub use paper_state::{PaperState, SqlitePaperStateRepository};
 pub use paper_tags::{SqlitePaperTagRepository, TAG_SOURCE_BIBTEX_IMPORT};
@@ -32,7 +49,7 @@ pub use tui_state::{SqliteTuiStateRepository, TuiState};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::functions::FunctionFlags;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::DbError;
 
@@ -143,16 +160,25 @@ impl Database {
     }
 
     /// Run all pending migrations, then backfill any paper rows that
-    /// lack a stable `bibtex_key` (#132). The backfill is idempotent —
-    /// on every subsequent call it's a no-op because every paper
-    /// already has a key. Papers gain keys via `save`/`save_many`
-    /// thereafter, keeping this migrate-call the only place that
-    /// needs to know about the assignment algorithm.
+    /// lack a stable `bibtex_key` (#132) and any legacy
+    /// `local_path` files that predate the `artefacts` table (ADR-007
+    /// §1 "Legacy data"). Both backfills are idempotent — on every
+    /// subsequent call they are no-ops, because every paper already has
+    /// a key and every legacy file already has an artefact row keyed by
+    /// `UNIQUE (paper_id, kind, version, locator)`. Papers gain keys via
+    /// `save`/`save_many` thereafter, keeping this migrate-call the only
+    /// place that needs to know about the assignment algorithm.
+    ///
+    /// The artefact backfill runs after `run_migrations` commits, so an
+    /// upgrade from a pre-013 library needs no separate command: hashing
+    /// and copying legacy files happens with no write lock held, and the
+    /// rows land in one short transaction (see `sqlite::acquisition`).
     pub fn migrate(&self) -> Result<(), DbError> {
         let conn = self.pool.get()?;
         run_migrations(&conn)?;
         drop(conn);
         self.backfill_bibtex_keys()?;
+        self.backfill_acquisition_artefacts()?;
         Ok(())
     }
 
@@ -214,6 +240,66 @@ impl Database {
     /// Get a connection from the pool.
     pub fn conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>, DbError> {
         Ok(self.pool.get()?)
+    }
+
+    /// ADR-007 §1 "Storage": the library root this database belongs to,
+    /// or `None` for an in-memory database.
+    pub fn library_root(&self) -> Result<Option<PathBuf>, DbError> {
+        let conn = self.pool.get()?;
+        blobs::library_root(&conn)
+    }
+
+    /// ADR-007 §1: write `artefacts` rows (and their blobs) in one short
+    /// transaction. See [`write_artefacts`] for the conflict handling.
+    ///
+    /// A method rather than only a free function so callers outside this
+    /// crate — the flat-layout importer — never have to take a direct
+    /// `rusqlite` dependency to write a row.
+    pub fn write_artefacts(
+        &self,
+        rows: &[ArtefactWrite],
+        mode: WriteMode,
+    ) -> Result<usize, DbError> {
+        let mut conn = self.pool.get()?;
+        artefacts::write_artefacts(&mut conn, rows, mode)
+    }
+
+    /// ADR-007 §1 "Legacy data": record one completed download, writing
+    /// the `artefacts` row and the legacy `papers` columns in a single
+    /// transaction. See [`record_download`].
+    ///
+    /// A method for the same reason as [`Self::write_artefacts`]: the
+    /// download chain lives outside this crate and must not need a direct
+    /// `rusqlite` dependency to record what it fetched.
+    pub fn record_download(&self, write: &DownloadWrite) -> Result<(), DbError> {
+        let mut conn = self.pool.get()?;
+        artefacts::record_download(&mut conn, write)
+    }
+
+    /// ADR-007 §1: record one wanted-but-absent artefact. See
+    /// [`write_acquisition_states`].
+    pub fn upsert_acquisition_state(&self, row: &StateWrite) -> Result<(), DbError> {
+        let mut conn = self.pool.get()?;
+        artefacts::write_acquisition_states(&mut conn, std::slice::from_ref(row))?;
+        Ok(())
+    }
+
+    /// ADR-007 §1 "Have": does this work already hold a full text?
+    pub fn has_fulltext_artefact(&self, paper_id: &str) -> Result<bool, DbError> {
+        let conn = self.pool.get()?;
+        artefacts::has_fulltext_artefact(&conn, paper_id)
+    }
+
+    /// ADR-007 §1: retract a gap recorded at `drop_path` — see
+    /// [`delete_acquisition_states_at`] for why the scoping is that
+    /// narrow.
+    pub fn retract_acquisition_gap(
+        &self,
+        paper_id: &str,
+        drop_path: &str,
+    ) -> Result<usize, DbError> {
+        let conn = self.pool.get()?;
+        artefacts::delete_acquisition_states_at(&conn, paper_id, drop_path)
     }
 
     /// Create all repository instances sharing this database.

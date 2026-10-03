@@ -17,7 +17,11 @@ use scitadel_db::sqlite::{
 
 /// Wrapper around the database that loads data for each TUI view.
 pub struct DataStore {
-    db: Database,
+    /// `pub(crate)` rather than private because the download task needs the
+    /// pool: ADR-007 S1 paces downloads against the SQLite ledger in this
+    /// database and dual-writes each one, so it cannot be handed a
+    /// downloader that has nowhere to record what it fetched.
+    pub(crate) db: Database,
 }
 
 impl DataStore {

@@ -594,17 +594,25 @@ pub async fn download_paper_tool(
     let config = load_config();
     let out_dir = config.papers_dir();
 
+    // One database for both halves of ADR-007 S1: the SQLite pacing ledger
+    // the downloader spends from, and the rows the completed download is
+    // dual-written into. Opening it here rather than per-branch is also
+    // what keeps the MCP process on the *same* budget as a TUI running
+    // against the same library.
+    let db = open_db()?;
     let downloader =
-        scitadel_adapters::download::PaperDownloader::new(config.openalex.auth(), 60.0);
+        scitadel_adapters::download::PaperDownloader::new(db.clone(), config.openalex.auth(), 60.0)
+            .map_err(|e| e.to_string())?;
 
     let result = if let Some(pid) = paper_id {
-        let db = open_db()?;
         let paper = resolve_paper_id(&db, pid)?;
         downloader
             .download_paper(&paper, &out_dir)
             .await
             .map_err(|e| e.to_string())?
     } else if let Some(d) = doi {
+        // DOI-only: no `Paper`, so nothing is dual-written here — this is
+        // the one path that leaves the library untouched.
         downloader
             .download(d, &out_dir)
             .await
@@ -617,7 +625,7 @@ pub async fn download_paper_tool(
         "Downloaded paper: {}\nFormat: {}\nSource: {}\nAccess: {}\nSize: {} bytes\nPath: {}",
         result.doi,
         result.format,
-        result.source,
+        result.source(),
         result.access,
         result.bytes,
         result.path.display()
