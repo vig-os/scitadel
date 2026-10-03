@@ -143,6 +143,40 @@ const BUCKETS: &[BucketSpec] = &[
         hosts: &["api.unpaywall.org", "unpaywall.org"],
     },
     BucketSpec {
+        // doi.org — the DOI resolution proxy, not a publisher (#275).
+        //
+        // S2's pre-fetch identity check resolves **every DOI in a campaign**
+        // through here, so this row is on the critical path of every
+        // acquisition rather than being incidental traffic. Left unrouted it
+        // inherited the unknown-host default of 5 s, which turns a 1,889-DOI
+        // corpus into 2 h 37 m of pure resolution before a single PDF is
+        // fetched.
+        //
+        // **Where the interval comes from.** doi.org's own resolution
+        // documentation publishes no rate limit for the proxy, and a probe of
+        // 30 sequential resolutions (~1.9 req/s) returned no 429 and no
+        // rate-limit headers at all — the service is deliberately
+        // unmetered here. The one *published* number that names doi.org is
+        // DataCite's, for requests that arrive via doi.org content
+        // negotiation: "1000 requests per 5 minutes per IP address", i.e.
+        // ~3.3 req/s. 500 ms sits at 2 req/s — comfortably under a ceiling
+        // that is only inferred, not observed.
+        //
+        // **Where the cap comes from: us, not them.** 1,000 per rolling 24 h
+        // is a scitadel policy choice, not a claim about doi.org, and is
+        // labelled as such because a policy table with unattributed numbers is
+        // one nobody can audit. A real campaign resolving 1,000 distinct DOIs
+        // raises this, and the right response is the caching below — not a
+        // larger number nobody sourced.
+        //
+        // doi.org's proxies cache handle values with a 24 h TTL, so
+        // re-resolving a DOI that has not changed is both wasteful and
+        // unnecessary.
+        name: "doi.org",
+        policy: BucketPolicy::new(500, 1_000, 1_000),
+        hosts: &["doi.org", "dx.doi.org", "www.doi.org", "doi.org:443"],
+    },
+    BucketSpec {
         // ADR-007 §4, "Springer platform (TDM)": 1 s per request, caps "per
         // `tdm_authorisation`". The caps below stand in for the
         // authorisation's caps until the credential store lands, and use the
@@ -514,6 +548,105 @@ mod tests {
         assert_eq!(
             table.policy_for(&Bucket("sciencedirect.com".into())),
             UNKNOWN_HOST_POLICY
+        );
+    }
+
+    /// #275: doi.org is on the critical path of every acquisition, because S2's
+    /// pre-fetch identity check resolves every DOI in a campaign through it.
+    ///
+    /// The assertion that matters is the **policy**, not the bucket name.
+    /// Unrouted, doi.org already resolved to a bucket *called* `doi.org` —
+    /// its registrable domain — so any check on the name alone reported it as
+    /// handled while it silently carried the unknown-host 5 s policy. That is
+    /// why this went unnoticed, and why the test compares policies.
+    #[test]
+    fn doi_org_is_routed_rather_than_inheriting_the_unknown_host_policy() {
+        let table = BucketPolicyTable::new();
+        let unknown_policy = table
+            .resolve(&Url::parse("https://unlisted.example/x").unwrap())
+            .policy;
+
+        for host in ["doi.org", "dx.doi.org", "www.doi.org"] {
+            let route = table.resolve(&Url::parse(&format!("https://{host}/10.1234/x")).unwrap());
+            assert_eq!(route.bucket.as_str(), "doi.org", "{host} bucket name");
+            assert_ne!(
+                route.policy.min_interval_ms, unknown_policy.min_interval_ms,
+                "{host} still carries the unknown-host policy"
+            );
+            assert_ne!(
+                route.policy.request_cap, unknown_policy.request_cap,
+                "{host} still carries the unknown-host cap"
+            );
+        }
+    }
+
+    /// The regression that mattered: unrouted, doi.org inherited the 5 s
+    /// unknown-host default, so a real corpus crawled. This pins both that it
+    /// is materially faster and that it stays under the only published
+    /// doi.org-related ceiling (DataCite's 1000 per 5 min ≈ 3.3 req/s).
+    #[test]
+    fn doi_org_pacing_is_far_below_the_unknown_host_default_and_under_the_cited_ceiling() {
+        let table = BucketPolicyTable::new();
+        let doi = table
+            .resolve(&Url::parse("https://doi.org/10.1234/x").unwrap())
+            .policy;
+        let unknown = table
+            .resolve(&Url::parse("https://some-unlisted-host.example/x").unwrap())
+            .policy;
+
+        // Materially faster than the 5 s default: this is the whole point of
+        // routing it.
+        assert!(
+            doi.min_interval_ms * 10 <= unknown.min_interval_ms,
+            "doi.org at {}ms is not meaningfully faster than the {}ms default",
+            doi.min_interval_ms,
+            unknown.min_interval_ms
+        );
+
+        // And under the cited ceiling. 1000 per 5 minutes is ~333 ms; 500 ms
+        // is 2 req/s against a ~3.3 req/s limit.
+        assert!(
+            doi.min_interval_ms >= 300,
+            "doi.org's interval of {}ms would exceed the cited 1000-per-5-min ceiling",
+            doi.min_interval_ms
+        );
+    }
+
+    /// Every routed host must have a policy, or the pacer is skipped for it —
+    /// which is the failure #250's ledger work was meant to make impossible.
+    #[test]
+    fn every_named_bucket_in_the_table_has_a_policy() {
+        let table = BucketPolicyTable::new();
+        for spec in BUCKETS {
+            let route =
+                table.resolve(&Url::parse(&format!("https://{}/x", spec.hosts[0])).unwrap());
+            assert_eq!(route.bucket.as_str(), spec.name);
+            assert_eq!(
+                route.policy.min_interval_ms, spec.policy.min_interval_ms,
+                "{} resolved to a different policy",
+                spec.name
+            );
+            assert!(
+                spec.policy.min_interval_ms > 0,
+                "{} has no floor",
+                spec.name
+            );
+            assert!(spec.policy.request_cap > 0, "{} has no cap", spec.name);
+        }
+    }
+
+    /// The cap is a scitadel policy choice and must not drift upward silently:
+    /// a 24 h corpus of 1,889 DOIs needs caching, not a bigger number.
+    #[test]
+    fn the_doi_org_cap_is_the_documented_policy_choice() {
+        let table = BucketPolicyTable::new();
+        assert_eq!(
+            table
+                .resolve(&Url::parse("https://doi.org/10.1234/x").unwrap())
+                .policy
+                .request_cap,
+            1_000,
+            "the doi.org cap changed without updating the comment that sources it"
         );
     }
 }
