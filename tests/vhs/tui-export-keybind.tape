@@ -20,6 +20,16 @@ Type `export PS1="$ "`
 Enter
 Type `export TMPDIR=$(mktemp -d)`
 Enter
+# Pin the reader identity rather than inheriting it.
+#
+# `scitadel tui` reads the reader from `$USER`, falling back to the literal
+# "unknown" when it is unset — and a vhs shell does not reliably have `USER`
+# exported. Seeding the shortlist with `$USER` could therefore write
+# reader='' while the TUI looked for reader='unknown', and the export would
+# fail with "export failed: shortlist is empty" for a reason that reads like a
+# product bug and is really an unset variable in the test.
+Type `export USER=demo`
+Enter
 Type `export SCITADEL_DB=$TMPDIR/scitadel.db`
 Enter
 Type `cd $TMPDIR`
@@ -29,6 +39,12 @@ Enter
 Sleep 1s
 
 # Seed: 1 question + 1 paper + 1 assessment + 1 shortlist row.
+#
+# The table is `shortlist_members`, not `shortlist` — migration 010 introduced
+# shortlists and named it that. Inserting into `shortlist` fails with "no such
+# table", the error scrolls past inside the tape, and the run continues to
+# export an empty shortlist, which fails with "export failed: shortlist is
+# empty" and renders a frame that looks like it worked.
 Type `sqlite3 $SCITADEL_DB "INSERT INTO research_questions (id, text, description, created_at, updated_at) VALUES ('q-attn', 'What is the role of attention?', 'For a lit review section.', datetime('now'), datetime('now'));"`
 Enter
 Sleep 200ms
@@ -38,7 +54,7 @@ Sleep 100ms
 Type `sqlite3 $SCITADEL_DB "INSERT INTO assessments (id, paper_id, question_id, score, reasoning, assessor, created_at) VALUES ('a-1', 'p-a', 'q-attn', 0.95, 'Landmark Transformer paper.', 'claude-opus-4-7', datetime('now'));"`
 Enter
 Sleep 100ms
-Type `sqlite3 $SCITADEL_DB "INSERT INTO shortlist (question_id, paper_id, reader, added_at, updated_at) VALUES ('q-attn', 'p-a', '$USER', datetime('now'), datetime('now'));"`
+Type `sqlite3 $SCITADEL_DB "INSERT INTO shortlist_members (question_id, paper_id, reader, added_at) VALUES ('q-attn', 'p-a', '$USER', datetime('now'), datetime('now'));"`
 Enter
 Sleep 300ms
 
@@ -50,9 +66,14 @@ Type "scitadel tui"
 Enter
 Sleep 2500ms
 
-# Tab → Tab → Tab to land on Questions.
-Tab
-Sleep 400ms
+# Tab twice to land on Questions.
+#
+# Twice, not three times: the tab strip is Searches | Papers | Questions |
+# Queue, so Questions is the third tab and three presses overshoot onto
+# Queue. That overshoot is invisible in the snapshots — `E` and `Enter` are
+# both no-ops on Queue, so frames 01-03 come out byte-identical and the
+# distinct-snapshot gate fails with a message that points at rendering rather
+# than at navigation. Matches `question-dashboard.tape`.
 Tab
 Sleep 400ms
 Tab
