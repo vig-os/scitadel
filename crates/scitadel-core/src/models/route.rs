@@ -22,15 +22,16 @@
 //!
 //! ## What S1 wires up
 //!
-//! Only five routes fetch in S1: [`RouteId::Arxiv`],
+//! Only six routes fetch in S1: [`RouteId::Arxiv`], [`RouteId::Biorxiv`],
 //! [`RouteId::OpenAlex`], [`RouteId::Unpaywall`], [`RouteId::Publisher`] and
-//! [`RouteId::ManualUrl`] — the four legs `download_paper` has always tried,
-//! plus the last-resort URL. The rest are declared now, before anything uses
-//! them, because S2/S3 record `route` on artefacts they fetch and the column
-//! has no `CHECK` constraint to fall back on: a route invented at the call
-//! site is a route nothing else can match. Their [`Self::fetch_tier`] and
-//! [`Self::access_basis`] answers are still real answers, so S2 does not have
-//! to re-derive them.
+//! [`RouteId::ManualUrl`] — the four index/landing legs `download_paper` has
+//! always tried, the last-resort URL, and #260's preprint leg, which is a
+//! transform of the DOI rather than an index lookup. The rest are declared
+//! now, before anything uses them, because S2/S3 record `route` on artefacts
+//! they fetch and the column has no `CHECK` constraint to fall back on: a
+//! route invented at the call site is a route nothing else can match. Their
+//! [`Self::fetch_tier`] and [`Self::access_basis`] answers are still real
+//! answers, so S2 does not have to re-derive them.
 //!
 //! ## The four pseudo-routes
 //!
@@ -68,6 +69,17 @@ pub enum RouteId {
     Unpaywall,
     /// The direct arXiv PDF. Free, no API call.
     Arxiv,
+    /// bioRxiv/medRxiv, reached by the DOI transform in
+    /// `scitadel_adapters::preprint` rather than through an index (#260).
+    ///
+    /// One route for both servers because the `10.1101` prefix covers both
+    /// and the DOI does not say which one a preprint is on — and because
+    /// `medrxiv.org` refuses the `/content/<doi>` path outright, so there is
+    /// nothing for a second variant to distinguish. The label matches the
+    /// `biorxiv` bucket in `scitadel_http`'s policy table, which likewise
+    /// spends one budget for `biorxiv.org` and `medrxiv.org` together
+    /// (spelled without a link: this crate does not depend on that one).
+    Biorxiv,
     /// DOE OSTI, for national-lab reports that have no DOI.
     Osti,
 
@@ -120,6 +132,7 @@ impl RouteId {
             Self::OpenAlex => "openalex",
             Self::Unpaywall => "unpaywall",
             Self::Arxiv => "arxiv",
+            Self::Biorxiv => "biorxiv",
             Self::Osti => "osti",
             Self::DataCite => "datacite",
             Self::Crossref => "crossref",
@@ -136,12 +149,13 @@ impl RouteId {
     }
 
     /// Every route, so a coverage report or a test cannot miss one.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::EuropePmc,
         Self::PmcOa,
         Self::OpenAlex,
         Self::Unpaywall,
         Self::Arxiv,
+        Self::Biorxiv,
         Self::Osti,
         Self::DataCite,
         Self::Crossref,
@@ -190,9 +204,12 @@ impl RouteId {
             | Self::Unpaywall
             | Self::DataCite
             | Self::Crossref => Some(PaceTier::Meta),
-            Self::PmcOa | Self::Arxiv | Self::Osti | Self::Publisher | Self::ManualUrl => {
-                Some(PaceTier::Oa)
-            }
+            Self::PmcOa
+            | Self::Arxiv
+            | Self::Biorxiv
+            | Self::Osti
+            | Self::Publisher
+            | Self::ManualUrl => Some(PaceTier::Oa),
             Self::ElsevierTdm | Self::WileyTdm | Self::SpringerTdm => Some(PaceTier::Tdm),
             Self::BrowserSession => Some(PaceTier::Session),
             Self::Legacy | Self::ImportFlat | Self::Manual => None,
@@ -202,19 +219,21 @@ impl RouteId {
     /// The `artefacts.version` value a fetch on this route can support, or
     /// `None` for a pseudo-route.
     ///
-    /// Only arXiv gets to claim `preprint`: a PDF served from arXiv is a
-    /// preprint by construction, and the ADR's own "have" rule trusts
-    /// `unknown` on `route IN ('legacy','import_flat')` rows precisely because
-    /// nothing else should carry it. Every other route is `unknown` here and
-    /// becomes `vor`/`am` when S3's resolve-then-rank compares OpenAlex,
-    /// Crossref and DataCite against each other. Claiming `vor` from a single
-    /// Unpaywall location is the overclaiming #261 exists to stop.
+    /// Only the two preprint-by-construction routes get to claim
+    /// `preprint`: a PDF served from arXiv or from bioRxiv/medRxiv *is* a
+    /// preprint, whatever the DOI says about its eventual journal version,
+    /// and the ADR's own "have" rule trusts `unknown` on
+    /// `route IN ('legacy','import_flat')` rows precisely because nothing
+    /// else should carry it. Every other route is `unknown` here and becomes
+    /// `vor`/`am` when S3's resolve-then-rank compares OpenAlex, Crossref and
+    /// DataCite against each other. Claiming `vor` from a single Unpaywall
+    /// location is the overclaiming #261 exists to stop.
     #[must_use]
     pub fn artefact_version(self) -> Option<&'static str> {
         if self.never_fetches() {
             return None;
         }
-        Some(if matches!(self, Self::Arxiv) {
+        Some(if matches!(self, Self::Arxiv | Self::Biorxiv) {
             "preprint"
         } else {
             "unknown"
@@ -250,6 +269,7 @@ impl RouteId {
             | Self::OpenAlex
             | Self::Unpaywall
             | Self::Arxiv
+            | Self::Biorxiv
             | Self::Osti => Some("oa_license"),
             Self::ElsevierTdm | Self::WileyTdm | Self::SpringerTdm => Some("tdm_licence"),
             Self::Publisher | Self::BrowserSession | Self::ManualUrl => Some("subscription_read"),
@@ -404,9 +424,14 @@ mod tests {
         let mut labels: Vec<&str> = RouteId::ALL.iter().map(|r| r.label()).collect();
         labels.sort_unstable();
         labels.dedup();
-        assert_eq!(labels.len(), 17, "the enum has seventeen routes");
+        assert_eq!(labels.len(), 18, "the enum has eighteen routes");
         assert!(RouteId::ALL.contains(&RouteId::DataCite));
         assert!(RouteId::ALL.contains(&RouteId::ManualUrl));
+        assert!(
+            RouteId::ALL.contains(&RouteId::Biorxiv),
+            "#260 added a route, and a route missing from ALL vanishes from every \
+             report that iterates routes with nothing to notice it"
+        );
     }
 
     /// The pseudo-routes are named in migration 013, not invented here, and
@@ -469,7 +494,12 @@ mod tests {
     /// actually names.
     #[test]
     fn fetch_tiers_follow_the_adrs_classification() {
-        for route in [RouteId::Arxiv, RouteId::Osti, RouteId::PmcOa] {
+        for route in [
+            RouteId::Arxiv,
+            RouteId::Biorxiv,
+            RouteId::Osti,
+            RouteId::PmcOa,
+        ] {
             assert_eq!(route.fetch_tier(), Some(PaceTier::Oa), "{route}");
         }
         for route in [
@@ -517,15 +547,24 @@ mod tests {
         }
     }
 
-    /// An arXiv PDF is a preprint; nothing else in S1 can tell VoR from
-    /// author manuscript, so everything else stays `unknown`.
+    /// A PDF served from a preprint server is a preprint, by construction:
+    /// arXiv (#S1's record-level leg) and bioRxiv/medRxiv (#260's DOI
+    /// transform). Nothing else in S1 can tell VoR from author manuscript, so
+    /// everything else stays `unknown`.
+    ///
+    /// The set is pinned rather than stated in prose because the failure mode
+    /// is silent: a route added to the preprint arm of
+    /// [`Self::artefact_version`] without being listed here would make a
+    /// publisher's VoR masquerade as a preprint — the inverse of the
+    /// overclaim this accessor exists to prevent.
     #[test]
-    fn only_arxiv_may_claim_a_version() {
+    fn only_the_preprint_servers_may_claim_a_version() {
         assert_eq!(RouteId::Arxiv.artefact_version(), Some("preprint"));
+        assert_eq!(RouteId::Biorxiv.artefact_version(), Some("preprint"));
         for route in RouteId::ALL
             .into_iter()
             .filter(|r| !r.never_fetches())
-            .filter(|r| *r != RouteId::Arxiv)
+            .filter(|r| !matches!(r, RouteId::Arxiv | RouteId::Biorxiv))
         {
             assert_eq!(
                 route.artefact_version(),
@@ -543,6 +582,11 @@ mod tests {
         assert_eq!(RouteId::DataCite.access_basis(), None);
         assert_eq!(RouteId::Crossref.access_basis(), None);
         assert_eq!(RouteId::Arxiv.access_basis(), Some("oa_license"));
+        assert_eq!(
+            RouteId::Biorxiv.access_basis(),
+            Some("oa_license"),
+            "a preprint server serves material free to read by construction"
+        );
         assert_eq!(RouteId::ElsevierTdm.access_basis(), Some("tdm_licence"));
         assert_eq!(RouteId::Publisher.access_basis(), Some("subscription_read"));
         assert_eq!(RouteId::ManualUrl.access_basis(), Some("subscription_read"));

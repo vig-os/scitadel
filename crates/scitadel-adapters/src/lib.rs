@@ -7,6 +7,7 @@ pub mod inspire;
 pub mod lens;
 pub mod openalex;
 pub mod patentsview;
+pub mod preprint;
 pub mod pubmed;
 
 use scitadel_core::config::OpenAlexAuth;
