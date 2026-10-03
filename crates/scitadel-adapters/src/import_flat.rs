@@ -562,9 +562,19 @@ fn sort_candidates(candidates: &mut [Candidate]) {
 /// resolved first, which is what stops `tables/../../secrets.csv` from
 /// being read. `Path::starts_with` compares whole components, so
 /// `/lib/papers/other` never passes for a child of `/lib/papers/this`.
+///
+/// Canonicalising only `path` is a bug that looks like it works: on macOS
+/// `tempfile::tempdir()` hands back `/var/folders/...`, which is a symlink to
+/// `/private/var/folders/...`. A file inside it canonicalises to the
+/// `/private/var` form, which does not `starts_with` the un-canonicalised
+/// root — so every legitimate file was refused, and the refusal reads like a
+/// security decision rather than a path-alias artefact. Comparing
+/// canonical-to-canonical makes the answer independent of how the caller came
+/// by `root`.
 fn within_root(root: &Path, path: &Path) -> bool {
+    let resolved_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| lexical_normalise(path));
-    resolved == root || resolved.starts_with(root)
+    resolved == resolved_root || resolved.starts_with(&resolved_root)
 }
 
 /// Resolve `.` and `..` in a path without touching the file system.
@@ -988,3 +998,48 @@ fn mime_for(ext: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests;
+
+/// macOS CI caught a real bug in [`within_root`]: `tempfile::tempdir()`
+/// returns `/var/folders/...`, which is a symlink to
+/// `/private/var/folders/...`. A file inside it canonicalises to the
+/// `/private/var` form, which does not `starts_with` a root the caller
+/// passed in un-canonicalised — so every legitimate file was *refused*, and
+/// the refusal read like a security decision rather than a path-alias
+/// artefact.
+///
+/// Reproduced here with a symlinked root so the property is pinned on every
+/// platform, not only on the runner that found it.
+#[cfg(all(test, unix))]
+mod symlink_containment_tests {
+    use super::*;
+
+    #[test]
+    fn a_root_reached_through_a_symlink_still_admits_its_own_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("tables")).unwrap();
+        std::fs::write(real.join("tables").join("table-1.csv"), "a,b\n1,2\n").unwrap();
+
+        let via_link = dir.path().join("link-to-real");
+        std::os::unix::fs::symlink(&real, &via_link).unwrap();
+
+        // Both spellings of "inside" must be accepted.
+        assert!(
+            within_root(&real, &real.join("tables").join("table-1.csv")),
+            "the canonical form must be inside the canonical root"
+        );
+        assert!(
+            within_root(&via_link, &via_link.join("tables").join("table-1.csv")),
+            "a file reached through a symlinked root is still inside that root"
+        );
+
+        // And a genuine escape is still refused when the root is a symlink,
+        // so canonicalising the root did not blunt the boundary.
+        let outside = dir.path().join("outside.csv");
+        std::fs::write(&outside, "secret\n").unwrap();
+        assert!(
+            !within_root(&via_link, &outside),
+            "canonicalising the root must not turn a real escape into an accept"
+        );
+    }
+}
