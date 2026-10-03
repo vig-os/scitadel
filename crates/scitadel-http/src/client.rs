@@ -157,7 +157,7 @@ impl PacedClient {
             // spend the login host's budget either.
             if is_login_redirect(&current) {
                 return Err(FetchError::LoginRedirect {
-                    url: current.to_string(),
+                    url: crate::error::redact_url(current.as_ref()),
                 });
             }
 
@@ -189,8 +189,8 @@ impl PacedClient {
                 .send()
                 .await
                 .map_err(|source| FetchError::Transport {
-                    url: current.to_string(),
-                    source,
+                    url: crate::error::redact_url(current.as_ref()),
+                    source: crate::error::TransportSource::new(source),
                 })?;
 
             let status = response.status();
@@ -200,7 +200,7 @@ impl PacedClient {
                 if hops > MAX_REDIRECT_HOPS {
                     return Err(FetchError::TooManyRedirects {
                         hops: hops - 1,
-                        url: requested_url.to_string(),
+                        url: crate::error::redact_url(requested_url.as_ref()),
                     });
                 }
                 let next = resolve_redirect(&current, location)?;
@@ -225,7 +225,7 @@ impl PacedClient {
             if !status.is_success() {
                 return Err(FetchError::Status {
                     code: status.as_u16(),
-                    url: current.to_string(),
+                    url: crate::error::redact_url(current.as_ref()),
                 });
             }
 
@@ -352,7 +352,10 @@ impl PacedResponse {
             .bytes()
             .await
             .map(|b| b.to_vec())
-            .map_err(|source| FetchError::Transport { url, source })
+            .map_err(|source| FetchError::Transport {
+                url: crate::error::redact_url(url.as_ref()),
+                source: crate::error::TransportSource::new(source),
+            })
     }
 
     /// Read the body as UTF-8 text.
@@ -361,7 +364,10 @@ impl PacedResponse {
         self.response
             .text()
             .await
-            .map_err(|source| FetchError::Transport { url, source })
+            .map_err(|source| FetchError::Transport {
+                url: crate::error::redact_url(url.as_ref()),
+                source: crate::error::TransportSource::new(source),
+            })
     }
 }
 
@@ -1068,6 +1074,48 @@ mod tests {
         assert!(matches!(err, FetchError::Transport { .. }), "{err:?}");
         assert!(err.to_string().contains("127.0.0.1:1"), "{err}");
         assert!(!err.is_rate_limited(), "{err}");
+    }
+
+    /// #276 end to end: a credential in the query string must not survive
+    /// into a `Transport` error.
+    ///
+    /// This is the leak that redacting `{url}` alone does not close, because
+    /// `reqwest::Error`'s own `Display` embeds the request URL — so an error
+    /// that rendered `{source}` would hand the key back. The assertion is on
+    /// the rendered string, which is what reaches the TUI's task panel and an
+    /// MCP agent's return value.
+    #[tokio::test]
+    async fn a_credential_in_the_query_never_reaches_a_transport_error() {
+        let client = client(FakePacer::new(), BucketPolicyTable::new());
+        let secret = "sk-live-SUPERSECRET";
+
+        let err = client
+            .get(
+                // Port 1 on loopback: nothing listens, so this is a real
+                // connection refusal rather than a stubbed error.
+                url(&format!(
+                    "http://127.0.0.1:1/works?api_key={secret}&mailto=me@example.org"
+                )),
+                PaceTier::Meta,
+                SafeHeaders::unauthenticated(),
+            )
+            .await
+            .expect_err("nothing is listening on port 1");
+
+        assert!(matches!(err, FetchError::Transport { .. }), "{err:?}");
+        for rendered in [err.to_string(), format!("{err:?}")] {
+            assert!(
+                !rendered.contains(secret),
+                "the credential reached a rendered error: {rendered}"
+            );
+            assert!(
+                !rendered.contains("api_key=sk-live"),
+                "the parameter survived unredacted: {rendered}"
+            );
+        }
+        // Redaction must not cost the information that makes the error useful.
+        assert!(err.to_string().contains("api_key=REDACTED"), "{err}");
+        assert!(err.to_string().contains("mailto=me%40example.org"), "{err}");
     }
 
     /// The redirect policy is the load-bearing part of the transport contract.
