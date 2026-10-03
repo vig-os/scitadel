@@ -1,19 +1,19 @@
 ---
 type: issue
-state: open
+state: closed
 created: 2026-09-30T00:11:53Z
-updated: 2026-09-30T00:11:53Z
+updated: 2026-10-02T23:19:01Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/250
-comments: 0
+comments: 1
 labels: bug, effort:small, priority:medium
 assignees: none
 milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-09-30T07:41:22.469Z
+synced: 2026-10-03T07:15:47.036Z
 ---
 
 # [Issue 250]: [fix(db): run_migrations is not transactional or locked — concurrent starts double-apply, failures leave partial schema](https://github.com/vig-os/scitadel/issues/250)
@@ -33,3 +33,19 @@ This becomes important with #247, where migration 013 also backfills data (legac
 Found in the #247 data-architecture review.
 
 Refs: #247
+---
+
+# [Comment #1]() by [gerchowl]()
+
+_Posted on October 2, 2026 at 11:19 PM_
+
+Fixed by #263 (merged into `dev`).
+
+`run_migrations` now runs inside one `BEGIN IMMEDIATE` transaction, so a failing migration rolls back whole and concurrent starts serialise on the write lock instead of both reading an empty `schema_version`.
+
+Both acceptance behaviours are pinned by tests that were each confirmed to **fail against the old code**:
+- `failing_migration_rolls_back_completely` → old: `partial schema must not survive a failure`
+- `two_processes_migrating_a_fresh_db_both_succeed` → old: `migration 7 failed: duplicate column name: local_path`
+
+The race test runs 8 fresh-database races, because the bug is timing-dependent and one pass can succeed by luck.
+

@@ -1,19 +1,19 @@
 ---
 type: issue
-state: open
+state: closed
 created: 2026-09-29T08:27:23Z
-updated: 2026-09-29T08:27:23Z
+updated: 2026-10-02T23:19:04Z
 author: c-vigo
 author_url: https://github.com/c-vigo
 url: https://github.com/vig-os/scitadel/issues/239
-comments: 0
+comments: 1
 labels: bug, area:ci
 assignees: none
 milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-09-30T07:41:25.699Z
+synced: 2026-10-03T07:15:49.928Z
 ---
 
 # [Issue 239]: [[BUG] rust-ci.yml contract-tests job never runs: guarded on schedule, but the workflow has no schedule trigger](https://github.com/vig-os/scitadel/issues/239)
@@ -56,4 +56,18 @@ One of:
 ## Context
 
 Noticed during the org-wide merge-protection audit, vig-os/org-config#294.
+
+---
+
+# [Comment #1]() by [gerchowl]()
+
+_Posted on October 2, 2026 at 11:19 PM_
+
+Fixed by #270 (merged into `dev`).
+
+Took the issue's second option — removed rather than scheduled. Adding `schedule:` would not have helped: `cargo test --workspace` and `cargo test --workspace --features contract-tests` both run **552 tests**, because the `contract-tests` feature was declared empty and nothing was gated behind it. Scheduling it would have produced a weekly green tick and zero coverage.
+
+Audited every `github.event_name ==` guard against its workflow's `on:` block; this was the only unreachable one.
+
+The unimplemented deliverable it was standing in for (DES-002 E4, live API contract tests) is now tracked on its own as #268.
 

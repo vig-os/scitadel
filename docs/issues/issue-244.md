@@ -2,7 +2,7 @@
 type: issue
 state: open
 created: 2026-09-29T12:26:32Z
-updated: 2026-09-29T12:26:32Z
+updated: 2026-10-03T00:34:24Z
 author: renovate[bot]
 author_url: https://github.com/renovate[bot]
 url: https://github.com/vig-os/scitadel/issues/244
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-09-30T07:41:24.485Z
+synced: 2026-10-03T07:15:48.717Z
 ---
 
 # [Issue 244]: [Dependency Dashboard](https://github.com/vig-os/scitadel/issues/244)
@@ -28,7 +28,7 @@ The following updates are awaiting their schedule. To get an update now, click o
  - [ ] <!-- unschedule-branch=renovate/async-trait-0.x-lockfile -->chore(deps): update rust crate async-trait to v0.1.92
  - [ ] <!-- unschedule-branch=renovate/chrono-0.x-lockfile -->chore(deps): update rust crate chrono to v0.4.45
  - [ ] <!-- unschedule-branch=renovate/rust-futures-monorepo -->chore(deps): update rust crate futures to v0.3.34
- - [ ] <!-- unschedule-branch=renovate/libc-0.x-lockfile -->chore(deps): update rust crate libc to v0.2.189
+ - [ ] <!-- unschedule-branch=renovate/libc-0.x-lockfile -->chore(deps): update rust crate libc to v0.2.190
  - [ ] <!-- unschedule-branch=renovate/schemars-1.x-lockfile -->chore(deps): update rust crate schemars to v1.2.2
  - [ ] <!-- unschedule-branch=renovate/serde-monorepo -->chore(deps): update rust crate serde to v1.0.229
  - [ ] <!-- unschedule-branch=renovate/serde_json-1.x-lockfile -->chore(deps): update rust crate serde_json to v1.0.151
@@ -50,7 +50,8 @@ The following updates are awaiting their schedule. To get an update now, click o
  - [ ] <!-- unschedule-branch=renovate/sha2-0.x -->chore(deps): update rust crate sha2 to 0.11
  - [ ] <!-- unschedule-branch=renovate/tempfile-3.x-lockfile -->chore(deps): update rust crate tempfile to v3.27.0
  - [ ] <!-- unschedule-branch=renovate/tokio-1.x-lockfile -->chore(deps): update rust crate tokio to v1.53.1
- - [ ] <!-- unschedule-branch=renovate/uuid-1.x-lockfile -->chore(deps): update rust crate uuid to v1.26.1
+ - [ ] <!-- unschedule-branch=renovate/uuid-1.x-lockfile -->chore(deps): update rust crate uuid to v1.27.0
+ - [ ] <!-- unschedule-branch=renovate/zeroize-1.x-lockfile -->chore(deps): update rust crate zeroize to v1.9.0
  - [ ] <!-- unschedule-branch=renovate/biblatex-0.x -->fix(deps): update rust crate biblatex to 0.12
  - [ ] <!-- unschedule-branch=renovate/toml-0.x -->fix(deps): update rust crate toml to 0.9
  - [ ] <!-- unschedule-branch=renovate/keyring-4.x -->chore(deps): update rust crate keyring to v4
@@ -62,10 +63,10 @@ The following updates are awaiting their schedule. To get an update now, click o
 
 ## Detected Dependencies
 
-<details><summary>cargo (9)</summary>
+<details><summary>cargo (10)</summary>
 <blockquote>
 
-<details><summary>Cargo.toml (35)</summary>
+<details><summary>Cargo.toml (37)</summary>
 
  - `uuid 1` → [Updates: `1`]
  - `chrono 0.4` → [Updates: `0.4`]
@@ -86,6 +87,8 @@ The following updates are awaiting their schedule. To get an update now, click o
  - `tracing-subscriber 0.3` → [Updates: `0.3`]
  - `keyring 3` → [Updates: `4`]
  - `rpassword 7`
+ - `zeroize 1` → [Updates: `1`]
+ - `security-framework 3`
  - `clap 4` → [Updates: `4`]
  - `ratatui 0.30`
  - `crossterm 0.29`
@@ -130,6 +133,12 @@ The following updates are awaiting their schedule. To get an update now, click o
 
  - `csv 1`
  - `biblatex 0.11` → [Updates: `0.12`]
+
+</details>
+
+<details><summary>crates/scitadel-http/Cargo.toml (1)</summary>
+
+ - `url 2`
 
 </details>
 
@@ -263,10 +272,8 @@ The following updates are awaiting their schedule. To get an update now, click o
 
 </details>
 
-<details><summary>.github/workflows/rust-ci.yml (6)</summary>
+<details><summary>.github/workflows/rust-ci.yml (4)</summary>
 
- - `actions/checkout v6` → [Updates: `v7`]
- - `Swatinem/rust-cache v2`
  - `actions/checkout v6` → [Updates: `v7`]
  - `Swatinem/rust-cache v2`
  - `actions/checkout v6` → [Updates: `v7`]
