@@ -795,12 +795,12 @@ fn attribute_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
 /// the one input in this crate most likely to be megabytes.
 fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
     let hay = haystack.as_bytes();
-    let ned = needle.as_bytes();
-    if ned.is_empty() || ned.len() > hay.len() {
+    let pat = needle.as_bytes();
+    if pat.is_empty() || pat.len() > hay.len() {
         return None;
     }
-    hay.windows(ned.len())
-        .position(|window| window.eq_ignore_ascii_case(ned))
+    hay.windows(pat.len())
+        .position(|window| window.eq_ignore_ascii_case(pat))
 }
 
 /// The first occurrence of `needle` in these bytes.
