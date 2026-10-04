@@ -1,10 +1,14 @@
 # VHS tape: 'O' keybind opens local PDF in OS viewer (#144).
 #
-# We deliberately seed a paper WITHOUT a local_path so pressing O in
-# the Detail overlay surfaces the "no local file — press D to download
-# first" failure in the task panel. This is the only path safe to
-# render in CI; the success path would actually launch a viewer and
-# steal focus from the headless terminal session.
+# We deliberately seed a paper with NO artefact, so pressing O in the Detail
+# overlay surfaces the "no local file — press D to download first" failure in the
+# task panel. This is the only path safe to render in CI; the success path would
+# actually launch a viewer and steal focus from the headless terminal session.
+#
+# Since #253's S2e, `O` resolves the file through ADR-007 §1's derivation
+# (artefacts -> blobs) rather than through `papers.local_path`. A paper with
+# neither is still a paper with no local file, so this tape's expectation is
+# unchanged — only the reason for it moved.
 
 Output "tests/vhs/snapshots/open-externally/run.gif"
 
@@ -26,8 +30,8 @@ Type "scitadel init --yes --email demo@example.org --sources arxiv --db $SCITADE
 Enter
 Sleep 1s
 
-# Seed one paper. local_path is intentionally NULL so O surfaces the
-# "no local file" failure instead of launching a viewer.
+# Seed one paper with no artefact row, so O surfaces the "no local file" failure
+# instead of launching a viewer.
 Type `sqlite3 $SCITADEL_DB "INSERT INTO papers (id, title, authors, year, created_at, updated_at) VALUES ('p-x', 'Attention Is All You Need', '[\"Vaswani, A.\"]', 2017, datetime('now'), datetime('now'));"`
 Enter
 Sleep 200ms

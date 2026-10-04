@@ -32,7 +32,8 @@ use std::collections::HashSet;
 
 use rusqlite::params;
 use rusqlite::{Connection, TransactionBehavior};
-use scitadel_core::models::{AccessStatus, DownloadStatus, RouteId};
+use scitadel_core::models::{AccessStatus, RouteId};
+use scitadel_core::untrusted::UntrustedText;
 use sha2::{Digest, Sha256};
 
 use crate::error::DbError;
@@ -430,22 +431,29 @@ pub struct DownloadWrite {
     /// the bytes in the store, which is a reason to refuse the whole
     /// write rather than to record a row pointing at nothing.
     pub blob: Option<BlobWrite>,
-    /// The legacy `papers.local_path`: the compatibility copy under
-    /// `papers_dir` that `find_cached_file` and `read_paper` still read.
-    pub local_path: String,
-    /// The legacy `papers.download_status`.
-    pub download_status: DownloadStatus,
 }
 
-/// Record one completed download, dual-writing ADR-007 §1's two shapes in
-/// a **single** `BEGIN IMMEDIATE`: the `blobs` row, the `artefacts` row,
-/// and the three legacy `papers` columns.
+/// Record one completed download: the `blobs` row and the `artefacts` row, in a
+/// **single** `BEGIN IMMEDIATE`.
 ///
-/// One transaction, not three, because the two shapes are one fact. A
-/// `papers` row saying "downloaded" beside an `artefacts` table that has
-/// never heard of the file is the exact divergence ADR-007 §1 exists to
-/// end — and S1 keeps writing both precisely so `find_cached_file` and
-/// `read_paper` do not break before S2 moves them.
+/// One transaction, because the two rows are one fact — a `blobs` row no artefact
+/// references is garbage `gc` has to reason about, and an artefact pointing at a
+/// blob that was never written is a file we claim to hold and cannot open.
+///
+/// # The legacy columns are not written here (#253 S2e)
+///
+/// Through S1 this also filled `papers.local_path`, `download_status` and
+/// `last_attempt_at`, so that the TUI state column, `find_cached_file` and
+/// `read_paper` kept working while `artefacts` was still the newer shape. All
+/// three of those readers now go through ADR-007 §1's derivation
+/// (`sqlite::coverage`), so the second write was the last thing keeping two
+/// answers to "do we have this paper" alive, and it was the one that went stale
+/// first: a re-fetch through a different route moved the artefact and left
+/// `local_path` pointing at the previous file.
+///
+/// The `papers` row is still **required** to exist — `artefacts.paper_id` is a
+/// foreign key into it, and that insert is what refuses otherwise. What is gone is
+/// the `UPDATE` of columns nothing reads.
 ///
 /// `INSERT OR IGNORE` on `blobs` is deliberate even though the artefact
 /// row is an upsert: the blob store is content-addressed, so an existing
@@ -469,10 +477,7 @@ pub struct DownloadWrite {
 ///   make coverage claim a full text we cannot read;
 /// - a `paper_id` with no `papers` row. With `PRAGMA foreign_keys` on —
 ///   which every connection out of [`crate::sqlite::Database`] has — the
-///   artefacts insert is what refuses, and the error names the foreign
-///   key. The explicit `updated != 1` check below exists for a bare
-///   connection without the pragma, where the same mistake would
-///   otherwise be a silently skipped legacy write.
+///   artefacts insert is what refuses, and the error names the foreign key.
 ///
 /// The caller propagates all of them: **a download that cannot be
 /// recorded is not a completed download.**
@@ -561,31 +566,6 @@ pub fn record_download(conn: &mut Connection, write: &DownloadWrite) -> Result<(
          WHERE paper_id = ?1 AND kind = 'fulltext' AND locator = '' AND drop_path IS NULL",
         params![write.paper_id],
     )?;
-    // The legacy shape, same statement batch, same transaction. One
-    // timestamp for `last_attempt_at` and `updated_at`, which is what
-    // `SqlitePaperRepository::update_download_state` has always written.
-    let updated = tx.execute(
-        "UPDATE papers SET local_path = ?1, download_status = ?2,
-                          last_attempt_at = ?3, updated_at = ?3
-         WHERE id = ?4",
-        params![
-            write.local_path,
-            write.download_status.as_str(),
-            write.retrieved_at,
-            write.paper_id
-        ],
-    )?;
-    if updated != 1 {
-        // Unreachable while `PRAGMA foreign_keys` is on — the artefacts
-        // insert above would already have refused. Checked anyway, because
-        // a silently-skipped legacy write is the divergence this whole
-        // function exists to make impossible, and the message is the one
-        // thing a caller can act on.
-        return Err(DbError::Migration(format!(
-            "no papers row for {}, so the legacy columns could not be dual-written",
-            write.paper_id
-        )));
-    }
     tx.commit()?;
     Ok(())
 }
@@ -830,6 +810,40 @@ pub struct ArtefactRow {
     pub blob_rel_path: Option<String>,
 }
 
+impl ArtefactRow {
+    /// This artefact's human label, as untrusted display text (ADR-007 §1's
+    /// untrusted-content envelope).
+    ///
+    /// **Always [`scitadel_core::untrusted::Provenance::PublisherSupplied`]**, and
+    /// that is a statement about the whole column rather than about one writer: a
+    /// `label` is a *slot name*, and every slot name in this workspace came out of
+    /// a file somebody else chose. `import_flat` takes it from a filename
+    /// (`<slug>_SI_<name>`), `scan` and `attach` from the dropped file's own stem,
+    /// and the flat layout's `tables.json` for a table. scitadel writes no label of
+    /// its own, so marking one `Ours` would be a lie the type could not keep.
+    ///
+    /// The raw string is behind [`UntrustedText::as_str`], which is what the
+    /// manifest mirror serialises: the mirror records what the publisher said, and
+    /// that fidelity is a separate requirement from being safe to display.
+    #[must_use]
+    pub fn label_text(&self) -> Option<UntrustedText> {
+        self.label.as_deref().map(UntrustedText::publisher_supplied)
+    }
+
+    /// This artefact's caption, as untrusted display text.
+    ///
+    /// A caption is a publisher's or a depositor's own sentence about a figure or a
+    /// table, verbatim: `meta.json` for a figure, `tables.json` for a table, a
+    /// `<id>.caption.txt` sidecar otherwise. Same provenance as
+    /// [`Self::label_text`], and the same reason.
+    #[must_use]
+    pub fn caption_text(&self) -> Option<UntrustedText> {
+        self.caption
+            .as_deref()
+            .map(UntrustedText::publisher_supplied)
+    }
+}
+
 /// Every artefact row for `paper_id`, in `(kind, locator)` order.
 ///
 /// The order is `coverage.rs`'s, so a projection of this list and a projection of
@@ -986,6 +1000,219 @@ mod tests {
         (dir, db)
     }
 
+    /// One artefact row as read back by a reader, for the provenance tests below.
+    fn read_one(db: &Database, kind: &str, locator: &str) -> crate::sqlite::artefacts::ArtefactRow {
+        read_artefacts_for_paper(&db.conn().unwrap(), "p-1")
+            .unwrap()
+            .into_iter()
+            .find(|r| r.kind == kind && r.locator == locator)
+            .unwrap_or_else(|| panic!("no {kind}/{locator} artefact"))
+    }
+
+    /// A figure row carrying a `label` and a `caption` — the two fields whose
+    /// content a publisher wrote and scitadel stores verbatim.
+    fn captioned_figure(label: &str, caption: &str) -> ArtefactWrite {
+        let mut row = row("figure", "fig-2", "aaa");
+        // A figure reference: no bytes, which is what the ADR allows for a
+        // `sha256 IS NULL` figure row and what a caption-only artefact is.
+        row.sha256 = None;
+        row.blob = None;
+        row.format = None;
+        row.access_status = "unknown".into();
+        row.label = Some(label.into());
+        row.caption = Some(caption.into());
+        row
+    }
+
+    // ---------- ADR-007 §1's untrusted-content envelope on artefact titles ----------
+
+    /// The security-relevant one, at the artefact level: a caption written by
+    /// whoever produced the file must come back out of the database unable to
+    /// drive a terminal.
+    ///
+    /// The three shapes a caption can be hostile in — an OSC 8 hyperlink, a CSI
+    /// that repaints, an OSC 0 that renames the window — are all written into the
+    /// row the way a real importer writes them (`meta.json`, `tables.json`, a
+    /// `.caption.txt` sidecar), read back, and rendered. Both the raw stored bytes
+    /// and the rendered form are asserted, because the interesting failure is
+    /// "the escape was stripped" *and* "the text is still there": a
+    /// neutraliser that redacted instead would pass the first and fail a reader.
+    #[test]
+    fn an_artefact_title_with_terminal_escapes_is_neutralised() {
+        use scitadel_core::untrusted::Provenance;
+
+        let hostile = concat!(
+            "Figure 2: the uptake curve",
+            "\u{1b}[31m",
+            "\u{1b}[2J\u{1b}[H",
+            "\u{1b}]8;;https://attacker.example/\u{1b}\\see the data\u{1b}]8;;\u{1b}\\",
+            "\u{1b}]0;scitadel\u{7}",
+            "\u{202e}reversed caption",
+        );
+        let (_dir, db) = open();
+        let mut conn = db.conn().unwrap();
+        write_artefacts(
+            &mut conn,
+            &[captioned_figure("Figure 2", hostile)],
+            WriteMode::Reconcile,
+        )
+        .unwrap();
+
+        let stored = read_one(&db, "figure", "fig-2");
+        assert_eq!(
+            stored.caption.as_deref(),
+            Some(hostile),
+            "what was written is what is stored: the mirror's fidelity is not \
+             display safety"
+        );
+
+        let caption = stored.caption_text().expect("a caption");
+        assert_eq!(caption.as_str(), hostile);
+        assert_eq!(
+            caption.provenance(),
+            Provenance::PublisherSupplied,
+            "a caption is the document's own sentence about a figure"
+        );
+
+        let rendered = caption.rendered().into_owned();
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "no escape byte survives a render: {rendered:?}"
+        );
+        for needle in ["attacker.example", "scitadel", "\u{202e}", "[2J"] {
+            assert!(!rendered.contains(needle), "{needle} must not survive");
+        }
+        assert!(
+            rendered.starts_with("Figure 2: the uptake curve see the data reversed caption"),
+            "the words survive, in order, as one line: {rendered:?}"
+        );
+
+        // `Display` is the neutralised form, so `{}` cannot reach a terminal.
+        assert_eq!(caption.to_string(), rendered);
+        assert_eq!(format!("{caption}"), rendered);
+
+        // And the label — the other title-bearing column, whose content is a
+        // filename somebody chose — is neutralised through the same accessor.
+        let label = stored.label_text().expect("a label");
+        assert_eq!(label.as_str(), "Figure 2");
+        assert_eq!(label.rendered(), "Figure 2");
+        assert!(!label.provenance().is_trusted());
+    }
+
+    /// The cap, at the artefact level: a `tables.json` caption is unbounded and
+    /// every surface that shows one is finite, so the boundary has to hold for the
+    /// string a reader actually receives.
+    #[test]
+    fn an_artefact_title_is_capped_in_length() {
+        use scitadel_core::untrusted::{MAX_RENDERED_CHARS, MAX_UNTRUSTED_CHARS};
+
+        let caption = "Supplementary table of uptake kinetics. ".repeat(40);
+        assert!(
+            caption.chars().count() > MAX_UNTRUSTED_CHARS,
+            "the fixture has to exceed the cap, or the test proves nothing"
+        );
+        let (_dir, db) = open();
+        let mut conn = db.conn().unwrap();
+        write_artefacts(
+            &mut conn,
+            &[captioned_figure("Table S1", &caption)],
+            WriteMode::Reconcile,
+        )
+        .unwrap();
+
+        let stored = read_one(&db, "figure", "fig-2");
+        let rendered = stored
+            .caption_text()
+            .expect("a caption")
+            .rendered()
+            .into_owned();
+        assert_eq!(rendered.chars().count(), MAX_RENDERED_CHARS);
+        assert!(
+            rendered.starts_with("Supplementary table of uptake kinetics. Supplementary"),
+            "the beginning of the caption, in order: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("  "),
+            "and the whitespace collapse has not introduced a run either"
+        );
+        assert_eq!(
+            stored
+                .caption
+                .as_deref()
+                .map(str::chars)
+                .map(Iterator::count),
+            Some(caption.chars().count()),
+            "the stored caption is untouched — the cap is a rendering limit"
+        );
+    }
+
+    /// The marker is recoverable at the call site, which is what makes it a
+    /// boundary: a consumer does not have to know which writer filled a row to know
+    /// whether it is looking at scitadel's own words.
+    ///
+    /// Two rows, one table, two provenances — and the contrast with the identity
+    /// check's two titles, where the *document's* title is
+    /// `PublisherSupplied` and the one we compared it against is `Ours`
+    /// (`IdentityCheckRow::resolved_title_text` /
+    /// `expected_title_text`).
+    #[test]
+    fn provenance_distinguishes_our_title_from_a_publisher_supplied_one() {
+        use scitadel_core::untrusted::{Provenance, UntrustedText};
+
+        let (_dir, db) = open();
+        let mut conn = db.conn().unwrap();
+        write_artefacts(
+            &mut conn,
+            &[captioned_figure(
+                "Figure 2",
+                "Uptake curve for the labelled cohort",
+            )],
+            WriteMode::Reconcile,
+        )
+        .unwrap();
+        let stored = read_one(&db, "figure", "fig-2");
+
+        let from_the_document = stored.caption_text().expect("a caption");
+        let ours = UntrustedText::ours("Uptake curve for the labelled cohort");
+
+        assert_eq!(
+            from_the_document.as_str(),
+            ours.as_str(),
+            "identical words: provenance is not a guess about the content"
+        );
+        assert_eq!(
+            from_the_document.provenance(),
+            Provenance::PublisherSupplied
+        );
+        assert_eq!(ours.provenance(), Provenance::Ours);
+        assert!(!from_the_document.is_trusted());
+        assert!(ours.is_trusted());
+        assert_ne!(
+            from_the_document.provenance().label(),
+            ours.provenance().label(),
+            "and a report can say which is which"
+        );
+        assert_ne!(from_the_document.provenance(), ours.provenance());
+
+        // Both render the same way, because `Ours` is a statement about who chose
+        // the string rather than a licence to skip the escaping.
+        assert_eq!(from_the_document.rendered(), ours.rendered());
+
+        // A row with no title says so, rather than offering an empty string a
+        // caller might render as a blank cell and read as a value.
+        let mut conn = db.conn().unwrap();
+        write_artefacts(
+            &mut conn,
+            &[row("fulltext_pdf", FULLTEXT_LOCATOR, "bbb")],
+            WriteMode::Reconcile,
+        )
+        .unwrap();
+        let bare = read_one(&db, "fulltext_pdf", FULLTEXT_LOCATOR);
+        assert_eq!(bare.caption, None);
+        assert_eq!(bare.caption_text(), None);
+        assert_eq!(bare.label_text(), None);
+    }
+
     /// One artefact row as a named tuple, so the tests above can say which
     /// column they mean.
     #[derive(Debug, PartialEq, Eq)]
@@ -1129,7 +1356,7 @@ mod tests {
         );
     }
 
-    // ---------- record_download: the dual write ----------
+    // ---------- record_download: the only shape ----------
 
     /// A download of `route` for `p-1`, with one content digest.
     fn download(route: RouteId, sha: &str, retrieved_at: &str) -> DownloadWrite {
@@ -1149,11 +1376,15 @@ mod tests {
                 rel_path: format!("blobs/{}/{sha}.pdf", &sha[..2]),
                 created_at: retrieved_at.into(),
             }),
-            local_path: "/library/papers/p-1.pdf".into(),
-            download_status: DownloadStatus::Downloaded,
         }
     }
 
+    /// `(local_path, download_status, last_attempt_at)` for `p-1`.
+    ///
+    /// The only reader of the three retired columns left in the workspace, and it
+    /// is a test: the S1 backfill (`sqlite::acquisition`) is the production one,
+    /// and it exists precisely to migrate an existing library. Everything else
+    /// reads artefacts.
     fn legacy_of(db: &Database) -> (Option<String>, Option<String>, Option<String>) {
         let conn = db.conn().unwrap();
         conn.query_row(
@@ -1164,12 +1395,23 @@ mod tests {
         .unwrap()
     }
 
-    /// ADR-007 §1 "Legacy data": one transaction writes the artefact row
-    /// *and* the legacy columns, from the route's own answers. Both shapes
-    /// have to be present or S2 has nothing to migrate to and the TUI's
-    /// state column has nothing to read.
+    /// #253's S2e: a recorded download writes the artefact row and nothing else.
+    ///
+    /// This replaces `a_download_records_the_artefact_and_the_legacy_columns_together`,
+    /// which asserted the opposite — that one transaction wrote `local_path`,
+    /// `download_status` and `last_attempt_at` beside the artefact. That test was
+    /// S1's promise ("no behaviour change") and it is now the bug: those columns
+    /// were a second answer to "do we have this paper", and a second answer is
+    /// what goes stale. A re-download through a different route moved the artefact
+    /// and left `local_path` naming the file from the fetch before it, so `O` in
+    /// the TUI opened the previous paper.
+    ///
+    /// The assertion is `NULL` on all three rather than "unchanged", because the
+    /// fixture's row has never been written: a test that recorded a value first and
+    /// asserted it survived would pass against an implementation that never wrote
+    /// the column in the first place, which is the half that matters.
     #[test]
-    fn a_download_records_the_artefact_and_the_legacy_columns_together() {
+    fn the_legacy_columns_are_no_longer_written() {
         let (_dir, db) = open();
         let mut conn = db.conn().unwrap();
         record_download(
@@ -1192,17 +1434,14 @@ mod tests {
         assert_eq!(rows[0].sha256.as_deref(), Some("aaa"));
         assert_eq!(rows[0].imported_from, None, "a fetch imports nothing");
 
-        let (local_path, status, attempted) = legacy_of(&db);
+        // The three retired columns are untouched. See the test's own docs for why
+        // this replaces the dual-write assertion rather than adding to it.
         assert_eq!(
-            local_path.as_deref(),
-            Some("/library/papers/p-1.pdf"),
-            "the compatibility copy is still recorded"
-        );
-        assert_eq!(status.as_deref(), Some("downloaded"));
-        assert_eq!(
-            attempted.as_deref(),
-            Some("2026-01-01T00:00:00+00:00"),
-            "one stamp for the whole write"
+            legacy_of(&db),
+            (None, None, None),
+            "a recorded download writes no local_path, no download_status and no \
+             last_attempt_at; ADR-007 §1's derivation is the only reader left, and \
+             the columns are dropped a release later"
         );
 
         let blobs: i64 = {

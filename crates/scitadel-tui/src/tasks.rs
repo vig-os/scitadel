@@ -29,8 +29,7 @@ pub struct Task {
 #[derive(Debug, Clone)]
 pub enum TaskKind {
     /// `ref_id` is the best identifier we have to show the user (DOI, arxiv id, or paper UUID prefix).
-    /// `paper_id` lets the drain loop persist the outcome back to the
-    /// `papers.download_status` column (#112).
+    /// `paper_id` identifies the work for the Papers table's in-flight `↻` marker.
     Download {
         paper_id: String,
         ref_id: String,
@@ -40,11 +39,12 @@ pub enum TaskKind {
     /// Fire-and-forget: success surfaces as the viewer opening, so this
     /// task only sticks around long enough to flash the failure message
     /// when no local file exists or the spawn errored.
-    OpenExternal {
-        paper_id: String,
-        ref_id: String,
-        title: String,
-    },
+    ///
+    /// Carries no `paper_id`: this task is never a download, so it never marks a
+    /// row in flight, and the file it opens was resolved before the task was
+    /// spawned. It used to, for the drain loop's write into the retired
+    /// `papers.download_status` column (#253's S2e).
+    OpenExternal { ref_id: String, title: String },
 }
 
 #[derive(Debug, Clone)]
@@ -135,7 +135,6 @@ pub fn spawn_open_external(tx: UnboundedSender<TaskUpdate>, paper: &Paper, path:
     let task = Task {
         id,
         kind: TaskKind::OpenExternal {
-            paper_id: paper.id.as_str().to_string(),
             ref_id,
             title: paper.title.clone(),
         },

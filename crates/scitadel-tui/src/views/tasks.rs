@@ -122,7 +122,6 @@ mod tests {
             publisher_url: None,
         };
         let kind = TaskKind::OpenExternal {
-            paper_id: "p".into(),
             ref_id: "ref".into(),
             title: "title".into(),
         };

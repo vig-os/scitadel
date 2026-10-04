@@ -1,14 +1,23 @@
 //! ADR-007 §1 "Legacy data": the backfill from today's three-column,
 //! one-file-per-paper shape into `artefacts` + `blobs`.
 //!
-//! Migration 013 gave a work many files with provenance; what is on disk
-//! today is one file per work recorded in `papers.local_path`, with
+//! Migration 013 gave a work many files with provenance; what was on disk
+//! before it was one file per work recorded in `papers.local_path`, with
 //! `download_status` saying whether it is the real thing and
 //! `last_attempt_at` saying when we last tried. This module carries that
-//! shape across without deleting any of it: the legacy columns stay (S1
-//! promises no behaviour change, so `find_cached_file` and `read_paper`
-//! keep reading them), and the files stay where they are — ADR-007 says
-//! the backfill **copies** into `blobs/` and never moves.
+//! shape across without deleting any of it: the columns stay, and the files
+//! stay where they are — ADR-007 says the backfill **copies** into `blobs/`
+//! and never moves.
+//!
+//! ## This is now the only reader of the three columns
+//!
+//! #253's S2e stopped writing them and moved every consumer onto ADR-007 §1's
+//! derivation (`sqlite::coverage`), so the backfill is the only code left that
+//! reads `local_path` — which is exactly what a migration is: the one reader that
+//! exists for a library shaped before the write was removed. It is why the columns
+//! are dropped a release later rather than in the same commit: without them this
+//! function has nothing to reconcile, and with them an upgrading library keeps its
+//! files reachable through `artefacts` from the first `migrate()`.
 //!
 //! ## Two phases, deliberately
 //!
@@ -38,10 +47,9 @@
 //! ## The decision tables
 //!
 //! `kind` comes from the file extension, lowercased. The legacy writer
-//! (`scitadel_adapters::download`) only ever produced `.pdf` and `.html`,
-//! and `find_cached_file` only looks for those two, so those are the
-//! cases that matter; `xml`/`nxml`/`jats` are included because JATS is a
-//! real full-text serialisation and raid consumes it.
+//! (`scitadel_adapters::download`) only ever produced `.pdf` and `.html`, so
+//! those are the cases that matter; `xml`/`nxml`/`jats` are included because JATS
+//! is a real full-text serialisation and raid consumes it.
 //!
 //! | extension | `kind` | `format` | `mime` |
 //! |---|---|---|---|

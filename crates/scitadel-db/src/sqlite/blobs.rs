@@ -8,13 +8,15 @@
 //! is by definition the same bytes.
 //!
 //! These primitives are shared by every writer of `blobs`: the legacy
-//! backfill (`sqlite::acquisition`) and the flat-layout importer
-//! (`scitadel_adapters::import_flat`). There is exactly one
-//! implementation, so the same bytes can never get two different store
-//! paths or two different artefact ids.
+//! backfill (`sqlite::acquisition`), the flat-layout importer
+//! (`scitadel_adapters::import_flat`) and the download chain
+//! (`scitadel_adapters::download`). There is exactly one implementation, so the
+//! same bytes can never get two different store paths or two different artefact
+//! ids.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
@@ -111,34 +113,124 @@ pub fn hash_file(path: &Path) -> Result<(String, i64), DbError> {
 }
 
 /// Copy `src` into `<library_root>/blobs/<first 2 hex>/<sha256>.<ext>`.
-/// The copy is staged in `blobs/.tmp/` and renamed into place, so a
-/// reader never sees a half-written blob and a crash never leaves one.
+///
+/// For a file that already exists on disk: the S1 legacy backfill and the
+/// flat-layout importer, whose inputs are files somebody else wrote. The copy
+/// is staged in `blobs/.tmp/` and renamed into place, so a reader never sees a
+/// half-written blob and a crash never leaves one.
+///
+/// **Copy, never move.** ADR-007 §1 "Legacy data" is explicit that the backfill
+/// "copies" and never moves: the file it was handed is the only copy of a paper a
+/// user had before scitadel knew the work existed, and a migration that consumed
+/// it would be unrecoverable. [`store_bytes`] is the one writer that renames —
+/// it created the file itself.
+///
+/// See [`store_bytes`] for freshly fetched bytes, which have no file yet.
 pub fn store_blob(src: &Path, sha256: &str, ext: &str, library_root: &Path) -> Result<(), DbError> {
     let dest = library_root.join(blob_rel_path(sha256, ext));
     if dest.exists() {
         // Content-addressed: same digest, same bytes.
         return Ok(());
     }
+    let staging = staging_path(library_root, sha256);
+    for dir in [staging.parent(), dest.parent()].into_iter().flatten() {
+        std::fs::create_dir_all(dir).map_err(|e| io_error("create blob dir", dir, &e))?;
+    }
+    std::fs::copy(src, &staging).map_err(|e| io_error("copy file into blob store", src, &e))?;
+    commit(&staging, &dest)
+}
 
-    let store = library_root.join(BLOB_DIR);
-    let staging = store
+/// A staging file inside the store's own staging directory, named by what will
+/// identify the blob once it is committed.
+fn staging_path(library_root: &Path, sha256: &str) -> PathBuf {
+    library_root
+        .join(BLOB_DIR)
         .join(BLOB_TMP_DIR)
-        .join(format!("{sha256}.{}.tmp", std::process::id()));
-    if let Some(dir) = staging.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| io_error("create blob tmp dir", dir, &e))?;
+        .join(format!("{sha256}.{}.tmp", std::process::id()))
+}
+
+/// Put freshly fetched bytes in the store, and report the digest and length.
+///
+/// ADR-007 §1 "Storage", for the case where the bytes are still in memory: they
+/// are written to `blobs/.tmp/` — **the store's own staging directory, on the
+/// same filesystem** — hashed there, and renamed to the path the digest names.
+/// So the atomicity argument is the one [`store_blob`] makes, not a new one, and
+/// there is no intermediate file anywhere else on the disk to clean up.
+///
+/// # Why the download chain stages rather than hashing in memory
+///
+/// The digest has to be of the bytes *as they landed on disk*, not of the buffer
+/// that produced them, because that is the digest every other writer records —
+/// the legacy backfill, the flat importer — and two writers that could disagree
+/// about a blob's identity would break the store's whole premise. Hashing one
+/// file in the same place keeps the answer to "what are these bytes" single.
+///
+/// One copy, not two: [`commit`] renames the staged file rather than copying it
+/// again, which is only safe because the staging directory is inside `blobs/`.
+///
+/// # Errors
+///
+/// [`io_error`]-shaped, naming the path that failed. The staged file is removed on
+/// a placement failure, so a failed fetch leaves nothing behind for `gc` to count.
+pub fn store_bytes(bytes: &[u8], ext: &str, library_root: &Path) -> Result<(String, i64), DbError> {
+    /// Unique per process *and* per call: two fetches in one process stage
+    /// concurrently, and a digest is not known until after the write.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    let staging_dir = library_root.join(BLOB_DIR).join(BLOB_TMP_DIR);
+    std::fs::create_dir_all(&staging_dir)
+        .map_err(|e| io_error("create blob tmp dir", &staging_dir, &e))?;
+
+    let staging = staging_dir.join(format!(
+        "fetch-{}-{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&staging, bytes).map_err(|e| io_error("stage fetched bytes", &staging, &e))?;
+
+    // `hash_file` reads in chunks, so a 100 MB PDF is never read into memory twice
+    // — which matters here, because it *was* in memory once already.
+    let (sha256, byte_len) = hash_file(&staging)?;
+    let dest = library_root.join(blob_rel_path(&sha256, ext));
+    if dest.exists() {
+        // Content-addressed: same digest, same bytes, so the store already has
+        // them and the staged copy is redundant.
+        let _ = std::fs::remove_file(&staging);
+        return Ok((sha256, byte_len));
     }
     if let Some(dir) = dest.parent() {
         std::fs::create_dir_all(dir).map_err(|e| io_error("create blob dir", dir, &e))?;
     }
-    std::fs::copy(src, &staging).map_err(|e| io_error("copy file into blob store", src, &e))?;
+    commit(&staging, &dest)?;
+    Ok((sha256, byte_len))
+}
 
-    match std::fs::rename(&staging, &dest) {
+/// Rename a staged file into its place in the store — the one definition of "in
+/// place" that [`store_blob`] and [`store_bytes`] share, so the two can never
+/// disagree about what a reader will see.
+///
+/// The staged file sits in `blobs/.tmp/`, which is the store's own staging
+/// directory, so the rename is within one filesystem and therefore atomic: a
+/// reader either sees no blob or sees a whole one.
+///
+/// A rename that loses a race to an identical blob is a success, not an error. Two
+/// processes fetching the same bytes is a normal outcome of a content-addressed
+/// store, and reporting it as a failure would fail a download that in fact
+/// succeeded — and leave the loser retrying forever.
+///
+/// On any other failure the staged file is removed, so a failed fetch leaves
+/// nothing behind for `gc` to count as untracked.
+fn commit(staged: &Path, dest: &Path) -> Result<(), DbError> {
+    match std::fs::rename(staged, dest) {
         Ok(()) => Ok(()),
         // Another process may have won the race with identical bytes.
-        Err(_) if dest.exists() => Ok(()),
+        Err(_) if dest.exists() => {
+            let _ = std::fs::remove_file(staged);
+            Ok(())
+        }
         Err(e) => {
-            let _ = std::fs::remove_file(&staging);
-            Err(io_error("place blob in store", &dest, &e))
+            let _ = std::fs::remove_file(staged);
+            Err(io_error("place blob in store", dest, &e))
         }
     }
 }
@@ -233,5 +325,45 @@ mod tests {
         assert_eq!(sha, hex_digest(&expected.finalize()));
         assert_eq!(bytes, body.len() as i64);
         assert!(hash_file(&dir.path().join("gone.pdf")).is_err());
+    }
+
+    /// `store_bytes` and `store_blob` must agree about what a blob's path is and
+    /// what its digest is, because both writers put the *same* bytes in the same
+    /// store — the download chain from memory, the importers from a file.
+    #[test]
+    fn stored_bytes_and_a_stored_file_land_on_one_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let body = b"%PDF-1.7 shared bytes\n%%EOF\n";
+
+        let source = root.join("somewhere.pdf");
+        std::fs::write(&source, body).unwrap();
+        let (sha_from_file, len_from_file) = hash_file(&source).unwrap();
+        store_blob(&source, &sha_from_file, "pdf", root).unwrap();
+
+        let (sha_from_bytes, len_from_bytes) = store_bytes(body, "pdf", root).unwrap();
+        assert_eq!(sha_from_bytes, sha_from_file, "one digest for one body");
+        assert_eq!(len_from_bytes, len_from_file);
+
+        let expected = root.join(blob_rel_path(&sha_from_file, "pdf"));
+        assert!(expected.is_file(), "at {}", expected.display());
+        assert_eq!(std::fs::read(&expected).unwrap(), body);
+
+        // Identical bytes are already in the store, so the second write adds
+        // nothing and leaves no staged file behind for `gc` to count.
+        let staged: Vec<_> = std::fs::read_dir(root.join(BLOB_DIR).join(BLOB_TMP_DIR))
+            .map(|entries| entries.flatten().collect())
+            .unwrap_or_default();
+        assert!(
+            staged.is_empty(),
+            "nothing left staged: {:?}",
+            staged.iter().map(|e| e.path()).collect::<Vec<_>>()
+        );
+
+        // A different body, and a store with no `blobs/` yet.
+        let (other_sha, other_len) = store_bytes(b"%PDF-1.7 other\n", "pdf", root).unwrap();
+        assert_ne!(other_sha, sha_from_file);
+        assert_eq!(other_len, 15);
+        assert!(root.join(blob_rel_path(&other_sha, "pdf")).is_file());
     }
 }

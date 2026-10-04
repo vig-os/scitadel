@@ -2,13 +2,14 @@ use std::collections::HashSet;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 
-use scitadel_core::models::{DownloadStatus, Paper};
+use scitadel_core::models::Paper;
+use scitadel_db::sqlite::DownloadState;
 
 use crate::data::DataStore;
-use crate::views::util::truncate;
+use crate::views::util::{download_state_cell, truncate};
 
 #[allow(clippy::too_many_arguments)]
 pub fn draw(
@@ -21,10 +22,12 @@ pub fn draw(
     papers_with_unread: &HashSet<String>,
 ) {
     let papers = data.load_papers(1000, 0).unwrap_or_default();
+    let states = data.load_download_states(&papers);
     render_paper_table(
         frame,
         area,
         &papers,
+        &states,
         selected,
         " Papers ",
         starred,
@@ -45,6 +48,7 @@ pub fn draw_for_search(
     papers_with_unread: &HashSet<String>,
 ) {
     let papers = data.load_papers_for_search(search_id).unwrap_or_default();
+    let states = data.load_download_states(&papers);
     let title = format!(
         " Papers for search {} ",
         search_id.chars().take(8).collect::<String>()
@@ -53,6 +57,7 @@ pub fn draw_for_search(
         frame,
         area,
         &papers,
+        &states,
         selected,
         &title,
         starred,
@@ -61,27 +66,12 @@ pub fn draw_for_search(
     );
 }
 
-/// Returns (symbol, color) for the Papers-table state column.
-/// `↻` if a download is currently running for this paper, otherwise
-/// derived from the persisted `download_status` (#112).
-fn download_cell(paper: &Paper, downloading: &HashSet<String>) -> (&'static str, Color) {
-    let t = crate::theme::theme();
-    if downloading.contains(paper.id.as_str()) {
-        return ("↻", t.warning);
-    }
-    match paper.download_status {
-        Some(DownloadStatus::Downloaded) => ("✓", t.success),
-        Some(DownloadStatus::Paywall) => ("⊘", t.warning),
-        Some(DownloadStatus::Failed) => ("✗", t.danger),
-        None => (" ", t.muted),
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn render_paper_table(
     frame: &mut Frame,
     area: Rect,
     papers: &[Paper],
+    states: &std::collections::HashMap<String, DownloadState>,
     selected: usize,
     title: &str,
     starred: &HashSet<String>,
@@ -128,7 +118,10 @@ fn render_paper_table(
             } else {
                 " "
             };
-            let (dl_symbol, dl_color) = download_cell(p, downloading);
+            let (dl_symbol, dl_color) = download_state_cell(
+                states.get(p.id.as_str()).copied(),
+                downloading.contains(p.id.as_str()),
+            );
 
             Row::new(vec![
                 Cell::from((i + 1).to_string()),

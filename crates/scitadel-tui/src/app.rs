@@ -518,22 +518,14 @@ impl App {
                     }
                 }
                 TaskUpdate::Status { id, status } => {
-                    // Persist Done/Failed back to papers.download_status
-                    // (#112) before mutating the in-memory task — borrow
-                    // the matching task once to read the paper_id.
-                    let paper_id = self
-                        .tasks
-                        .iter()
-                        .find(|t| t.id == id)
-                        .map(|t| match &t.kind {
-                            TaskKind::Download { paper_id, .. } => (paper_id.clone(), true),
-                            TaskKind::OpenExternal { paper_id, .. } => (paper_id.clone(), false),
-                        });
-                    if let Some((pid, persist)) = paper_id
-                        && persist
-                    {
-                        self.persist_download_outcome(&pid, &status);
-                    }
+                    // #253's S2e: nothing is written here any more. A download task
+                    // used to persist its own outcome into the retired
+                    // `papers.download_status` column, which made the state column a
+                    // second, TUI-owned answer to "do we have this paper" — and the
+                    // one that went stale first, because the downloader had already
+                    // recorded the artefact through a different writer. The state
+                    // column now derives its answer from `artefacts`, so the task
+                    // panel only has to say what happened to the person watching it.
                     if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
                         t.status = status;
                         if matches!(t.status, TaskStatus::Done { .. } | TaskStatus::Failed(_)) {
@@ -567,38 +559,6 @@ impl App {
                 TaskKind::OpenExternal { .. } => None,
             })
             .collect()
-    }
-
-    fn persist_download_outcome(&self, paper_id: &str, status: &TaskStatus) {
-        use scitadel_adapters::download::AccessStatus;
-        use scitadel_core::models::DownloadStatus;
-        let outcome = match status {
-            TaskStatus::Done { path, access, .. } => {
-                let download_status = match access {
-                    AccessStatus::FullText => DownloadStatus::Downloaded,
-                    AccessStatus::Abstract | AccessStatus::Paywall | AccessStatus::Unknown => {
-                        DownloadStatus::Paywall
-                    }
-                };
-                Some((path.to_string_lossy().into_owned(), download_status))
-            }
-            TaskStatus::Failed(_) => Some((String::new(), DownloadStatus::Failed)),
-            TaskStatus::Queued | TaskStatus::Running => None,
-        };
-        if let Some((path, ds)) = outcome {
-            let path_arg = if matches!(ds, DownloadStatus::Failed) {
-                None
-            } else {
-                Some(path.as_str())
-            };
-            if let Err(e) = self.data.record_download_outcome(paper_id, path_arg, ds) {
-                tracing::warn!(
-                    paper_id,
-                    error = %e,
-                    "failed to persist download outcome"
-                );
-            }
-        }
     }
 
     /// True when the currently-active overlay is consuming character
@@ -1237,11 +1197,25 @@ impl App {
     /// Spawn the OS default viewer for the paper's local file. Surfaces
     /// errors (no local file, exec failure) via a transient task panel
     /// row — success is implicit because the user sees the viewer pop up.
+    ///
+    /// The file is resolved through ADR-007 §1's derivation
+    /// (`download::find_cached_file`), which is the same answer `read_paper` gets.
+    /// It used to be `paper.local_path` — a column nothing writes since S2e, so
+    /// `O` would have opened whatever the last pre-S2e download left behind, for
+    /// every paper downloaded since. Both paths resolving through one derivation is
+    /// also why the "no local file" message below cannot be reached while
+    /// `read_paper` would have found something.
     fn open_paper_externally(&self, paper_id: &str) {
         let Ok(Some(paper)) = self.data.load_paper(paper_id) else {
             return;
         };
-        let path = paper.local_path.as_ref().map(std::path::PathBuf::from);
+        let path = match scitadel_adapters::download::find_cached_file(&self.data.db, &paper) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(paper_id, error = %e, "could not resolve a local file");
+                None
+            }
+        };
         if let Some(p) = path {
             crate::tasks::spawn_open_external(self.task_tx.clone(), &paper, p);
         } else {
@@ -1257,7 +1231,6 @@ impl App {
             let task = crate::tasks::Task {
                 id,
                 kind: TaskKind::OpenExternal {
-                    paper_id: paper.id.as_str().to_string(),
                     ref_id,
                     title: paper.title.clone(),
                 },

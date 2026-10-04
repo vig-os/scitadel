@@ -78,10 +78,12 @@
 //! - It never deletes a file that no `blobs` row names. Those are counted and
 //!   reported (`untracked_files`) and left on disk — they are somebody's
 //!   working files, and gc has no way to know which.
-//! - It never follows the legacy `papers/<stem>.<ext>` copies. ADR-007 §1
-//!   "Compatibility until S2" has `find_cached_file` and `read_paper` still
-//!   reading them; retiring those copies is S2e's job, not a side effect of a
-//!   garbage-collection run.
+//! - It never follows the legacy `papers/<stem>.<ext>` copies. Those copies
+//!   are no longer written (#253's S2e retired the dual-write), so a library
+//!   has them only if it predates that change — and they are not inside
+//!   `blobs/`, so [`count_untracked_files`] never counted them and never will.
+//!   Removing them is a person's decision (`scitadel scan` reconciles them into
+//!   artefacts; a human deletes them), not a garbage-collection run's.
 
 use std::path::{Path, PathBuf};
 

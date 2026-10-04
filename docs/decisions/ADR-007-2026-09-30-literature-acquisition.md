@@ -323,16 +323,38 @@ written by consumers:
 - `meta.json` figure URLs and captions become figure references;
 - `tables.json` entries become table artefacts.
 
-**Compatibility until S2.** S1 promises no behaviour change, so it keeps
-**dual-writing**:
+**Compatibility until S2 — retired by S2e.** S1 promised no behaviour
+change, so it kept **dual-writing**:
 
 - the legacy columns `local_path`, `download_status` and
   `last_attempt_at`;
 - the `papers/<stem>.<ext>` copy, which the TUI state column,
-  `find_cached_file` and `read_paper` still read.
+  `find_cached_file` and `read_paper` read.
 
-S2 moves the TUI and `read_paper` onto artefacts and stops the legacy
-writes. The columns are dropped in the release after S2.
+**S2e (shipped) removed both writes and moved every reader onto the
+derivation above.** `find_cached_file` and `read_paper` resolve through
+`artefacts` → `blobs`; the TUI's state column and its `O` keybind derive
+their answers from `sqlite::coverage`, which is also what `coverage` and
+`action_list` read — so there is one derivation and one answer. The
+columns stay until the release after S2 so the backfill can still read an
+existing library, and **nothing writes them any more**.
+
+A dual write is a mirror with two writers, and it goes stale silently: a
+re-fetch through a different route moves the artefact and leaves
+`local_path` naming the previous file, with no error anywhere.
+
+**What an existing library finds.** Every non-blank `local_path` whose
+extension is in the `kind` vocabulary is recorded by the backfill, which
+runs on every `migrate()`, so those files resolve through `artefacts`
+with nothing to do. The cases the backfill deliberately does *not* record
+— a whitespace-only path, an extension outside the vocabulary, and a file
+sitting in `papers/<stem>.<ext>` that no column ever pointed at — are
+reconciled by the explicit commands this ADR already names: `scitadel
+scan` for a file found on disk, `scitadel attach <paper> <file> --kind …`
+for a file a person placed. Neither is a side effect of reading, and a
+recorded path whose file has since gone is kept with
+`missing_on_disk = 1` so the state column can say so rather than reporting
+a file that cannot be opened.
 
 ## 2 · Status vocabulary
 

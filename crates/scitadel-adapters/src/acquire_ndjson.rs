@@ -85,6 +85,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use scitadel_core::models::Paper;
+use scitadel_core::untrusted::UntrustedText;
 use scitadel_db::sqlite::{Database, FULLTEXT_LOCATOR, StateWrite, status_vocab};
 use serde::Serialize;
 
@@ -156,6 +157,28 @@ pub struct IdentityDisagreement {
     pub expected_title: String,
     /// What the `papers` row says.
     pub stored_title: String,
+}
+
+impl IdentityDisagreement {
+    /// raid's expectation, as untrusted display text.
+    ///
+    /// It came out of an NDJSON line somebody handed us, so it is
+    /// [`Provenance::PublisherSupplied`] — this marker's whole claim is "not
+    /// scitadel's own statement about the work", and a curation queue is not that
+    /// whatever wrote it.
+    #[must_use]
+    pub fn expected_title_text(&self) -> UntrustedText {
+        UntrustedText::publisher_supplied(self.expected_title.clone())
+    }
+
+    /// What the `papers` row says, as untrusted display text.
+    ///
+    /// [`Provenance::Ours`]: it is our record of the work. It is still rendered
+    /// escaped, because a bibliographic feed put it there once.
+    #[must_use]
+    pub fn stored_title_text(&self) -> UntrustedText {
+        UntrustedText::ours(self.stored_title.clone())
+    }
 }
 
 /// What one import did.
