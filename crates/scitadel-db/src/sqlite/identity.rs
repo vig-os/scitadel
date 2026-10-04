@@ -777,6 +777,24 @@ pub fn read_osti_id(conn: &Connection, paper_id: &str) -> Result<Option<String>,
     .map_err(DbError::from)
 }
 
+/// `papers.pmcid` for `paper_id`.
+///
+/// The same targeted-reader shape as [`read_osti_id`] and for the same reason:
+/// `Paper` is written back wholesale, so a `Paper` carrying `pmcid: None` for a
+/// work that has one would null the column on the next save. ADR-007 §1's note
+/// that "`pmcid` and `osti_id` join the `Paper` model and row mapping in S1" is
+/// still true, and this reader is the half of it that cannot lose the value.
+pub fn read_pmcid(conn: &Connection, paper_id: &str) -> Result<Option<String>, DbError> {
+    conn.query_row(
+        "SELECT pmcid FROM papers WHERE id = ?1",
+        params![paper_id],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .optional()
+    .map(|row| row.flatten())
+    .map_err(DbError::from)
+}
+
 /// Set `papers.osti_id` for `paper_id`, returning whether a row was updated.
 ///
 /// The only writer today is this crate's own tests and `scitadel import-flat`;

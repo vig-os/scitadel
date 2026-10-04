@@ -1,4 +1,5 @@
 pub mod acquire;
+pub mod acquire_ndjson;
 pub mod arxiv;
 pub mod download;
 pub mod epo;
@@ -7,11 +8,14 @@ pub mod identity;
 pub mod import_flat;
 pub mod inspire;
 pub mod lens;
+pub mod magic;
+pub mod manifest;
 pub mod openalex;
 pub mod osti;
 pub mod patentsview;
 pub mod preprint;
 pub mod pubmed;
+pub mod scan;
 
 use scitadel_core::config::OpenAlexAuth;
 use scitadel_core::ports::SourceAdapter;

@@ -2304,6 +2304,9 @@ fn render_override_identity(report: &scitadel_db::sqlite::IdentityOverrideReport
 /// into a different request by a call site.
 #[derive(Debug, Default)]
 pub struct AcquireOptions {
+    /// `--from <queue.ndjson>`: import raid's acquisition queue first. Writes,
+    /// so it is refused under `--dry-run`.
+    pub from: Option<PathBuf>,
     /// `--dry-run`: plan only, no writes and no requests.
     pub dry_run: bool,
     /// `--resume`: only fetch what is due.
@@ -2342,9 +2345,38 @@ pub async fn acquire(opts: AcquireOptions, json: bool) -> Result<()> {
         scitadel_adapters::download::PaperDownloader::new(db.clone(), config.openalex.auth(), 60.0)
             .context("build the downloader")?;
 
-    let report = scitadel_adapters::acquire::run(&db, &downloader, &config.papers_dir(), &request)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // `--from` imports, then drains: two reconciliations of two different things,
+    // so they are two calls with one order. A queue import writes
+    // `acquisition_state` rows, which is why `run_from_ndjson` refuses to do it
+    // under `--dry-run` rather than quietly violating the flag.
+    let report = match opts.from.as_deref() {
+        Some(source) => {
+            let (import, report) = scitadel_adapters::acquire::run_from_ndjson(
+                &db,
+                &downloader,
+                &config.papers_dir(),
+                &request,
+                source,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "import": import,
+                        "acquire": report,
+                    }))?
+                );
+                return Ok(());
+            }
+            print!("{}", render_ndjson_import(&import));
+            report
+        }
+        None => scitadel_adapters::acquire::run(&db, &downloader, &config.papers_dir(), &request)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+    };
 
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -2352,6 +2384,506 @@ pub async fn acquire(opts: AcquireOptions, json: bool) -> Result<()> {
         print!("{}", render_acquire(&report));
     }
     Ok(())
+}
+
+/// `acquire --from works.ndjson`'s import, as text.
+///
+/// The curation section is the one that must not be skimmed: it is the whole
+/// point of the flag, and a reader who trusts that scitadel re-labelled raid's
+/// curation verdicts would be wrong. So every preserved status is printed with
+/// both strings — raid's own, and what scitadel stored — and the unknowns are
+/// printed because a non-empty list means the queue's real shape differs from
+/// what this build reads.
+#[allow(clippy::too_many_lines)]
+fn render_ndjson_import(report: &scitadel_adapters::acquire::NdjsonImport) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Imported {} — raid's acquisition fields, curation statuses preserved verbatim.",
+        report.source.display()
+    );
+    let _ = writeln!(
+        out,
+        "\n{:<10} {:>6} {:>6} {:>6} {:>6} {:>6}",
+        "", "rows", "gaps", "kept", "kept?", "unknown"
+    );
+    let _ = writeln!(
+        out,
+        "{:<10} {:>6} {:>6} {:>6} {:>6} {:>6}",
+        "read",
+        report.rows_read,
+        report.gaps_written,
+        report.untouched_existing_gaps,
+        report.preserved_statuses.len(),
+        report.unknown.len()
+    );
+
+    if !report.preserved_statuses.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nCuration statuses — RAID's word, then scitadel's. Nothing was translated."
+        );
+        for status in &report.preserved_statuses {
+            let stored = if status.in_reason {
+                format!("{} (verbatim in reason)", status.stored_as)
+            } else {
+                format!("{} (raid's own ADR-007 §2 word)", status.stored_as)
+            };
+            let _ = writeln!(
+                out,
+                "  {}  {}/{}  \"{}\" → {}",
+                short_id(&status.paper_id),
+                status.kind,
+                status.locator,
+                status.raid_status,
+                stored
+            );
+        }
+        let _ = writeln!(
+            out,
+            "\n`pending` is a claim about SCITADEL — never tried by us — not a translation of \
+             raid's verdict."
+        );
+    }
+    if !report.unknown.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nNot in this library ({}): {}",
+            report.unknown.len(),
+            report.unknown.join(", ")
+        );
+        let _ = writeln!(
+            out,
+            "  No paper rows were created. `acquire_queue_add` treats an unknown id the same way."
+        );
+    }
+    if !report.unsupported_kinds.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nArtefact kinds outside ADR-007 §2's vocabulary, not recorded:"
+        );
+        for (kind, n) in &report.unsupported_kinds {
+            let _ = writeln!(out, "  {kind} × {n}");
+        }
+    }
+    if !report.identity_disagreements.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nIdentity expectations that disagree with the stored work ({}). Not applied — \
+             `scitadel override-identity` settles one by hand:",
+            report.identity_disagreements.len()
+        );
+        for gap in &report.identity_disagreements {
+            let _ = writeln!(
+                out,
+                "  {}  raid: \"{}\"  stored: \"{}\"",
+                short_id(&gap.paper_id),
+                gap.expected_title,
+                gap.stored_title
+            );
+        }
+    }
+    if !report.unknown_fields.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nFields this build does not read ({}): {}",
+            report.unknown_fields.len(),
+            report
+                .unknown_fields
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let _ = writeln!(
+            out,
+            "  Reported, not dropped: #247's \"covers raid's queue files without loss\" is a \
+             question about this list."
+        );
+    }
+    out
+}
+
+// ---------- scan / attach / gc (ADR-007 §1 "Manual drop-ins", "Artefact rules")
+
+/// The paper a `scan` / `attach` names, by id prefix like every other command.
+///
+/// Shared by both so the resolution rule — and its refusal on an ambiguous
+/// prefix — is one implementation. Named by prefix because a person pastes the
+/// eight characters `show` prints.
+fn resolve_paper(
+    paper: &str,
+) -> Result<(scitadel_db::sqlite::Database, scitadel_core::models::Paper)> {
+    use scitadel_core::ports::PaperRepository as _;
+
+    let db = open_db()?;
+    let (paper_repo, _, _, _, _) = db.repositories();
+    let matches: Vec<scitadel_core::models::Paper> = paper_repo
+        .list_all(10_000, 0)?
+        .into_iter()
+        .filter(|p| p.id.as_str().starts_with(paper))
+        .collect();
+    match matches.len() {
+        0 => bail!("no paper matches id prefix '{paper}'"),
+        // Naming one of two works would file the file under the wrong one, so
+        // this is the caller's error to fix rather than a coin flip.
+        1 => Ok((db, matches.into_iter().next().expect("one match"))),
+        n => bail!("ambiguous paper id prefix '{paper}' — matches {n} records"),
+    }
+}
+
+/// `scitadel scan --paper <id> [--root <dir>] [--dry-run] [--json]`.
+pub fn scan(paper: &str, root: Option<&std::path::Path>, dry_run: bool, json: bool) -> Result<()> {
+    let (db, paper_row) = resolve_paper(paper)?;
+    if dry_run {
+        let report = scitadel_adapters::scan::plan(&db, &paper_row, root)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            print!("{}", render_scan(&report, true));
+        }
+        return Ok(());
+    }
+    let report =
+        scitadel_adapters::scan::scan(&db, &paper_row, root).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", render_scan(&report, false));
+    }
+    Ok(())
+}
+
+/// `scitadel attach <paper> <file> --kind <k> [--label] [--locator] [--json]`.
+pub fn attach(
+    paper: &str,
+    file: &std::path::Path,
+    kind: &str,
+    label: Option<&str>,
+    locator: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let (db, paper_row) = resolve_paper(paper)?;
+    let report = scitadel_adapters::scan::attach(&db, &paper_row, file, kind, label, locator)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // A refusal is a non-zero exit **in both output modes**. Returning 0 with
+    // `"refused_because": "bad_magic"` on stdout would put back exactly the silent
+    // failure ADR-007 §1 measured: a landing page saved as an SI, in a script that
+    // only checked the exit code.
+    let refusal = report.file.refused_because.as_ref().map(|reason| {
+        format!(
+            "{} was not filed [{reason}]: {}",
+            report.file.path.display(),
+            report
+                .file
+                .detail
+                .as_deref()
+                .unwrap_or("(no reason recorded)")
+        )
+    });
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", render_attach(&report));
+    }
+    if let Some(refusal) = refusal {
+        bail!("{refusal}");
+    }
+    Ok(())
+}
+
+/// `scitadel gc [--dry-run] [--min-age-hours N] [--json]`.
+pub fn gc(dry_run: bool, min_age_hours: i64, json: bool) -> Result<()> {
+    let db = open_db()?;
+    // `--dry-run` is a real flag rather than the default, and the report says
+    // which of the two it is: "gc collected nothing" and "gc would collect
+    // nothing" are different sentences.
+    let report = db.collect_blobs(dry_run, min_age_hours)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", render_gc(&report));
+    }
+    // A refused exit code when there is nothing to do and no dry run is *not*
+    // implied: `gc` succeeding means "the store is as it should be", whether
+    // that is because it cleaned up or because there was nothing to clean.
+    Ok(())
+}
+
+/// `scan`'s text projection.
+///
+/// The refusals are printed **before** the counts and are not summarised away: a
+/// run that silently skipped seven landing pages looks exactly like a clean one,
+/// and the 7-of-27 measurement in ADR-007 §1 is why that matters.
+fn render_scan(report: &scitadel_adapters::scan::ScanReport, dry_run: bool) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Scan{} — {} in {}",
+        if dry_run { " (dry run)" } else { "" },
+        report.paper_id_short,
+        report.root.display()
+    );
+    if report.leased_elsewhere {
+        let _ = writeln!(
+            out,
+            "\nAnother live process holds this work's lease, so nothing was read or written. \
+             Run again once it finishes."
+        );
+        return out;
+    }
+    let refused: Vec<&scitadel_adapters::scan::FileOutcome> = report
+        .files
+        .iter()
+        .filter(|f| f.refused_because.is_some())
+        .collect();
+    if !refused.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nNot filed ({}): each is recorded in `acquisition_attempts`, and no artefact row \
+             was created.",
+            refused.len()
+        );
+        for file in &refused {
+            let _ = writeln!(
+                out,
+                "  [{}] {}  {}/{}",
+                file.refused_because.as_deref().unwrap_or("?"),
+                file.path.display(),
+                file.kind,
+                file.locator
+            );
+            if let Some(detail) = &file.detail {
+                let _ = writeln!(out, "      {detail}");
+            }
+        }
+    }
+    if dry_run {
+        let _ = writeln!(
+            out,
+            "\nWould file ({}), copy {} blob(s) into the store, and write no row.",
+            report.files.len() - refused.len(),
+            report.blobs
+        );
+        for file in report.files.iter().filter(|f| f.refused_because.is_none()) {
+            let _ = writeln!(out, "  + {}  {}", file.kind, file.path.display());
+        }
+    } else {
+        let _ = writeln!(out, "\nRecorded:");
+        for (kind, n) in &report.counts {
+            let _ = writeln!(out, "  {kind:<16} {n}");
+        }
+        let _ = writeln!(out, "  {:<16} {}", "blobs", report.blobs);
+    }
+    if !report.vanished.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nGone from disk ({}): flagged `missing_on_disk = 1`, the rows kept.",
+            report.vanished.len()
+        );
+        for entry in &report.vanished {
+            let _ = writeln!(out, "  - {entry}");
+        }
+    }
+    if !report.identity.is_empty() {
+        let _ = writeln!(out, "\nIdentity checks (ADR-007 §3, post-fetch):");
+        for check in &report.identity {
+            let _ = writeln!(
+                out,
+                "  {:<16} {}  {}",
+                check.status,
+                check.path.display(),
+                check
+                    .resolved_title
+                    .as_deref()
+                    .unwrap_or("(no title in the bytes)")
+            );
+        }
+    }
+    if !report.gaps.is_empty() {
+        let _ = writeln!(out, "\nStill wanted (recorded, not held):");
+        for gap in &report.gaps {
+            let _ = writeln!(
+                out,
+                "  + {} → drop the file at {}",
+                gap.kind,
+                gap.drop_path.display()
+            );
+        }
+    }
+    match &report.manifest {
+        Some(mirror) => {
+            let _ = writeln!(out, "\nManifest: {}", mirror.path.display());
+            let _ = writeln!(
+                out,
+                "  generated from the database after its commit, by the lease holder, through a \
+                 rename. Never read back."
+            );
+        }
+        None if dry_run => {
+            let _ = writeln!(out, "\nManifest: not written (dry run).");
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "\nManifest: not written. The database is authoritative; the next run \
+                 regenerates it."
+            );
+        }
+    }
+    out
+}
+
+/// `attach`'s text projection.
+///
+/// A refusal is printed rather than thrown from here, so the report is complete
+/// before the command exits non-zero — the caller owns the exit code, and it does
+/// so in `--json` mode too. Returning 0 with `"refused_because": "bad_magic"` on
+/// stdout would put back exactly the silent failure ADR-007 §1 measured: a landing
+/// page saved as an SI, in a script that only checks the exit code.
+fn render_attach(report: &scitadel_adapters::scan::AttachReport) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "Attach — {}", report.paper_id_short);
+    let _ = writeln!(
+        out,
+        "  {}  {}/{}",
+        report.file.path.display(),
+        report.file.kind,
+        report.file.locator
+    );
+    if let Some(reason) = &report.file.refused_because {
+        let _ = writeln!(
+            out,
+            "  NOT filed [{reason}] — recorded in `acquisition_attempts`."
+        );
+        if let Some(detail) = &report.file.detail {
+            let _ = writeln!(out, "  {detail}");
+        }
+    }
+    let _ = writeln!(out, "  Filed. route=manual, access_basis=manual.");
+    if let Some(check) = &report.identity {
+        let _ = writeln!(
+            out,
+            "  identity: {} — file says {:?}, work says {:?}",
+            check.status,
+            check.resolved_title.as_deref().unwrap_or("(none)"),
+            check.expected_title.as_deref().unwrap_or("(none)")
+        );
+    }
+    if report.retracted > 0 {
+        let _ = writeln!(
+            out,
+            "  closed {} recorded gap(s) for this work.",
+            report.retracted
+        );
+    }
+    let _ = writeln!(
+        out,
+        "  provenance: {}",
+        if report.inside_library {
+            "inside this library, so the recorded path still resolves if the library moves"
+        } else {
+            "OUTSIDE this library — `imported_from` is an absolute path that will not move with              the library"
+        }
+    );
+    if let Some(mirror) = &report.manifest {
+        let _ = writeln!(out, "  manifest: {}", mirror.path.display());
+    }
+    out
+}
+
+/// `gc`'s text projection.
+///
+/// `bytes` shown for a dry run is what it *would* reclaim, and is labelled as
+/// such: the two answers are the same number and mean different things.
+fn render_gc(report: &scitadel_db::sqlite::GcReport) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "gc{} — unreferenced blobs (ADR-007 §1 \"Artefact rules\"). Min age: {}h.",
+        if report.dry_run { " (dry run)" } else { "" },
+        report.min_age_hours
+    );
+    let _ = writeln!(
+        out,
+        "\n{:<10} {:>8} {:>8} {:>8}",
+        "blobs", "referenced", "unreferenced", "untracked files"
+    );
+    let _ = writeln!(
+        out,
+        "{:<10} {:>8} {:>8} {:>8}",
+        "in store", report.blobs_total, report.referenced_total, report.untracked_files
+    );
+
+    if report.candidates.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nNothing {} collectable.",
+            if report.dry_run { " would be" } else { " was" }
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "\n{} ({}), {}:",
+            if report.dry_run {
+                "Would collect"
+            } else {
+                "Collected"
+            },
+            report.candidates.len(),
+            human_bytes(report.reclaimable_bytes)
+        );
+        for candidate in &report.candidates {
+            let _ = writeln!(
+                out,
+                "  {}  {:>10}  {}",
+                &candidate.sha256[..candidate.sha256.len().min(12)],
+                human_bytes(candidate.bytes),
+                candidate.rel_path
+            );
+        }
+    }
+    if !report.skipped.is_empty() {
+        let _ = writeln!(out, "\nKept ({}):", report.skipped.len());
+        for skip in &report.skipped {
+            let _ = writeln!(
+                out,
+                "  {}  {}",
+                &skip.sha256[..12.min(skip.sha256.len())],
+                skip.reason
+            );
+        }
+    }
+    if report.dry_run {
+        let _ = writeln!(
+            out,
+            "\nNothing was deleted. Re-run without --dry-run to collect."
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "\n{} row(s) deleted, {} file(s) removed, {} freed.",
+            report.collected_rows,
+            report.removed_files,
+            human_bytes(report.freed_bytes())
+        );
+    }
+    out
+}
+
+/// A byte count in the words a person reading a gc report needs.
+fn human_bytes(bytes: i64) -> String {
+    match bytes {
+        b if b >= 1024 * 1024 * 1024 => format!("{:.1} GB", b as f64 / (1024.0 * 1024.0 * 1024.0)),
+        b if b >= 1024 * 1024 => format!("{:.1} MB", b as f64 / (1024.0 * 1024.0)),
+        b if b >= 1024 => format!("{:.1} kB", b as f64 / 1024.0),
+        b => format!("{b} bytes"),
+    }
 }
 
 /// `acquire`'s text projection.

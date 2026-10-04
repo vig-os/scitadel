@@ -2919,6 +2919,7 @@ dependencies = [
  "predicates",
  "rmcp",
  "rpassword",
+ "rusqlite",
  "scitadel-adapters",
  "scitadel-core",
  "scitadel-db",

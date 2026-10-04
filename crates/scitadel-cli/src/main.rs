@@ -272,7 +272,21 @@ enum Commands {
     ///
     /// `--kind` accepts `fulltext` only: every ADR-007 §3 route is a
     /// full-text route, so no other want can be closed by a fetch.
+    ///
+    /// `--from <works.ndjson>` imports raid's `p1` / `p3` queue first, so an
+    /// imported gap becomes actionable by this very command. Raid's own
+    /// curation statuses are **preserved verbatim** — scitadel's
+    /// `acquisition_state` is about wants and gaps, and raid is the authority on
+    /// curation — so a curation status scitadel has no word for is kept
+    /// character-for-character in the gap's `reason` and listed in the report,
+    /// never translated into a scitadel status that reads like it.
+    ///
+    /// `--from` writes, so it is refused under `--dry-run`: the flag promises no
+    /// writes.
     Acquire {
+        /// Import a raid NDJSON acquisition queue before draining it
+        #[arg(long, value_name = "FILE")]
+        from: Option<PathBuf>,
         /// Print the plan — what would be fetched, what is held, what is
         /// deferred — and write nothing and request nothing
         #[arg(long)]
@@ -288,6 +302,103 @@ enum Commands {
         #[arg(long, value_name = "N")]
         limit: Option<usize>,
         /// Emit the plan and the per-work outcomes as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Reconcile manually dropped-in files against the database (ADR-007 §1)
+    ///
+    /// The one command that does this, by design: ADR-007 §1 says manual
+    /// drop-ins "are reconciled only by an explicit `scitadel scan` or
+    /// `scitadel attach`, never as a side effect of reading", so reading a work
+    /// never files a file that happens to be lying next to it.
+    ///
+    /// Walks the work's own directory (`<library>/papers/<stem>/`) unless
+    /// `--root` names another, checks every file's **magic bytes against its
+    /// declared format** and its size against ADR-007 §1's caps, takes the
+    /// ADR-007 §3 post-fetch identity check on every supplementary file, flags a
+    /// recorded file that has disappeared as `missing_on_disk = 1` (keeping the
+    /// row), and regenerates the work's `manifest.json` — written by the lease
+    /// holder, after the database commit, through a rename.
+    ///
+    /// Idempotent: an unchanged directory writes nothing. `--dry-run` reports
+    /// every decision without writing a row, without copying a blob and without
+    /// taking the work's lease.
+    Scan {
+        /// Paper id (full id or unambiguous prefix)
+        #[arg(long)]
+        paper: String,
+        /// The directory to reconcile. Defaults to the work's own
+        /// `papers/<stem>/` directory.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Report every decision — including the refusals — and write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Emit the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// File one manually dropped-in file under a work (ADR-007 §1)
+    ///
+    /// For the case where you know exactly which work a file belongs to. Same
+    /// checks as `scitadel scan` — magic bytes against the declared format,
+    /// ADR-007 §1's size cap, the post-fetch identity check, and a refused file
+    /// records an `acquisition_attempts` row (`bad_magic`, `too_large` or
+    /// `identity_mismatch`) with **no artefact created**.
+    ///
+    /// `--kind` must match the file: `fulltext` resolves through the extension,
+    /// and naming `fulltext_pdf` for an HTML file is refused rather than filed
+    /// under a format its bytes do not have.
+    Attach {
+        /// Paper id (full id or unambiguous prefix)
+        paper: String,
+        /// The file to file
+        file: PathBuf,
+        /// Which slot it fills
+        #[arg(long, value_parser = scitadel_adapters::scan::ATTACH_KINDS)]
+        kind: String,
+        /// The human name, e.g. "Supporting Information S1". The stable locator
+        /// is derived from it unless `--locator` is given.
+        #[arg(long, value_name = "TEXT")]
+        label: Option<String>,
+        /// The stable locator, if it is not derived from `--label`
+        #[arg(long, value_name = "TEXT")]
+        locator: Option<String>,
+        /// Emit the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Collect blobs no artefact references (ADR-007 §1 "Artefact rules")
+    ///
+    /// "Unreferenced blobs are collected by `scitadel gc`." A blob is referenced
+    /// exactly when some `artefacts` row names it, and every deletion is
+    /// re-checked under the write lock immediately before it happens.
+    ///
+    /// Conservative by construction, because a wrong deletion destroys the only
+    /// copy of a file:
+    ///
+    /// - `--dry-run` (the default shape of the flag) reports what *would* be
+    ///   collected and removes nothing;
+    /// - a blob referenced by **any** artefact is never deleted, and so is a blob
+    ///   younger than `--min-age-hours` (24 by default), which is what keeps an
+    ///   in-flight fetch's staged bytes alive;
+    /// - only a path that is a blob path **for its own digest** is ever removed —
+    ///   `blobs/<2 hex>/<digest>.<ext>`, relative to the library root;
+    /// - `blobs/.tmp/` is never a candidate;
+    /// - unreferenced files no `blobs` row names are **counted, never deleted**.
+    Gc {
+        /// Report what would be collected and delete nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// How old a blob must be before it is collected (hours). Widening this
+        /// is the safe direction; lowering it to 0 is only right when no other
+        /// process is using the library.
+        #[arg(long, value_name = "HOURS", default_value_t = scitadel_db::sqlite::DEFAULT_MIN_AGE_HOURS)]
+        min_age_hours: i64,
+        /// Emit the report as JSON
         #[arg(long)]
         json: bool,
     },
@@ -631,6 +742,7 @@ async fn main() -> Result<()> {
             json,
         } => commands::override_identity(&paper, &reason, json),
         Commands::Acquire {
+            from,
             dry_run,
             resume,
             kind,
@@ -639,6 +751,7 @@ async fn main() -> Result<()> {
         } => {
             commands::acquire(
                 commands::AcquireOptions {
+                    from,
                     dry_run,
                     resume,
                     kind,
@@ -648,5 +761,31 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Commands::Scan {
+            paper,
+            root,
+            dry_run,
+            json,
+        } => commands::scan(&paper, root.as_deref(), dry_run, json),
+        Commands::Attach {
+            paper,
+            file,
+            kind,
+            label,
+            locator,
+            json,
+        } => commands::attach(
+            &paper,
+            &file,
+            &kind,
+            label.as_deref(),
+            locator.as_deref(),
+            json,
+        ),
+        Commands::Gc {
+            dry_run,
+            min_age_hours,
+            json,
+        } => commands::gc(dry_run, min_age_hours, json),
     }
 }
