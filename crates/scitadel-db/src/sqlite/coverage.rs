@@ -64,7 +64,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 use rusqlite::Connection;
-use scitadel_core::publisher::{classify_publisher, PublisherVerdict, RouteVerdict};
+use scitadel_core::publisher::{PublisherVerdict, RouteVerdict, classify_publisher};
 use serde::Serialize;
 
 use crate::error::DbError;
@@ -1112,8 +1112,8 @@ impl Database {
 mod tests {
     use super::*;
     use crate::sqlite::artefacts::{
-        write_acquisition_states, write_artefacts, ArtefactWrite, BlobWrite, StateWrite, WriteMode,
-        ACCESS_BASIS_MANUAL, ROUTE_IMPORT_FLAT, VERSION_UNKNOWN,
+        ACCESS_BASIS_MANUAL, ArtefactWrite, BlobWrite, ROUTE_IMPORT_FLAT, StateWrite,
+        VERSION_UNKNOWN, WriteMode, write_acquisition_states, write_artefacts,
     };
     use crate::sqlite::{Database, ROUTE_LEGACY};
 
@@ -1917,14 +1917,16 @@ mod tests {
             ],
             "deferred buckets come out in ADR-007 §2's order"
         );
-        assert!(list
-            .deferred
-            .iter()
-            .any(|d| d.status == "unavailable" && d.goes_to.contains("no action")));
-        assert!(list
-            .deferred
-            .iter()
-            .any(|d| d.status == "rate_limited" && d.goes_to.contains("next_attempt_at")));
+        assert!(
+            list.deferred
+                .iter()
+                .any(|d| d.status == "unavailable" && d.goes_to.contains("no action"))
+        );
+        assert!(
+            list.deferred
+                .iter()
+                .any(|d| d.status == "rate_limited" && d.goes_to.contains("next_attempt_at"))
+        );
     }
 
     /// `--kind` narrows the entries and every number computed over them, while

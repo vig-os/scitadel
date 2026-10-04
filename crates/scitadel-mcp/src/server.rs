@@ -323,6 +323,42 @@ pub struct DownloadPaperRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct AcquireRequest {
+    /// Works to fetch. Each may be a full paper id or an unambiguous prefix.
+    /// Empty drains the whole queue — every recorded gap whose ADR-007 §2
+    /// status routes to `acquire` (`pending`, `error`, `rate_limited`, …).
+    /// Naming works narrows the run to them, which is also how you re-ask for
+    /// one whose gap a person owns.
+    #[serde(default)]
+    pub paper_ids: Vec<String>,
+    /// Plan only: return the decision, write nothing and request nothing.
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+    /// Only fetch what is due — a gap whose `next_attempt_at` is in the future
+    /// is deferred rather than retried.
+    #[serde(default)]
+    pub resume: Option<bool>,
+    /// Stop after this many works, counted over the works that are due.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    // No `kind`: every ADR-007 §3 route is a full-text route, so `fulltext` is
+    // the only want a fetch can close. The CLI's `--kind` exists for the same
+    // reason as this comment does — it says so rather than offering a choice
+    // that cannot be exercised.
+    //
+    // No output directory, for the reason `DownloadPaperRequest` has none
+    // (#249): bytes always land under the configured `papers_dir`.
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AcquireQueueAddRequest {
+    /// Paper ids (full or unambiguous prefix) to put in the `acquire` queue.
+    /// Works that already have a want row are left alone and reported under
+    /// `already_queued`; ids that match no work are reported under `unknown`.
+    pub paper_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReadPaperRequest {
     /// Paper ID
     pub paper_id: String,
@@ -1034,6 +1070,46 @@ impl ScitadelServer {
         };
         notify(&ctx.peer, token.as_ref(), 1.0, Some(1.0), done_msg).await;
         result
+    }
+
+    #[tool(
+        description = "Fetch the full texts the library wants and does not hold (ADR-007 §2, §3). Prefer `acquire_queue_add` first: a work nobody asked for has no recorded gap, and this does not invent one. `paper_ids` empty drains the whole queue; naming works narrows the run to them. Full text only — every ADR-007 §3 route is a full-text route — and gaps that need a person (`needs_ill`, `needs_login`, `identity_mismatch`, `wrong_version`, …) are not fetched: use `action_list` for those. Whether a work is already held is decided from `artefacts` BEFORE anything is fetched, so a repeat run over a library that already holds its full texts makes no network calls at all. `dry_run: true` returns that decision and writes nothing. Returns: JSON `{plan: {kind, missing_total, held_total, held_at_another_version, human_action_total, queued_total, works[], deferred[], truncated_by_limit, unmatched[]}, outcomes: [{paper_id, outcome: acquired|failed|not_attempted, status, reason, next_attempt_at, publisher, publisher_note, route, access, bytes, path, error}]}` — `outcomes` is empty for a dry run, and `status` is the status the walk established, never one this tool chose. An unclassified publisher is `null` with `publisher_note` explaining that no route was evaluated."
+    )]
+    async fn acquire(
+        &self,
+        Parameters(req): Parameters<AcquireRequest>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<String, String> {
+        let token = ctx.meta.get_progress_token();
+        notify(
+            &ctx.peer,
+            token.as_ref(),
+            0.0,
+            None,
+            if req.dry_run.unwrap_or(false) {
+                "planning the acquire queue".to_string()
+            } else {
+                format!("acquiring {} named work(s)", req.paper_ids.len())
+            },
+        )
+        .await;
+        let result = tools::acquire_tool(req.paper_ids, req.dry_run, req.resume, req.limit).await;
+        let done = match &result {
+            Ok(_) => "acquire complete".to_string(),
+            Err(e) => format!("acquire failed: {e}"),
+        };
+        notify(&ctx.peer, token.as_ref(), 1.0, None, done).await;
+        result
+    }
+
+    #[tool(
+        description = "Put works in the `acquire` queue: records a `pending` full-text want for each id, which is what makes them eligible for `acquire`. Pair with `acquire`. A work that already has a want row is left EXACTLY as it is and reported under `already_queued` — in particular a `needs_ill` row, which is a human decision. Ids matching no work are reported under `unknown` rather than aborting the batch. Re-enqueueing writes nothing. A work whose full text is already held is still enqueued, and that costs nothing: the ADR-007 §1 derivation reads the new want as satisfied, so it is never reported missing and `acquire` never requests it. Returns: JSON `{requested[], enqueued[], already_queued[], unknown[]}`."
+    )]
+    fn acquire_queue_add(
+        &self,
+        Parameters(req): Parameters<AcquireQueueAddRequest>,
+    ) -> Result<String, String> {
+        tools::acquire_queue_add_tool(req.paper_ids)
     }
 
     #[tool(

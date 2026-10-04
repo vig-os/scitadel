@@ -644,6 +644,19 @@ impl PaperDownloader {
     /// dropped, where a failure in [`Self::finish`] propagates — that one is
     /// about a download that *succeeded*, which is a different thing.
     fn record_gap(&self, paper: &Paper, ladder: &Ladder) {
+        // Ownership, not a cache. `status` and `reason` are this walk's to
+        // establish; `next_attempt_at` belongs to whoever scheduled the retry
+        // (ADR-007 §2's "retried with backoff by `acquire`"), and a single walk
+        // has no reason to cancel a schedule a campaign set. Carrying it over
+        // is what keeps a re-run a no-op: clearing it here would make every
+        // second walk differ from the last, so `write_acquisition_states`'s
+        // `WHERE` guard would fire and move `updated_at` on every re-run.
+        let scheduled_retry = self
+            .db
+            .acquisition_state(paper.id.as_str(), GAP_FULLTEXT_KIND, FULLTEXT_LOCATOR)
+            .ok()
+            .flatten()
+            .and_then(|row| row.next_attempt_at);
         let row = StateWrite {
             paper_id: paper.id.as_str().to_string(),
             kind: GAP_FULLTEXT_KIND.to_string(),
@@ -666,8 +679,10 @@ impl PaperDownloader {
             // Deliberately `None` too: a single walk does not know when the
             // work should be tried again. Deciding that is the *campaign*'s
             // job (`acquire`, ADR-007 §2's "retried with backoff"), and it is
-            // the campaign that can read a bucket's ledger.
-            next_attempt_at: None,
+            // the campaign that can read a bucket's ledger — so what this row
+            // carries is whatever the campaign already scheduled, never a
+            // fresh guess.
+            next_attempt_at: scheduled_retry,
             updated_at: Utc::now().to_rfc3339(),
         };
         if let Err(e) = self.db.upsert_acquisition_state(&row) {
@@ -1593,7 +1608,12 @@ fn classify_html(bytes: &[u8]) -> AccessStatus {
 /// in a new place — telling 249 papers to go and register a key because a
 /// prefix was in a table. A classified publisher therefore gets the name
 /// and no note; the note column exists for the gap in *our* coverage.
-fn publisher_columns(doi: Option<&str>) -> (Option<String>, Option<String>) {
+///
+/// `pub(crate)` because [`crate::acquire`] fills the same two fields on an
+/// `acquisition_state` row: the two halves of `PublisherVerdict` must have one
+/// implementation per crate, or #261 is one edited function away from coming
+/// back.
+pub(crate) fn publisher_columns(doi: Option<&str>) -> (Option<String>, Option<String>) {
     match doi.map(classify_publisher) {
         Some(PublisherVerdict::Known { publisher, .. }) => {
             (Some(publisher.label().to_string()), None)

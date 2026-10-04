@@ -1,3 +1,4 @@
+pub mod acquire;
 pub mod arxiv;
 pub mod download;
 pub mod epo;

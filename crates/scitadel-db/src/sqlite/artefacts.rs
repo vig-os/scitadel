@@ -656,6 +656,93 @@ pub fn write_acquisition_states(
     Ok(rows.len())
 }
 
+/// One `acquisition_state` row as stored — the reader's mirror of
+/// [`StateWrite`].
+///
+/// A whole row rather than a projected subset because every caller that reads
+/// one has to write it back: `acquire` reads the status a *walk* established
+/// and re-writes it with `next_attempt_at` set, which means reading a subset
+/// would mean inventing the values for the columns it did not read. Reuse is
+/// the point — a reader that reconstructed a `StateWrite` from parts is how
+/// `publisher` or `drop_path` gets dropped on the way through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateRow {
+    pub paper_id: String,
+    pub kind: String,
+    pub locator: String,
+    pub wanted_version: String,
+    pub status: String,
+    pub reason: Option<String>,
+    pub publisher: Option<String>,
+    pub hint_url: Option<String>,
+    pub drop_path: Option<String>,
+    pub next_attempt_at: Option<String>,
+    pub updated_at: String,
+}
+
+impl StateRow {
+    /// The [`StateWrite`] that reproduces this row, so a read-modify-write
+    /// cannot lose a column.
+    #[must_use]
+    pub fn to_write(&self) -> StateWrite {
+        StateWrite {
+            paper_id: self.paper_id.clone(),
+            kind: self.kind.clone(),
+            locator: self.locator.clone(),
+            wanted_version: self.wanted_version.clone(),
+            status: self.status.clone(),
+            reason: self.reason.clone(),
+            publisher: self.publisher.clone(),
+            hint_url: self.hint_url.clone(),
+            drop_path: self.drop_path.clone(),
+            next_attempt_at: self.next_attempt_at.clone(),
+            updated_at: self.updated_at.clone(),
+        }
+    }
+}
+
+/// Read the gap row for `(paper_id, kind, locator)`, if there is one.
+///
+/// The primary key is exactly those three columns, so this is the whole
+/// identity of a want and a caller cannot accidentally read a neighbour's row.
+/// `None` means no want is recorded — which is *not* the same as "held": only
+/// the ADR-007 §1 derivation in [`crate::sqlite::coverage`] can say a want is
+/// satisfied, and a caller that needs that must ask it.
+pub fn read_acquisition_state(
+    conn: &Connection,
+    paper_id: &str,
+    kind: &str,
+    locator: &str,
+) -> Result<Option<StateRow>, DbError> {
+    let row = conn.query_row(
+        "SELECT paper_id, kind, locator, wanted_version, status, reason, publisher,
+                hint_url, drop_path, next_attempt_at, updated_at
+         FROM acquisition_state
+         WHERE paper_id = ?1 AND kind = ?2 AND locator = ?3",
+        params![paper_id, kind, locator],
+        |r| {
+            Ok(StateRow {
+                paper_id: r.get(0)?,
+                kind: r.get(1)?,
+                locator: r.get(2)?,
+                wanted_version: r.get(3)?,
+                status: r.get(4)?,
+                reason: r.get(5)?,
+                publisher: r.get(6)?,
+                hint_url: r.get(7)?,
+                drop_path: r.get(8)?,
+                next_attempt_at: r.get(9)?,
+                updated_at: r.get(10)?,
+            })
+        },
+    );
+    match row {
+        Ok(row) => Ok(Some(row)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Delete the gap rows for `paper_id` recorded at `drop_path`.
 ///
 /// The importer calls this for a gap it previously recorded and has now
@@ -1399,8 +1486,9 @@ mod tests {
             artefact_id("a", "bc", "unknown", "")
         );
         assert_eq!(id.len(), 32);
-        assert!(id
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
     }
 }
