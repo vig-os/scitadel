@@ -2899,10 +2899,12 @@ dependencies = [
  "scitadel-http",
  "serde",
  "serde_json",
+ "strsim",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "unicode-normalization",
  "wiremock",
 ]
 

@@ -496,6 +496,46 @@ under that DOI.
 
 `doi_corrected_from` is recorded whenever a DOI is fixed.
 
+**`ok` means corroborated, not merely unrefuted.** A title match alone is
+not enough to record `ok`: it needs positive corroboration from a year
+within ±1 or a first-author surname. Without either, the result is
+`unverified` — never `ok`. The two corroborators are deliberately
+asymmetric: a first author is a property of the *work*, so it contradicts
+even at an exact title match, whereas a year is a property of a *version*,
+so a 2021 preprint published in 2024 is one work and a year never overturns
+a title that matches outright.
+
+**A consequence worth stating: a PDF post-fetch check can only be
+`unverified` or `mismatch`.** A PDF carries no year and no author to
+corroborate its `/Title`, so it never fabricates an `ok`. It still does its
+job — a redirect to another work's PDF carries another `/Title` and lands
+below the floor.
+
+**`unverified` does not block; `mismatch` does.** A mismatch is positive
+evidence that the bytes are another work, which is the failure this
+section exists to prevent. An unverified check is no evidence at all, and
+it is a property of the *data* rather than of the fetch — a PDF with no
+`/Title` would return `unverified` forever, so blocking on it would mean no
+machine run could ever acquire it. The check row is written either way,
+with both titles.
+
+**Overrides are write-once, and they return the gap to `pending`.** A human
+ruling outranks the machine permanently, so `write_identity_check` refuses
+to touch a row whose status is `overridden` and does not record its own
+score beside it — a row whose status and timestamps disagree about who last
+touched it turns "newest row's status wins" into "newest row wins, whatever
+else it says". `phase_is_settled` then skips the phase entirely, so an
+overridden work is not blocked either; that is also why an override puts its
+want back to `pending`, since a settled work has nothing for `acquire` to
+pick up. Machine paths cannot write `overridden` at all: `override_identity`
+is its only writer, and it requires a reason.
+
+**Override rows carry `source = 'human'`.** The other four spellings
+(`openalex`, `crossref`, `datacite`, `served_page`) all name a machine, and
+reusing one would make a person's ruling look like OpenAlex had said so.
+This is the one addition to the vocabulary in §1, and it is this
+implementation's, not the table's.
+
 ## 4 · Pacer
 
 ```rust

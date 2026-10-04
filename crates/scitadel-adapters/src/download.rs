@@ -1,8 +1,8 @@
 //! The paper download chain, on `Route` + `PacedClient` (ADR-007 §3, S1).
 //!
-//! Six ladder steps in a fixed order — arXiv id → **preprint transform** →
-//! OpenAlex → Unpaywall → publisher HTML — then the paper record's own `url`
-//! as a last resort. Two things changed shape in S1; the outputs did not.
+//! Seven ladder steps in a fixed order — arXiv id → **preprint transform** →
+//! **OSTI** → OpenAlex → Unpaywall → publisher HTML — then the paper record's own
+//! `url` as a last resort. Two things changed shape in S1; the outputs did not.
 //!
 //! ## The preprint leg runs before every index leg (#260)
 //!
@@ -104,15 +104,18 @@ use scitadel_core::models::{
 use scitadel_core::ports::{Bucket, PaceTier, Pacer};
 use scitadel_core::publisher::{PublisherVerdict, RouteVerdict, classify_publisher};
 use scitadel_db::sqlite::{
-    BlobWrite, Database, DownloadWrite, FULLTEXT_LOCATOR, SqlitePacer, StateWrite, blob_rel_path,
-    fulltext_kind, hash_file, store_blob,
+    AttemptWrite, BlobWrite, Database, DownloadWrite, FULLTEXT_LOCATOR, IdentityPhase,
+    IdentitySource, SqlitePacer, StateRow, StateWrite, blob_rel_path, fulltext_kind, hash_file,
+    store_blob,
 };
 use scitadel_http::{
     BucketPolicyTable, FetchError, PacedClient, PacedResponse, SafeHeaders, WorkScope,
 };
 
 use crate::error::AdapterError;
+use crate::identity::{self, WorkIdentity};
 use crate::openalex::OPENALEX_API_URL;
+use crate::osti;
 use crate::preprint::{self, PreprintBases};
 
 /// The format of a downloaded paper.
@@ -293,6 +296,13 @@ pub struct Endpoints {
     pub biorxiv_content: String,
     /// Base of `GET {base}/{openalex_id}?mailto=…&api_key=…`.
     pub openalex_api: String,
+    /// Root of OSTI, from which `GET {base}/servlets/purl/{osti_id}` and
+    /// `{base}/biblio/{osti_id}` are built.
+    ///
+    /// A base rather than the two full URLs, because the two paths are part of
+    /// the route's shape and a test should not be able to change one without the
+    /// other.
+    pub osti_base: String,
 }
 
 impl Default for Endpoints {
@@ -303,6 +313,7 @@ impl Default for Endpoints {
             arxiv_pdf: "https://arxiv.org/pdf".to_string(),
             biorxiv_content: PreprintBases::default().biorxiv_content,
             openalex_api: OPENALEX_API_URL.to_string(),
+            osti_base: osti::OSTI_BASE.to_string(),
         }
     }
 }
@@ -571,6 +582,28 @@ impl PaperDownloader {
             ladder.skip(Leg::Preprint, "the record carries no usable doi");
         }
 
+        // Ahead of every index leg, and for the same reason as the preprint
+        // transform: where a DOE report's full text lives is a function of its
+        // `osti_id`, so there is nothing to look up. A national-lab report has no
+        // DOI, so without this leg it is a work the ladder can only answer
+        // `needs_ill` about — for a document that is free to read.
+        match self.db.osti_id(paper.id.as_str()) {
+            Ok(Some(osti_id)) => match self.try_osti(&work, &osti_id, &stem, output_dir).await {
+                Ok(fetched) => return self.finish(Some(paper), fetched).await,
+                Err(e) => {
+                    tracing::info!(osti_id = %osti_id, error = %e, "OSTI route failed");
+                    ladder.record(Leg::Osti, e.outcome);
+                }
+            },
+            Ok(None) => ladder.skip(Leg::Osti, "the record carries no osti_id"),
+            Err(e) => {
+                // A ledger we cannot read is not a reason to fetch something: the
+                // ladder continues, and the walk's own outcome is unchanged.
+                tracing::warn!(paper_id = %paper.id, error = %e, "could not read osti_id");
+                ladder.skip(Leg::Osti, "the osti_id could not be read");
+            }
+        }
+
         if let Some(id) = paper.openalex_id.as_deref().filter(|s| !s.is_empty()) {
             match self.try_openalex(&work, id, &stem, output_dir).await {
                 Ok(fetched) => return self.finish(Some(paper), fetched).await,
@@ -632,6 +665,304 @@ impl PaperDownloader {
         Err(AdapterError::NotFound(
             "no arxiv_id, openalex_id, doi, or url to try".into(),
         ))
+    }
+
+    /// ADR-007 §3's two identity checks, run before anything is filed (#253).
+    ///
+    /// Both are recorded and **either** can refuse:
+    ///
+    /// - **pre-fetch**, when a leg resolved the work through a metadata
+    ///   registry: the stored paper's title against the registry's. Today that
+    ///   is [`RouteId::OpenAlex`], and it is the only registry on this path —
+    ///   ADR-007 §3's chain is "OpenAlex → Crossref → DataCite", Crossref and
+    ///   DataCite have no adapter yet (S3), and Unpaywall's `title` is a copy of
+    ///   the publisher-supplied title rather than a second opinion worth having.
+    /// - **post-fetch**, for every route: what the bytes themselves say they are
+    ///   (`citation_title`, or a PDF's `/Title`) against what the metadata said.
+    ///   This is the one that catches a redirect to the wrong paper.
+    ///
+    /// ## Why an `unverified` does not stop the fetch
+    ///
+    /// [`Verdict::Mismatch`] refuses; [`Verdict::Unverified`] records and
+    /// continues, and the asymmetry is deliberate (see `crate::identity`): a
+    /// mismatch is positive evidence that the bytes are another work, while an
+    /// `unverified` is no evidence at all. Blocking on it would mean a PDF with
+    /// no `/Title` could never be acquired by any machine run — `unverified` is a
+    /// property of the data, so a blocked fetch would return it again forever.
+    /// The row is written either way, with both titles, so the reader can see
+    /// what was not established.
+    ///
+    /// ## A standing override stops blocking, without being asked twice
+    ///
+    /// Each phase's check in force is read before it runs, so a work a person
+    /// has settled is not re-litigated by a later run — the check is not even
+    /// recorded over the override.
+    fn gate_identity(
+        &self,
+        paper: &Paper,
+        route: RouteId,
+        bytes: &[u8],
+        registry: Option<&ResolvedWork>,
+    ) -> Result<(), AdapterError> {
+        let expected = WorkIdentity {
+            title: Some(paper.title.clone()),
+            year: paper.year,
+            first_author: paper.authors.first().cloned(),
+        };
+        let now = Utc::now().to_rfc3339();
+
+        // ---- pre-fetch: the stored paper against the registry ----
+        let mut refused = None;
+        if let Some(resolved) = registry
+            && !self.phase_is_settled(paper, IdentityPhase::PreFetch)
+        {
+            let checked = identity::verify(&expected, &resolved.identity);
+            self.record_check(
+                paper,
+                IdentityPhase::PreFetch,
+                ComparedSides {
+                    source: resolved.source,
+                    expected_title: Some(paper.title.clone()),
+                    resolved_title: resolved.identity.title.clone(),
+                },
+                &checked,
+                &now,
+            );
+            if !checked.verdict.allows_filing() {
+                refused = Some((
+                    IdentityPhase::PreFetch,
+                    resolved.source.to_string(),
+                    checked,
+                ));
+            }
+        }
+
+        // ---- post-fetch: the metadata (or the paper) against the bytes ----
+        if refused.is_none()
+            && !self.phase_is_settled(paper, IdentityPhase::PostFetch)
+            && let Some(served) = identity::served_identity(bytes)
+        {
+            // ADR-007 §3: "the served page or PDF title against OpenAlex". With
+            // no registry answer, the stored paper is the only expectation there
+            // is — a weaker check, and the row says which expectation was used by
+            // carrying both titles.
+            let expected_side =
+                registry.map_or_else(|| expected.clone(), |resolved| resolved.identity.clone());
+            let checked = identity::verify(&expected_side, &served);
+            self.record_check(
+                paper,
+                IdentityPhase::PostFetch,
+                ComparedSides {
+                    source: IdentitySource::ServedPage,
+                    expected_title: expected_side.title.clone(),
+                    resolved_title: served.title.clone(),
+                },
+                &checked,
+                &now,
+            );
+            if !checked.verdict.allows_filing() {
+                refused = Some((
+                    IdentityPhase::PostFetch,
+                    "the served page or PDF".to_string(),
+                    checked,
+                ));
+            }
+        }
+
+        let Some((phase, resolver, verdict)) = refused else {
+            return Ok(());
+        };
+        Err(self.refuse_on_mismatch(
+            paper, route, phase, resolver, &expected, registry, bytes, &verdict, &now,
+        ))
+    }
+
+    /// Has a person already settled this work's identity **for this phase**?
+    ///
+    /// The whole of #253's escape hatch, and it is deliberately stronger than
+    /// "the machine's verdict is not recorded": the phase is **not run at all**,
+    /// so a settled work cannot be blocked either. Recording the check while
+    /// still refusing on it would have made the override a way of watching a work
+    /// stay blocked forever with a note saying it should not be — which is the
+    /// shape of the bug the escape hatch exists to prevent.
+    fn phase_is_settled(&self, paper: &Paper, phase: IdentityPhase) -> bool {
+        match self.db.latest_identity_check(paper.id.as_str(), phase) {
+            Ok(Some(existing)) if existing.status.is_overridden() => {
+                tracing::info!(
+                    paper_id = %paper.id,
+                    phase = %phase,
+                    reason = %existing.override_reason.as_deref().unwrap_or("(none recorded)"),
+                    "identity check skipped: a person has already settled this work's identity"
+                );
+                true
+            }
+            // A read that fails is **not** a settlement: failing closed here
+            // would let a broken ledger block every acquisition in the library.
+            Ok(_) => false,
+            Err(error) => {
+                tracing::warn!(
+                    paper_id = %paper.id,
+                    phase = %phase,
+                    %error,
+                    "could not read the identity check in force; running it anyway"
+                );
+                false
+            }
+        }
+    }
+
+    /// Record one identity check.
+    ///
+    /// The standing-override question is asked once, by
+    /// [`Self::phase_is_settled`], at the call site — so this cannot be the
+    /// second place that decides whether a person's ruling is in force.
+    ///
+    /// A write failure is logged and dropped rather than propagated. It has two
+    /// causes and neither may stop a fetch: a status the matcher cannot produce
+    /// (impossible — [`identity::Checked`] only ever yields three of them), or
+    /// an override landing between the settlement read and this write, which is
+    /// the same answer that read already gave. Failing the fetch here would let a
+    /// race between a person and a campaign turn into a lost acquisition.
+    fn record_check(
+        &self,
+        paper: &Paper,
+        phase: IdentityPhase,
+        sides: ComparedSides,
+        checked: &identity::Checked,
+        now: &str,
+    ) {
+        let write = checked.to_write(
+            paper.id.as_str().to_string(),
+            phase,
+            sides.source,
+            sides.expected_title,
+            sides.resolved_title,
+            now.to_string(),
+        );
+        if let Err(error) = self.db.write_identity_check(&write) {
+            tracing::warn!(
+                paper_id = %paper.id,
+                phase = %phase,
+                %error,
+                "could not record an identity check; the fetch continues"
+            );
+        }
+    }
+
+    /// #253's refusal path: the check is already recorded, so this records the
+    /// other two halves — that a fetch happened and was refused, and that the
+    /// want is now blocked on a person — and returns the error the caller sees.
+    ///
+    /// Nothing here touches `artefacts`, `blobs` or `papers`: the acceptance
+    /// criterion for this slice is that a mismatch leaves the artefact table
+    /// exactly as it found it, and the cheapest way to guarantee that is for this
+    /// function to have no write that could reach it.
+    #[allow(clippy::too_many_arguments)]
+    fn refuse_on_mismatch(
+        &self,
+        paper: &Paper,
+        route: RouteId,
+        phase: IdentityPhase,
+        resolver: String,
+        expected: &WorkIdentity,
+        registry: Option<&ResolvedWork>,
+        bytes: &[u8],
+        checked: &identity::Checked,
+        now: &str,
+    ) -> AdapterError {
+        let expected_title = expected.title.clone().unwrap_or_default();
+        let resolved_title = match (phase, registry) {
+            (IdentityPhase::PreFetch, Some(registry)) => {
+                registry.identity.title.clone().unwrap_or_default()
+            }
+            _ => identity::served_identity(bytes)
+                .and_then(|served| served.title)
+                .unwrap_or_default(),
+        };
+        let detail = format!(
+            "{} check at {phase} against {resolver}: expected {expected_title:?}, got \
+             {resolved_title:?} ({})",
+            route.label(),
+            checked.why
+        );
+
+        // The audit row: a fetch happened, and it deliberately filed nothing.
+        // Best-effort, like `record_gap` — a row about a refusal must never become
+        // the refusal the caller sees.
+        if let Err(error) = self.db.record_attempt(&AttemptWrite {
+            paper_id: Some(paper.id.as_str().to_string()),
+            kind: GAP_FULLTEXT_KIND.to_string(),
+            locator: FULLTEXT_LOCATOR.to_string(),
+            route: route.label().to_string(),
+            bucket: None,
+            started_at: now.to_string(),
+            outcome: "identity_mismatch".to_string(),
+            http_status: None,
+            detail: Some(detail.clone()),
+        }) {
+            tracing::warn!(
+                paper_id = %paper.id,
+                %error,
+                "could not record the refused fetch in acquisition_attempts"
+            );
+        }
+
+        self.record_identity_gap(paper, &detail, now);
+
+        AdapterError::IdentityMismatch(Box::new(crate::error::IdentityMismatchDetail {
+            phase: phase.label(),
+            expected: expected_title,
+            resolver,
+            resolved: resolved_title,
+            why: checked.why.clone(),
+        }))
+    }
+
+    /// Record ADR-007 §2's `identity_mismatch` gap row.
+    ///
+    /// Ownership, for the same reason [`Self::record_gap`] documents it: `status`
+    /// and `reason` are this refusal's to establish, `next_attempt_at` is carried
+    /// over untouched (a blocked work has nothing to retry), and `publisher`
+    /// stays `None` — the report-time grouping derives it from the DOI registry,
+    /// and a name this walk cannot check is a name it should not store.
+    ///
+    /// The row is read before it is written so `drop_path` and `hint_url` cannot
+    /// be lost on the way through.
+    fn record_identity_gap(&self, paper: &Paper, detail: &str, now: &str) {
+        let existing = self
+            .db
+            .acquisition_state(paper.id.as_str(), GAP_FULLTEXT_KIND, FULLTEXT_LOCATOR)
+            .ok()
+            .flatten();
+        let mut row: StateWrite = existing.as_ref().map_or_else(
+            || StateWrite {
+                paper_id: paper.id.as_str().to_string(),
+                kind: GAP_FULLTEXT_KIND.to_string(),
+                locator: FULLTEXT_LOCATOR.to_string(),
+                wanted_version: WANTED_VERSION_VOR.to_string(),
+                status: String::new(),
+                reason: None,
+                publisher: None,
+                hint_url: None,
+                drop_path: None,
+                next_attempt_at: None,
+                updated_at: now.to_string(),
+            },
+            StateRow::to_write,
+        );
+        row.status = STATUS_IDENTITY_MISMATCH.to_string();
+        row.reason = Some(detail.to_string());
+        row.hint_url = self.doi_hint_url(paper);
+        row.publisher = None;
+        row.next_attempt_at = existing.and_then(|row| row.next_attempt_at);
+        row.updated_at = now.to_string();
+        if let Err(error) = self.db.upsert_acquisition_state(&row) {
+            tracing::warn!(
+                paper_id = %paper.id,
+                %error,
+                "could not record the identity_mismatch gap; the refusal stands"
+            );
+        }
     }
 
     /// Record what the walk concluded as an `acquisition_state` gap.
@@ -732,7 +1063,17 @@ impl PaperDownloader {
             source_url,
             publisher_url,
             path,
+            resolved,
         } = fetched;
+
+        // #253, and the reason the bytes are still only in memory here: nothing
+        // is written before the identity gate has passed. `Fetched::path` is
+        // never created by a leg, so refusing here means the response body is
+        // dropped on the floor — no legacy copy, no blob, no `artefacts` row, no
+        // gap retraction, and no `download_status` claiming a file.
+        if let Some(paper) = paper {
+            self.gate_identity(paper, route, &bytes, resolved.as_ref())?;
+        }
 
         // The `kind` vocabulary is closed, so an extension outside it is a
         // refusal rather than a guess: filing a `.docx` as `fulltext_html`
@@ -957,6 +1298,7 @@ impl PaperDownloader {
             // The PDF we asked for, which is also the posting's canonical
             // page — a human handed this URL sees the preprint.
             publisher_url: Some(candidate.url.clone()),
+            resolved: None,
         })
     }
 
@@ -967,6 +1309,88 @@ impl PaperDownloader {
             biorxiv_content: self.endpoints.biorxiv_content.clone(),
             arxiv_pdf: self.endpoints.arxiv_pdf.clone(),
         }
+    }
+
+    /// ADR-007 §3 step 3: DOE OSTI's deterministic full-text URL, from the
+    /// work's `osti_id`.
+    ///
+    /// Ahead of every index leg for the reason the preprint transform is
+    /// (#260): the URL is a function of the identifier, so there is nothing to
+    /// look up and no index whose "no location" answer could make a free
+    /// national-lab report look unobtainable.
+    ///
+    /// Charged [`PaceTier::Oa`] like any other OA host, and recorded as
+    /// [`RouteId::Osti`] so the artefact carries the route that served it. A
+    /// `purl` that redirects to a national lab's own host is followed by
+    /// `PacedClient`, which spends a permit per hop against **that** bucket.
+    ///
+    /// # Errors
+    ///
+    /// [`LegError::inconclusive`] when the bytes are not a PDF — which is the
+    /// shape the live service really returns for an id it does not have: a 404
+    /// carrying a 265 kB HTML page of its own site. `Inconclusive` rather than
+    /// `Refused` because the *status* was the refusal and this is about the
+    /// body; either way the walk continues to the next leg, and a body that is
+    /// not a PDF never reaches a file. See [`crate::osti`].
+    async fn try_osti(
+        &self,
+        work: &WorkScope,
+        osti_id: &str,
+        stem: &str,
+        output_dir: &Path,
+    ) -> Result<Fetched, LegError> {
+        let url = osti::purl_url_at(&self.endpoints.osti_base, osti_id).ok_or_else(|| {
+            // Unreachable when the caller has already normalised the value; kept
+            // rather than unwrapped so a future caller cannot build a URL by
+            // concatenation.
+            LegError::gated(AdapterError::Validation(format!(
+                "{osti_id:?} is not an OSTI identifier, so no full-text URL can be derived"
+            )))
+        })?;
+        let response = self
+            .get(work, &url, PaceTier::Oa, RouteId::Osti.label())
+            .await?;
+        // Read the URL off before `bytes()` consumes the response: this is the
+        // post-redirect one, which for some records is a national lab's own host
+        // rather than `osti.gov` — and it is what `artefacts.source_url` records.
+        let source_url = response.url.to_string();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| fetch_failure("failed to read OSTI bytes", e))?;
+
+        // The fail-closed check. A status of 200, a `text/html` content type and
+        // an HTML body all agree here, and the body is what decides: a place
+        // that answers with an error page has not served the report.
+        if !identity::is_pdf(&bytes) {
+            return Err(LegError::inconclusive(AdapterError::Parse(format!(
+                "OSTI answered {url} with {} bytes that are not a PDF (first bytes: {:?}), \
+                 so there is no report to file — an HTML error page is not a document",
+                bytes.len(),
+                String::from_utf8_lossy(&bytes[..bytes.len().min(16)])
+            ))));
+        }
+
+        Ok(Fetched {
+            reference: osti_id.to_string(),
+            path: output_dir.join(format!("{stem}.{PDF_EXT}")),
+            bytes,
+            ext: PDF_EXT,
+            format: DownloadFormat::Pdf,
+            // A national-lab report is served whole; there is no partial-content
+            // shape for this route, and the magic-byte check above has already
+            // refused the one shape that could have been an error page.
+            access: AccessStatus::FullText,
+            route: RouteId::Osti,
+            source_url,
+            // The record page, which is also the only human-facing URL a report
+            // with no DOI has.
+            publisher_url: osti::biblio_url_at(&self.endpoints.osti_base, osti_id),
+            // No registry was asked: the URL came from the identifier on the
+            // record, so there is no "resolved" metadata to check against. The
+            // post-fetch check still runs, off the PDF's own `/Title`.
+            resolved: None,
+        })
     }
 
     /// Query Unpaywall for an open-access PDF URL and download it.
@@ -1025,6 +1449,13 @@ impl PaperDownloader {
             route: RouteId::Unpaywall,
             source_url,
             publisher_url: None,
+            // Deliberately `None`: Unpaywall's `title` is a copy of the
+            // publisher-supplied title it was handed, so using it as the
+            // identity reference would be a second opinion about the same
+            // string — and ADR-007 §3's chain is "OpenAlex → Crossref →
+            // DataCite", which does not include Unpaywall. See
+            // [`try_openalex`].
+            resolved: None,
         })
     }
 
@@ -1055,6 +1486,7 @@ impl PaperDownloader {
             // canonical page a human should be pointed at, and a paywalled
             // article needs the DOI, not whichever CDN served the stub.
             publisher_url: Some(doi_url),
+            resolved: None,
         })
     }
 
@@ -1085,6 +1517,7 @@ impl PaperDownloader {
             route: RouteId::Arxiv,
             source_url,
             publisher_url: None,
+            resolved: None,
         })
     }
 
@@ -1175,6 +1608,7 @@ impl PaperDownloader {
             route: RouteId::OpenAlex,
             source_url,
             publisher_url: (format == DownloadFormat::Html).then(|| pdf_url.to_string()),
+            resolved: Some(openalex_identity(&body)),
         })
     }
 
@@ -1199,6 +1633,7 @@ impl PaperDownloader {
             route: RouteId::ManualUrl,
             source_url,
             publisher_url: Some(url.to_string()),
+            resolved: None,
         })
     }
 
@@ -1247,6 +1682,33 @@ struct Fetched {
     source_url: String,
     publisher_url: Option<String>,
     path: PathBuf,
+    /// What a **metadata registry** said this work is, on the legs that ask one.
+    ///
+    /// `None` for a leg that derives its URL from an identifier and never asks:
+    /// arXiv, the preprint transform, OSTI. That is the whole point of those
+    /// routes, and it is why their identity check has nothing to compare on the
+    /// pre-fetch side — the *post*-fetch check still runs, off the served bytes.
+    ///
+    /// When it is `Some`, it is the "resolved" side of ADR-007 §3's pre-fetch
+    /// check, and the caller ([`PaperDownloader::finish`]) runs that check
+    /// **before** anything is written. This is the field that makes
+    /// "the expected title against the resolved one" more than a sentence in an
+    /// ADR.
+    resolved: Option<ResolvedWork>,
+}
+
+/// The two sides of one comparison, as the recorded row carries them.
+struct ComparedSides {
+    source: IdentitySource,
+    expected_title: Option<String>,
+    resolved_title: Option<String>,
+}
+
+/// One registry's answer about a work: what it is called, when, and by whom.
+#[derive(Debug, Clone, PartialEq)]
+struct ResolvedWork {
+    identity: WorkIdentity,
+    source: IdentitySource,
 }
 
 /// The two full-text serialisations these legs have ever stored.
@@ -1289,6 +1751,8 @@ enum Leg {
     ArxivId,
     /// The DOI's preprint transform (#260).
     Preprint,
+    /// DOE OSTI's deterministic `purl` URL, from the record's `osti_id`.
+    Osti,
     /// OpenAlex `/works/{id}`.
     OpenAlex,
     /// Unpaywall `/v2/{doi}` and the PDF it resolves to.
@@ -1305,6 +1769,7 @@ impl Leg {
         match self {
             Self::ArxivId => "arxiv id",
             Self::Preprint => "preprint transform",
+            Self::Osti => "osti",
             Self::OpenAlex => "openalex",
             Self::Unpaywall => "unpaywall",
             Self::Publisher => "doi.org publisher page",
@@ -1577,6 +2042,15 @@ const STATUS_UNAVAILABLE: &str = "unavailable";
 /// `acquisition_state.status`: a route was tried and could not be resolved.
 const STATUS_ERROR: &str = "error";
 
+/// `acquisition_state.status`: the identity gate refused to file these bytes.
+///
+/// ADR-007 §2's own row for it — "the resolved or served title doesn't match the
+/// expected one" — whose action is "check DOI (both titles shown)". A work in
+/// this status is **not** re-fetched by `acquire`: it is a human action, so the
+/// queue leaves it alone and `action_list` prints the group with the evidence
+/// beside it.
+const STATUS_IDENTITY_MISMATCH: &str = "identity_mismatch";
+
 /// Write the legacy `papers/<stem>.<ext>` copy.
 ///
 /// Kept exactly where ADR-007 §1 "Legacy data" says it is, under the name
@@ -1593,6 +2067,40 @@ fn write_legacy_copy(path: &Path, bytes: &[u8]) -> Result<(), AdapterError> {
 /// recognised as a PDF is not text we can classify.
 fn classify_html(bytes: &[u8]) -> AccessStatus {
     std::str::from_utf8(bytes).map_or(AccessStatus::Unknown, detect_access_status)
+}
+
+/// What OpenAlex's `/works/{id}` says the work is, for the pre-fetch identity
+/// check.
+///
+/// Read from the same envelope the leg already parsed rather than from a second
+/// request: `title` and `publication_year` are top-level fields, and the first
+/// authorship's `author.display_name` is the first author in the same order the
+/// registry lists them. A missing field yields `None` rather than a placeholder,
+/// because an absent fact must read as [`Verdict::Unverified`] and never as
+/// agreement.
+fn openalex_identity(work: &serde_json::Value) -> ResolvedWork {
+    let identity = WorkIdentity {
+        title: work
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        year: work
+            .get("publication_year")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|year| i32::try_from(year).ok()),
+        first_author: work
+            .get("authorships")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|authorships| authorships.first())
+            .and_then(|authorship| authorship.get("author"))
+            .and_then(|author| author.get("display_name"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    };
+    ResolvedWork {
+        identity,
+        source: IdentitySource::OpenAlex,
+    }
 }
 
 /// The `publisher` and `publisher_note` columns for a work.
@@ -1887,6 +2395,7 @@ mod tests {
                     arxiv_pdf: format!("{base}/pdf"),
                     biorxiv_content: format!("{base}/content"),
                     openalex_api: format!("{base}/works"),
+                    osti_base: base.clone(),
                 },
             )
         }

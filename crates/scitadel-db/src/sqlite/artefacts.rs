@@ -615,8 +615,27 @@ pub fn write_acquisition_states(
         return Ok(0);
     }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    write_acquisition_states_in(&tx, rows)?;
+    tx.commit()?;
+    Ok(rows.len())
+}
+
+/// [`write_acquisition_states`], on a connection or transaction the **caller**
+/// owns.
+///
+/// The half that can join somebody else's transaction, which
+/// `override_identity` needs: it writes the identity override and returns a
+/// mismatched gap to the `acquire` queue as one atomic fact, so a reader
+/// between the two writes could never see a work whose identity a person has
+/// settled and whose want row still says the machine blocked it. `rusqlite`'s
+/// `Transaction` deliberately does not implement `DerefMut`, so this cannot be
+/// reached by handing the transaction to [`write_acquisition_states`].
+pub fn write_acquisition_states_in(
+    conn: &Connection,
+    rows: &[StateWrite],
+) -> Result<usize, DbError> {
     for row in rows {
-        tx.execute(
+        conn.execute(
             "INSERT INTO acquisition_state
                  (paper_id, kind, locator, wanted_version, status, reason, publisher,
                   hint_url, drop_path, next_attempt_at, updated_at)
@@ -652,7 +671,6 @@ pub fn write_acquisition_states(
             ],
         )?;
     }
-    tx.commit()?;
     Ok(rows.len())
 }
 

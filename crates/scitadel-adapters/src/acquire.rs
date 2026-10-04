@@ -905,7 +905,7 @@ mod tests {
     use scitadel_core::ports::{Bucket, Cost, PaceDenied, PaceTier, Pacer, Permit};
     use scitadel_db::sqlite::{ACCESS_BASIS_MANUAL, ArtefactWrite, BlobWrite, WriteMode};
     use scitadel_http::{BucketPolicyTable, PacedClient};
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const PDF_BYTES: &[u8] = b"%PDF-1.7\nacquired body\n%%EOF\n";
@@ -983,6 +983,7 @@ mod tests {
                     arxiv_pdf: format!("{base}/pdf"),
                     biorxiv_content: format!("{base}/content"),
                     openalex_api: format!("{base}/works"),
+                    osti_base: base.clone(),
                 },
             )
         }
@@ -1009,6 +1010,20 @@ mod tests {
                 .await;
         }
 
+        /// A 404 for a path **including** its query string — wiremock refuses to
+        /// match a `?` in a path, so this splits it into a path plus a
+        /// `query_param` matcher.
+        async fn miss_with_query(&self, route: &str) {
+            let (route_path, query) = route.split_once('?').expect("a query string");
+            let (key, value) = query.split_once('=').expect("k=v");
+            Mock::given(method("GET"))
+                .and(path(route_path))
+                .and(query_param(key, value))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&self.server)
+                .await;
+        }
+
         async fn miss(&self, route: &str) {
             Mock::given(method("GET"))
                 .and(path(route))
@@ -1024,6 +1039,106 @@ mod tests {
                 .await
                 .expect("wiremock recorded")
                 .len()
+        }
+
+        /// Serve an OpenAlex `/works/{id}` answer with the three facts the
+        /// pre-fetch identity check reads — `title`, `publication_year` and the
+        /// first authorship — plus an OA location the leg can fetch.
+        ///
+        /// `title` and `author` take [`None`] to leave the field out entirely,
+        /// which is the shape that produces `unverified` rather than `ok`.
+        async fn serve_openalex_work(
+            &self,
+            openalex_id: &str,
+            title: Option<&str>,
+            year: Option<i32>,
+            author: Option<&str>,
+        ) {
+            let pdf_route = format!("/oa/{openalex_id}.pdf");
+            let pdf_url = format!("{}{pdf_route}", self.server.uri());
+            let field = |name: &str, value: Option<String>| match value {
+                Some(value) => {
+                    let json = serde_json::to_string(&value).expect("json");
+                    format!(r#""{name}":{json},"#)
+                }
+                None => String::new(),
+            };
+            let authorships = match author {
+                Some(author) => {
+                    let json = serde_json::to_string(&author).expect("json");
+                    format!(r#""authorships":[{{"author":{{"display_name":{json}}}}}],"#)
+                }
+                None => String::new(),
+            };
+            self.serve(
+                &format!("/works/{openalex_id}"),
+                format!(
+                    "{{{}{}{}\"best_oa_location\":{{\"pdf_url\":{}}}}}",
+                    field("title", title.map(str::to_string)),
+                    field("publication_year", year.map(|year| year.to_string()),),
+                    authorships,
+                    serde_json::to_string(&pdf_url).expect("json")
+                ),
+            )
+            .await;
+            self.serve(&pdf_route, String::from_utf8_lossy(PDF_BYTES).to_string())
+                .await;
+        }
+
+        /// A saved `Paper` whose title, year and first author the identity check
+        /// reads, plus whatever identifiers the walk needs.
+        fn paper_with(
+            &self,
+            id: &str,
+            title: &str,
+            year: Option<i32>,
+            authors: &[&str],
+            doi: Option<&str>,
+            openalex_id: Option<&str>,
+        ) {
+            let mut p = Paper::new(title);
+            p.id = scitadel_core::models::PaperId::from(id.to_string());
+            p.year = year;
+            p.authors = authors.iter().map(|author| (*author).to_string()).collect();
+            p.doi = doi.map(str::to_string);
+            p.openalex_id = openalex_id.map(str::to_string);
+            let (paper_repo, _, _, _, _) = self.db.repositories();
+            paper_repo.save(&p).expect("save paper");
+        }
+
+        /// `paper_identity_checks` as `(phase, status, expected, resolved)` per row.
+        fn identity_checks(&self) -> Vec<(String, String, Option<String>, Option<String>)> {
+            let conn = self.db.conn().expect("conn");
+            let mut stmt = conn
+                .prepare(
+                    "SELECT phase, status, expected_title, resolved_title
+                       FROM paper_identity_checks ORDER BY paper_id, phase",
+                )
+                .expect("prepare");
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .expect("query")
+                .map(Result::unwrap)
+                .collect()
+        }
+
+        /// How many `blobs` rows exist — the other half of "nothing was filed",
+        /// since an artefact's bytes are its blob's.
+        fn count_blobs(&self) -> i64 {
+            let conn = self.db.conn().expect("conn");
+            conn.query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get(0))
+                .expect("count")
+        }
+
+        /// `acquisition_attempts` as `(route, outcome, detail)`.
+        fn attempts(&self) -> Vec<(String, String, Option<String>)> {
+            let conn = self.db.conn().expect("conn");
+            let mut stmt = conn
+                .prepare("SELECT route, outcome, detail FROM acquisition_attempts ORDER BY id")
+                .expect("prepare");
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .expect("query")
+                .map(Result::unwrap)
+                .collect()
         }
 
         /// A saved `Paper` with the identifiers a test needs.
@@ -1266,6 +1381,381 @@ mod tests {
             fx.request_count().await,
             after_first,
             "the second run put nothing on the wire"
+        );
+    }
+
+    // =====================================================================
+    // 1. #253: no artefact is ever filed under a mismatched identity.
+    // =====================================================================
+
+    /// The criterion, asserted on the table itself: **a mismatch writes no
+    /// `artefacts` row.**
+    ///
+    /// Byte-identical before and after — every column of every row, not a count —
+    /// because "the rows look the same" is satisfied by a run that filed the
+    /// wrong document and then deleted it, and by a run that filed the right one
+    /// under a different id.
+    ///
+    /// The mismatch is a **served page** naming another paper: the shape ADR-007
+    /// §3's post-fetch check exists for ("this catches redirects to the wrong
+    /// paper"), and the one an index cannot be blamed for.
+    #[tokio::test]
+    async fn a_mismatch_writes_no_artefact_row() {
+        let fx = Fixture::new().await;
+        fx.paper_with(
+            "p-mismatch",
+            "Deep learning for radiopharmaceutical image reconstruction",
+            Some(2020),
+            &["Young, Christopher J."],
+            Some(UNKNOWN_DOI),
+            None,
+        );
+        fx.gap("p-mismatch", "pending", None, None);
+        // Unpaywall names no location; the DOI resolver lands on a page whose
+        // own metadata says it is a different article.
+        fx.miss_with_query(&format!("/v2/{UNKNOWN_DOI}?email=polite@example.org"))
+            .await;
+        fx.serve(
+            &format!("/doi/{UNKNOWN_DOI}"),
+            r#"<!doctype html><html><head>
+                 <meta name="citation_title" content="Total-body PET scanners for theranostics">
+                 <meta name="citation_publication_date" content="2019-04-01">
+                 <meta name="citation_author" content="Harris, James M.">
+                 </head><body>an entirely different article</body></html>"#
+                .to_string(),
+        )
+        .await;
+
+        let before = fx.artefacts();
+        assert!(before.is_empty(), "nothing is held to begin with");
+
+        let report = fx.acquire(&AcquireRequest::queue()).await;
+
+        assert_eq!(report.acquired(), 0, "nothing was filed");
+        assert_eq!(
+            fx.artefacts(),
+            before,
+            "#253: a mismatch must leave the artefacts table exactly as it found it"
+        );
+        assert_eq!(
+            fx.count_blobs(),
+            0,
+            "and no blob either — the bytes were discarded, not stored"
+        );
+
+        // The other half of "a mismatch": the reason has to be *visible*.
+        let checks = fx.identity_checks();
+        assert_eq!(checks.len(), 1, "the check is recorded: {checks:?}");
+        let (phase, status, expected, resolved) = &checks[0];
+        assert_eq!(phase, "post_fetch");
+        assert_eq!(status, "mismatch");
+        assert_eq!(
+            expected.as_deref(),
+            Some("Deep learning for radiopharmaceutical image reconstruction"),
+            "both titles are stored, or the row cannot be acted on"
+        );
+        assert_eq!(
+            resolved.as_deref(),
+            Some("Total-body PET scanners for theranostics")
+        );
+
+        // ADR-007 §2's status for exactly this, which is a human action — so
+        // `action_list` prints it and `acquire` never re-fetches it.
+        let gap = fx
+            .db
+            .acquisition_state("p-mismatch", FULLTEXT_KIND, FULLTEXT_LOCATOR)
+            .expect("read gap")
+            .expect("a gap row exists");
+        assert_eq!(gap.status, "identity_mismatch");
+        assert!(
+            gap.reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("theranostics")),
+            "the reason names the served title: {:?}",
+            gap.reason
+        );
+
+        // And the audit row: a fetch happened and deliberately filed nothing.
+        let attempts = fx.attempts();
+        assert_eq!(attempts.len(), 1, "{attempts:?}");
+        assert_eq!(attempts[0].1, "identity_mismatch");
+        assert!(
+            attempts[0]
+                .2
+                .as_deref()
+                .is_some_and(|detail| detail.contains("theranostics")),
+            "{attempts:?}"
+        );
+    }
+
+    /// The schema's whole point is being able to see the disagreement, so this is
+    /// the pre-fetch half of it: the **stored** paper's title against the one
+    /// OpenAlex resolved for it.
+    ///
+    /// Both titles, verbatim, on the row — which is what ADR-007 §2's
+    /// `identity_mismatch` action ("check DOI (both titles shown)") is a promise
+    /// about.
+    #[tokio::test]
+    async fn a_pre_fetch_mismatch_is_recorded_with_both_titles() {
+        let fx = Fixture::new().await;
+        fx.paper_with(
+            "p-openalex",
+            "Deep learning for radiopharmaceutical image reconstruction",
+            Some(2020),
+            &["Young, Christopher J."],
+            None,
+            Some("W123"),
+        );
+        fx.gap("p-openalex", "pending", None, None);
+        // OpenAlex answers with a different article's title for this id.
+        fx.serve_openalex_work(
+            "W123",
+            Some("Total-body PET scanners for theranostics"),
+            Some(2021),
+            Some("Harris, James M."),
+        )
+        .await;
+
+        let report = fx.acquire(&AcquireRequest::queue()).await;
+        assert_eq!(report.acquired(), 0);
+        assert!(fx.artefacts().is_empty(), "nothing filed");
+
+        let checks = fx.identity_checks();
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        let (phase, status, expected, resolved) = &checks[0];
+        assert_eq!(
+            phase, "pre_fetch",
+            "the mismatch is caught before the bytes"
+        );
+        assert_eq!(status, "mismatch");
+        assert_eq!(
+            expected.as_deref(),
+            Some("Deep learning for radiopharmaceutical image reconstruction"),
+            "the expected title is the stored paper's"
+        );
+        assert_eq!(
+            resolved.as_deref(),
+            Some("Total-body PET scanners for theranostics"),
+            "and the resolved one is the registry's"
+        );
+    }
+
+    /// The opposite of the criterion: a check that could not be *confirmed* must
+    /// not block acquisition, or the ladder would stop working for every work
+    /// whose PDF carries no readable `/Title` — and `unverified` is a property of
+    /// the data, so a blocked fetch would return it again forever.
+    ///
+    /// The shape here is the real one: OpenAlex names the work correctly but
+    /// records no year and no author, so the titles match and **nothing
+    /// corroborates** them. The verdict is `unverified`, the row says so, and the
+    /// PDF is filed.
+    ///
+    /// This is deliberately the opposite rule to [`a_mismatch_writes_no_artefact_row`],
+    /// and the difference is the whole design: `mismatch` is positive evidence
+    /// that the bytes are another work, `unverified` is no evidence at all.
+    #[tokio::test]
+    async fn an_unverified_check_still_lets_the_fetch_proceed() {
+        let fx = Fixture::new().await;
+        fx.paper_with(
+            "p-unverified",
+            "Deep learning for radiopharmaceutical image reconstruction",
+            Some(2020),
+            &[],
+            None,
+            Some("W999"),
+        );
+        fx.gap("p-unverified", "pending", None, None);
+        fx.serve_openalex_work(
+            "W999",
+            Some("Deep learning for radiopharmaceutical image reconstruction"),
+            None,
+            None,
+        )
+        .await;
+
+        let report = fx.acquire(&AcquireRequest::queue()).await;
+        assert_eq!(report.acquired(), 1, "an unverified check is not a block");
+        assert_eq!(
+            fx.artefacts().len(),
+            1,
+            "the full text is filed: the check did not establish a mismatch"
+        );
+
+        let checks = fx.identity_checks();
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert_eq!(checks[0].0, "pre_fetch");
+        assert_eq!(
+            checks[0].1, "unverified",
+            "and it is recorded as `unverified`, not as a pass: {:?}",
+            checks[0]
+        );
+        assert!(
+            fx.attempts().is_empty(),
+            "nothing was refused, so nothing is recorded as refused"
+        );
+    }
+
+    /// #253's escape hatch, end to end: a person settles the identity, and a
+    /// **later run** fetches and files the work instead of re-asking.
+    ///
+    /// Asserted in both directions, because "write-once" is only a claim about
+    /// machines if a person's own later `--reason` still replaces their earlier
+    /// one, and only a claim about machines if a machine's second mismatch is not
+    /// recorded over the override.
+    #[tokio::test]
+    async fn an_override_survives_a_later_run() {
+        let fx = Fixture::new().await;
+        fx.paper_with(
+            "p-override",
+            "Deep learning for radiopharmaceutical image reconstruction",
+            Some(2020),
+            &["Young, Christopher J."],
+            Some(UNKNOWN_DOI),
+            None,
+        );
+        fx.gap("p-override", "pending", None, None);
+        fx.miss_with_query(&format!("/v2/{UNKNOWN_DOI}?email=polite@example.org"))
+            .await;
+        fx.serve(
+            &format!("/doi/{UNKNOWN_DOI}"),
+            r#"<meta name="citation_title" content="Total-body PET scanners for theranostics">"#
+                .to_string(),
+        )
+        .await;
+
+        // Run 1: refused, and the work is parked on a person.
+        assert_eq!(fx.acquire(&AcquireRequest::queue()).await.acquired(), 0);
+        assert!(
+            fx.artefacts().is_empty(),
+            "run 1 filed nothing: the gate said no"
+        );
+
+        // The person checks it by hand. A blank reason is refused outright.
+        assert!(
+            matches!(
+                fx.db.override_identity("p-override", "   "),
+                Err(scitadel_db::sqlite::IdentityError::ReasonRequired)
+            ),
+            "an override without a reason is not an override"
+        );
+        let report = fx
+            .db
+            .override_identity("p-override", "same report; OpenAlex has the older title")
+            .expect("override");
+        assert_eq!(
+            report.gap_status_before.as_deref(),
+            Some("identity_mismatch"),
+            "the work was blocked, and the override says so"
+        );
+        assert_eq!(report.gap_status_after.as_deref(), Some("pending"));
+
+        // Run 2: the same bytes, the same mismatch — and it is filed this time,
+        // because a person said the identity question was already settled.
+        assert_eq!(
+            fx.acquire(&AcquireRequest::queue()).await.acquired(),
+            1,
+            "a settled identity must not block the work for ever"
+        );
+        assert_eq!(fx.artefacts().len(), 1);
+        assert!(
+            fx.identity_checks()
+                .iter()
+                .all(|(_, status, _, _)| status == "overridden"),
+            "and the machine's second verdict was not recorded over the override: {:?}",
+            fx.identity_checks()
+        );
+
+        // A person may change their own mind; only machines are locked out.
+        fx.db
+            .override_identity("p-override", "checked again against the OSTI record")
+            .expect("re-override");
+        let checks = fx.identity_checks();
+        assert_eq!(
+            checks.len(),
+            2,
+            "one row per phase, still — a second `--reason` updates rather than inserts: {checks:?}"
+        );
+        assert!(
+            checks
+                .iter()
+                .all(|(_, status, _, _)| status == "overridden"),
+            "{checks:?}"
+        );
+    }
+
+    /// ADR-007 §3 step 3: a DOE report with no DOI is fetched from OSTI's
+    /// deterministic `purl` URL, and a body that is not a PDF is never filed.
+    ///
+    /// Both halves, because the second is the one that would be invisible
+    /// otherwise: OSTI answers an id it does not have with **404 and a 265 kB
+    /// HTML page of its own site** (probed 2026-10-04), so a route that trusted
+    /// the status code would hand `coverage` a "full text" nobody can read.
+    #[tokio::test]
+    async fn the_osti_route_fetches_a_pdf_and_fails_closed_on_an_html_error_page() {
+        let fx = Fixture::new().await;
+        let title = "IDC Re-Engineering Phase 2 Glossary";
+        // A report with no DOI at all — the only identifier is `osti_id`, which is
+        // exactly the class the route exists for.
+        fx.paper_with("p-osti", title, Some(2016), &[], None, None);
+        fx.db.set_osti_id("p-osti", "1234567").expect("set osti_id");
+        fx.gap("p-osti", "pending", None, None);
+        fx.serve(
+            "/servlets/purl/1234567",
+            format!("%PDF-1.6\n/Title({title})\nbody\n%%EOF\n"),
+        )
+        .await;
+
+        let report = fx.acquire(&AcquireRequest::queue()).await;
+        assert_eq!(report.acquired(), 1, "the report is fetched and filed");
+        let artefacts = fx.artefacts();
+        assert_eq!(artefacts.len(), 1, "{artefacts:?}");
+        assert!(
+            artefacts[0].contains("osti"),
+            "the artefact records the route that served it: {artefacts:?}"
+        );
+
+        // The failing half: an HTML page under the same route.
+        let fx = Fixture::new().await;
+        fx.paper_with("p-osti-html", title, Some(2016), &[], None, None);
+        fx.db
+            .set_osti_id("p-osti-html", "999999999")
+            .expect("set osti_id");
+        fx.gap("p-osti-html", "pending", None, None);
+        fx.serve(
+            "/servlets/purl/999999999",
+            "<!DOCTYPE html><html lang=\"en\"><title>Page not found</title>\
+             <body>265 kB of site chrome</body></html>"
+                .to_string(),
+        )
+        .await;
+
+        let report = fx.acquire(&AcquireRequest::queue()).await;
+        assert_eq!(report.acquired(), 0, "an HTML page is not a report");
+        assert!(
+            fx.artefacts().is_empty(),
+            "and it is not filed as one: {:?}",
+            fx.artefacts()
+        );
+        assert_eq!(fx.count_blobs(), 0, "no blob for a body that is not a PDF");
+        // The walk continued past it (there was nothing else to try), and said so
+        // rather than calling the report unavailable — the route was asked and
+        // could not be resolved.
+        let gap = fx
+            .db
+            .acquisition_state("p-osti-html", FULLTEXT_KIND, FULLTEXT_LOCATOR)
+            .expect("read gap")
+            .expect("a gap row exists");
+        assert_eq!(
+            gap.status, "error",
+            "OSTI could not be resolved, which is `error` and not `unavailable`: {:?}",
+            gap.reason
+        );
+        assert!(
+            gap.reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("not a PDF")),
+            "the reason says why: {:?}",
+            gap.reason
         );
     }
 
