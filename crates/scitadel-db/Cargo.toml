@@ -18,6 +18,7 @@ tokio = { workspace = true }
 rusqlite = { workspace = true }
 r2d2 = { workspace = true }
 r2d2_sqlite = { workspace = true }
+serde = { workspace = true } # ADR-007 §2: coverage / action_list JSON is the report, serialized
 serde_json = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }

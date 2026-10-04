@@ -193,6 +193,40 @@ enum Commands {
         #[arg(long)]
         root: PathBuf,
     },
+    /// What the library wants and does not hold (ADR-007 §1, §2)
+    ///
+    /// Per-kind and per-status totals plus every missing entry. "Have" is
+    /// derived from `artefacts` on read — there is no stored have-status — and a
+    /// work with no recorded want is reported as untracked rather than counted
+    /// as missing. Every status the schema allows appears, including at zero,
+    /// so "no such papers" is distinguishable from "not tracked".
+    Coverage {
+        /// Restrict to one artefact kind (fulltext, fulltext_pdf,
+        /// fulltext_html, fulltext_xml, si, table, figure)
+        #[arg(long, value_parser = scitadel_db::sqlite::ALL_WANT_KINDS)]
+        kind: Option<String>,
+        /// Emit the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// One grouped list of what still needs a person (ADR-007 §2)
+    ///
+    /// The missing entries grouped by (action group, publisher), carrying each
+    /// entry's `hint_url` and `drop_path`. Its counts equal the `coverage`
+    /// missing totals exactly: every missing entry is either in a group or
+    /// listed below with the reason it is not a human action. A publisher
+    /// scitadel could not classify is never named, and never reported as
+    /// lacking a TDM route.
+    ///
+    /// Named `action_list` because ADR-007 §2 and issue #253 both spell it that
+    /// way, and MCP's read-only verb is `action_list` too; `action-list` works
+    /// as well, for anyone who expects the workspace's kebab-case spelling.
+    #[command(name = "action_list", visible_alias = "action-list")]
+    ActionList {
+        /// Emit the grouped list as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -525,5 +559,7 @@ async fn main() -> Result<()> {
             model,
         } => commands::snowball(&search_id, &question, depth, threshold, &direction, &model),
         Commands::ImportFlat { paper, root } => commands::import_flat(&paper, &root),
+        Commands::Coverage { kind, json } => commands::coverage(kind.as_deref(), json),
+        Commands::ActionList { json } => commands::action_list(json),
     }
 }
