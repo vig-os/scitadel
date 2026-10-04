@@ -1784,6 +1784,360 @@ pub fn import_flat(paper: &str, root: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+// ---------- coverage / action_list (ADR-007 §1 "Have", §2 "Status vocabulary") ----------
+
+use scitadel_db::sqlite::{ALL_STATUSES, ALL_WANT_KINDS, ActionList, CoverageReport, PublisherKey};
+
+/// The machine shape of `scitadel action_list --json`.
+///
+/// Carries the report the groups were partitioned *from* alongside the groups,
+/// so a consumer can check the acceptance criterion itself:
+/// `missing_total == report.missing_total == sum(group counts) + sum(deferred
+/// counts)` without a second query and without trusting this file's arithmetic.
+/// The machine shape of `scitadel coverage --json`.
+///
+/// The report verbatim, plus its three totals as fields rather than as something
+/// a consumer has to re-derive — and the same shape `action_list --json`
+/// answers with, so the acceptance criterion is checkable by comparing two JSON
+/// documents and nothing else.
+#[derive(serde::Serialize)]
+struct CoverageJson<'a> {
+    /// Recorded wants the ADR-007 §1 derivation says we do not hold.
+    missing_total: usize,
+    wanted_total: usize,
+    held_total: usize,
+    #[serde(flatten)]
+    report: &'a CoverageReport,
+}
+
+#[derive(serde::Serialize)]
+struct ActionListJson<'a> {
+    /// [`CoverageReport::missing_total`] — the number `coverage` prints.
+    missing_total: usize,
+    /// Entries a human can act on: the sum of the group counts.
+    human_total: usize,
+    /// Entries left out of the human list, and why (see `deferred`).
+    deferred_total: usize,
+    /// `human_total + deferred_total`. Structurally equal to `missing_total`.
+    accounted_total: usize,
+    groups: &'a [scitadel_db::sqlite::ActionGroup],
+    deferred: &'a [scitadel_db::sqlite::DeferredGroup],
+    report: &'a CoverageReport,
+}
+
+/// `scitadel coverage [--kind <k>] [--json]` — what the library wants and does
+/// not hold, per kind and per status (ADR-007 §1, §2).
+///
+/// "Have" is derived on read from `artefacts`; there is no stored have-status
+/// and this command reads none. A work with no recorded want and no artefacts
+/// is reported as untracked rather than counted as missing — no gap has been
+/// recorded for it, and inventing one is the failure mode this report exists to
+/// avoid (#260, #261, #275).
+pub fn coverage(kind: Option<&str>, json: bool) -> Result<()> {
+    // One read, one computation. `action_list` is the same value seen from the
+    // other side; see [`action_list`].
+    let list = read_action_list()?;
+    // `coverage`'s projection of the same value `action_list` groups, so the
+    // headline number it prints is the number the groups have to account for.
+    let report = list.coverage(kind).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if json {
+        let view = CoverageJson {
+            missing_total: report.missing_total(),
+            wanted_total: report.wanted_total(),
+            held_total: report.held_total(),
+            report: &report,
+        };
+        println!("{}", serde_json::to_string_pretty(&view)?);
+    } else {
+        print!("{}", render_coverage(&report, list.accounted(), kind));
+    }
+    Ok(())
+}
+
+/// `scitadel action_list [--json]` — the missing entries grouped for a person,
+/// by (action group, publisher) (ADR-007 §2).
+///
+/// Only what a human can act on is in the list. The statuses ADR-007 §2 marks
+/// "—" — `pending`, `oa_fetchable`, `tdm_available`, `unavailable`,
+/// `rate_limited`, `error` — are the `acquire` queue's, and every one of them
+/// is listed below the groups with the ADR's own reason, because the counts
+/// here sum to the `coverage` missing totals exactly and a reader has to be
+/// able to see where the rest went.
+pub fn action_list(json: bool) -> Result<()> {
+    let list = read_action_list()?;
+    if json {
+        let view = ActionListJson {
+            missing_total: list.report.missing_total(),
+            human_total: list.human_total(),
+            deferred_total: list.deferred_total(),
+            accounted_total: list.accounted(),
+            groups: &list.groups,
+            deferred: &list.deferred,
+            report: &list.report,
+        };
+        println!("{}", serde_json::to_string_pretty(&view)?);
+    } else {
+        print!("{}", render_action_list(&list));
+    }
+    Ok(())
+}
+
+/// The one read both commands make.
+fn read_action_list() -> Result<ActionList> {
+    let db = open_db()?;
+    db.action_list().map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// `coverage`'s text projection.
+///
+/// `accounted` is [`ActionList::accounted`] rather than
+/// [`CoverageReport::missing_total`] on purpose: the headline number a person
+/// reads here is the one `action_list` has to match, so it is the number a
+/// disagreement would show up in. `debug_assert_eq!` ties the two.
+#[allow(clippy::too_many_lines)]
+fn render_coverage(report: &CoverageReport, accounted: usize, kind: Option<&str>) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+
+    let _ = writeln!(
+        out,
+        "Coverage — \"have\" is derived from `artefacts` (ADR-007 §1); nothing here is a stored status."
+    );
+    match kind {
+        Some(kind) => {
+            let _ = writeln!(
+                out,
+                "Restricted to --kind {kind}; the scope counters below stay library-wide."
+            );
+        }
+        None => {
+            let _ = writeln!(out);
+        }
+    }
+
+    let _ = writeln!(out, "Scope");
+    let _ = writeln!(
+        out,
+        "  {:<44} {:>6}   library-wide, not narrowed by --kind",
+        "works in library", report.works_total
+    );
+    let _ = writeln!(
+        out,
+        "  {:<44} {:>6}   at least one recorded want",
+        "works in acquisition scope", report.works_in_scope
+    );
+    let _ = writeln!(
+        out,
+        "  {:<44} {:>6}   no want, no artefacts: no gap is recorded, so not missing",
+        "works untracked", report.untracked_works
+    );
+    let _ = writeln!(
+        out,
+        "  {:<44} {:>6}   files held, no want stated: neither covered nor missing",
+        "works holding files nobody queued", report.held_untracked_works
+    );
+
+    let _ = writeln!(
+        out,
+        "\nBy kind — recorded wants, and how many the derivation closes"
+    );
+    let _ = writeln!(
+        out,
+        "  {:<18} {:>7} {:>8} {:>8}",
+        "kind", "wanted", "missing", "held"
+    );
+    for kind in ALL_WANT_KINDS {
+        let total = report.by_kind.get(kind).copied().unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "  {kind:<18} {:>7} {:>8} {:>8}",
+            total.wanted, total.missing, total.held
+        );
+    }
+    let _ = writeln!(
+        out,
+        "  {:<18} {:>7} {:>8} {:>8}",
+        "total",
+        report.wanted_total(),
+        report.missing_total(),
+        report.held_total()
+    );
+
+    let _ = writeln!(
+        out,
+        "\nBy status — missing entries only. A zero means no such papers, not \
+         \"not tracked\": every status migration 013 allows appears."
+    );
+    for vocab in ALL_STATUSES {
+        let count = report.by_status.get(vocab.status).copied().unwrap_or(0);
+        let _ = writeln!(out, "  {:<20} {count:>5}   {}", vocab.status, vocab.meaning);
+    }
+    let _ = writeln!(out, "  {:<20} {:>5}", "sum", report.missing_total());
+
+    if report.held_at_another_version > 0 {
+        let _ = writeln!(
+            out,
+            "\n{} of the {} are works we DO hold a full text for, at a version the want does not \
+             accept (ADR-007 §2 `wrong_version`).",
+            report.held_at_another_version,
+            report.missing_total()
+        );
+    }
+
+    match kind {
+        // Unfiltered, the two numbers are the same number — and that is
+        // ADR-007 §2's acceptance criterion, so the assertion is here rather
+        // than only in a test.
+        None => {
+            debug_assert_eq!(
+                accounted,
+                report.missing_total(),
+                "action_list must account for every missing entry coverage reports"
+            );
+            let _ = writeln!(
+                out,
+                "\nMissing: {} of {} wanted ({} held). `scitadel action_list` accounts for the \
+                 same {}.",
+                report.missing_total(),
+                report.wanted_total(),
+                report.held_total(),
+                report.missing_total()
+            );
+        }
+        // Filtered, the two are different slices on purpose, so the line says
+        // which is which rather than implying they should match.
+        Some(_) => {
+            let _ = writeln!(
+                out,
+                "\nMissing: {} of {} wanted in this slice ({} held). Unfiltered, \
+                 `scitadel action_list` accounts for {accounted}.",
+                report.missing_total(),
+                report.wanted_total(),
+                report.held_total()
+            );
+        }
+    }
+
+    if report.entries.is_empty() {
+        let _ = writeln!(out, "\nNothing is missing from this slice of the library.");
+        return out;
+    }
+
+    let _ = writeln!(out, "\nMissing entries ({})", report.entries.len());
+    for entry in &report.entries {
+        let _ = writeln!(
+            out,
+            "  {}  {}  {}",
+            short_id(&entry.paper_id),
+            entry.describe(),
+            entry.status
+        );
+        if let Some(reason) = &entry.reason {
+            let _ = writeln!(out, "      reason: {reason}");
+        }
+        // The publisher line comes from the DOI registry, never from a stored
+        // name, so it cannot name a publisher that was never classified (#261).
+        let key = PublisherKey::of(report.doi_of(&entry.paper_id));
+        let _ = writeln!(out, "      publisher: {}", key.display());
+        if let Some(note) = key.route_note(&entry.status, report.doi_of(&entry.paper_id)) {
+            let _ = writeln!(out, "      route: {note}");
+        }
+        if let Some(hint) = &entry.hint_url {
+            let _ = writeln!(out, "      hint: {hint}");
+        }
+        if let Some(drop) = &entry.drop_path {
+            let _ = writeln!(out, "      drop: {drop}");
+        }
+    }
+    out
+}
+
+/// `action_list`'s text projection.
+fn render_action_list(list: &ActionList) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+
+    let _ = writeln!(
+        out,
+        "Action list — {} missing entries in {} group(s) a person can act on.",
+        list.report.missing_total(),
+        list.groups.len()
+    );
+    let _ = writeln!(
+        out,
+        "Same missing entries as `scitadel coverage`: {} accounted for, none dropped.",
+        list.accounted()
+    );
+    debug_assert_eq!(list.accounted(), list.report.missing_total());
+
+    if list.groups.is_empty() {
+        let _ = writeln!(out, "\nNothing here needs a person.");
+    }
+    for group in &list.groups {
+        let _ = writeln!(
+            out,
+            "\n{} — {} ({})",
+            group.action,
+            group.publisher.display(),
+            group.count()
+        );
+        // The registry's own wording, so an unclassified publisher is never
+        // reported as lacking a TDM route (#261).
+        if let Some(note) = &group.route_note {
+            let _ = writeln!(out, "  {note}");
+        }
+        for entry in &group.entries {
+            let _ = writeln!(
+                out,
+                "  + {}  {}  [{}]",
+                short_id(&entry.paper_id),
+                entry.describe(),
+                entry.status
+            );
+            if let Some(reason) = &entry.reason {
+                let _ = writeln!(out, "      reason: {reason}");
+            }
+            if let Some(hint) = &entry.hint_url {
+                let _ = writeln!(out, "      hint: {hint}");
+            }
+            if let Some(drop) = &entry.drop_path {
+                let _ = writeln!(out, "      drop: {drop}");
+            }
+        }
+    }
+
+    let _ = writeln!(
+        out,
+        "\nNot a human action — {} entries, excluded from the groups above:",
+        list.deferred_total()
+    );
+    let _ = writeln!(out, "  {:<20} {:>5}   goes to", "status", "count");
+    for group in &list.deferred {
+        let _ = writeln!(
+            out,
+            "  {:<20} {:>5}   {}",
+            group.status, group.count, group.goes_to
+        );
+    }
+    let _ = writeln!(out, "  {:<20} {:>5}", "total", list.deferred_total());
+
+    let _ = writeln!(
+        out,
+        "\nAccounts for {} missing entries: {} human, {} deferred.",
+        list.accounted(),
+        list.human_total(),
+        list.deferred_total()
+    );
+    out
+}
+
+/// The 8 characters every other scitadel surface prints for a work.
+fn short_id(paper_id: &str) -> String {
+    scitadel_core::models::PaperId::from(paper_id)
+        .short()
+        .to_string()
+}
+
 #[cfg(test)]
 mod bib_diff_tests {
     //! Unit tests for the CLI's `bib diff` plumbing. The pure-logic
@@ -2068,5 +2422,383 @@ mod bib_verify_tests {
         let capped = cap_diff(&big, 40);
         assert!(capped.lines().count() <= 41);
         assert!(capped.contains("more lines truncated"));
+    }
+}
+
+#[cfg(test)]
+mod coverage_action_list_tests {
+    //! The acceptance criterion for ADR-007 §2: "Its counts sum exactly to the
+    //! missing totals in `coverage`."
+    //!
+    //! These tests render both commands' text from **one** `ActionList` and
+    //! compare the numbers a reader would actually read off the screen, because
+    //! the two projections come from one value by construction and the only
+    //! thing left to prove is that the printing does not lose the count.
+
+    use super::{ActionListJson, CoverageJson, render_action_list, render_coverage};
+    use scitadel_core::models::{Paper, PaperId};
+    use scitadel_core::ports::PaperRepository as _;
+    use scitadel_db::sqlite::Database;
+    use scitadel_db::sqlite::{
+        ALL_STATUSES, ActionList, ArtefactWrite, BlobWrite, StateWrite, WriteMode,
+    };
+
+    const NOW: &str = "2026-01-01T00:00:00+00:00";
+
+    /// A migrated database holding the named works. Everything goes through
+    /// `scitadel-db`'s own API — the CLI takes no `rusqlite` dependency, and a
+    /// test that reached past it would not be testing the same surface.
+    fn fixture(papers: &[(&str, Option<&str>)]) -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("scitadel.db")).unwrap();
+        db.migrate().unwrap();
+        let (paper_repo, ..) = db.repositories();
+        for (id, doi) in papers {
+            let mut paper = Paper::new(format!("Work {id}"));
+            paper.id = PaperId::from(*id);
+            paper.doi = doi.map(str::to_string);
+            paper_repo.save(&paper).unwrap();
+        }
+        (dir, db)
+    }
+
+    fn want(db: &Database, paper_id: &str, kind: &str, status: &str) {
+        db.upsert_acquisition_state(&StateWrite {
+            paper_id: paper_id.into(),
+            kind: kind.into(),
+            locator: String::new(),
+            wanted_version: "vor".into(),
+            status: status.into(),
+            reason: Some(format!("why {status} happened on {paper_id}")),
+            hint_url: Some("https://doi.org/10.1039/d0nr01234a".into()),
+            drop_path: None,
+            updated_at: NOW.into(),
+        })
+        .unwrap();
+    }
+
+    /// Hold a VoR full text for `paper_id`, which closes its `fulltext` want.
+    fn hold_fulltext(db: &Database, paper_id: &str) {
+        let sha = format!("sha-{paper_id}");
+        db.write_artefacts(
+            &[ArtefactWrite {
+                id: String::new(),
+                paper_id: paper_id.into(),
+                kind: "fulltext_pdf".into(),
+                version: "vor".into(),
+                locator: String::new(),
+                sha256: Some(sha.clone()),
+                format: Some("pdf".into()),
+                access_status: "full_text".into(),
+                route: "publisher".into(),
+                access_basis: "subscription_read".into(),
+                label: None,
+                caption: None,
+                source_url: None,
+                publisher: None,
+                publisher_note: None,
+                imported_from: None,
+                retrieved_at: NOW.into(),
+                missing_on_disk: false,
+                blob: Some(BlobWrite {
+                    sha256: sha,
+                    bytes: 4,
+                    mime: "application/pdf".into(),
+                    rel_path: format!("blobs/{paper_id}.pdf"),
+                    created_at: NOW.into(),
+                }),
+            }],
+            WriteMode::Reconcile,
+        )
+        .unwrap();
+    }
+
+    /// A library with one work in every interesting state: a human action, a
+    /// deferred status, a held full text, and a work nobody ever wanted.
+    fn mixed_library() -> (tempfile::TempDir, Database) {
+        let (dir, db) = fixture(&[
+            ("p-ill", Some("10.1039/d0nr01234a")),
+            ("p-key", Some("10.1016/j.jneumeth.2005.09.009")),
+            ("p-queue", Some("10.1101/2025.06.14.659707")),
+            ("p-held", Some("10.1007/s10462-023-04567-8")),
+            ("p-untouched", None),
+        ]);
+        // Two human actions, two deferred rows, and one want a real file
+        // closes — so every branch of both renderers is exercised.
+        want(&db, "p-ill", "fulltext", "needs_ill");
+        want(&db, "p-ill", "si", "unavailable");
+        want(&db, "p-key", "fulltext", "tdm_key_missing");
+        want(&db, "p-queue", "fulltext", "pending");
+        want(&db, "p-held", "fulltext", "pending");
+        hold_fulltext(&db, "p-held");
+        (dir, db)
+    }
+
+    /// `coverage`'s two shapes and `action_list`'s text, all from one read.
+    fn report_and_text(list: &ActionList, kind: Option<&str>) -> (String, String) {
+        let report = list.coverage(kind).unwrap();
+        let text = render_coverage(&report, list.accounted(), kind);
+        let json = serde_json::to_string_pretty(&CoverageJson {
+            missing_total: report.missing_total(),
+            wanted_total: report.wanted_total(),
+            held_total: report.held_total(),
+            report: &report,
+        })
+        .unwrap();
+        (json, text)
+    }
+
+    /// The value printed after `Missing:` — the number a reader compares with
+    /// `action_list`.
+    fn coverage_missing_total(text: &str) -> usize {
+        text.lines()
+            .find_map(|line| line.strip_prefix("Missing: "))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no `Missing: N` line in:\n{text}"))
+    }
+
+    /// The value printed after `Accounts for` — `action_list`'s own total.
+    fn action_list_accounted_total(text: &str) -> usize {
+        text.lines()
+            .find_map(|line| line.strip_prefix("Accounts for "))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no `Accounts for N` line in:\n{text}"))
+    }
+
+    /// ADR-007 §2's acceptance criterion, asserted on the two commands' actual
+    /// output: the number `coverage` prints as missing and the number
+    /// `action_list` prints as accounted for are the same number.
+    #[test]
+    fn action_list_totals_equal_coverage_totals() {
+        let (_dir, db) = mixed_library();
+        let list = db.action_list().unwrap();
+
+        let (coverage_json, coverage_text) = report_and_text(&list, None);
+        let action_text = render_action_list(&list);
+
+        let missing = coverage_missing_total(&coverage_text);
+        let accounted = action_list_accounted_total(&action_text);
+        assert_eq!(
+            missing, accounted,
+            "the two projections must print the same total\n--- coverage ---\n{coverage_text}\n\
+             --- action_list ---\n{action_text}"
+        );
+        assert_eq!(missing, list.report.missing_total());
+        assert_eq!(accounted, list.accounted());
+        assert_eq!(
+            missing, 4,
+            "five recorded wants, one of them closed by a real file"
+        );
+        assert_eq!(list.human_total(), 2);
+        assert_eq!(list.deferred_total(), 2);
+
+        // And the machine-readable forms agree too, which is what CI can check.
+        let json: serde_json::Value = serde_json::from_str(&coverage_json).unwrap();
+        assert_eq!(json["missing_total"], serde_json::json!(missing));
+        assert_eq!(
+            json["by_status"]
+                .as_object()
+                .unwrap()
+                .values()
+                .map(|v| v.as_u64().unwrap())
+                .sum::<u64>(),
+            u64::try_from(missing).unwrap(),
+            "the per-status table sums to the missing total"
+        );
+
+        let action_json = serde_json::to_string_pretty(&ActionListJson {
+            missing_total: list.report.missing_total(),
+            human_total: list.human_total(),
+            deferred_total: list.deferred_total(),
+            accounted_total: list.accounted(),
+            groups: &list.groups,
+            deferred: &list.deferred,
+            report: &list.report,
+        })
+        .unwrap();
+        let action_json: serde_json::Value = serde_json::from_str(&action_json).unwrap();
+        assert_eq!(
+            action_json["accounted_total"], action_json["missing_total"],
+            "the JSON carries both sides of the criterion"
+        );
+        assert_eq!(
+            action_json["human_total"].as_u64().unwrap()
+                + action_json["deferred_total"].as_u64().unwrap(),
+            action_json["accounted_total"].as_u64().unwrap()
+        );
+
+        // Both projections see the same entries, not merely the same number.
+        let grouped: Vec<&scitadel_db::sqlite::MissingEntry> =
+            list.groups.iter().flat_map(|g| g.entries.iter()).collect();
+        let deferred: usize = list.deferred.iter().map(|d| d.count).sum();
+        assert_eq!(grouped.len() + deferred, missing);
+        for entry in &list.report.entries {
+            let in_a_group = grouped.contains(&entry);
+            let in_deferred = matches!(
+                entry.status.as_str(),
+                "pending"
+                    | "oa_fetchable"
+                    | "tdm_available"
+                    | "unavailable"
+                    | "rate_limited"
+                    | "error"
+            );
+            assert!(
+                in_a_group ^ in_deferred,
+                "{entry:?} must be on exactly one side of the partition"
+            );
+        }
+    }
+
+    /// #261, end to end: an unclassified registrant prefix must not produce a
+    /// publisher name and must not be reported as lacking a TDM route, in
+    /// either command's output.
+    #[test]
+    fn an_unclassified_publisher_prints_no_route_verdict() {
+        let (_dir, db) = fixture(&[("p-odd", Some("10.99999/some.suffix.12345"))]);
+        want(&db, "p-odd", "fulltext", "needs_ill");
+        let list = db.action_list().unwrap();
+
+        let (coverage_json, coverage_text) = report_and_text(&list, None);
+        let action_text = render_action_list(&list);
+
+        for (name, text) in [
+            ("coverage", coverage_text.as_str()),
+            ("action_list", action_text.as_str()),
+            ("coverage --json", coverage_json.as_str()),
+        ] {
+            assert!(
+                !text.contains("no TDM route available"),
+                "{name} reported a TDM verdict for a publisher nobody classified:\n{text}"
+            );
+            for publisher in scitadel_core::publisher::ALL_PUBLISHERS {
+                assert!(
+                    !text.contains(publisher.display_name()),
+                    "{name} named an unclassified publisher ({}) :\n{text}",
+                    publisher.display_name()
+                );
+            }
+        }
+        // What it *does* say is the registry's own wording, prefix included.
+        for text in [&coverage_text, &action_text] {
+            assert!(text.contains("not classified"), "{text}");
+            assert!(text.contains("99999"), "{text}");
+            assert!(text.contains("undetermined"), "{text}");
+        }
+    }
+
+    /// `pending` belongs to the `acquire` queue, not to a person — and the
+    /// report says so out loud rather than dropping it, because dropping it
+    /// would make `action_list` under-count `coverage`.
+    #[test]
+    fn a_pending_work_is_not_in_the_human_action_list() {
+        let (_dir, db) = fixture(&[
+            ("p-pending", Some("10.1101/2025.06.14.659707")),
+            ("p-ill", Some("10.1039/d0nr01234a")),
+        ]);
+        want(&db, "p-pending", "fulltext", "pending");
+        want(&db, "p-ill", "fulltext", "needs_ill");
+
+        let list = db.action_list().unwrap();
+        let action_text = render_action_list(&list);
+        let (_, coverage_text) = report_and_text(&list, None);
+
+        // Not in a group.
+        assert_eq!(list.groups.len(), 1);
+        assert_eq!(list.groups[0].status, "needs_ill");
+        assert!(
+            list.groups[0]
+                .entries
+                .iter()
+                .all(|e| e.paper_id != "p-pending"),
+            "{:?}",
+            list.groups[0].entries
+        );
+        // Still counted, and named where it went.
+        assert_eq!(list.human_total(), 1);
+        assert_eq!(list.deferred_total(), 1);
+        let deferred = list
+            .deferred
+            .iter()
+            .find(|d| d.status == "pending")
+            .expect("pending is accounted for");
+        assert_eq!(deferred.count, 1);
+        assert!(deferred.goes_to.contains("acquire"), "{}", deferred.goes_to);
+
+        assert!(action_text.contains("Not a human action"), "{action_text}");
+        assert!(action_text.contains("never tried"), "{action_text}");
+        assert!(
+            coverage_missing_total(&coverage_text) == 2,
+            "coverage still counts it: {coverage_text}"
+        );
+        assert_eq!(
+            action_list_accounted_total(&action_text),
+            coverage_missing_total(&coverage_text)
+        );
+    }
+
+    /// Every status is printed even at zero, so a reader can tell "no such
+    /// papers" from "this category is not tracked".
+    #[test]
+    fn the_text_output_names_every_status_and_kind() {
+        let (_dir, db) = fixture(&[("p-one", Some("10.1039/d0nr01234a"))]);
+        want(&db, "p-one", "fulltext", "needs_ill");
+        let list = db.action_list().unwrap();
+        let (_, text) = report_and_text(&list, None);
+        for vocab in ALL_STATUSES {
+            assert!(
+                text.contains(vocab.status),
+                "{} does not appear in the coverage output:\n{text}",
+                vocab.status
+            );
+        }
+        for kind in scitadel_db::sqlite::ALL_WANT_KINDS {
+            assert!(text.contains(kind), "{kind} missing from:\n{text}");
+        }
+    }
+
+    /// `--kind` narrows every number it prints, and the scope counters say
+    /// they are not narrowed rather than quietly reporting a filtered number.
+    #[test]
+    fn the_kind_filter_narrows_the_printed_numbers() {
+        let (_dir, db) = mixed_library();
+        let list = db.action_list().unwrap();
+        let (_, text) = report_and_text(&list, Some("si"));
+        assert!(text.contains("Restricted to --kind si"), "{text}");
+        assert_eq!(coverage_missing_total(&text), 1, "{text}");
+        // The library-wide line survives the filter and says so.
+        assert!(text.contains("library-wide"), "{text}");
+        assert!(text.contains("works in library"), "{text}");
+    }
+
+    /// A golden-ish smoke test of the human output: it is the only place the
+    /// two projections are seen side by side, so a formatting change that made
+    /// a number unreadable would show up here.
+    #[test]
+    fn the_rendered_reports_read_the_way_they_are_meant_to() {
+        let (_dir, db) = mixed_library();
+        let list = db.action_list().unwrap();
+        let (_, coverage_text) = report_and_text(&list, None);
+        let action_text = render_action_list(&list);
+        println!("=== scitadel coverage ===\n{coverage_text}");
+        println!("=== scitadel action_list ===\n{action_text}");
+        assert!(coverage_text.contains("Royal Society of Chemistry has no TDM route available"));
+        assert!(action_text.contains("register a key — elsevier"));
+    }
+
+    /// A work nobody wanted is reported, never counted.
+    #[test]
+    fn an_unwanted_work_is_reported_and_not_counted() {
+        let (_dir, db) = fixture(&[("p-quiet", Some("10.1039/d0nr01234a"))]);
+        let list = db.action_list().unwrap();
+        let (json, text) = report_and_text(&list, None);
+        assert_eq!(coverage_missing_total(&text), 0, "{text}");
+        assert!(text.contains("works untracked"), "{text}");
+        let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(json["untracked_works"], serde_json::json!(1));
+        assert_eq!(json["works_in_scope"], serde_json::json!(0));
+        assert_eq!(json["missing_total"], serde_json::json!(0));
     }
 }

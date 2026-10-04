@@ -4,6 +4,7 @@ mod artefacts;
 mod assessments;
 mod blobs;
 mod citations;
+mod coverage;
 mod migrations;
 mod pacer;
 mod paper_aliases;
@@ -31,6 +32,13 @@ pub use assessments::SqliteAssessmentRepository;
 /// ADR-007 §1 "Storage": the content-addressed blob store.
 pub use blobs::{blob_rel_path, file_extension, hash_file, library_root, store_blob};
 pub use citations::SqliteCitationRepository;
+/// ADR-007 §1 "Have" (derived) and §2 "Status vocabulary": the readers behind
+/// `coverage` and `action_list`. One computation, two projections.
+pub use coverage::{
+    ALL_STATUSES, ALL_WANT_KINDS, ActionGroup, ActionList, CoverageError, CoverageReport,
+    DeferredGroup, FULLTEXT_ARTEFACT_KINDS, KindTotal, MissingEntry, PublisherKey, StatusVocab,
+    UNTRACKED_VERSION_ROUTES, UnknownWantKind, status_vocab, version_satisfies,
+};
 pub use migrations::run_migrations;
 pub use pacer::{PolicyLookup, SqlitePacer};
 pub use paper_aliases::{SOURCE_BIBTEX_IMPORT, SOURCE_REKEY, SqlitePaperAliasRepository};
