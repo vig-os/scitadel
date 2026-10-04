@@ -19,10 +19,8 @@ use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 
-use scitadel_core::models::{DownloadStatus, Paper};
-
 use crate::data::DataStore;
-use crate::views::util::truncate;
+use crate::views::util::{download_state_cell, truncate};
 
 pub fn draw(
     frame: &mut Frame,
@@ -33,6 +31,9 @@ pub fn draw(
     downloading: &HashSet<String>,
 ) {
     let papers = data.load_starred_papers(reader).unwrap_or_default();
+    // Derived once, drawn through the same cell as the Papers tab: the Queue and
+    // the Papers table must never disagree about whether a paper is downloaded.
+    let states = data.load_download_states(&papers);
     let title = format!(" Queue — {} starred ", papers.len());
 
     if papers.is_empty() {
@@ -65,7 +66,10 @@ pub fn draw(
         .map(|(i, p)| {
             let authors = format_authors(&p.authors);
             let year = p.year.map_or_else(|| "—".to_string(), |y| y.to_string());
-            let (dl_symbol, dl_color) = download_cell(p, downloading);
+            let (dl_symbol, dl_color) = download_state_cell(
+                states.get(p.id.as_str()).copied(),
+                downloading.contains(p.id.as_str()),
+            );
 
             Row::new(vec![
                 Cell::from((i + 1).to_string()),
@@ -97,24 +101,6 @@ pub fn draw(
     let mut state = TableState::default();
     state.select(Some(selected));
     frame.render_stateful_widget(table, area, &mut state);
-}
-
-/// Mirror of the Papers-tab download-state column so the Queue feels
-/// consistent. Copied-not-shared for now; a future refactor can lift
-/// this into `views/util` if a third view ever needs it.
-fn download_cell(
-    paper: &Paper,
-    downloading: &HashSet<String>,
-) -> (&'static str, ratatui::style::Color) {
-    if downloading.contains(paper.id.as_str()) {
-        return ("↻", Color::Yellow);
-    }
-    match paper.download_status {
-        Some(DownloadStatus::Downloaded) => ("✓", Color::Green),
-        Some(DownloadStatus::Paywall) => ("⊘", Color::Yellow),
-        Some(DownloadStatus::Failed) => ("✗", Color::Red),
-        None => (" ", Color::DarkGray),
-    }
 }
 
 fn format_authors(authors: &[String]) -> String {

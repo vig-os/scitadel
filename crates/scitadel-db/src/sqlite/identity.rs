@@ -71,6 +71,7 @@
 use chrono::Utc;
 use rusqlite::params;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use scitadel_core::untrusted::UntrustedText;
 use serde::Serialize;
 
 use crate::error::DbError;
@@ -298,6 +299,47 @@ pub struct IdentityCheckRow {
     pub status: IdentityStatus,
     pub override_reason: Option<String>,
     pub doi_corrected_from: Option<String>,
+}
+
+impl IdentityCheckRow {
+    /// The title this check compared *against*, as untrusted display text.
+    ///
+    /// [`scitadel_core::untrusted::Provenance::Ours`], and the reason is the whole
+    /// comparison: this is **our** statement about what the work is — the stored
+    /// record's title, or the registry's answer for the work at the moment we
+    /// asked. It is the side of the check the document itself cannot touch, which
+    /// is exactly what makes it the side a reader trusts when they weigh a
+    /// `mismatch`.
+    ///
+    /// It arrived from a bibliographic feed once, so it is still rendered through
+    /// [`scitadel_core::untrusted::UntrustedText::rendered`] rather than raw: `Ours`
+    /// is a statement about who chose the string, not a licence to put a feed's
+    /// bytes on a terminal.
+    #[must_use]
+    pub fn expected_title_text(&self) -> Option<UntrustedText> {
+        self.expected_title.as_deref().map(UntrustedText::ours)
+    }
+
+    /// The title the **document** claimed for itself, as untrusted display text.
+    ///
+    /// Always
+    /// [`scitadel_core::untrusted::Provenance::PublisherSupplied`]. This string
+    /// came out of the bytes: a PDF's `/Title`, a served page's `citation_title`, a
+    /// JATS `<article-title>`, or the same read out of a file a person dropped on
+    /// disk. #287's whole point is that it is attacker-influenceable and reaches
+    /// a terminal — `scitadel scan` and `scitadel attach` both print it, beside the
+    /// expected title, which is what makes "both titles shown" (ADR-007 §2) an
+    /// actionable line rather than a decorative one.
+    ///
+    /// The row cannot say *which* of those it came from: `source` is `served_page`
+    /// for an HTTP fetch and for a dropped file alike, so there is no honest third
+    /// provenance to record, and inventing one would be a marker that lies.
+    #[must_use]
+    pub fn resolved_title_text(&self) -> Option<UntrustedText> {
+        self.resolved_title
+            .as_deref()
+            .map(UntrustedText::publisher_supplied)
+    }
 }
 
 /// One work's standing identity override, as `coverage` / `action_list` show it.

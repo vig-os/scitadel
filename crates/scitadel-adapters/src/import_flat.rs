@@ -15,9 +15,10 @@
 //!
 //! `<paper-stem>` comes from
 //! [`file_stem_for`](crate::download::file_stem_for) — the same DOI →
-//! `arxiv_` → `openalex_` → UUID ladder `find_cached_file` and
-//! `download_paper` already use, so this importer and the downloader
-//! agree on what a work's directory is called.
+//! `arxiv_` → `openalex_` → UUID ladder `scan` and `manifest` use, so this
+//! importer, the manifest mirror and `scitadel scan` all agree on what a work's
+//! directory is called. It is a *directory* name, which ADR-007 §1 keeps; the
+//! per-file `<stem>.<ext>` copy it also used to name is gone (#253's S2e).
 //!
 //! ## The decision table
 //!
@@ -734,8 +735,14 @@ fn artefact(slot: Slot, label: String, format: String) -> Classified {
 }
 
 /// `true` for a full-text filename in the flat layout: the fixed
-/// `fulltext.<ext>`, or the `<stem>.<ext>` spelling `download_paper`
-/// writes and `find_cached_file` looks for.
+/// `fulltext.<ext>`, or the `<stem>.<ext>` spelling that raid wrote and that
+/// `download_paper` used to write too.
+///
+/// The `<stem>.<ext>` half is *import* compatibility, not a lookup convention:
+/// nothing resolves a file by that name any more (#253's S2e retired the
+/// `papers/<stem>.<ext>` copy and `find_cached_file`'s filename check), so these
+/// files are recognised because they are a work's full text inside its own
+/// directory — which is also the only place they can be.
 fn is_fulltext_name(lower_name: &str, stem: &str) -> bool {
     if lower_name.starts_with("fulltext.") {
         return true;

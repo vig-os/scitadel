@@ -8,6 +8,32 @@ use super::PaperId;
 /// Canonical, deduplicated paper record.
 ///
 /// A paper exists once regardless of how many searches found it.
+///
+/// # What this record does *not* carry
+///
+/// No `local_path`, no `download_status`, no `last_attempt_at`. Those three
+/// columns (migration 007) were the pre-ADR-007 shape — one file per work,
+/// recorded by absolute path, with a status column beside it. ADR-007 §1 makes
+/// the database the source of truth and a work own many **artefacts**, and
+/// #253's S2e stopped writing the columns.
+///
+/// They are gone from the type rather than left behind as dead fields on
+/// purpose. A field nobody writes is the worst of both worlds: it reads back as
+/// a stale truth — a `local_path` frozen at the last S1-era download — so a
+/// consumer that still reads it silently reports a file that has since been
+/// re-fetched, moved or deleted, with no error anywhere. Removing it turns every
+/// reader into a compile error instead. The columns themselves stay until the
+/// release after S2, because the S1 backfill still reads them when it reconciles
+/// an existing library.
+///
+/// What replaces them, for every reader:
+///
+/// - **Which file we hold** — ADR-007 §1 "Have" (derived), through
+///   `scitadel_db::sqlite::coverage::held_fulltext_artefacts`.
+/// - **Whether we hold it** — the same derivation, through
+///   `scitadel_db::sqlite::coverage::download_states`.
+/// - **When we last tried** — `artefacts.retrieved_at` for a fetch that
+///   succeeded, `acquisition_state.updated_at` for a recorded gap.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Paper {
     pub id: PaperId,
@@ -29,22 +55,9 @@ pub struct Paper {
     pub source_urls: HashMap<String, String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    /// Absolute path to the locally downloaded file (PDF/HTML), if any.
-    /// Populated by the download pipeline; `None` until first successful
-    /// download attempt. See #112.
-    #[serde(default)]
-    pub local_path: Option<String>,
-    /// Outcome of the most recent download attempt. `None` = never tried.
-    #[serde(default)]
-    pub download_status: Option<DownloadStatus>,
-    /// Wall-clock time of the most recent download attempt. Together with
-    /// `download_status` lets the UI distinguish "fresh failure" from
-    /// "tried weeks ago, retry might work".
-    #[serde(default)]
-    pub last_attempt_at: Option<DateTime<Utc>>,
     /// Stable citation key used in BibTeX / BibLaTeX export (#132).
     /// Assigned on first encounter via the Better-BibTeX-style
-    /// algorithm in `scitadel-export::bibtex::generate_key` and frozen
+    /// algorithm in `scitadel_export::bibtex::generate_key` and frozen
     /// thereafter — the freeze contract is why we persist it rather
     /// than recompute. `None` means the paper predates migration 009
     /// and will be backfilled on next `Database::migrate` call.
@@ -74,48 +87,7 @@ impl Paper {
             source_urls: HashMap::new(),
             created_at: now,
             updated_at: now,
-            local_path: None,
-            download_status: None,
-            last_attempt_at: None,
             bibtex_key: None,
-        }
-    }
-}
-
-/// Outcome of a paper download attempt. Persisted on `papers.download_status`.
-///
-/// `Downloaded` means the adapter classified the fetched bytes as full
-/// content. `Paywall` means we got bytes but they're an HTML stub /
-/// abstract / paywall page — file exists but doesn't contain the paper.
-/// `Failed` means the download itself errored (network, 404, etc.).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DownloadStatus {
-    Downloaded,
-    Paywall,
-    Failed,
-}
-
-impl DownloadStatus {
-    /// SQL-friendly string used in the `download_status` text column.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Downloaded => "downloaded",
-            Self::Paywall => "paywall",
-            Self::Failed => "failed",
-        }
-    }
-
-    /// Inverse of `as_str`. Returns `None` for unknown values so a
-    /// stale row from a future schema doesn't crash the loader.
-    #[must_use]
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "downloaded" => Some(Self::Downloaded),
-            "paywall" => Some(Self::Paywall),
-            "failed" => Some(Self::Failed),
-            _ => None,
         }
     }
 }

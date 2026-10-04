@@ -855,10 +855,13 @@ pub async fn download(doi: &str, output_dir: Option<PathBuf>) -> Result<()> {
 
     let result = downloader.download(doi, &out_dir).await;
 
-    // Persist outcome on the matching paper row (#112) before reporting
-    // so the Papers table reflects the attempt regardless of outcome.
-    persist_cli_download_outcome(&config, doi, result.as_ref().ok());
-
+    // #253's S2e: the outcome is no longer written to the matching paper row. This
+    // path resolves no `Paper` — the downloader stores no artefact and no
+    // `acquisition_state` row — so the only thing it used to record was the retired
+    // `local_path` / `download_status` / `last_attempt_at` triple, whose reader (the
+    // TUI's state column) now derives its answer from `artefacts`. Writing it would
+    // have kept a second answer alive that nothing reads and that goes stale the
+    // moment the paper is fetched properly.
     let result = result.context("download failed")?;
 
     println!("  Format: {}", result.format);
@@ -866,58 +869,14 @@ pub async fn download(doi: &str, output_dir: Option<PathBuf>) -> Result<()> {
     println!("  Access: {}", result.access);
     println!("  Size:   {} bytes", result.bytes);
     println!("  Saved:  {}", result.path.display());
+    println!(
+        "  Note:   this path records nothing in the library — the file above is the \
+         deliverable. To have it acquired *and* recorded (so `scitadel coverage` and \
+         the TUI's state column see it), queue the work and run `scitadel acquire`, \
+         which fetches it into the blob store as an artefact."
+    );
 
     Ok(())
-}
-
-fn persist_cli_download_outcome(
-    config: &scitadel_core::config::Config,
-    doi: &str,
-    success: Option<&scitadel_adapters::download::DownloadResult>,
-) {
-    use scitadel_adapters::download::AccessStatus;
-    use scitadel_core::models::DownloadStatus;
-    use scitadel_core::ports::PaperRepository as _;
-
-    let db = match scitadel_db::sqlite::Database::open(&config.db_path) {
-        Ok(db) => db,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not open DB to persist download outcome");
-            return;
-        }
-    };
-    if let Err(e) = db.migrate() {
-        tracing::warn!(error = %e, "DB migration failed while persisting download outcome");
-        return;
-    }
-    let (paper_repo, _, _, _, _) = db.repositories();
-    let paper = match paper_repo.find_by_doi(doi) {
-        Ok(Some(p)) => p,
-        Ok(None) => {
-            tracing::debug!(doi, "no paper row for DOI; skipping download-state write");
-            return;
-        }
-        Err(e) => {
-            tracing::warn!(doi, error = %e, "DOI lookup failed");
-            return;
-        }
-    };
-
-    let (path, status) = match success {
-        Some(r) => {
-            let ds = match r.access {
-                AccessStatus::FullText => DownloadStatus::Downloaded,
-                AccessStatus::Abstract | AccessStatus::Paywall | AccessStatus::Unknown => {
-                    DownloadStatus::Paywall
-                }
-            };
-            (Some(r.path.to_string_lossy().into_owned()), ds)
-        }
-        None => (None, DownloadStatus::Failed),
-    };
-    if let Err(e) = paper_repo.update_download_state(paper.id.as_str(), path.as_deref(), status) {
-        tracing::warn!(error = %e, "failed to persist download outcome");
-    }
 }
 
 #[allow(clippy::unnecessary_wraps)]
@@ -2475,12 +2434,15 @@ fn render_ndjson_import(report: &scitadel_adapters::acquire::NdjsonImport) -> St
             report.identity_disagreements.len()
         );
         for gap in &report.identity_disagreements {
+            // `Display` on `UntrustedText` is the neutralised form, so neither
+            // title can carry an escape sequence onto this terminal (#287). One is
+            // ours and one is not, and the two accessors say which.
             let _ = writeln!(
                 out,
                 "  {}  raid: \"{}\"  stored: \"{}\"",
                 short_id(&gap.paper_id),
-                gap.expected_title,
-                gap.stored_title
+                gap.expected_title_text(),
+                gap.stored_title_text()
             );
         }
     }
@@ -2691,15 +2653,16 @@ fn render_scan(report: &scitadel_adapters::scan::ScanReport, dry_run: bool) -> S
     if !report.identity.is_empty() {
         let _ = writeln!(out, "\nIdentity checks (ADR-007 §3, post-fetch):");
         for check in &report.identity {
+            // The title came out of the file's own bytes, so it is rendered through
+            // the untrusted-text boundary rather than interpolated raw (#287).
             let _ = writeln!(
                 out,
                 "  {:<16} {}  {}",
                 check.status,
                 check.path.display(),
                 check
-                    .resolved_title
-                    .as_deref()
-                    .unwrap_or("(no title in the bytes)")
+                    .resolved_title_text()
+                    .map_or_else(|| "(no title in the bytes)".to_string(), |t| t.to_string())
             );
         }
     }
@@ -2766,12 +2729,21 @@ fn render_attach(report: &scitadel_adapters::scan::AttachReport) -> String {
     }
     let _ = writeln!(out, "  Filed. route=manual, access_basis=manual.");
     if let Some(check) = &report.identity {
+        // "both titles shown" is ADR-007 §2's action for an identity mismatch, and
+        // it is only actionable if both strings can be *read*: the one out of the
+        // file's bytes is rendered through the untrusted-text boundary, so a crafted
+        // `/Title` cannot repaint this terminal while a person compares the two
+        // (#287). `Display` is the neutralised form, so `{}` here is the safe one.
+        let file_says = check
+            .resolved_title_text()
+            .map_or("(none)".to_string(), |title| title.to_string());
+        let work_says = check
+            .expected_title_text()
+            .map_or("(none)".to_string(), |title| title.to_string());
         let _ = writeln!(
             out,
-            "  identity: {} — file says {:?}, work says {:?}",
-            check.status,
-            check.resolved_title.as_deref().unwrap_or("(none)"),
-            check.expected_title.as_deref().unwrap_or("(none)")
+            "  identity: {} — file says \"{file_says}\", work says \"{work_says}\"",
+            check.status
         );
     }
     if report.retracted > 0 {

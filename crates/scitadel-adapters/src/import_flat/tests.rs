@@ -355,6 +355,84 @@ fn two_tables_under_one_paper_do_not_collide() {
     );
 }
 
+/// #287: a caption written by whoever produced the file cannot reach a terminal.
+///
+/// The end-to-end version of the boundary, and the one that proves the string is
+/// reachable rather than theoretical: a real `.caption.txt` sidecar is written into
+/// a real flat tree, imported by the real importer, read back through the real
+/// reader, and rendered. Every shape a hostile caption can take is in the one file —
+/// a CSI that repaints, an OSC 8 that makes it a link, an OSC 0 that renames the
+/// window, a bidi override that reverses how it looks — and every one of them is
+/// gone from the rendered form while the words survive.
+///
+/// The mirror is asserted separately, because the two requirements are different and
+/// both real: what a reader sees must be safe, and what the provenance document
+/// records must be faithful.
+#[test]
+fn a_hostile_caption_sidecar_is_neutralised_before_it_can_be_rendered() {
+    use scitadel_core::untrusted::Provenance;
+
+    let fx = Fixture::new();
+    let hostile = concat!(
+        "Figure 9: the uptake curve for cohort A\n",
+        "\u{1b}[31m\u{1b}[2J\u{1b}[H",
+        "\u{1b}]8;;https://attacker.example/\u{1b}\\see the raw data\u{1b}]8;;\u{1b}\\",
+        "\u{1b}]0;window title\u{7}",
+        "\u{202e}mirrored",
+    );
+    fx.write("figures/fig9.caption.txt", hostile.as_bytes());
+
+    let report = fx.import();
+    assert_eq!(report.count("figure"), 1, "{report:?}");
+
+    let conn = fx.db.conn().unwrap();
+    let stored: Vec<(String, Option<String>)> = {
+        let mut stmt = conn
+            .prepare("SELECT locator, caption FROM artefacts WHERE paper_id = ?1")
+            .unwrap();
+        let rows = stmt
+            .query_map(params![fx.paper.id.as_str()], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        rows.map(Result::unwrap).collect()
+    };
+    assert_eq!(stored.len(), 1);
+    assert_eq!(
+        stored[0].1.as_deref(),
+        Some(hostile),
+        "the importer stores the caption verbatim — a mirror that quietly cleaned \
+         it would be lying about what the file said"
+    );
+
+    let artefacts =
+        scitadel_db::sqlite::read_artefacts_for_paper(&conn, fx.paper.id.as_str()).unwrap();
+    let caption = artefacts[0].caption_text().expect("a caption");
+    assert_eq!(caption.provenance(), Provenance::PublisherSupplied);
+    assert_eq!(caption.as_str(), hostile);
+
+    let rendered = caption.rendered().into_owned();
+    assert!(
+        !rendered.contains('\u{1b}'),
+        "no escape byte survives: {rendered:?}"
+    );
+    for needle in ["attacker.example", "window title", "\u{202e}", "[2J"] {
+        assert!(!rendered.contains(needle), "{needle} must not survive");
+    }
+    assert!(
+        rendered.starts_with("Figure 9: the uptake curve for cohort A see the raw data mirrored"),
+        "the words survive, in order, on one line: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains('\n'),
+        "an embedded newline is collapsed, so a caption cannot reflow a table row"
+    );
+
+    // And `Display` — what `{}` reaches — is that same neutralised form, so a
+    // future render site cannot get this wrong by accident.
+    assert_eq!(caption.to_string(), rendered);
+}
+
 /// ADR-007 §1 "Artefact rules": a figure can be a *reference* —
 /// `sha256 IS NULL` with a caption — because raid's digitisation queue
 /// needs the caption and the location, not the image.

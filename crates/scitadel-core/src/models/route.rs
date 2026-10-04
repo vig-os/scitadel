@@ -51,7 +51,6 @@
 //! to the network — a tier for a route that cannot fetch would be a lie, and
 //! `manual_url` is not one of them.
 
-use crate::models::DownloadStatus;
 use crate::ports::PaceTier;
 
 /// Which route produced an artefact.
@@ -345,21 +344,6 @@ impl AccessStatus {
     /// exactly the migration 013 CHECK vocabulary — the list is here so that
     /// assertion can be exhaustive without a second hand-written copy.
     pub const ALL_LABELS: [&'static str; 4] = ["full_text", "abstract", "paywall", "unknown"];
-
-    /// The legacy `papers.download_status` this access level implies.
-    ///
-    /// One mapping, defined once. The TUI has always collapsed Abstract,
-    /// Paywall and Unknown into a single `paywall` value (ADR-007 §1 "Legacy
-    /// data" calls this out), and both the TUI and the CLI's post-download
-    /// write used to re-derive it independently — which is how two writers
-    /// eventually disagree about the same download.
-    #[must_use]
-    pub fn download_status(self) -> DownloadStatus {
-        match self {
-            Self::FullText => DownloadStatus::Downloaded,
-            Self::Abstract | Self::Paywall | Self::Unknown => DownloadStatus::Paywall,
-        }
-    }
 }
 
 impl std::fmt::Display for AccessStatus {
@@ -621,25 +605,50 @@ mod tests {
         assert_eq!(AccessStatus::Unknown.to_string(), "unknown");
     }
 
-    /// The legacy mapping the TUI and the CLI both used to re-derive: only
-    /// real full text counts as `downloaded`, and the other three collapse to
-    /// `paywall` (ADR-007 §1 "Legacy data").
+    /// The mapping this build *does* keep, and the one that replaced the legacy
+    /// collapse: `access_status` is recorded per artefact and read back
+    /// unchanged, so the TUI's state column and `coverage` now distinguish an
+    /// abstract from a hard paywall instead of folding all three into one value.
+    ///
+    /// This replaces `access_status_maps_to_the_legacy_download_status`, which
+    /// pinned `AccessStatus::download_status()` — the map onto
+    /// `papers.download_status`. That method went with the column in #253's S2e:
+    /// a one-to-one map onto a retired two-valued column had no reader left, and
+    /// keeping it would have kept a second, quietly-diverging answer to "did we
+    /// get the paper" alive next to `sqlite::coverage`'s derivation.
     #[test]
-    fn access_status_maps_to_the_legacy_download_status() {
-        assert_eq!(
-            AccessStatus::FullText.download_status(),
-            DownloadStatus::Downloaded
-        );
+    fn access_status_labels_round_trip_and_stay_distinct() {
         for access in [
+            AccessStatus::FullText,
             AccessStatus::Abstract,
             AccessStatus::Paywall,
             AccessStatus::Unknown,
         ] {
             assert_eq!(
-                access.download_status(),
-                DownloadStatus::Paywall,
-                "{access} collapses to the legacy paywall value"
+                AccessStatus::ALL_LABELS
+                    .iter()
+                    .filter(|label| **label == access.label())
+                    .count(),
+                1,
+                "{access} writes a label the schema allows, and writes it once"
             );
+        }
+        // The three that the legacy column collapsed into `paywall` are three
+        // distinct labels now, which is the whole point of reading the artefact
+        // rather than the column.
+        let collapsed = [
+            AccessStatus::Abstract,
+            AccessStatus::Paywall,
+            AccessStatus::Unknown,
+        ];
+        for a in collapsed {
+            for b in collapsed {
+                assert_eq!(
+                    a.label() == b.label(),
+                    a == b,
+                    "{a} and {b} are distinguishable by label"
+                );
+            }
         }
     }
 }

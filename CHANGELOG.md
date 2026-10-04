@@ -56,6 +56,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The legacy dual-write is gone; every reader is on `artefacts`**
+  ([#253](https://github.com/vig-os/scitadel/issues/253), S2e;
+  ADR-007 §1). The download chain used to write two shapes of one fact — the
+  `artefacts` + `blobs` rows, *and* `papers.local_path` / `download_status` /
+  `last_attempt_at` plus a `papers/<stem>.<ext>` copy — because S1 promised no
+  behaviour change while `artefacts` was still the newer of the two. A mirror with
+  two writers goes stale silently: a re-fetch through a different route moved the
+  artefact and left `local_path` naming the *previous* file, so `O` in the TUI and
+  `read_paper` could open the wrong paper with no error anywhere. All three now
+  write one shape, and every reader asks ADR-007 §1's derivation
+  (`sqlite::coverage`, the same one `scitadel coverage` and `action_list` use):
+  - `read_paper` and `find_cached_file` resolve through `artefacts` → `blobs`. A
+    paywall stub is no longer extracted as a paper's text, and a file no artefact
+    names is no longer found by filename convention.
+  - The Papers and Queue tables' state column derives from `artefacts` +
+    `acquisition_state`. Same four glyphs, one answer; `missing_on_disk` and a
+    non-`pending` gap are now distinguishable, and a work with nothing recorded
+    stays blank rather than reading as a failure.
+  - `O` in the TUI opens the derived file, which is why it keeps working after the
+    columns stop being written.
+  - `scitadel download <doi>` no longer writes the paper row. It never recorded an
+    artefact, so the library is unchanged either way; its output now says so and
+    points at `scitadel acquire` for a download that is recorded.
+  - **Existing libraries need nothing.** The backfill runs on every `migrate()` and
+    records every `local_path` whose extension is in the `kind` vocabulary, so those
+    files resolve through `artefacts` immediately. A file sitting in
+    `papers/<stem>.<ext>` that no column ever pointed at is reconciled by
+    `scitadel scan` (or `scitadel attach`), which is where ADR-007 §1 always said
+    manual drop-ins get picked up — never as a side effect of reading. A recorded
+    path whose file is gone keeps its row with `missing_on_disk = 1`.
+  - The three columns still exist and the backfill still reads them; they are
+    dropped in the release after this one.
 - **Devkit governance hooks adopted; `core.hooksPath` wired on shell entry**
   ([#228](https://github.com/vig-os/scitadel/issues/228)). The five hooks the
   1.17.0 template ships that had been missing since #207 are now in
@@ -103,6 +135,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **`Paper.local_path`, `Paper.download_status`, `Paper.last_attempt_at`,
+  `PaperRepository::update_download_state` and the `DownloadStatus` enum**
+  ([#253](https://github.com/vig-os/scitadel/issues/253), S2e). Nothing writes the
+  three columns any more, so leaving the fields on the record would hand every
+  reader a frozen copy of the last pre-S2e download — a stale truth with no error
+  attached. Removing them turns each remaining reader into a compile error instead
+  of a silent one. The `papers` columns themselves are untouched until the release
+  after this one.
 - **Four orphaned devkit scaffold paths**
   ([#225](https://github.com/vig-os/scitadel/issues/225)) — `.cursor/`
   (superseded by `.claude/` in devkit 0.4.0), `.hadolint.yaml` (0.4.0),
@@ -156,6 +196,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [`docs/RELEASING.md`](docs/RELEASING.md#rust-toolchain-bumps).
 
 ### Security
+
+- **Untrusted-content boundary for text that came out of a document**
+  ([#287](https://github.com/vig-os/scitadel/issues/287), part of
+  [#253](https://github.com/vig-os/scitadel/issues/253) S2e; ADR-007 §1). A
+  document's title is attacker-controlled — a PDF's `/Title`, a served page's
+  `citation_title`, a `meta.json` figure caption, a `.caption.txt` sidecar — and
+  this repo's TUI is a terminal application, so a crafted title could move the
+  cursor, repaint the status column, or become a clickable link.
+  `UntrustedText` (`scitadel_core::untrusted`) is the boundary: it carries a
+  `Provenance` marker (`Ours` vs the document's own) so a consumer cannot mistake
+  one for the other, and **its `Display` is the neutralised form** — terminal escape
+  sequences (CSI, OSC including OSC 8 hyperlinks, DCS/APC strings, charset
+  designations), control characters and invisible formatting characters (bidi
+  overrides, zero-width characters, BOM) are stripped, whitespace is collapsed,
+  and the length is capped. `{}` is therefore the safe way to render one, and
+  `as_str()` is the only way to reach the raw string for matching, hashing or the
+  manifest mirror. Applied at every render boundary that shows such text today:
+  `scitadel scan`, `scitadel attach` and `acquire --from` (the identity lines that
+  print both titles).
+  Still open in #287, and **not** in this change: the reader's own provenance
+  display, the TUI chrome that would show a title at all, and the `read_paper` MCP
+  return wording (ADR-007 §5's envelope for the returned full text).
 
 ## [0.8.0](https://github.com/vig-os/scitadel/releases/tag/0.8.0) - 2026-09-24
 

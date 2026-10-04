@@ -48,32 +48,40 @@
 //! resolves to is charged [`PaceTier::Oa`] — one `unpaywall` route, two
 //! different budgets, because the bytes come off an OA host.
 //!
-//! ## Every successful download is dual-written
+//! ## A successful download writes one shape (#253 S2e)
 //!
-//! S1 promises no behaviour change, so a successful download writes both
-//! shapes of ADR-007 §1 "Legacy data" and writes them in **one
-//! transaction**:
+//! A download against a work writes the `artefacts` row and its `blobs` row,
+//! in one transaction through [`Database::record_download`], with `route`,
+//! `version` and `access_basis` taken from the [`RouteId`] that served it and
+//! `access_status` from the classification the chain has always made. The bytes
+//! go into `blobs/` and nowhere else.
 //!
-//! - the `artefacts` row (+ its `blobs` row, via
-//!   [`Database::record_download`]), with `route`, `version` and
-//!   `access_basis` taken from the [`RouteId`] that served it, and
-//!   `access_status` from the classification the chain has always made;
-//! - the three legacy `papers` columns (`local_path`, `download_status`,
-//!   `last_attempt_at`), which `find_cached_file`, `read_paper` and the
-//!   TUI's state column still read until S2 moves them onto artefacts.
+//! S1 wrote a second shape beside it — the three legacy `papers` columns and a
+//! `papers/<stem>.<ext>` copy — so that no behaviour would change while
+//! `artefacts` was still the newer of the two. S2e removes it, because ADR-007
+//! §1 makes the database the source of truth and the file layout a mirror, and a
+//! mirror with two writers is a mirror that goes stale: a re-fetch through a
+//! different route moved the artefact and left `local_path` pointing at the file
+//! from the fetch before. Every reader that took the legacy path —
+//! [`find_cached_file`], `read_paper`, the TUI's state column, the TUI's `O`
+//! key — now reads ADR-007 §1's derivation instead, so nothing reads the columns
+//! at all and the columns are dropped a release later.
 //!
-//! The `papers/<stem>.<ext>` copy is still written exactly where it was,
-//! under the name it always had. S2 retires both the columns and the copy.
+//! A download that **cannot** be recorded is not a completed download, so every
+//! recording failure propagates rather than being logged and dropped. The only
+//! place a failure is absorbed is a leg of the ladder that did not win: those are
+//! `info!`-logged and the walk continues, exactly as before.
 //!
-//! A download that **cannot** be recorded is not a completed download, so
-//! every recording failure propagates rather than being logged and
-//! dropped. The only place a failure is absorbed is a leg of the ladder
-//! that did not win: those are `info!`-logged and the walk continues,
-//! exactly as before.
-//!
-//! Two-phase, like the legacy backfill and the flat importer: hashing and
-//! the copy into `blobs/` happen with no write lock held, then one short
+//! Two-phase, like the legacy backfill and the flat importer: the hash and the
+//! write into `blobs/` happen with no write lock held, then one short
 //! `BEGIN IMMEDIATE` for the rows.
+//!
+//! ## The DOI-only path is not a download into the library
+//!
+//! [`PaperDownloader::download`] resolves no `papers` row, so there is no work to
+//! file bytes under and no artefact to record. It writes the file the caller asked
+//! for into the caller's `output_dir` and stops — see
+//! [`write_download_output`].
 //!
 //! ## The DOI gate (#262)
 //!
@@ -97,16 +105,12 @@ use std::time::Duration;
 use chrono::Utc;
 use reqwest::Url;
 use scitadel_core::config::OpenAlexAuth;
-use scitadel_core::models::{
-    AccessStatus as StoredAccessStatus, Paper, RouteId, doi_to_filename, validate_doi,
-    validate_doi_detailed,
-};
+use scitadel_core::models::{Paper, RouteId, doi_to_filename, validate_doi, validate_doi_detailed};
 use scitadel_core::ports::{Bucket, PaceTier, Pacer};
 use scitadel_core::publisher::{PublisherVerdict, RouteVerdict, classify_publisher};
 use scitadel_db::sqlite::{
-    AttemptWrite, BlobWrite, Database, DownloadWrite, FULLTEXT_LOCATOR, IdentityPhase,
-    IdentitySource, SqlitePacer, StateRow, StateWrite, blob_rel_path, fulltext_kind, hash_file,
-    store_blob,
+    ANY_VERSION, AttemptWrite, BlobWrite, Database, DownloadWrite, FULLTEXT_LOCATOR, IdentityPhase,
+    IdentitySource, SqlitePacer, StateRow, StateWrite, blob_rel_path, fulltext_kind, store_bytes,
 };
 use scitadel_http::{
     BucketPolicyTable, FetchError, PacedClient, PacedResponse, SafeHeaders, WorkScope,
@@ -114,6 +118,7 @@ use scitadel_http::{
 
 use crate::error::AdapterError;
 use crate::identity::{self, WorkIdentity};
+use crate::import_flat::resolve_best_effort;
 use crate::openalex::OPENALEX_API_URL;
 use crate::osti;
 use crate::preprint::{self, PreprintBases};
@@ -423,12 +428,18 @@ impl PaperDownloader {
     /// Download by DOI only — kept for the CLI `download <doi>` path.
     /// Tries Unpaywall first, then publisher HTML fallback.
     ///
-    /// Nothing is dual-written here: there is no `Paper` row to write
-    /// against, and inventing one is not this function's job. The CLI's
-    /// `persist_cli_download_outcome` still records the outcome against
-    /// whatever row the DOI resolves to, exactly as before. For the same
-    /// reason there is no `acquisition_state` row either: the gap table is
-    /// keyed by `paper_id`.
+    /// Nothing about the library changes here: there is no `Paper` row to file the
+    /// bytes against, and inventing one is not this function's job. The file lands
+    /// in the caller's `output_dir` and the result carries its path. For the same
+    /// reason there is no `acquisition_state` row either — the gap table is keyed by
+    /// `paper_id`.
+    ///
+    /// That also means `scitadel download <doi>` records **no** artefact, and
+    /// therefore no `papers.local_path` and no status. It never recorded an
+    /// artefact; what it recorded was the retired three-column shape, and the
+    /// reader of that shape (the TUI state column) now derives its answer from
+    /// `artefacts`. A library that wants a DOI-only download *recorded* goes
+    /// through [`Self::download_paper`] — which is what `scitadel acquire` does.
     pub async fn download(
         &self,
         doi: &str,
@@ -1037,17 +1048,17 @@ impl PaperDownloader {
             .map(|doi| self.endpoints.doi_url(&doi))
     }
 
-    /// Write the legacy copy, store the blob, and dual-write the rows.
+    /// Store the blob and record the download.
     ///
-    /// `paper` is `None` for the DOI-only path, which has no work row to
-    /// write against; the file is still written and the result returned.
+    /// `paper` is `None` for the DOI-only path, which has no work row to write
+    /// against; the bytes are written to the caller's `output_dir` and the result
+    /// returned, and nothing about the library changes.
     ///
     /// # Errors
     ///
-    /// Every phase propagates. The phases are, in order: the legacy
-    /// `papers/<stem>.<ext>` copy, the content hash and the copy into
-    /// `blobs/`, then one transaction for the rows. A caller that got `Ok`
-    /// can rely on all three having happened.
+    /// Every phase propagates. The phases are, in order: the content hash and the
+    /// write into `blobs/`, then one transaction for the rows. A caller that got
+    /// `Ok` can rely on both having happened.
     async fn finish(
         &self,
         paper: Option<&Paper>,
@@ -1069,8 +1080,8 @@ impl PaperDownloader {
         // #253, and the reason the bytes are still only in memory here: nothing
         // is written before the identity gate has passed. `Fetched::path` is
         // never created by a leg, so refusing here means the response body is
-        // dropped on the floor — no legacy copy, no blob, no `artefacts` row, no
-        // gap retraction, and no `download_status` claiming a file.
+        // dropped on the floor — no blob, no `artefacts` row, no gap retraction,
+        // and no file anywhere claiming to be this paper's.
         if let Some(paper) = paper {
             self.gate_identity(paper, route, &bytes, resolved.as_ref())?;
         }
@@ -1100,34 +1111,36 @@ impl PaperDownloader {
         };
 
         let Some(paper) = paper else {
-            // No work row to write against: the legacy copy is the whole
-            // deliverable for the DOI-only path.
-            write_legacy_copy(&path, &bytes)?;
+            // No work row to write against, so there is no artefact to file the
+            // bytes under: the file the caller asked for *is* the deliverable of
+            // `scitadel download <doi>`. It is not a mirror of anything — there is
+            // no row saying where it should be — which is the difference between
+            // this and the retired `papers/<stem>.<ext>` copy.
+            write_download_output(&path, &bytes)?;
             return Ok(result);
         };
 
+        let library_root = self.db.library_root()?.ok_or_else(|| {
+            AdapterError::Other(
+                "this library is in-memory, so it has no root and can hold no blobs \
+                 (ADR-007 §1 \"Storage\"); a download cannot be recorded against it"
+                    .to_string(),
+            )
+        })?;
+
         // Phase 1 — file work with no write lock held, and off the runtime:
-        // hashing a 200-page PDF is not something a paced campaign should
-        // feel. Same split as the legacy backfill and the flat importer —
-        // file work first, one short transaction after.
-        let db = self.db.clone();
-        let bytes = Arc::new(bytes);
-        let staging = path.clone();
-        let (sha256, byte_len) = tokio::task::spawn_blocking(move || -> Result<_, AdapterError> {
-            // The legacy copy goes down under the name it has always had,
-            // because the TUI state column, `find_cached_file` and
-            // `read_paper` are still reading it and S2 is what retires it.
-            write_legacy_copy(&staging, &bytes)?;
-            let library_root = db.library_root()?.ok_or_else(|| {
-                AdapterError::Other(
-                    "this library is in-memory, so it has no root and can hold no blobs \
-                     (ADR-007 §1 \"Storage\"); a download cannot be recorded against it"
-                        .to_string(),
-                )
-            })?;
-            let (sha256, byte_len) = hash_file(&staging)?;
-            store_blob(&staging, &sha256, ext, &library_root)?;
-            Ok((sha256, byte_len))
+        // hashing a 200-page PDF is not something a paced campaign should feel.
+        // Same split as the legacy backfill and the flat importer — file work
+        // first, one short transaction after.
+        //
+        // `store_bytes` stages in `blobs/.tmp/` — the store's own staging
+        // directory, on the same filesystem — hashes there and renames into
+        // place. So this is one copy, atomic, and leaves nothing behind: which is
+        // also why there is no `papers/<stem>.<ext>` copy any more. The blob *is*
+        // the file now, and `find_cached_file` opens it through the artefact row.
+        let stored_root = library_root.clone();
+        let (sha256, byte_len) = tokio::task::spawn_blocking(move || {
+            store_bytes(&bytes, ext, &stored_root).map_err(AdapterError::from)
         })
         .await
         .map_err(|e| AdapterError::Other(format!("download staging task failed: {e}")))??;
@@ -1137,7 +1150,7 @@ impl PaperDownloader {
             publisher_columns(paper.doi.as_deref().filter(|d| validate_doi(d)));
 
         // Phase 2 — one transaction: `blobs`, the `artefacts` row, and the
-        // three legacy `papers` columns.
+        // retraction of the want this fetch just satisfied.
         self.db.record_download(&DownloadWrite {
             paper_id: paper.id.as_str().to_string(),
             route,
@@ -1154,11 +1167,14 @@ impl PaperDownloader {
                 rel_path: blob_rel_path(&sha256, ext),
                 created_at: now,
             }),
-            local_path: path.to_string_lossy().into_owned(),
-            download_status: StoredAccessStatus::from(access).download_status(),
         })?;
 
         Ok(DownloadResult {
+            // The path a reader can open is now the blob's, and it exists. This
+            // used to be the legacy copy's path, which is the one thing about it
+            // that was worth keeping: a caller that printed `result.path` got a
+            // file it could hand to a viewer, and still does.
+            path: library_root.join(blob_rel_path(&sha256, ext)),
             publisher_note,
             ..result
         })
@@ -2051,12 +2067,22 @@ const STATUS_ERROR: &str = "error";
 /// beside it.
 const STATUS_IDENTITY_MISMATCH: &str = "identity_mismatch";
 
-/// Write the legacy `papers/<stem>.<ext>` copy.
+/// Write the caller's chosen output file — the DOI-only path's deliverable.
 ///
-/// Kept exactly where ADR-007 §1 "Legacy data" says it is, under the name
-/// it has always had: the TUI state column, `find_cached_file` and
-/// `read_paper` all resolve it by that path, and S2 is what retires it.
-fn write_legacy_copy(path: &Path, bytes: &[u8]) -> Result<(), AdapterError> {
+/// The only file this module writes outside the blob store, and it is not a
+/// mirror of anything: `scitadel download <doi>` resolves no `papers` row, so
+/// there is no `artefacts` row to mirror and no `local_path` to keep in step
+/// with. `output_dir` is the user's own choice, and the file lands there under
+/// the name it has always had.
+///
+/// A download **against a work** never comes here. It is stored in `blobs/` and
+/// read back through the artefact row, which is ADR-007 §1's rule that the
+/// database is the source of truth and the file layout is a mirror.
+fn write_download_output(path: &Path, bytes: &[u8]) -> Result<(), AdapterError> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| AdapterError::Io(format!("failed to create {}: {e}", dir.display())))?;
+    }
     std::fs::write(path, bytes)
         .map_err(|e| AdapterError::Io(format!("failed to write {}: {e}", path.display())))
 }
@@ -2218,17 +2244,77 @@ fn arxiv_pdf_url(id_or_url: &str) -> String {
     Endpoints::default().arxiv_pdf_url(id_or_url)
 }
 
-/// Locate an already-downloaded file for this paper. Returns the path if the
-/// expected `.pdf` or `.html` exists under `papers_dir`.
-pub fn find_cached_file(paper: &Paper, papers_dir: &Path) -> Option<PathBuf> {
-    let stem = file_stem_for(paper);
-    for ext in ["pdf", "html"] {
-        let path = papers_dir.join(format!("{stem}.{ext}"));
-        if path.exists() {
-            return Some(path);
+/// Locate the file ADR-007 §1 says this work holds, or `None`.
+///
+/// # It resolves through `artefacts`, and nothing else
+///
+/// The old version looked for `papers_dir/<stem>.pdf` and then
+/// `papers_dir/<stem>.html` — a filename convention, with no database involved at
+/// all. That is what ADR-007 §1 retires, and it was wrong in three ways at once:
+///
+/// - it could only ever find files whose name matched the convention, so a file
+///   recorded at any other path was invisible to `read_paper` and invisible to
+///   `O` in the TUI;
+/// - it could not tell a `paywall` stub from a full text, so `read_paper` happily
+///   extracted a landing page and reported it as a paper's text;
+/// - it had no version to offer, so a preprint's `/Title` could not be compared
+///   against anything.
+///
+/// Now: the derived full text ([`sqlite::coverage::held_fulltext_artefacts`] with
+/// [`sqlite::coverage::ANY_VERSION`], since a reader wants a file rather than a
+/// verdict), the blob's root-relative `rel_path`, and an existence check on the
+/// result. `paper` is used only for its id.
+///
+/// # `resolve_best_effort` on both sides
+///
+/// The existence check is a path comparison, and this is the macOS `/var` →
+/// `/private/var` trap that has bitten this area three times: the library root
+/// comes from `Database::library_root`, which canonicalises, while a path a caller
+/// holds may not have been. Both sides go through
+/// [`resolve_best_effort`](crate::import_flat::resolve_best_effort), so a
+/// comparison is made in one coordinate system.
+///
+/// # Errors
+///
+/// [`AdapterError::Db`] if the database cannot be read, and [`AdapterError::Other`]
+/// for a library with no root — an in-memory database gets no blobs (ADR-007 §1
+/// "Storage"), so it holds no files to find. Both are errors rather than `None`,
+/// because "we hold nothing" and "we could not look" must not look alike.
+pub fn find_cached_file(db: &Database, paper: &Paper) -> Result<Option<PathBuf>, AdapterError> {
+    let Some(root) = db.library_root()? else {
+        return Err(AdapterError::Other(format!(
+            "paper {} lives in an in-memory library, which has no root and therefore no \
+             blobs (ADR-007 §1 \"Storage\")",
+            paper.id
+        )));
+    };
+    let root = resolve_best_effort(&root);
+
+    let held = db
+        .held_fulltext_artefacts(paper.id.as_str(), ANY_VERSION)
+        .map_err(AdapterError::from)?;
+
+    for artefact in held {
+        // A figure reference and a missing row carry no path; both are "there is
+        // no file here" rather than an error.
+        let Some(rel_path) = artefact.blob_rel_path else {
+            continue;
+        };
+        let path = resolve_best_effort(&root.join(&rel_path));
+        if path.is_file() {
+            return Ok(Some(path));
         }
+        // The row says we hold it and the bytes are not there. Not an error
+        // either — `scitadel gc` reports it and `scitadel scan` reconciles it — so
+        // the next candidate gets its turn.
+        tracing::debug!(
+            paper_id = %paper.id,
+            artefact_id = %artefact.id,
+            rel_path = %rel_path,
+            "an artefact row names a blob that is not on disk; not offering it as a file"
+        );
     }
-    None
+    Ok(None)
 }
 
 /// Pick a safe filename stem preferring DOI, then arxiv, then openalex, then the paper's UUID.
@@ -2262,7 +2348,8 @@ mod tests {
     use super::*;
 
     use async_trait::async_trait;
-    use scitadel_core::ports::{Cost, PaceDenied, Permit};
+    use scitadel_core::ports::{Cost, PaceDenied, PaperRepository as _, Permit};
+    use scitadel_db::sqlite::{ArtefactWrite, DownloadState, WriteMode, write_artefacts};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2527,6 +2614,16 @@ mod tests {
             .expect("rows")
         }
 
+        /// What a reader's state column shows for a work — ADR-007 §1's
+        /// derivation, the same call the TUI's column makes.
+        fn derived_state(&self, paper_id: &str) -> Option<DownloadState> {
+            self.db
+                .download_states(std::slice::from_ref(&paper_id.to_string()))
+                .expect("download_states")
+                .get(paper_id)
+                .copied()
+        }
+
         /// `(local_path, download_status, last_attempt_at)` for a work.
         fn legacy(&self, paper_id: &str) -> (Option<String>, Option<String>, Option<String>) {
             let conn = self.db.conn().expect("conn");
@@ -2543,6 +2640,97 @@ mod tests {
             conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
                 .expect("count")
         }
+    }
+
+    /// A migrated, file-backed library in a temp directory, and the `TempDir`
+    /// that has to outlive it: the pool opens connections lazily, so dropping the
+    /// directory mid-test would let a later `conn()` create a fresh, empty
+    /// database.
+    fn library() -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("scitadel.db")).expect("open db");
+        db.migrate().expect("migrate");
+        (dir, db)
+    }
+
+    /// A fixed stamp, so a `retrieved_at` assertion is about the value rather
+    /// than about the clock.
+    const NOW: &str = "2026-01-01T00:00:00+00:00";
+
+    /// A full-text artefact row for `paper`, before the caller adjusts it.
+    /// `missing_on_disk` drops the digest with it, because a row that names a blob
+    /// we do not have would fail the foreign key — and the pair always travels
+    /// together (`sqlite::coverage` treats them as one fact).
+    fn fulltext_row(paper: &Paper, sha: &str) -> ArtefactWrite {
+        ArtefactWrite {
+            id: String::new(),
+            paper_id: paper.id.as_str().to_string(),
+            kind: "fulltext_pdf".into(),
+            version: "vor".into(),
+            locator: FULLTEXT_LOCATOR.into(),
+            sha256: Some(sha.into()),
+            format: Some("pdf".into()),
+            access_status: "full_text".into(),
+            route: "publisher".into(),
+            access_basis: "oa_license".into(),
+            label: None,
+            caption: None,
+            source_url: None,
+            publisher: None,
+            publisher_note: None,
+            imported_from: None,
+            retrieved_at: NOW.into(),
+            missing_on_disk: false,
+            blob: None,
+        }
+    }
+
+    /// Record `row` for `paper`, inserting the `papers` row if it is missing.
+    ///
+    /// `artefacts.paper_id` is a foreign key, so the work has to exist — which is
+    /// also why `find_cached_file` cannot answer for a work the library has never
+    /// heard of.
+    fn write_artefact(db: &Database, paper: &Paper, mut row: ArtefactWrite) {
+        let (paper_repo, _, _, _, _) = db.repositories();
+        if paper_repo.get(paper.id.as_str()).expect("read").is_none() {
+            paper_repo.save(paper).expect("save paper");
+        }
+        if row.missing_on_disk {
+            // A row that names a digest it does not have would fail the foreign
+            // key, and the two columns are one fact: "the path is recorded but we
+            // hold no usable bytes for it".
+            row.sha256 = None;
+            row.blob = None;
+        }
+        if let Some(blob) = &mut row.blob {
+            let shard = db
+                .library_root()
+                .expect("root")
+                .expect("a file-backed library")
+                .join(blob.rel_path.clone())
+                .parent()
+                .expect("a shard")
+                .to_path_buf();
+            std::fs::create_dir_all(&shard).expect("shard dir");
+        }
+        let mut conn = db.conn().expect("conn");
+        write_artefacts(&mut conn, &[row], WriteMode::Reconcile).expect("record artefact");
+    }
+
+    /// `(local_path, download_status, last_attempt_at)` for a work — the retired
+    /// columns, read the only way anything reads them now.
+    fn legacy_columns(
+        db: &Database,
+        paper_id: &str,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        db.conn()
+            .expect("conn")
+            .query_row(
+                "SELECT local_path, download_status, last_attempt_at FROM papers WHERE id = ?1",
+                [paper_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("legacy row")
     }
 
     /// A saved `Paper` with the identifiers a test needs, plus its row.
@@ -2690,17 +2878,18 @@ mod tests {
     // and the network (wiremock) are substituted.
     // =====================================================================
 
-    /// ADR-007 §1 "Legacy data": S1 promises no behaviour change, so a
-    /// successful download has to land in **both** shapes — the
-    /// `artefacts` row with the route's own `version` and `access_basis`,
-    /// and the three legacy `papers` columns the TUI state column,
-    /// `find_cached_file` and `read_paper` still read.
+    /// #253's S2e: a successful download writes the `artefacts` row with the
+    /// route's own `version` and `access_basis`, the blob, and nothing else.
     ///
-    /// Asserting only the artefact row would pass against a "migrate and
-    /// stop" implementation, and only the legacy columns would pass against
-    /// the pre-S1 code. Both are the point.
+    /// This replaces `a_successful_download_writes_an_artefact_and_the_legacy_columns`,
+    /// which asserted that the same download *also* filled `local_path`,
+    /// `download_status` and `last_attempt_at` and wrote a
+    /// `papers/<stem>.<ext>` copy. S1's promise ("no behaviour change") is spent:
+    /// those were the second answer, and the one that went stale first. What is
+    /// asserted here is the shape that replaced them — one artefact, one blob, and
+    /// a `find_cached_file` that opens the blob rather than a filename.
     #[tokio::test]
-    async fn a_successful_download_writes_an_artefact_and_the_legacy_columns() {
+    async fn a_successful_download_writes_one_artefact_and_no_legacy_columns() {
         let fx = Fixture::new().await;
         fx.serve("/pdf/2005.07866.pdf", PDF_BYTES).await;
         let paper = save(
@@ -2734,46 +2923,342 @@ mod tests {
         );
         assert_eq!(row.access_status, "full_text");
         assert!(row.sha256.is_some(), "the bytes are hashed");
+        // The stamp S1 used to write twice — once here and once into
+        // `last_attempt_at` — is now written once. It has to be RFC 3339 UTC,
+        // because every timestamp ADR-007 §1 declares is, and nothing normalises it
+        // on the way in.
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&row.retrieved_at).is_ok(),
+            "retrieved_at is RFC 3339: {:?}",
+            row.retrieved_at
+        );
         assert_eq!(
             row.source_url.as_deref(),
             Some(format!("{}/pdf/2005.07866.pdf", fx.server.uri()).as_str()),
             "source_url is where the bytes actually came from"
         );
 
-        // --- the legacy columns, in the same breath ---
-        let (local_path, status, attempted) = fx.legacy("p-arxiv");
+        // --- and no legacy columns, in the same breath ---
         assert_eq!(
-            local_path.as_deref(),
-            Some(result.path.to_string_lossy().as_ref()),
-            "local_path is still the papers/ copy, under its old name"
+            fx.legacy("p-arxiv"),
+            (None, None, None),
+            "a recorded download writes no local_path, no download_status and no \
+             last_attempt_at; ADR-007 §1's derivation is the only reader left"
         );
-        assert_eq!(status.as_deref(), Some("downloaded"));
-        let attempted = attempted.expect("last_attempt_at is stamped");
-        assert_eq!(
-            row.retrieved_at, attempted,
-            "the artefact and the legacy row carry one retrieval stamp, \
-             because they are written by the same transaction"
-        );
-        assert!(result.path.exists(), "the legacy copy is on disk");
-        assert_eq!(
-            find_cached_file(&paper, &out_dir).as_deref(),
-            Some(result.path.as_path()),
-            "find_cached_file still resolves the download"
+        let legacy_copies: Vec<PathBuf> = std::fs::read_dir(fx.papers_dir())
+            .map(|entries| entries.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        assert!(
+            legacy_copies.is_empty(),
+            "and no papers/<stem>.pdf copy: the blob is the file now, and a second \
+             copy is the thing ADR-007 §1 retires. Found: {legacy_copies:?}"
         );
 
-        // --- and the bytes are in the content-addressed store ---
+        // --- the bytes are in the content-addressed store, and that is the file ---
         let sha = row.sha256.expect("hashed");
-        let stored = fx
-            .root()
-            .join("blobs")
-            .join(&sha[..2])
-            .join(format!("{sha}.pdf"));
+        let stored = resolve_best_effort(
+            &fx.root()
+                .join("blobs")
+                .join(&sha[..2])
+                .join(format!("{sha}.pdf")),
+        );
         assert_eq!(
-            std::fs::read(stored).expect("stored blob").as_slice(),
+            std::fs::read(&stored).expect("stored blob").as_slice(),
             PDF_BYTES,
             "the blob store holds the bytes, at a root-relative path"
         );
         assert_eq!(fx.count("blobs"), 1);
+        assert!(
+            result.path.is_file(),
+            "the reported path is a file that exists: {}",
+            result.path.display()
+        );
+        assert_eq!(
+            resolve_best_effort(&result.path),
+            stored,
+            "and it is the blob, resolved on both sides — `library_root` \
+             canonicalises and `tempdir()` may hand back a symlinked path"
+        );
+        assert_eq!(
+            find_cached_file(&fx.db, &paper)
+                .expect("the library has a root")
+                .map(|p| resolve_best_effort(&p)),
+            Some(stored),
+            "find_cached_file resolves the download through the artefact row"
+        );
+    }
+
+    // =====================================================================
+    // ADR-007 S2e: readers resolve through `artefacts`, never through a
+    // filename convention and never through the retired columns.
+    // =====================================================================
+
+    /// The upgrade path, and the question it answers: an existing library has
+    /// legacy columns *and* `papers/<stem>.<ext>` files, and the S1 backfill
+    /// copied them into `blobs/`. Does a reader still find them?
+    ///
+    /// The fixture is the S1 backfill's own shape, built by hand rather than by a
+    /// fetch: a `papers` row carrying `local_path` / `download_status` /
+    /// `last_attempt_at`, a real file at that path, and **no `artefacts` row at
+    /// all** — because an existing library has none until the backfill runs. The
+    /// backfill runs inside `Database::migrate`, so `migrate()` is what the reader
+    /// inherits, and the assertion is that the file comes back with no `local_path`
+    /// write anywhere in the picture.
+    ///
+    /// The discriminating detail is `downloaded`: the backfill maps it to
+    /// `access_status = 'full_text'`, which is the only value ADR-007 §1's gate
+    /// accepts, so this row is one a reader may open. A `paywall` row would be
+    /// found and refused, which is the point of the next test's stub.
+    #[test]
+    fn a_library_with_only_legacy_rows_still_resolves_a_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let db = Database::open(&root.join("scitadel.db")).expect("open db");
+        // The schema first. In a real upgrade migration 013 creates `artefacts`
+        // and the backfill then reads a library whose rows predate it; the
+        // migration runner cannot stop half-way to plant one, so the fixture
+        // migrates, plants the legacy row, and migrates again — which is the
+        // second `migrate()` that runs the backfill over it, exactly as it runs
+        // on every startup thereafter.
+        db.migrate().expect("first migrate");
+        // A library that predates ADR-007: one file per work, recorded by path.
+        let papers = root.join("papers");
+        std::fs::create_dir_all(&papers).expect("papers dir");
+        let legacy_file = papers.join("10.1039_d0nr01234a.pdf");
+        std::fs::write(&legacy_file, PDF_BYTES).expect("legacy file");
+        {
+            let conn = db.conn().expect("conn");
+            conn.execute(
+                "INSERT INTO papers (id, title, authors, doi, created_at, updated_at,
+                                     local_path, download_status, last_attempt_at)
+                 VALUES ('p-legacy', 'A legacy paper', '[]', '10.1039/d0nr01234a', ?1, ?1,
+                         ?2, 'downloaded', '2026-01-01T00:00:00+00:00')",
+                rusqlite::params!["2026-01-01T00:00:00+00:00", legacy_file.to_string_lossy()],
+            )
+            .expect("insert legacy paper");
+            conn.execute(
+                "INSERT INTO acquisition_state
+                     (paper_id, kind, locator, wanted_version, status, updated_at)
+                 VALUES ('p-legacy', 'fulltext', '', 'vor', 'pending', ?1)",
+                ["2026-01-01T00:00:00+00:00"],
+            )
+            .expect("insert want");
+        }
+
+        // Pre-S2e this was the only thing that made the file findable. The
+        // backfill is what carries it across, and it runs here.
+        db.migrate().expect("migrate runs the backfill");
+
+        let conn = db.conn().expect("conn");
+        let (kind, version, route, access_status, missing): (String, String, String, String, i64) =
+            conn.query_row(
+                "SELECT kind, version, route, access_status, missing_on_disk
+                   FROM artefacts WHERE paper_id = 'p-legacy'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .expect("the backfill recorded the legacy file");
+        assert_eq!(kind, "fulltext_pdf");
+        assert_eq!(
+            version, "unknown",
+            "a legacy file predates version tracking"
+        );
+        assert_eq!(route, "legacy");
+        assert_eq!(access_status, "full_text", "`downloaded` is the only vouch");
+        assert_eq!(missing, 0, "and the bytes are in the store");
+
+        let paper = {
+            let (paper_repo, _, _, _, _) = db.repositories();
+            paper_repo.get("p-legacy").expect("read").expect("a row")
+        };
+        let found = find_cached_file(&db, &paper)
+            .expect("a file-backed library has a root")
+            .expect("the file resolves");
+        assert!(
+            found.is_file(),
+            "and the blob it points at is on disk: {}",
+            found.display()
+        );
+        assert_eq!(std::fs::read(&found).expect("read"), PDF_BYTES);
+        assert!(
+            found.starts_with(resolve_best_effort(&root.join("blobs"))),
+            "through the blob store, not through papers/: {}",
+            found.display()
+        );
+
+        // The reader never wrote the retired columns, and the legacy file is still
+        // where the user left it — the backfill copies, ADR-007 §1 says so.
+        assert_eq!(
+            legacy_columns(&db, "p-legacy"),
+            (
+                Some(legacy_file.to_string_lossy().into_owned()),
+                Some("downloaded".to_string()),
+                Some("2026-01-01T00:00:00+00:00".to_string()),
+            ),
+            "reading a legacy library changes none of the columns"
+        );
+        assert!(legacy_file.exists(), "and never moves the user's own file");
+    }
+
+    /// A reader resolves through the artefact row, not through a filename.
+    ///
+    /// Both halves matter and neither is optional:
+    ///
+    /// - a blob-only library resolves, which the filename convention could never
+    ///   do — the file is named by its digest, and no stem rule produces it;
+    /// - a file sitting at the convention path with **no** artefact row does *not*
+    ///   resolve, which is the half that stops the old behaviour coming back. A
+    ///   hand-placed `papers/<stem>.pdf` is now reconciled by `scitadel scan`
+    ///   (ADR-007 §1: "Manual drop-ins are reconciled only by an explicit
+    ///   `scitadel scan` or `scitadel attach`, never as a side effect of reading"),
+    ///   and until then it is not a file this product claims to hold.
+    #[test]
+    fn find_cached_file_resolves_through_artefacts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let db = Database::open(&root.join("scitadel.db")).expect("open db");
+        db.migrate().expect("migrate");
+        let mut paper = Paper::new("A paper");
+        paper.id = scitadel_core::models::PaperId::from("p-artefact");
+        paper.doi = Some("10.1039/d0nr01234a".into());
+        {
+            let conn = db.conn().expect("conn");
+            conn.execute(
+                "INSERT INTO papers (id, title, authors, doi, created_at, updated_at)
+                 VALUES (?1, ?2, '[]', ?3, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+                rusqlite::params![paper.id.as_str(), paper.title, paper.doi],
+            )
+            .expect("insert paper");
+        }
+
+        // A file at the old convention path, with no artefact behind it. Before
+        // S2e this alone was enough for `read_paper` to extract an abstract and
+        // call it the paper.
+        let papers = root.join("papers");
+        std::fs::create_dir_all(&papers).expect("papers dir");
+        std::fs::write(
+            papers.join(format!("{}.pdf", file_stem_for(&paper))),
+            b"<html><body>Paywall. Purchase access to continue.</body></html>",
+        )
+        .expect("a hand-placed file");
+        assert_eq!(
+            find_cached_file(&db, &paper).expect("a root"),
+            None,
+            "a file no artefact names is not a file this library holds: run \
+             `scitadel scan` or `scitadel attach` to record it"
+        );
+
+        // Record it properly, as `scan`/`attach`/`import-flat` would, and the same
+        // file resolves — through the blob, under a digest name.
+        let sha = "d0".repeat(32);
+        let rel = blob_rel_path(&sha, "pdf");
+        std::fs::create_dir_all(root.join("blobs").join(&sha[..2])).expect("shard");
+        std::fs::write(root.join(&rel), PDF_BYTES).expect("write blob");
+        {
+            let mut conn = db.conn().expect("conn");
+            write_artefacts(
+                &mut conn,
+                &[ArtefactWrite {
+                    id: String::new(),
+                    paper_id: paper.id.as_str().to_string(),
+                    kind: "fulltext_pdf".into(),
+                    version: "vor".into(),
+                    locator: FULLTEXT_LOCATOR.into(),
+                    sha256: Some(sha.clone()),
+                    format: Some("pdf".into()),
+                    access_status: "full_text".into(),
+                    route: "publisher".into(),
+                    access_basis: "oa_license".into(),
+                    label: None,
+                    caption: None,
+                    source_url: None,
+                    publisher: None,
+                    publisher_note: None,
+                    imported_from: None,
+                    retrieved_at: "2026-01-01T00:00:00+00:00".into(),
+                    missing_on_disk: false,
+                    blob: Some(BlobWrite {
+                        sha256: sha.clone(),
+                        bytes: PDF_BYTES.len() as i64,
+                        mime: "application/pdf".into(),
+                        rel_path: rel.clone(),
+                        created_at: "2026-01-01T00:00:00+00:00".into(),
+                    }),
+                }],
+                WriteMode::Reconcile,
+            )
+            .expect("record the artefact");
+        }
+
+        let found = find_cached_file(&db, &paper)
+            .expect("a root")
+            .expect("resolved through the artefact");
+        assert_eq!(
+            resolve_best_effort(&found),
+            resolve_best_effort(&root.join(&rel)),
+            "through the blob's root-relative path, resolved on both sides"
+        );
+        assert!(
+            found
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&sha)),
+            "and named by its digest, not by a stem rule: {}",
+            found.display()
+        );
+        assert_eq!(std::fs::read(&found).expect("read"), PDF_BYTES);
+    }
+
+    /// A blob the `artefacts` row points at but that is not on disk is a fact to
+    /// report, not a file to hand a reader — and a `paywall` stub is not a paper
+    /// even when its bytes are present. Both are the same mistake in opposite
+    /// directions, and the old resolver made both.
+    #[test]
+    fn a_reader_is_offered_neither_a_stub_nor_a_vanished_blob() {
+        let (_dir, db) = library();
+        let mut paper = Paper::new("A paper");
+        paper.id = scitadel_core::models::PaperId::from("p-stub");
+
+        // A paywall stub: `access_status` is the only thing that says so, and the
+        // bytes on disk are a landing page.
+        write_artefact(
+            &db,
+            &paper,
+            ArtefactWrite {
+                access_status: "paywall".into(),
+                sha256: Some("stub".into()),
+                blob: Some(BlobWrite {
+                    sha256: "stub".into(),
+                    bytes: 4,
+                    mime: "text/html".into(),
+                    rel_path: "blobs/st/stub.html".into(),
+                    created_at: NOW.into(),
+                }),
+                ..fulltext_row(&paper, "stub")
+            },
+        );
+        assert_eq!(
+            find_cached_file(&db, &paper).expect("a root"),
+            None,
+            "a paywall stub is not the full text, so no reader is offered it"
+        );
+
+        // A vanished blob: the row is `full_text`, `missing_on_disk` says the bytes
+        // are gone, and so it names no digest — "the path is recorded but we hold
+        // no usable bytes for it".
+        write_artefact(
+            &db,
+            &paper,
+            ArtefactWrite {
+                missing_on_disk: true,
+                ..fulltext_row(&paper, "gone")
+            },
+        );
+        assert_eq!(
+            find_cached_file(&db, &paper).expect("a root"),
+            None,
+            "`missing_on_disk` is the same refusal: the row is there and the file \
+             is not, and handing a reader a path that opens nothing is worse"
+        );
     }
 
     /// #262's ingest half: a malformed DOI is refused **before** anything is
@@ -3178,9 +3663,21 @@ mod tests {
         let row = fx.artefact("p-paywall").expect("row");
         assert_eq!(row.access_status, "paywall");
         assert_eq!(row.kind, "fulltext_html");
-        // The legacy column and the artefact row must agree, or "have" and
-        // the TUI's state column would tell two different stories.
-        assert_eq!(fx.legacy("p-paywall").1.as_deref(), Some("paywall"));
+        // The derived state and the artefact row must agree, or "have" and the
+        // TUI's state column would tell two different stories. This replaces an
+        // assertion that the legacy `download_status` column said `paywall`: that
+        // column is no longer written, so agreeing with it is no longer possible —
+        // and it could not have been the whole answer anyway, since it recorded
+        // the *fetch's* classification rather than what the work holds.
+        assert_eq!(
+            fx.derived_state("p-paywall"),
+            Some(DownloadState::NotFullText)
+        );
+        assert_eq!(
+            find_cached_file(&fx.db, &paper).expect("a root"),
+            None,
+            "and no reader is offered a paywall stub as the paper's text"
+        );
         assert_eq!(
             result.publisher_url.as_deref(),
             Some(format!("{}/doi/10.99999/some.suffix.12345", fx.server.uri()).as_str()),
@@ -3281,7 +3778,12 @@ mod tests {
             ),
             "the bytes came from the verified transform URL"
         );
-        assert_eq!(fx.legacy("p-preprint").1.as_deref(), Some("downloaded"));
+        assert_eq!(
+            fx.derived_state("p-preprint"),
+            Some(DownloadState::FullText),
+            "the work holds a full text, which is what the state column says — \
+             and it says it by deriving, not by reading a column nothing writes"
+        );
         assert!(
             fx.states("p-preprint").is_empty(),
             "a work that was obtained records no gap: {:?}",

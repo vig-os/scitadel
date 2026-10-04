@@ -634,9 +634,17 @@ pub async fn download_paper_tool(
 
 /// Extract text from a paper's downloaded file (PDF or HTML).
 ///
-/// Looks up the paper in the DB, locates its cached file under `papers_dir()`,
-/// and returns the extracted text. Truncated to `max_chars` (default 20_000)
-/// to keep responses manageable for the host LLM.
+/// Looks up the paper in the DB, resolves the file ADR-007 §1 says it holds
+/// (`artefacts` → `blobs`, through
+/// `download::find_cached_file`), and returns the extracted text. Truncated to
+/// `max_chars` (default 20_000) to keep responses manageable for the host LLM.
+///
+/// The file is resolved through the artefact row rather than a filename
+/// convention, which is what makes two refusals possible that were not before:
+/// a work whose only file is a paywall stub is *not* the full text and is not
+/// extracted, and a work whose blob has gone is not offered as a path that opens
+/// nothing. Both come back as the same "not downloaded yet" message, because
+/// from an agent's point of view they are one state.
 ///
 /// When `with_annotations` is `None` or `Some(true)` (the default), the
 /// response is a JSON envelope that folds in live annotations alongside the
@@ -648,7 +656,6 @@ pub async fn read_paper_tool(
     max_chars: Option<usize>,
     with_annotations: Option<bool>,
 ) -> Result<String, String> {
-    let config = load_config();
     let db = open_db()?;
     let paper = resolve_paper_id(&db, paper_id)?;
     let (paper_repo, _, _, _, _) = db.repositories();
@@ -665,7 +672,8 @@ pub async fn read_paper_tool(
 
     let mut extractor: Option<&'static str> = None;
     if text.is_none() {
-        let p = scitadel_adapters::download::find_cached_file(&paper, &config.papers_dir())
+        let p = scitadel_adapters::download::find_cached_file(&db, &paper)
+            .map_err(|e| format!("could not resolve this paper's file: {e}"))?
             .ok_or_else(|| "paper not downloaded yet. Call download_paper first.".to_string())?;
         let extracted = match p.extension().and_then(|e| e.to_str()) {
             Some("pdf") => {

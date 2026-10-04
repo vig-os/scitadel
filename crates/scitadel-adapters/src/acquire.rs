@@ -1383,24 +1383,35 @@ mod tests {
             rows.map(Result::unwrap).collect()
         }
 
-        /// The three legacy `papers` columns a dual-written download fills.
-        fn legacy_columns(&self) -> Vec<String> {
+        /// Every `papers` row, whole, as one comparable string.
+        ///
+        /// This replaces a `legacy_columns` helper that read only
+        /// `local_path` / `download_status` / `last_attempt_at`. Those three are no
+        /// longer written by anything (#253's S2e), so asserting they had not moved
+        /// tested nothing: it would have passed against an implementation that never
+        /// touched them in the first place, which is exactly the property the dry-run
+        /// test exists to check. Whole-row equality subsumes the three and cannot
+        /// rot that way.
+        fn papers_rows(&self) -> Vec<String> {
             let conn = self.db.conn().expect("conn");
             let mut stmt = conn
-                .prepare(
-                    "SELECT id, local_path, download_status, last_attempt_at FROM papers
-                     ORDER BY id",
-                )
+                .prepare("SELECT * FROM papers ORDER BY id")
                 .expect("prepare");
+            let names: Vec<String> = stmt
+                .column_names()
+                .iter()
+                .map(|n| (*n).to_string())
+                .collect();
             let rows = stmt
                 .query_map([], |r| {
-                    Ok(format!(
-                        "{:?}|{:?}|{:?}|{:?}",
-                        r.get::<_, String>(0)?,
-                        r.get::<_, Option<String>>(1)?,
-                        r.get::<_, Option<String>>(2)?,
-                        r.get::<_, Option<String>>(3)?,
-                    ))
+                    let values = names
+                        .iter()
+                        .map(|name| {
+                            format!("{name}={:?}", r.get::<_, Option<String>>(name.as_str()))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    Ok(format!("{{ {values} }}"))
                 })
                 .expect("query");
             rows.map(Result::unwrap).collect()
@@ -1874,9 +1885,11 @@ mod tests {
     /// A dry run writes nothing and calls nothing.
     ///
     /// "Writes nothing" is checked as whole-table equality — every column of
-    /// `acquisition_state`, every artefact row, and the three legacy `papers`
-    /// columns a dual-written download fills — because a count would miss an
-    /// in-place update, which is the shape an idempotence bug takes.
+    /// `acquisition_state`, every artefact row, and every column of every `papers`
+    /// row — because a count would miss an in-place update, which is the shape an
+    /// idempotence bug takes. Whole `papers` rows rather than the three retired
+    /// download columns: nothing writes those any more, so checking them would
+    /// pass vacuously.
     #[tokio::test]
     async fn dry_run_writes_nothing_and_calls_nothing() {
         let fx = Fixture::new().await;
@@ -1888,7 +1901,7 @@ mod tests {
 
         let states = fx.state_rows();
         let artefacts = fx.artefacts();
-        let legacy = fx.legacy_columns();
+        let papers = fx.papers_rows();
 
         let report = fx.acquire(&AcquireRequest::queue().planning()).await;
 
@@ -1912,7 +1925,7 @@ mod tests {
         );
         assert_eq!(fx.state_rows(), states, "acquisition_state is unchanged");
         assert_eq!(fx.artefacts(), artefacts, "artefacts is unchanged");
-        assert_eq!(fx.legacy_columns(), legacy, "no legacy column moved");
+        assert_eq!(fx.papers_rows(), papers, "no `papers` row moved, at all");
     }
 
     // =====================================================================

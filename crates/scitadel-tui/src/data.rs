@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -19,7 +19,7 @@ use scitadel_db::sqlite::{
 pub struct DataStore {
     /// `pub(crate)` rather than private because the download task needs the
     /// pool: ADR-007 S1 paces downloads against the SQLite ledger in this
-    /// database and dual-writes each one, so it cannot be handed a
+    /// database and records each fetch as an artefact, so it cannot be handed a
     /// downloader that has nowhere to record what it fetched.
     pub(crate) db: Database,
 }
@@ -288,17 +288,43 @@ impl DataStore {
         )
     }
 
-    /// Persist the outcome of a download attempt for the Papers-table
-    /// state column (#112). `local_path` is the absolute path to the
-    /// saved file on success, `None` on failure.
-    pub fn record_download_outcome(
+    /// The derived download state of each of `papers`, keyed by id.
+    ///
+    /// #253's S2e. The Papers and Queue tables used to read
+    /// `papers.download_status`, which the TUI itself dual-wrote after every
+    /// download task (`record_download_outcome`) and which the download chain also
+    /// wrote — two writers of one fact, and the one that went stale first: a
+    /// re-fetch through a different route moved the artefact and left the column
+    /// naming the previous outcome. Both writers are gone; the state column now asks
+    /// ADR-007 §1's derivation, once, here.
+    ///
+    /// `None` in the returned map means "nothing recorded for this work", which is
+    /// a different answer from `Some(DownloadState::Untracked)` only in that it is
+    /// the absence of an entry — the cell renders blank for both.
+    ///
+    /// A read failure is logged and treated as "no states", so the table still
+    /// renders. It is **not** silent: a state column that quietly shows nothing is
+    /// indistinguishable from a library that holds nothing, which is the failure
+    /// mode ADR-007 §1's derivation exists to prevent.
+    pub fn load_download_states(
         &self,
-        paper_id: &str,
-        local_path: Option<&str>,
-        status: scitadel_core::models::DownloadStatus,
-    ) -> Result<()> {
-        let (paper_repo, _, _, _, _) = self.db.repositories();
-        Ok(paper_repo.update_download_state(paper_id, local_path, status)?)
+        papers: &[scitadel_core::models::Paper],
+    ) -> HashMap<String, scitadel_db::sqlite::DownloadState> {
+        let ids: Vec<String> = papers
+            .iter()
+            .map(|paper| paper.id.as_str().to_string())
+            .collect();
+        match self.db.download_states(&ids) {
+            Ok(states) => states,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    papers = ids.len(),
+                    "could not derive download states; the state column will show nothing"
+                );
+                HashMap::new()
+            }
+        }
     }
 
     /// Persist the TUI's current selection so an MCP-side agent can

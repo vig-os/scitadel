@@ -36,15 +36,16 @@ pub use assessments::SqliteAssessmentRepository;
 /// ADR-007 §1 "Storage": the content-addressed blob store.
 pub use blobs::{
     BLOB_DIR, BLOB_TMP_DIR, CAP_FIGURE_BYTES, CAP_FULLTEXT_BYTES, CAP_SI_BYTES, blob_rel_path,
-    cap_for_kind, file_extension, hash_file, io_error, library_root, store_blob,
+    cap_for_kind, file_extension, hash_file, io_error, library_root, store_blob, store_bytes,
 };
 pub use citations::SqliteCitationRepository;
 /// ADR-007 §1 "Have" (derived) and §2 "Status vocabulary": the readers behind
 /// `coverage` and `action_list`. One computation, two projections.
 pub use coverage::{
-    ALL_STATUSES, ALL_WANT_KINDS, ActionGroup, ActionList, CoverageError, CoverageReport,
-    DeferredGroup, FULLTEXT_ARTEFACT_KINDS, KindTotal, MissingEntry, PublisherKey, StatusVocab,
-    UNTRACKED_VERSION_ROUTES, UnknownWantKind, status_vocab, version_satisfies,
+    ALL_STATUSES, ALL_WANT_KINDS, ANY_VERSION, ActionGroup, ActionList, CoverageError,
+    CoverageReport, DeferredGroup, DownloadState, FULLTEXT_ARTEFACT_KINDS, KindTotal, MissingEntry,
+    PublisherKey, StatusVocab, UNTRACKED_VERSION_ROUTES, UnknownWantKind, download_states,
+    held_fulltext_artefacts, is_held_fulltext, status_vocab, version_satisfies,
 };
 /// ADR-007 §1 "Artefact rules": "Unreferenced blobs are collected by `scitadel
 /// gc`". The candidate query, the collection itself, and the path-shape check

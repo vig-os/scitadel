@@ -15,7 +15,7 @@ pub use annotation::{
 pub use assessment::Assessment;
 pub use citation::{Citation, CitationDirection, SnowballRun};
 pub use doi::{DoiRejection, doi_to_filename, normalize_doi, validate_doi, validate_doi_detailed};
-pub use paper::{CandidatePaper, DownloadStatus, Paper};
+pub use paper::{CandidatePaper, Paper};
 pub use question::{ResearchQuestion, SearchTerm};
 pub use route::{AccessStatus, RouteId, UnknownRoute};
 pub use search::{Search, SearchResult, SourceOutcome, SourceStatus};

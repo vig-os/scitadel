@@ -59,6 +59,22 @@
 //! evaluated. [`RouteVerdict::NoTdmRouteAvailable`] is reachable only through a
 //! classified publisher, so "no TDM route available" cannot be printed for a
 //! publisher nobody looked at.
+//!
+//! # Readers take the same answer, not a second one
+//!
+//! The report is not the only thing that has to know what we hold.
+//! `read_paper` and `find_cached_file` have to know *which file* we hold, and
+//! the TUI's download-state column has to know whether we hold it at all — and
+//! all three have to agree, or a reader opens a file the report says is not
+//! there.
+//!
+//! So they come here too: [`is_held_fulltext`] is the gate the bulk read applies,
+//! [`held_fulltext_artefacts`] is that gate over the rows themselves, and
+//! [`download_states`] projects it onto one column.
+//! `the_report_and_a_reader_agree_on_which_artefact_is_the_full_text` holds all
+//! three against a matrix of rows that disagree on every clause, because a
+//! second derivation is exactly the kind of thing that passes one test and then
+//! diverges on the row nobody thought of.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -228,6 +244,215 @@ pub fn version_satisfies(wanted_version: &str, held_version: &str, route: &str) 
         "preprint" => held_version == "preprint",
         _ => false,
     }
+}
+
+/// ADR-007 §1's gate on one stored artefact row: is this the full text we hold?
+///
+/// The reader-facing twin of [`is_satisfied`], and deliberately written against
+/// the *row* rather than the reduced [`HeldArtefact`] so a consumer that needs the
+/// artefact — to open its blob, to name its kind — can ask the same question the
+/// report asks and get the same rows back.
+///
+/// The three clauses and where each comes from:
+///
+/// - `access_status = 'full_text'` is ADR-007 §1's gate verbatim. An abstract or a
+///   paywall stub is bytes we hold and is not the paper.
+/// - `missing_on_disk = 0` is the same addition [`read_held_artefacts`] makes in
+///   SQL: the column means "the path is recorded but we hold no usable bytes", and
+///   counting such a row would let a deleted file read as a held full text.
+/// - `version_satisfies` is §1's version rule, unchanged, including the
+///   `route IN ('legacy','import_flat')` trust for an `unknown` version.
+///
+/// `wanted_version` is the reader's *own* question, not a default: a reader asking
+/// "do we have a file to open" passes [`ANY_VERSION`], while the report passes the
+/// want's own version and can therefore answer `wrong_version`. Same gate,
+/// different question — which is why it is a parameter and not a constant.
+#[must_use]
+pub fn is_held_fulltext(row: &crate::sqlite::artefacts::ArtefactRow, wanted_version: &str) -> bool {
+    FULLTEXT_ARTEFACT_KINDS.contains(&row.kind.as_str())
+        && row.access_status == scitadel_core::models::AccessStatus::FullText.label()
+        && !row.missing_on_disk
+        && version_satisfies(wanted_version, &row.version, &row.route)
+}
+
+/// The `wanted_version` for a reader that wants a file rather than a verdict:
+/// every version is acceptable.
+pub const ANY_VERSION: &str = "any";
+
+/// Every artefact ADR-007 §1 says this work holds as its full text, best first.
+///
+/// The single answer `find_cached_file`, `read_paper` and the TUI's state column
+/// take, so none of them decides on its own which artefact counts. A work with
+/// nothing held yields an empty vector, never a guess.
+///
+/// ## The order is the reader's order
+///
+/// ADR-007 §3 ranks versions — VoR over AM over preprint — because a version of
+/// record *is* the work, and that is the order the ladder fetches in. Within a
+/// version the serialisation decides, and there the order is the one this product
+/// has always opened in: a PDF before HTML before XML, because a PDF is what both
+/// the text extractor and the OS viewer accept, and an XML serialisation exists
+/// here because JATS is a real full text and nothing else was available.
+///
+/// Ordering is therefore total and deterministic, so two runs — and two callers —
+/// pick the same file for a work that holds more than one.
+pub fn held_fulltext_artefacts(
+    conn: &Connection,
+    paper_id: &str,
+    wanted_version: &str,
+) -> Result<Vec<crate::sqlite::artefacts::ArtefactRow>, DbError> {
+    let mut held: Vec<_> = crate::sqlite::artefacts::read_artefacts_for_paper(conn, paper_id)?
+        .into_iter()
+        .filter(|row| is_held_fulltext(row, wanted_version))
+        .collect();
+    held.sort_by_key(|row| (version_rank(&row.version), serialisation_rank(&row.kind)));
+    Ok(held)
+}
+
+/// Where a version sits in ADR-007 §3's ranking. `unknown` last: it is the
+/// fallback for a file nobody could place, not a claim about the work.
+fn version_rank(version: &str) -> u8 {
+    match version {
+        "vor" => 0,
+        "am" => 1,
+        "preprint" => 2,
+        _ => 3,
+    }
+}
+
+/// Where a serialisation sits in a reader's preference order.
+fn serialisation_rank(kind: &str) -> u8 {
+    match kind {
+        "fulltext_pdf" => 0,
+        "fulltext_html" => 1,
+        _ => 2,
+    }
+}
+
+/// What a reader shows in a work's download-state column.
+///
+/// Derived, like everything else here: there is no stored status to read, which is
+/// why this type exists instead of the retired `DownloadStatus` column
+/// (`scitadel_core::models::Paper` documents that one). The variants are the shapes
+/// a human can act on, not the shapes the fetch chain can produce — a paywall stub
+/// and an abstract are both "we hold something that is not the paper", and
+/// `artefacts.access_status` is where a consumer that must tell them apart looks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadState {
+    /// We hold the full text, on disk, at a version a `fulltext` want accepts.
+    FullText,
+    /// We hold a full-text artefact that is **not** the full text: a paywall stub,
+    /// an abstract page, or bytes nobody classified. The file exists, so this is the
+    /// shape where opening it shows a human something that is not the paper.
+    NotFullText,
+    /// A row says we should have it and the bytes are gone (`missing_on_disk`).
+    /// Distinct from holding nothing because it is a *loss*, and `scitadel scan` is
+    /// what reconciles it. A work that never had a file is not this.
+    Missing,
+    /// Nothing held, and a recorded gap that concluded something — every status but
+    /// `pending`, which is the only one that means "never tried" (ADR-007 §2) and
+    /// the only one `acquire` picks up on its own.
+    Gap,
+    /// Nothing held and nothing recorded. No claim either way, which is
+    /// deliberately not [`Self::Gap`]: reporting "not downloaded" for a work nobody
+    /// asked about is inventing a requirement.
+    Untracked,
+}
+
+impl DownloadState {
+    /// Every value, so a caller mapping this onto a glyph is exhaustive over one
+    /// list rather than a hand-written copy that drifts.
+    pub const ALL: [Self; 5] = [
+        Self::FullText,
+        Self::NotFullText,
+        Self::Missing,
+        Self::Gap,
+        Self::Untracked,
+    ];
+}
+
+/// The derived download state of every work in `paper_ids`.
+///
+/// One work in, one answer out, keyed by `paper_id`. A work with nothing recorded
+/// is **absent from the map** rather than mapped to `Untracked`, so a caller
+/// rendering a table keeps its own "no row" default and this function does not have
+/// to guess what that default is.
+///
+/// Two queries rather than one per work: the TUI's table asks for a thousand rows
+/// on every redraw, and a per-work derivation there would be a thousand queries per
+/// frame. Works not named in `paper_ids` are computed and dropped, so a caller that
+/// passes a short list pays for that list only in the filter — the aggregation is
+/// library-wide by design, because the alternative is a `WHERE paper_id IN (…)`
+/// built by string interpolation, which is how a 1000-element SQL statement and a
+/// `SQLITE_MAX_VARIABLE_NUMBER` error arrive together.
+///
+/// # Errors
+///
+/// `DbError` if SQLite fails. Nothing is refused for content.
+pub fn download_states(
+    conn: &Connection,
+    paper_ids: &[String],
+) -> Result<HashMap<String, DownloadState>, DbError> {
+    let mut full: HashSet<String> = HashSet::new();
+    let mut not_full: HashSet<String> = HashSet::new();
+    let mut missing: HashSet<String> = HashSet::new();
+
+    let kinds = FULLTEXT_ARTEFACT_KINDS
+        .iter()
+        .map(|kind| format!("'{kind}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT paper_id, access_status, missing_on_disk FROM artefacts WHERE kind IN ({kinds})"
+    ))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (paper_id, access_status, missing_on_disk) = row?;
+        if missing_on_disk != 0 {
+            missing.insert(paper_id);
+        } else if access_status == scitadel_core::models::AccessStatus::FullText.label() {
+            full.insert(paper_id);
+        } else {
+            not_full.insert(paper_id);
+        }
+    }
+
+    let mut gaps: HashSet<String> = HashSet::new();
+    let mut stmt = conn.prepare(
+        "SELECT paper_id FROM acquisition_state
+          WHERE kind = 'fulltext' AND locator = '' AND status <> 'pending'",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        gaps.insert(row?);
+    }
+
+    let mut states = HashMap::new();
+    for paper_id in paper_ids {
+        // Holding the full text wins over a gap row. `record_download` retracts the
+        // want in the same transaction that writes the artefact, so this arm only
+        // fires for a gap recorded *after* the fetch — and the file is on disk, so
+        // it is the answer a reader needs.
+        let state = if full.contains(paper_id) {
+            DownloadState::FullText
+        } else if not_full.contains(paper_id) {
+            DownloadState::NotFullText
+        } else if missing.contains(paper_id) {
+            DownloadState::Missing
+        } else if gaps.contains(paper_id) {
+            DownloadState::Gap
+        } else {
+            continue;
+        };
+        states.insert(paper_id.clone(), state);
+    }
+    Ok(states)
 }
 
 /// Which artefact kinds a want of `kind` accepts.
@@ -1124,6 +1349,39 @@ impl Database {
     pub fn action_list(&self) -> Result<ActionList, CoverageError> {
         Ok(self.coverage_report(None)?.action_list())
     }
+
+    /// Every artefact ADR-007 §1 says this work holds as its full text, best first
+    /// — the answer `find_cached_file` and `read_paper` open.
+    ///
+    /// `wanted_version` is the caller's own question; see [`ANY_VERSION`] for the
+    /// one a reader wants.
+    ///
+    /// # Errors
+    ///
+    /// `DbError` if SQLite fails. Nothing is refused for content: a work with
+    /// nothing held is an empty vector, not an error.
+    pub fn held_fulltext_artefacts(
+        &self,
+        paper_id: &str,
+        wanted_version: &str,
+    ) -> Result<Vec<crate::sqlite::artefacts::ArtefactRow>, DbError> {
+        let conn = self.pool.get().map_err(DbError::from)?;
+        held_fulltext_artefacts(&conn, paper_id, wanted_version)
+    }
+
+    /// The derived download state of each work in `paper_ids` — what a reader's
+    /// state column shows. A work with nothing recorded is absent from the map.
+    ///
+    /// # Errors
+    ///
+    /// `DbError` if SQLite fails.
+    pub fn download_states(
+        &self,
+        paper_ids: &[String],
+    ) -> Result<HashMap<String, DownloadState>, DbError> {
+        let conn = self.pool.get().map_err(DbError::from)?;
+        download_states(&conn, paper_ids)
+    }
 }
 
 #[cfg(test)]
@@ -1287,6 +1545,334 @@ mod tests {
     fn write_artefact(db: &Database, row: ArtefactWrite) {
         let mut conn = db.conn().unwrap();
         write_artefacts(&mut conn, &[row], WriteMode::Reconcile).unwrap();
+    }
+
+    // ---------- ADR-007 §1 "Have", read by a reader rather than a report ----------
+
+    /// The one test that makes "reuse this module's derivation" true rather than
+    /// aspirational: the report's bulk SQL and the reader's row filter are two
+    /// implementations of ADR-007 §1's gate, so they are run against a matrix of
+    /// rows that disagree on every clause and required to agree on every one.
+    ///
+    /// Each row below differs from a held full text in exactly one way, and each
+    /// case asserts three things that must not be allowed to drift apart: the
+    /// report's `held` count for the work, the rows [`held_fulltext_artefacts`]
+    /// returns, and [`download_states`]' verdict.
+    #[test]
+    fn the_report_and_a_reader_agree_on_which_artefact_is_the_full_text() {
+        // (paper_id, note, what one clause does)
+        let cases: [(&str, &str, ArtefactWrite); 8] = [
+            (
+                "p-plain",
+                "a plain held PDF",
+                artefact_row(
+                    "p-plain",
+                    "fulltext_pdf",
+                    "",
+                    "vor",
+                    "publisher",
+                    "full_text",
+                    false,
+                ),
+            ),
+            (
+                "p-abstract",
+                "access_status is not full_text",
+                artefact_row(
+                    "p-abstract",
+                    "fulltext_pdf",
+                    "",
+                    "vor",
+                    "publisher",
+                    "abstract",
+                    false,
+                ),
+            ),
+            (
+                "p-paywall",
+                "a paywall stub is bytes, not the paper",
+                artefact_row(
+                    "p-paywall",
+                    "fulltext_html",
+                    "",
+                    "vor",
+                    "publisher",
+                    "paywall",
+                    false,
+                ),
+            ),
+            (
+                "p-vanished",
+                "the row is there and the bytes are not",
+                artefact_row(
+                    "p-vanished",
+                    "fulltext_pdf",
+                    "",
+                    "vor",
+                    "publisher",
+                    "full_text",
+                    true,
+                ),
+            ),
+            (
+                "p-si",
+                "an SI is not a full text",
+                artefact_row(
+                    "p-si",
+                    "si",
+                    "table-1",
+                    "vor",
+                    "publisher",
+                    "full_text",
+                    false,
+                ),
+            ),
+            (
+                "p-figure",
+                "a figure reference is not a full text",
+                artefact_row(
+                    "p-figure",
+                    "figure",
+                    "fig-2",
+                    "vor",
+                    "publisher",
+                    "full_text",
+                    false,
+                ),
+            ),
+            (
+                "p-preprint",
+                "a preprint is held, but not at `vor`",
+                artefact_row(
+                    "p-preprint",
+                    "fulltext_pdf",
+                    "",
+                    "preprint",
+                    "arxiv",
+                    "full_text",
+                    false,
+                ),
+            ),
+            (
+                "p-legacy",
+                "a legacy file is `unknown`, and that is trusted",
+                artefact_row(
+                    "p-legacy",
+                    "fulltext_pdf",
+                    "",
+                    "unknown",
+                    ROUTE_LEGACY,
+                    "full_text",
+                    false,
+                ),
+            ),
+        ];
+        let (_dir, db) = open();
+        for (paper_id, _, row) in &cases {
+            add_paper(&db, paper_id, None);
+            // Every work wants the version of record, which is the want the report
+            // is built around and the one that distinguishes a preprint.
+            want(&db, paper_id, "fulltext", "pending");
+            write_artefact(&db, row.clone());
+        }
+
+        let report = db.coverage_report(None).unwrap();
+
+        for (paper_id, note, row) in &cases {
+            let report_holds = report.entries.iter().all(|e| e.paper_id != *paper_id);
+            let held = db.held_fulltext_artefacts(paper_id, "vor").unwrap();
+            // `ArtefactWrite.id` is derived at write time, so the identity to
+            // compare is the UNIQUE key rather than a caller-supplied id.
+            let matches_row = held.len() == 1
+                && held[0].kind == row.kind
+                && held[0].version == row.version
+                && held[0].locator == row.locator;
+
+            // One table, one answer: the report, the reader and the column all say
+            // the same thing about this row, or this test fails.
+            let expect_held = matches!(*paper_id, "p-plain" | "p-legacy");
+            assert_eq!(
+                report_holds, expect_held,
+                "{paper_id} ({note}): the report and the reader must agree"
+            );
+            assert_eq!(
+                matches_row, expect_held,
+                "{paper_id} ({note}): the reader returns the row the report counted"
+            );
+        }
+
+        // `any` is a reader's question, not a want's: the preprint is a file we can
+        // open, so a reader takes it while the `vor` want stays a version mismatch.
+        let for_reader = db
+            .held_fulltext_artefacts("p-preprint", ANY_VERSION)
+            .unwrap();
+        assert_eq!(for_reader.len(), 1, "a reader opens the preprint we hold");
+        assert!(
+            report
+                .entries
+                .iter()
+                .any(|e| e.paper_id == "p-preprint" && e.wanted_version == "vor"),
+            "while the report still counts the `vor` want as missing"
+        );
+        assert_eq!(
+            report.held_at_another_version, 1,
+            "and names it a version mismatch rather than an absence"
+        );
+    }
+
+    /// A work holding several full texts: the version of record first, then the
+    /// serialisation a reader can actually open. The old `find_cached_file`
+    /// preferred `.pdf` and nothing else, so this pins that behaviour *inside* the
+    /// derivation rather than in a caller's loop.
+    #[test]
+    fn a_reader_is_offered_the_version_of_record_before_the_preprint() {
+        let (_dir, db) = open();
+        add_paper(&db, "p-many", None);
+        for (kind, version, route) in [
+            ("fulltext_html", "vor", "publisher"),
+            ("fulltext_pdf", "preprint", "arxiv"),
+            ("fulltext_pdf", "vor", "publisher"),
+            ("fulltext_xml", "am", "europepmc"),
+        ] {
+            write_artefact(
+                &db,
+                artefact_row("p-many", kind, "", version, route, "full_text", false),
+            );
+        }
+        let held = db.held_fulltext_artefacts("p-many", ANY_VERSION).unwrap();
+        let order: Vec<(&str, &str)> = held
+            .iter()
+            .map(|r| (r.version.as_str(), r.kind.as_str()))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("vor", "fulltext_pdf"),
+                ("vor", "fulltext_html"),
+                ("am", "fulltext_xml"),
+                ("preprint", "fulltext_pdf"),
+            ],
+            "VoR first, then a serialisation a reader can open; a held VoR PDF \
+             beats an HTML VoR because the extractor and the OS viewer both take it"
+        );
+    }
+
+    /// The four shapes a state column shows, derived. `pending` is excluded from
+    /// `Gap` on purpose: it is the only status that means "never tried", so a work
+    /// in the `acquire` queue is not a work whose download failed.
+    #[test]
+    fn the_derived_download_state_of_every_shape() {
+        let (_dir, db) = open();
+        for id in [
+            "p-full", "p-stub", "p-gone", "p-failed", "p-queued", "p-silent",
+        ] {
+            add_paper(&db, id, None);
+        }
+        write_artefact(
+            &db,
+            artefact_row(
+                "p-full",
+                "fulltext_pdf",
+                "",
+                "vor",
+                "publisher",
+                "full_text",
+                false,
+            ),
+        );
+        write_artefact(
+            &db,
+            artefact_row(
+                "p-stub",
+                "fulltext_html",
+                "",
+                "vor",
+                "publisher",
+                "paywall",
+                false,
+            ),
+        );
+        write_artefact(
+            &db,
+            artefact_row(
+                "p-gone",
+                "fulltext_pdf",
+                "",
+                "vor",
+                "publisher",
+                "full_text",
+                true,
+            ),
+        );
+        want(&db, "p-failed", "fulltext", "error");
+        want(&db, "p-queued", "fulltext", "pending");
+
+        let ids: Vec<String> = [
+            "p-full", "p-stub", "p-gone", "p-failed", "p-queued", "p-silent",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        let states = db.download_states(&ids).unwrap();
+
+        assert_eq!(states.get("p-full"), Some(&DownloadState::FullText));
+        assert_eq!(states.get("p-stub"), Some(&DownloadState::NotFullText));
+        assert_eq!(states.get("p-gone"), Some(&DownloadState::Missing));
+        assert_eq!(states.get("p-failed"), Some(&DownloadState::Gap));
+        assert_eq!(
+            states.get("p-queued"),
+            None,
+            "`pending` is the only status that means \"never tried\", and a work \
+             waiting in the `acquire` queue has concluded nothing — so it is blank \
+             rather than a failure"
+        );
+        assert_eq!(
+            states.get("p-silent"),
+            None,
+            "a work with nothing recorded is absent, so a table keeps its own \
+             \"not tracked\" default rather than this function guessing it"
+        );
+
+        // A full text beats a gap row, in whichever order the rows come back: the
+        // file is on disk, which is what the column is for.
+        want(&db, "p-full", "fulltext", "needs_ill");
+        let after = db.download_states(&["p-full".to_string()]).unwrap();
+        assert_eq!(after.get("p-full"), Some(&DownloadState::FullText));
+    }
+
+    /// Holding the full text and holding a stub for the same work is possible — a
+    /// paywalled landing page first, then a real PDF from an OA route — and the
+    /// column must not report the stub just because it is also there.
+    #[test]
+    fn a_stub_beside_a_full_text_does_not_downgrade_the_answer() {
+        let (_dir, db) = open();
+        add_paper(&db, "p-both", None);
+        write_artefact(
+            &db,
+            artefact_row(
+                "p-both",
+                "fulltext_html",
+                "",
+                "unknown",
+                "publisher",
+                "paywall",
+                false,
+            ),
+        );
+        write_artefact(
+            &db,
+            artefact_row(
+                "p-both",
+                "fulltext_pdf",
+                "",
+                "vor",
+                "unpaywall",
+                "full_text",
+                false,
+            ),
+        );
+        let states = db.download_states(&["p-both".to_string()]).unwrap();
+        assert_eq!(states.get("p-both"), Some(&DownloadState::FullText));
     }
 
     // ---------- ADR-007 §1 "Have" ----------

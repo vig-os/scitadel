@@ -77,6 +77,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use scitadel_core::models::Paper;
+use scitadel_core::untrusted::UntrustedText;
 use scitadel_db::sqlite::{
     ACCESS_BASIS_MANUAL, ArtefactWrite, AttemptWrite, BlobWrite, Database, FULLTEXT_LOCATOR,
     IdentityPhase, IdentitySource, StateWrite, VERSION_UNKNOWN, WriteMode, blob_rel_path,
@@ -159,6 +160,32 @@ pub struct ManualIdentity {
     pub expected_title: Option<String>,
     pub resolved_title: Option<String>,
     pub score: Option<f64>,
+}
+
+impl ManualIdentity {
+    /// The work's own title, as untrusted display text — `Provenance::Ours`.
+    ///
+    /// Ours is a statement about *who chose the string* (we did: it is the stored
+    /// record of the work), not a licence to render a feed's bytes raw, so it still
+    /// goes through the envelope.
+    #[must_use]
+    pub fn expected_title_text(&self) -> Option<UntrustedText> {
+        self.expected_title.as_deref().map(UntrustedText::ours)
+    }
+
+    /// The title the **dropped file** claimed for itself, as untrusted display
+    /// text — `Provenance::PublisherSupplied`.
+    ///
+    /// This is the reachable shape of #287: a person (or anything that wrote to
+    /// their disk) puts a file in the library, `scitadel attach` reads its
+    /// `/Title` or `citation_title`, and `scan`/`attach` print it beside the
+    /// expected title. Whoever produced the file wrote that string.
+    #[must_use]
+    pub fn resolved_title_text(&self) -> Option<UntrustedText> {
+        self.resolved_title
+            .as_deref()
+            .map(UntrustedText::publisher_supplied)
+    }
 }
 
 /// What one `scan` run did.

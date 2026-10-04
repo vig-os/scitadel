@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use rusqlite::params;
 use scitadel_core::error::CoreError;
-use scitadel_core::models::{DownloadStatus, Paper, PaperId};
+use scitadel_core::models::{Paper, PaperId};
 use scitadel_core::ports::PaperRepository;
 
 use super::Database;
@@ -327,9 +327,6 @@ fn row_to_paper(row: &rusqlite::Row) -> rusqlite::Result<Paper> {
     let created_at: String = row.get("created_at")?;
     let updated_at: String = row.get("updated_at")?;
 
-    let local_path: Option<String> = row.get("local_path").ok();
-    let download_status_raw: Option<String> = row.get("download_status").ok();
-    let last_attempt_at_raw: Option<String> = row.get("last_attempt_at").ok();
     let bibtex_key: Option<String> = row.get("bibtex_key").ok();
 
     Ok(Paper {
@@ -350,14 +347,12 @@ fn row_to_paper(row: &rusqlite::Row) -> rusqlite::Result<Paper> {
         source_urls: serde_json::from_str(&source_urls_json).unwrap_or_default(),
         created_at: super::parse_rfc3339_or_now(&created_at),
         updated_at: super::parse_rfc3339_or_now(&updated_at),
-        local_path,
-        download_status: download_status_raw
-            .as_deref()
-            .and_then(DownloadStatus::parse),
-        last_attempt_at: last_attempt_at_raw
-            .as_deref()
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc)),
+        // Deliberately no `local_path`, `download_status` or `last_attempt_at`.
+        // Those columns still exist — they are dropped a release after #253's S2,
+        // and the S1 backfill reads them when it reconciles an existing library —
+        // but nothing writes them any more, so mapping them here would hand every
+        // reader a frozen copy of the last pre-S2e download. See
+        // `scitadel_core::models::Paper`'s own docs.
         bibtex_key,
     })
 }
@@ -502,23 +497,6 @@ impl PaperRepository for SqlitePaperRepository {
         conn.execute(
             "UPDATE papers SET full_text = ?1, updated_at = ?2 WHERE id = ?3",
             params![text, chrono::Utc::now().to_rfc3339(), paper_id],
-        )
-        .map_err(DbError::Sqlite)?;
-        Ok(())
-    }
-
-    fn update_download_state(
-        &self,
-        paper_id: &str,
-        local_path: Option<&str>,
-        status: DownloadStatus,
-    ) -> Result<(), CoreError> {
-        let conn = self.db.conn()?;
-        let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE papers SET local_path = ?1, download_status = ?2, last_attempt_at = ?3, \
-             updated_at = ?3 WHERE id = ?4",
-            params![local_path, status.as_str(), now, paper_id],
         )
         .map_err(DbError::Sqlite)?;
         Ok(())
@@ -761,38 +739,6 @@ mod tests {
                 "remapped paper_id should exist in DB"
             );
         }
-    }
-
-    #[test]
-    fn download_state_round_trips() {
-        let (_, repo) = setup();
-        let paper = Paper::new("DL state");
-        repo.save(&paper).unwrap();
-
-        // Pristine row: no download attempted yet.
-        let initial = repo.get(paper.id.as_str()).unwrap().unwrap();
-        assert!(initial.local_path.is_none());
-        assert!(initial.download_status.is_none());
-        assert!(initial.last_attempt_at.is_none());
-
-        // Successful download.
-        repo.update_download_state(
-            paper.id.as_str(),
-            Some("/tmp/foo.pdf"),
-            DownloadStatus::Downloaded,
-        )
-        .unwrap();
-        let after = repo.get(paper.id.as_str()).unwrap().unwrap();
-        assert_eq!(after.local_path.as_deref(), Some("/tmp/foo.pdf"));
-        assert_eq!(after.download_status, Some(DownloadStatus::Downloaded));
-        assert!(after.last_attempt_at.is_some());
-
-        // Subsequent failure overwrites cleanly (path None, status Failed).
-        repo.update_download_state(paper.id.as_str(), None, DownloadStatus::Failed)
-            .unwrap();
-        let failed = repo.get(paper.id.as_str()).unwrap().unwrap();
-        assert!(failed.local_path.is_none());
-        assert_eq!(failed.download_status, Some(DownloadStatus::Failed));
     }
 
     /// Regression for #159: SQLite's built-in `LOWER()` is ASCII-only,
