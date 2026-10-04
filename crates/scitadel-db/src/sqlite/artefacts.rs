@@ -196,9 +196,28 @@ pub struct StateWrite {
     pub wanted_version: String,
     pub status: String,
     pub reason: Option<String>,
+    /// A publisher we can name, or `None` when the DOI's registrant prefix is
+    /// not in [`scitadel_core::publisher`]'s table. Never a guess (#261) —
+    /// and `None` is the *correct* answer for a writer that did not classify
+    /// anything, which is different from "there is no publisher".
+    ///
+    /// Both existing writers pass `None` deliberately: the flat importer
+    /// names no publisher, and the ladder's gap is grouped by the DOI
+    /// registry's answer at report time ([`crate::sqlite::coverage`]) rather
+    /// than from this column. `acquire` is the writer that fills it, because
+    /// it is the writer that has already classified the work's DOI.
+    pub publisher: Option<String>,
     pub hint_url: Option<String>,
     /// Where a human should put the file to close this gap.
     pub drop_path: Option<String>,
+    /// When a later run should pick this gap up again, RFC 3339 UTC
+    /// (ADR-007 §2: `rate_limited` means "retry at `next_attempt_at`").
+    ///
+    /// `None` means *no retry is scheduled* — the gap is due now, or a human
+    /// owns it. This is the column `--resume` reads, so a row whose only
+    /// change is this one must still update: it is in the `WHERE` guard of
+    /// [`write_acquisition_states`].
+    pub next_attempt_at: Option<String>,
     pub updated_at: String,
 }
 
@@ -573,9 +592,21 @@ pub fn record_download(conn: &mut Connection, write: &DownloadWrite) -> Result<(
 
 /// Upsert `acquisition_state` rows, returning how many were written.
 ///
-/// Like [`write_artefacts`] in [`WriteMode::Reconcile`], an identical
+/// Like [`write_artefacts`] in `WriteMode::Reconcile`, an identical
 /// re-run updates nothing — a gap row's `updated_at` should say when the
 /// gap last *changed*, not when someone looked at it again.
+///
+/// ## `publisher` and `next_attempt_at` are in the `WHERE` guard too
+///
+/// Both columns are in the updated set *and* in the guard, which is the
+/// only combination that lets "the status did not change but the retry time
+/// did" be a real update. Leaving them out of the guard — as
+/// [`write_artefacts`] deliberately does for a few `artefacts` columns —
+/// would make a row whose only change is `next_attempt_at` a silent no-op:
+/// `INSERT ... ON CONFLICT DO UPDATE ... WHERE <false>` updates nothing, and
+/// `--resume` would then keep re-fetching a work it had already deferred,
+/// forever. The whole point of the column is that it *changes independently*
+/// of the status, so it is in the guard.
 pub fn write_acquisition_states(
     conn: &mut Connection,
     rows: &[StateWrite],
@@ -587,20 +618,25 @@ pub fn write_acquisition_states(
     for row in rows {
         tx.execute(
             "INSERT INTO acquisition_state
-                 (paper_id, kind, locator, wanted_version, status, reason, hint_url, drop_path, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 (paper_id, kind, locator, wanted_version, status, reason, publisher,
+                  hint_url, drop_path, next_attempt_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT (paper_id, kind, locator) DO UPDATE SET
                wanted_version = excluded.wanted_version,
                status = excluded.status,
                reason = excluded.reason,
+               publisher = excluded.publisher,
                hint_url = excluded.hint_url,
                drop_path = excluded.drop_path,
+               next_attempt_at = excluded.next_attempt_at,
                updated_at = excluded.updated_at
              WHERE acquisition_state.wanted_version IS NOT excluded.wanted_version
                 OR acquisition_state.status IS NOT excluded.status
                 OR acquisition_state.reason IS NOT excluded.reason
+                OR acquisition_state.publisher IS NOT excluded.publisher
                 OR acquisition_state.hint_url IS NOT excluded.hint_url
-                OR acquisition_state.drop_path IS NOT excluded.drop_path",
+                OR acquisition_state.drop_path IS NOT excluded.drop_path
+                OR acquisition_state.next_attempt_at IS NOT excluded.next_attempt_at",
             params![
                 row.paper_id,
                 row.kind,
@@ -608,8 +644,10 @@ pub fn write_acquisition_states(
                 row.wanted_version,
                 row.status,
                 row.reason,
+                row.publisher,
                 row.hint_url,
                 row.drop_path,
+                row.next_attempt_at,
                 row.updated_at,
             ],
         )?;
@@ -1158,8 +1196,10 @@ mod tests {
             wanted_version: "vor".into(),
             status: "pending".into(),
             reason: Some("nothing there".into()),
+            publisher: None,
             hint_url: None,
             drop_path: Some("/lib/papers/stem/fulltext.pdf".into()),
+            next_attempt_at: None,
             updated_at: "2026-01-01T00:00:00+00:00".into(),
         };
         {
@@ -1198,6 +1238,78 @@ mod tests {
         assert_eq!(n, 0);
     }
 
+    /// The `WHERE` guard is load-bearing for the two columns ADR-007 §2 needs
+    /// and `StateWrite` used to have no way to write: a row whose *only* change
+    /// is `next_attempt_at` (the retry time moving while the status stands
+    /// still) or `publisher` has to update. Excluded from the guard, the
+    /// upsert is a silent no-op — `ON CONFLICT DO UPDATE ... WHERE <false>`
+    /// touches nothing — and `--resume` would then re-fetch a work it had
+    /// already deferred, forever.
+    #[test]
+    fn a_change_to_only_next_attempt_at_or_publisher_updates_the_row() {
+        let (_dir, db) = open();
+        let base = StateWrite {
+            paper_id: "p-1".into(),
+            kind: "fulltext".into(),
+            locator: String::new(),
+            wanted_version: "vor".into(),
+            status: "error".into(),
+            reason: Some("the OA host could not be resolved".into()),
+            publisher: None,
+            hint_url: None,
+            drop_path: None,
+            next_attempt_at: None,
+            updated_at: "2026-01-01T00:00:00+00:00".into(),
+        };
+        let mut conn = db.conn().unwrap();
+        write_acquisition_states(&mut conn, std::slice::from_ref(&base)).unwrap();
+
+        let stamp = |db: &Database| -> (Option<String>, Option<String>, String) {
+            let conn = db.conn().unwrap();
+            conn.query_row(
+                "SELECT publisher, next_attempt_at, updated_at FROM acquisition_state",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(stamp(&db), (None, None, base.updated_at.clone()));
+
+        // Only `next_attempt_at` moves. Nothing else differs — including
+        // `updated_at`, which the caller wrote identically.
+        let deferred = StateWrite {
+            next_attempt_at: Some("2026-01-01T00:10:00+00:00".into()),
+            ..base.clone()
+        };
+        write_acquisition_states(&mut conn, &[deferred]).unwrap();
+        assert_eq!(
+            stamp(&db),
+            (
+                None,
+                Some("2026-01-01T00:10:00+00:00".to_string()),
+                base.updated_at.clone()
+            ),
+            "a row whose only change is next_attempt_at must update"
+        );
+
+        // Only `publisher` moves — the classified-after-the-fact case.
+        let classified = StateWrite {
+            publisher: Some("springer".into()),
+            next_attempt_at: Some("2026-01-01T00:10:00+00:00".into()),
+            ..base.clone()
+        };
+        write_acquisition_states(&mut conn, &[classified]).unwrap();
+        assert_eq!(
+            stamp(&db),
+            (
+                Some("springer".to_string()),
+                Some("2026-01-01T00:10:00+00:00".to_string()),
+                base.updated_at.clone()
+            ),
+            "a row whose only change is publisher must update"
+        );
+    }
+
     /// #260: the acquisition ladder records a gap when a walk ends without
     /// bytes, so a *later* successful download has to take it back — in the
     /// same transaction, or a reader in between sees a work that is both held
@@ -1227,8 +1339,10 @@ mod tests {
                     wanted_version: "vor".into(),
                     status: "unavailable".into(),
                     reason: Some("every route that could be tried refused".into()),
+                    publisher: None,
                     hint_url: Some("https://doi.org/10.1038/s41586-020-2649-2".into()),
                     drop_path: drop_path.map(str::to_string),
+                    next_attempt_at: None,
                     updated_at: "2026-01-01T00:00:00+00:00".into(),
                 }],
             )
@@ -1285,9 +1399,8 @@ mod tests {
             artefact_id("a", "bc", "unknown", "")
         );
         assert_eq!(id.len(), 32);
-        assert!(
-            id.chars()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-        );
+        assert!(id
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 }

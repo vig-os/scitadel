@@ -651,11 +651,23 @@ impl PaperDownloader {
             wanted_version: WANTED_VERSION_VOR.to_string(),
             status: ladder.status().to_string(),
             reason: Some(ladder.reason()),
+            // `None` on purpose: this walk evaluated *no* publisher's routes
+            // and named no publisher, and `classify_publisher` is the one
+            // authority allowed to fill that column (#261). The report-time
+            // grouping in `sqlite::coverage` derives it from the work's DOI
+            // registry answer rather than reading it back from here, so
+            // storing it would add a second, unchecked copy of the same fact.
+            publisher: None,
             hint_url: self.doi_hint_url(paper),
             // Deliberately `None`: there is no file for a human to drop here.
             // That absence is also what distinguishes this row from the flat
             // importer's, which is retracted by its exact `drop_path`.
             drop_path: None,
+            // Deliberately `None` too: a single walk does not know when the
+            // work should be tried again. Deciding that is the *campaign*'s
+            // job (`acquire`, ADR-007 §2's "retried with backoff"), and it is
+            // the campaign that can read a bucket's ledger.
+            next_attempt_at: None,
             updated_at: Utc::now().to_rfc3339(),
         };
         if let Err(e) = self.db.upsert_acquisition_state(&row) {

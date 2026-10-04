@@ -96,9 +96,9 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use scitadel_core::models::Paper;
 use scitadel_db::sqlite::{
-    ACCESS_BASIS_MANUAL, ArtefactWrite, BlobWrite, Database, FULLTEXT_LOCATOR, ROUTE_IMPORT_FLAT,
-    StateWrite, VERSION_UNKNOWN, WriteMode, blob_rel_path, file_extension, fulltext_kind,
-    hash_file, store_blob,
+    blob_rel_path, file_extension, fulltext_kind, hash_file, store_blob, ArtefactWrite, BlobWrite,
+    Database, StateWrite, WriteMode, ACCESS_BASIS_MANUAL, FULLTEXT_LOCATOR, ROUTE_IMPORT_FLAT,
+    VERSION_UNKNOWN,
 };
 
 use crate::download::file_stem_for;
@@ -1007,8 +1007,17 @@ fn record_gaps(
         wanted_version: "vor".to_string(),
         status: "pending".to_string(),
         reason: Some(gap.reason.clone()),
+        // Both `None`, and deliberately. This importer classifies no
+        // publisher: it reads files out of a directory tree and never looks
+        // at a DOI, so there is no registrant prefix to classify one from
+        // (#261) — and an `action_list` group derives the publisher from the
+        // registry at report time regardless. `next_attempt_at` is `None`
+        // because this gap is closed by a human dropping a file at
+        // `drop_path`, not by a fetch: it is not a row in any retry queue.
+        publisher: None,
         hint_url: None,
         drop_path: Some(drop_path.to_string_lossy().into_owned()),
+        next_attempt_at: None,
         updated_at: now.to_rfc3339(),
     })?;
     Ok((false, vec![gap]))

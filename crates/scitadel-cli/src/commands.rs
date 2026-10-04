@@ -2470,8 +2470,10 @@ mod coverage_action_list_tests {
             wanted_version: "vor".into(),
             status: status.into(),
             reason: Some(format!("why {status} happened on {paper_id}")),
+            publisher: None,
             hint_url: Some("https://doi.org/10.1039/d0nr01234a".into()),
             drop_path: None,
+            next_attempt_at: None,
             updated_at: NOW.into(),
         })
         .unwrap();

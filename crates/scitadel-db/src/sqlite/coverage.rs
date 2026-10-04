@@ -64,7 +64,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 use rusqlite::Connection;
-use scitadel_core::publisher::{PublisherVerdict, RouteVerdict, classify_publisher};
+use scitadel_core::publisher::{classify_publisher, PublisherVerdict, RouteVerdict};
 use serde::Serialize;
 
 use crate::error::DbError;
@@ -1112,8 +1112,8 @@ impl Database {
 mod tests {
     use super::*;
     use crate::sqlite::artefacts::{
-        ACCESS_BASIS_MANUAL, ArtefactWrite, BlobWrite, ROUTE_IMPORT_FLAT, StateWrite,
-        VERSION_UNKNOWN, WriteMode, write_acquisition_states, write_artefacts,
+        write_acquisition_states, write_artefacts, ArtefactWrite, BlobWrite, StateWrite, WriteMode,
+        ACCESS_BASIS_MANUAL, ROUTE_IMPORT_FLAT, VERSION_UNKNOWN,
     };
     use crate::sqlite::{Database, ROUTE_LEGACY};
 
@@ -1181,8 +1181,13 @@ mod tests {
             wanted_version: wanted_version.into(),
             status: status.into(),
             reason: None,
+            // No publisher and no retry time: this helper is about the *want*,
+            // and a fixture that stored a publisher would let a test pass on a
+            // publisher it never meant to exercise.
+            publisher: None,
             hint_url: None,
             drop_path: None,
+            next_attempt_at: None,
             updated_at: NOW.into(),
         }
     }
@@ -1912,16 +1917,14 @@ mod tests {
             ],
             "deferred buckets come out in ADR-007 §2's order"
         );
-        assert!(
-            list.deferred
-                .iter()
-                .any(|d| d.status == "unavailable" && d.goes_to.contains("no action"))
-        );
-        assert!(
-            list.deferred
-                .iter()
-                .any(|d| d.status == "rate_limited" && d.goes_to.contains("next_attempt_at"))
-        );
+        assert!(list
+            .deferred
+            .iter()
+            .any(|d| d.status == "unavailable" && d.goes_to.contains("no action")));
+        assert!(list
+            .deferred
+            .iter()
+            .any(|d| d.status == "rate_limited" && d.goes_to.contains("next_attempt_at")));
     }
 
     /// `--kind` narrows the entries and every number computed over them, while
