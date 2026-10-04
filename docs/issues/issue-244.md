@@ -2,7 +2,7 @@
 type: issue
 state: open
 created: 2026-09-29T12:26:32Z
-updated: 2026-10-03T00:34:24Z
+updated: 2026-10-03T22:38:31Z
 author: renovate[bot]
 author_url: https://github.com/renovate[bot]
 url: https://github.com/vig-os/scitadel/issues/244
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-10-03T07:15:48.717Z
+synced: 2026-10-04T07:34:06.603Z
 ---
 
 # [Issue 244]: [Dependency Dashboard](https://github.com/vig-os/scitadel/issues/244)
@@ -37,7 +37,7 @@ The following updates are awaiting their schedule. To get an update now, click o
  - [ ] <!-- unschedule-branch=renovate/github-actions-(minor-and-patch) -->ci(actions): update vig-os/commit-action action to v0.3.3
  - [ ] <!-- unschedule-branch=renovate/assert_cmd-2.x-lockfile -->chore(deps): update rust crate assert_cmd to v2.2.2
  - [ ] <!-- unschedule-branch=renovate/clap-4.x-lockfile -->chore(deps): update rust crate clap to v4.6.7
- - [ ] <!-- unschedule-branch=renovate/insta-1.x-lockfile -->chore(deps): update rust crate insta to v1.48.0
+ - [ ] <!-- unschedule-branch=renovate/insta-1.x-lockfile -->chore(deps): update rust crate insta to v1.49.0
  - [ ] <!-- unschedule-branch=renovate/pdf-extract-0.x -->chore(deps): update rust crate pdf-extract to 0.12
  - [ ] <!-- unschedule-branch=renovate/proptest-1.x-lockfile -->chore(deps): update rust crate proptest to v1.11.0
  - [ ] <!-- unschedule-branch=renovate/quick-xml-0.x -->chore(deps): update rust crate quick-xml to 0.42
@@ -49,7 +49,7 @@ The following updates are awaiting their schedule. To get an update now, click o
  - [ ] <!-- unschedule-branch=renovate/sha1-0.x -->chore(deps): update rust crate sha1 to 0.11
  - [ ] <!-- unschedule-branch=renovate/sha2-0.x -->chore(deps): update rust crate sha2 to 0.11
  - [ ] <!-- unschedule-branch=renovate/tempfile-3.x-lockfile -->chore(deps): update rust crate tempfile to v3.27.0
- - [ ] <!-- unschedule-branch=renovate/tokio-1.x-lockfile -->chore(deps): update rust crate tokio to v1.53.1
+ - [ ] <!-- unschedule-branch=renovate/tokio-1.x-lockfile -->chore(deps): update rust crate tokio to v1.53.2
  - [ ] <!-- unschedule-branch=renovate/uuid-1.x-lockfile -->chore(deps): update rust crate uuid to v1.27.0
  - [ ] <!-- unschedule-branch=renovate/zeroize-1.x-lockfile -->chore(deps): update rust crate zeroize to v1.9.0
  - [ ] <!-- unschedule-branch=renovate/biblatex-0.x -->fix(deps): update rust crate biblatex to 0.12
