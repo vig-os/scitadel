@@ -2020,6 +2020,7 @@ fn render_coverage(report: &CoverageReport, accounted: usize, kind: Option<&str>
 
     if report.entries.is_empty() {
         let _ = writeln!(out, "\nNothing is missing from this slice of the library.");
+        out.push_str(&render_identity_overrides(&report.identity_overrides));
         return out;
     }
 
@@ -2048,6 +2049,49 @@ fn render_coverage(report: &CoverageReport, accounted: usize, kind: Option<&str>
         if let Some(drop) = &entry.drop_path {
             let _ = writeln!(out, "      drop: {drop}");
         }
+    }
+    out.push_str(&render_identity_overrides(&report.identity_overrides));
+    out
+}
+
+/// The overrides a report carries, printed by **both** projections.
+///
+/// #253's escape hatch, and the reason it is printed rather than merely stored:
+/// every other verdict in this codebase is chosen so a human can overturn it, and
+/// an override nobody can see is indistinguishable from a bug. A work that
+/// stopped blocking because a person checked the DOI by hand looks exactly like a
+/// work that stopped blocking because the matcher changed — only the reason
+/// distinguishes them, and the reason is the whole value of the flag.
+///
+/// Printed **after** the missing-entry tables and outside every total: an
+/// override is neither a want nor an artefact, so counting it in either would
+/// break the accounting ADR-007 §2 requires of `action_list`.
+fn render_identity_overrides(overrides: &[scitadel_db::sqlite::IdentityOverride]) -> String {
+    use std::fmt::Write as _;
+    if overrides.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "\nIdentity overridden by a person — {} work(s). The identity gate does not block \
+         these, and no later run re-asks:",
+        overrides.len()
+    );
+    for entry in overrides {
+        let _ = writeln!(
+            out,
+            "  + {}  {}",
+            short_id(&entry.paper_id),
+            entry
+                .phases
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let _ = writeln!(out, "      reason: {}", entry.reason);
+        let _ = writeln!(out, "      recorded: {}", entry.recorded_at);
     }
     out
 }
@@ -2121,6 +2165,8 @@ fn render_action_list(list: &ActionList) -> String {
     }
     let _ = writeln!(out, "  {:<20} {:>5}", "total", list.deferred_total());
 
+    out.push_str(&render_identity_overrides(&list.report.identity_overrides));
+
     let _ = writeln!(
         out,
         "\nAccounts for {} missing entries: {} human, {} deferred.",
@@ -2136,6 +2182,120 @@ fn short_id(paper_id: &str) -> String {
     scitadel_core::models::PaperId::from(paper_id)
         .short()
         .to_string()
+}
+
+// ---------- override-identity (#253: a human overturns the identity gate) ----------
+
+/// `scitadel override-identity <paper> --reason "<text>" [--json]`.
+///
+/// ADR-007 §3's "a mismatch blocks filing anything under that DOI" has one door
+/// out of it, and this is it. Three things it deliberately does:
+///
+/// - **requires the reason.** `scitadel_db::sqlite::override_identity` refuses a
+///   blank one, because `override_reason` is the only record that a person looked
+///   at this work — an empty string would leave the row indistinguishable from a
+///   bug.
+/// - **covers both identity phases.** A person answering "is this the work I
+///   asked for?" is answering once, not once per fetch step, and a flag that took
+///   a phase argument would be a flag people forget.
+/// - **returns a mismatched work to the `acquire` queue.** `identity_mismatch` is
+///   ADR-007 §2's human-action status, so the work stays in `action_list` asking to
+///   be checked until someone does. Leaving it there after they have would keep
+///   asking forever.
+///
+/// Read-only apart from the override itself: no request, and nothing about the
+/// want row is changed beyond the status transition the report names.
+pub fn override_identity(paper: &str, reason: &str, json: bool) -> Result<()> {
+    let config = load_config();
+    let db = Database::open(&config.db_path).context("open database")?;
+    db.migrate().context("migration failed")?;
+
+    // Every other surface accepts an unambiguous prefix, so this one does too:
+    // an id a tool printed must work on the way back in (#232).
+    let paper_id = resolve_paper_id(&db, paper)?;
+
+    let report = db
+        .override_identity(&paper_id, reason)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", render_override_identity(&report));
+    }
+    Ok(())
+}
+
+/// The full id for an exact id or an unambiguous prefix.
+fn resolve_paper_id(db: &Database, paper: &str) -> Result<String> {
+    let (paper_repo, _, _, _, _) = db.repositories();
+    if paper_repo.get(paper).is_ok() {
+        return Ok(paper.to_string());
+    }
+    let matches: Vec<String> = paper_repo
+        .list_all(10_000, 0)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .into_iter()
+        .filter(|p| p.id.as_str().starts_with(paper))
+        .map(|p| p.id.as_str().to_string())
+        .collect();
+    match matches.as_slice() {
+        [] => Err(anyhow::anyhow!(
+            "no work named {paper:?}; `scitadel show {paper}` lists what the library holds"
+        )),
+        // Naming one of two works would settle the wrong work's identity.
+        [only] => Ok(only.clone()),
+        many => Err(anyhow::anyhow!(
+            "{paper:?} matches {} works ({}, …); use more of the id",
+            many.len(),
+            many[0]
+        )),
+    }
+}
+
+fn render_override_identity(report: &scitadel_db::sqlite::IdentityOverrideReport) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Identity settled for {} — the gate will not block it again.",
+        report.paper_id
+    );
+    let _ = writeln!(
+        out,
+        "  phases:   {} (an override covers both; a later run does not re-ask)",
+        report
+            .phases
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let _ = writeln!(out, "  reason:   {}", report.reason);
+    match (&report.gap_status_before, &report.gap_status_after) {
+        (Some(before), Some(after)) => {
+            let _ = writeln!(
+                out,
+                "  queue:    {before} -> {after} (back in the `acquire` queue; \
+                 `scitadel acquire` will fetch it)"
+            );
+        }
+        (Some(before), None) => {
+            let _ = writeln!(out, "  queue:    {before}, unchanged");
+        }
+        _ => {
+            let _ = writeln!(
+                out,
+                "  queue:    no want row recorded, so there was nothing to unblock"
+            );
+        }
+    }
+    let _ = writeln!(
+        out,
+        "\nShown by `scitadel coverage` and `scitadel action_list` under \
+         \"Identity overridden by a person\"."
+    );
+    out
 }
 
 // ---------- acquire (ADR-007 §2 "Status vocabulary", §3 "Routes and the ladder")
@@ -2661,6 +2821,155 @@ mod bib_verify_tests {
         let capped = cap_diff(&big, 40);
         assert!(capped.lines().count() <= 41);
         assert!(capped.contains("more lines truncated"));
+    }
+}
+
+#[cfg(test)]
+mod identity_override_cli_tests {
+    //! #253's escape hatch, at the surface a person actually uses.
+    //!
+    //! The db-side tests pin the write-once rule; these pin the two things only
+    //! the CLI can show: that an override **requires** a reason, and that an
+    //! override is **visible** in both projections. The second is the point of the
+    //! whole flag — an override nobody can see is indistinguishable from a bug,
+    //! and a work that stopped blocking because a person checked it looks exactly
+    //! like one that stopped blocking because the matcher changed.
+
+    use super::{render_action_list, render_coverage, render_identity_overrides};
+    use scitadel_core::models::{Paper, PaperId};
+    use scitadel_core::ports::PaperRepository as _;
+    use scitadel_db::sqlite::{Database, IdentityError, IdentityOverride, StateWrite};
+
+    const NOW: &str = "2026-01-01T00:00:00+00:00";
+
+    fn fixture() -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("scitadel.db")).unwrap();
+        db.migrate().unwrap();
+        let (paper_repo, ..) = db.repositories();
+        let mut paper = Paper::new("Deep learning for radiopharmaceutical image reconstruction");
+        paper.id = PaperId::from("p-1");
+        paper_repo.save(&paper).unwrap();
+        db.upsert_acquisition_state(&StateWrite {
+            paper_id: "p-1".into(),
+            kind: "fulltext".into(),
+            locator: String::new(),
+            wanted_version: "vor".into(),
+            status: "identity_mismatch".into(),
+            reason: Some("the served title was a different paper".into()),
+            publisher: None,
+            hint_url: None,
+            drop_path: None,
+            next_attempt_at: None,
+            updated_at: NOW.into(),
+        })
+        .unwrap();
+        (dir, db)
+    }
+
+    /// A blank reason is refused, and the work stays blocked — an override
+    /// nobody explained is not a decision.
+    #[test]
+    fn an_override_without_a_reason_is_refused_and_changes_nothing() {
+        let (_dir, db) = fixture();
+        for blank in ["", "  ", "\t"] {
+            assert!(
+                matches!(
+                    db.override_identity("p-1", blank),
+                    Err(IdentityError::ReasonRequired)
+                ),
+                "{blank:?} must be refused"
+            );
+        }
+        let gap = db
+            .acquisition_state("p-1", "fulltext", "")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            gap.status, "identity_mismatch",
+            "the work is still blocked: nothing was settled"
+        );
+    }
+
+    /// The reason a person gives is printed, with the work it applies to, and the
+    /// gap is returned to the `acquire` queue — otherwise `action_list` keeps
+    /// asking them to check a DOI they have just checked.
+    #[test]
+    fn an_override_reports_the_queue_transition_and_is_visible_in_both_projections() {
+        let (_dir, db) = fixture();
+        let report = db
+            .override_identity("p-1", "same report; OpenAlex has the older title")
+            .unwrap();
+        assert_eq!(
+            report.gap_status_before.as_deref(),
+            Some("identity_mismatch")
+        );
+        assert_eq!(report.gap_status_after.as_deref(), Some("pending"));
+
+        let rendered = super::render_override_identity(&report);
+        assert!(
+            rendered.contains("same report; OpenAlex has the older title"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("identity_mismatch -> pending"),
+            "{rendered}"
+        );
+
+        let list = db.action_list().unwrap();
+        let action_text = render_action_list(&list);
+        let coverage_text = render_coverage(&list.coverage(None).unwrap(), list.accounted(), None);
+        for (name, text) in [("action_list", &action_text), ("coverage", &coverage_text)] {
+            assert!(
+                text.contains("Identity overridden by a person"),
+                "{name} does not show the override:\n{text}"
+            );
+            assert!(
+                text.contains("same report; OpenAlex has the older title"),
+                "{name} does not print the reason:\n{text}"
+            );
+        }
+        // And the accounting is untouched: an override is neither a want nor an
+        // artefact, so it must not move a single total.
+        assert_eq!(list.report.missing_total(), 1);
+        assert_eq!(list.accounted(), list.report.missing_total());
+    }
+
+    /// No overrides ⇒ no section. A library that has never been overridden must
+    /// not print an empty heading on every run.
+    #[test]
+    fn no_overrides_prints_no_section() {
+        assert!(render_identity_overrides(&[]).is_empty());
+        let (_dir, db) = fixture();
+        let list = db.action_list().unwrap();
+        assert!(list.report.identity_overrides.is_empty());
+        assert!(
+            !render_action_list(&list).contains("Identity overridden"),
+            "nothing has been overridden, so nothing is printed"
+        );
+    }
+
+    /// The rendered shape, pinned so a future edit cannot quietly drop the
+    /// heading or the reason line.
+    #[test]
+    fn the_override_section_names_the_work_the_phases_and_the_reason() {
+        let text = render_identity_overrides(&[IdentityOverride {
+            paper_id: "cafe1234-dead-beef-cafe-1234567890ab".into(),
+            phases: vec![
+                scitadel_db::sqlite::IdentityPhase::PreFetch,
+                scitadel_db::sqlite::IdentityPhase::PostFetch,
+            ],
+            reason: "checked by hand against the OSTI record".into(),
+            recorded_at: NOW.into(),
+        }]);
+        assert!(text.contains("1 work(s)"), "{text}");
+        assert!(text.contains("cafe1234"), "{text}");
+        assert!(text.contains("pre_fetch, post_fetch"), "{text}");
+        assert!(
+            text.contains("checked by hand against the OSTI record"),
+            "{text}"
+        );
+        assert!(text.contains(NOW), "and when it was recorded: {text}");
     }
 }
 

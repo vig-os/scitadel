@@ -415,6 +415,18 @@ pub struct CoverageReport {
     /// [`Self::filtered`] can recount instead of guessing.
     #[serde(skip)]
     version_mismatches: BTreeSet<WantKey>,
+    /// Works whose identity a **person** has settled
+    /// (`paper_identity_checks.status = 'overridden'`), with the reason they
+    /// gave (#253's escape hatch).
+    ///
+    /// Library-wide, like [`Self::works_total`], and **not** part of the missing
+    /// totals: an override is not a want and not an artefact, so counting it in
+    /// either would break the accounting ADR-007 §2 requires. It is here so that
+    /// both projections can *show* it, which is the difference between an
+    /// override and a silent behaviour change — a work that stopped blocking
+    /// because a person said so looks exactly like a work that stopped blocking
+    /// because the matcher changed, and only the reason distinguishes them.
+    pub identity_overrides: Vec<crate::sqlite::identity::IdentityOverride>,
 }
 
 /// Why a coverage read failed. A distinct type rather than a [`DbError`]
@@ -509,6 +521,7 @@ impl CoverageReport {
             works_in_scope: self.works_in_scope,
             untracked_works: self.untracked_works,
             held_untracked_works: self.held_untracked_works,
+            identity_overrides: self.identity_overrides,
         })
     }
 
@@ -971,6 +984,11 @@ pub fn coverage_report(
         held_untracked_works,
         work_dois: BTreeMap::new(),
         version_mismatches: BTreeSet::new(),
+        // Propagated rather than defaulted: a report that printed "no overrides"
+        // because the read failed would be indistinguishable from one that
+        // printed it because there are none — which is exactly the silence
+        // `scitadel override-identity` exists to avoid.
+        identity_overrides: crate::sqlite::identity::identity_overrides(conn)?,
     };
 
     for want in wants {

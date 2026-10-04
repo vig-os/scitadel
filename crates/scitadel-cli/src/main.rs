@@ -227,6 +227,35 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Settle a work's identity by hand: the identity gate stops blocking it
+    /// (#253)
+    ///
+    /// ADR-007 §3 says a mismatch "blocks filing anything under that DOI", and
+    /// every other verdict scitadel records is chosen so a person can overturn
+    /// it. This is that door. It records an `overridden` row against **both**
+    /// identity phases with a reason you have to type — an unexplained override
+    /// is indistinguishable from a bug — and returns a work blocked by a
+    /// mismatch to the `acquire` queue, because leaving it there would keep
+    /// asking you to check a DOI you have just checked.
+    ///
+    /// A later `acquire` run does not re-ask the question and does not undo this:
+    /// an `overridden` row is write-once against machine verdicts. The override is
+    /// printed by `scitadel coverage` and `scitadel action_list`.
+    ///
+    /// A separate command rather than a flag on `acquire`, because a flag that
+    /// silently also drained the queue would make "check this one DOI" and "fetch
+    /// the whole library" the same invocation.
+    OverrideIdentity {
+        /// Paper id (full id or unambiguous prefix)
+        paper: String,
+        /// Why the machine was wrong. Required — there is no default, and an empty
+        /// reason is refused.
+        #[arg(long, value_name = "TEXT")]
+        reason: String,
+        /// Emit the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Fetch the full texts the library wants and does not hold (ADR-007 §2, §3)
     ///
     /// Drains the `acquire` queue — the recorded gaps ADR-007 §2 routes to
@@ -596,6 +625,11 @@ async fn main() -> Result<()> {
         Commands::ImportFlat { paper, root } => commands::import_flat(&paper, &root),
         Commands::Coverage { kind, json } => commands::coverage(kind.as_deref(), json),
         Commands::ActionList { json } => commands::action_list(json),
+        Commands::OverrideIdentity {
+            paper,
+            reason,
+            json,
+        } => commands::override_identity(&paper, &reason, json),
         Commands::Acquire {
             dry_run,
             resume,

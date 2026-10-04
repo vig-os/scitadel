@@ -5,6 +5,7 @@ mod assessments;
 mod blobs;
 mod citations;
 mod coverage;
+mod identity;
 mod migrations;
 mod pacer;
 mod paper_aliases;
@@ -26,7 +27,8 @@ pub use artefacts::{
     ACCESS_BASIS_MANUAL, ArtefactWrite, BlobWrite, DownloadWrite, FULLTEXT_LOCATOR, FulltextKind,
     ROUTE_IMPORT_FLAT, StateRow, StateWrite, VERSION_UNKNOWN, WriteMode, artefact_id,
     delete_acquisition_states_at, fulltext_kind, has_fulltext_artefact, read_acquisition_state,
-    record_download, write_acquisition_states, write_artefacts, write_artefacts_in,
+    record_download, write_acquisition_states, write_acquisition_states_in, write_artefacts,
+    write_artefacts_in,
 };
 pub use assessments::SqliteAssessmentRepository;
 /// ADR-007 §1 "Storage": the content-addressed blob store.
@@ -38,6 +40,17 @@ pub use coverage::{
     ALL_STATUSES, ALL_WANT_KINDS, ActionGroup, ActionList, CoverageError, CoverageReport,
     DeferredGroup, FULLTEXT_ARTEFACT_KINDS, KindTotal, MissingEntry, PublisherKey, StatusVocab,
     UNTRACKED_VERSION_ROUTES, UnknownWantKind, status_vocab, version_satisfies,
+};
+/// ADR-007 §3, last paragraph: "Identity is checked twice, and a mismatch
+/// blocks filing anything under that DOI." The `paper_identity_checks` writer and
+/// reader, the `acquisition_attempts` writer, and the `overridden` escape hatch
+/// that stops a machine from re-asking a question a person has already answered.
+pub use identity::{
+    ALL_ATTEMPT_OUTCOMES, ALL_PHASES, ALL_SOURCES, AttemptWrite, IdentityCheckRow,
+    IdentityCheckWrite, IdentityError, IdentityOverride, IdentityOverrideReport, IdentityPhase,
+    IdentitySource, IdentityStatus, IdentityWrite, correct_doi, identity_overrides,
+    latest_identity_check, override_identity, read_osti_id, record_attempt, write_identity_check,
+    write_osti_id,
 };
 pub use migrations::run_migrations;
 pub use pacer::{PolicyLookup, SqlitePacer};
@@ -325,6 +338,67 @@ impl Database {
     ) -> Result<usize, DbError> {
         let conn = self.pool.get()?;
         artefacts::delete_acquisition_states_at(&conn, paper_id, drop_path)
+    }
+
+    /// ADR-007 §3: record one identity check for `(paper_id, phase)`.
+    ///
+    /// A method for the same reason as [`Self::write_acquisition_states`] is not:
+    /// the download chain lives outside this crate and must not need a direct
+    /// `rusqlite` dependency to record a verdict about a work's identity.
+    pub fn write_identity_check(&self, row: &IdentityCheckWrite) -> Result<IdentityWrite, DbError> {
+        let mut conn = self.pool.get()?;
+        identity::write_identity_check(&mut conn, row)
+    }
+
+    /// ADR-007 §3: the check in force for `(paper_id, phase)`.
+    ///
+    /// `None` means no check has ever been taken, which is **not** the same as
+    /// `unverified`: that means the caller has not looked yet.
+    pub fn latest_identity_check(
+        &self,
+        paper_id: &str,
+        phase: IdentityPhase,
+    ) -> Result<Option<IdentityCheckRow>, DbError> {
+        let conn = self.pool.get()?;
+        identity::latest_identity_check(&conn, paper_id, phase)
+    }
+
+    /// ADR-007 §3: a person overturns the machine's verdict on a work. See
+    /// [`identity::override_identity`]; requires a reason.
+    pub fn override_identity(
+        &self,
+        paper_id: &str,
+        reason: &str,
+    ) -> Result<IdentityOverrideReport, IdentityError> {
+        let mut conn = self.pool.get().map_err(DbError::from)?;
+        identity::override_identity(&mut conn, paper_id, reason)
+    }
+
+    /// Every standing override, for `coverage` and `action_list` to show.
+    pub fn identity_overrides(&self) -> Result<Vec<IdentityOverride>, DbError> {
+        let conn = self.pool.get()?;
+        identity::identity_overrides(&conn)
+    }
+
+    /// ADR-007 §1: record one `acquisition_attempts` row — including a fetch
+    /// that deliberately filed nothing.
+    pub fn record_attempt(&self, attempt: &AttemptWrite) -> Result<i64, DbError> {
+        let conn = self.pool.get()?;
+        identity::record_attempt(&conn, attempt)
+    }
+
+    /// `papers.osti_id` for `paper_id`; the identifier ADR-007 §3 step 3 fetches
+    /// DOE national-lab reports by.
+    pub fn osti_id(&self, paper_id: &str) -> Result<Option<String>, DbError> {
+        let conn = self.pool.get()?;
+        identity::read_osti_id(&conn, paper_id)
+    }
+
+    /// Set `papers.osti_id` for `paper_id`, on its own column so nothing that
+    /// saves a whole `Paper` can clobber it.
+    pub fn set_osti_id(&self, paper_id: &str, osti_id: &str) -> Result<bool, DbError> {
+        let conn = self.pool.get()?;
+        identity::write_osti_id(&conn, paper_id, osti_id)
     }
 
     /// Create all repository instances sharing this database.

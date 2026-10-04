@@ -22,8 +22,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
+strsim = { workspace = true } # ADR-007 §3: the identity matcher's title similarity and its surname comparison
 thiserror = { workspace = true }
 tracing = { workspace = true }
+unicode-normalization = { workspace = true } # ADR-007 §3: diacritic-insensitive title matching. Already in Cargo.lock at 0.1.25 (transitively, via idna), so this adds a dependency edge and no new package
 
 [dev-dependencies]
 # The importer's tests assert on `artefacts` rows directly; the library
