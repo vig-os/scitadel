@@ -227,6 +227,41 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Fetch the full texts the library wants and does not hold (ADR-007 §2, §3)
+    ///
+    /// Drains the `acquire` queue — the recorded gaps ADR-007 §2 routes to
+    /// `acquire` — through the existing download ladder. Whether a work is
+    /// already held is decided from `artefacts` **before** anything is
+    /// fetched, so a second run makes no network call for a file the library
+    /// already has.
+    ///
+    /// Statuses that need a person (`needs_ill`, `needs_login`,
+    /// `not_entitled`, `identity_mismatch`, `wrong_version`, …) are not
+    /// fetched: `scitadel action_list` owns those. A work the library already
+    /// holds is not fetched either, and is reported as held rather than as
+    /// nothing to do.
+    ///
+    /// `--kind` accepts `fulltext` only: every ADR-007 §3 route is a
+    /// full-text route, so no other want can be closed by a fetch.
+    Acquire {
+        /// Print the plan — what would be fetched, what is held, what is
+        /// deferred — and write nothing and request nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Only fetch what is due: a gap whose `next_attempt_at` is in the
+        /// future is deferred to a later run instead of retried
+        #[arg(long)]
+        resume: bool,
+        /// Restrict to one want kind. Only `fulltext` is acquirable.
+        #[arg(long, value_parser = ["fulltext"])]
+        kind: Option<String>,
+        /// Stop after this many works (applied to the works that are due)
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+        /// Emit the plan and the per-work outcomes as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -561,5 +596,23 @@ async fn main() -> Result<()> {
         Commands::ImportFlat { paper, root } => commands::import_flat(&paper, &root),
         Commands::Coverage { kind, json } => commands::coverage(kind.as_deref(), json),
         Commands::ActionList { json } => commands::action_list(json),
+        Commands::Acquire {
+            dry_run,
+            resume,
+            kind,
+            limit,
+            json,
+        } => {
+            commands::acquire(
+                commands::AcquireOptions {
+                    dry_run,
+                    resume,
+                    kind,
+                    limit,
+                },
+                json,
+            )
+            .await
+        }
     }
 }

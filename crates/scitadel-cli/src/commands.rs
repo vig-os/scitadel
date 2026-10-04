@@ -2138,6 +2138,245 @@ fn short_id(paper_id: &str) -> String {
         .to_string()
 }
 
+// ---------- acquire (ADR-007 §2 "Status vocabulary", §3 "Routes and the ladder")
+
+/// What `acquire` was asked for. One struct so the flags cannot be re-ordered
+/// into a different request by a call site.
+#[derive(Debug, Default)]
+pub struct AcquireOptions {
+    /// `--dry-run`: plan only, no writes and no requests.
+    pub dry_run: bool,
+    /// `--resume`: only fetch what is due.
+    pub resume: bool,
+    pub kind: Option<String>,
+    pub limit: Option<usize>,
+}
+
+/// `scitadel acquire [--dry-run] [--resume] [--kind] [--limit] [--json]`.
+///
+/// Drains the `acquire` queue — the `acquisition_state` rows ADR-007 §2 routes
+/// to `acquire` — through the existing ladder. The decision of *which* works to
+/// fetch is made from the derived "have" before anything is fetched, so a
+/// second run over a library that already holds its full texts puts nothing on
+/// the wire; see `scitadel_adapters::acquire`.
+pub async fn acquire(opts: AcquireOptions, json: bool) -> Result<()> {
+    let config = load_config();
+    // Opened for the pacing ledger as well as the rows: the downloader spends
+    // from the same SQLite ledger the rest of scitadel uses, and two in-memory
+    // ledgers is the twice-the-traffic failure ADR-007 §4 exists to prevent.
+    let db = Database::open(&config.db_path).context("open database for the pacing ledger")?;
+    db.migrate().context("migration failed")?;
+
+    let request = scitadel_adapters::acquire::AcquireRequest {
+        paper_ids: Vec::new(),
+        kind: opts.kind.clone(),
+        limit: opts.limit,
+        resume: opts.resume,
+        dry_run: opts.dry_run,
+    };
+
+    // Built even for a dry run: it opens no socket and spends no permit, and
+    // sharing one constructor with the real path is what keeps `--dry-run`
+    // from being a second, subtly different code path.
+    let downloader =
+        scitadel_adapters::download::PaperDownloader::new(db.clone(), config.openalex.auth(), 60.0)
+            .context("build the downloader")?;
+
+    let report = scitadel_adapters::acquire::run(&db, &downloader, &config.papers_dir(), &request)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", render_acquire(&report));
+    }
+    Ok(())
+}
+
+/// `acquire`'s text projection.
+///
+/// Two things here are not decoration. The **held** count is printed next to
+/// the acquired count, because "acquired 0" reads like a failure until you can
+/// see that the work was already done. And every publisher line is either a
+/// label the DOI registry produced or the registry's own wording for why it
+/// produced none — never a TDM verdict for a publisher nobody classified
+/// (#261).
+#[allow(clippy::too_many_lines)]
+fn render_acquire(report: &scitadel_adapters::acquire::AcquireReport) -> String {
+    use std::fmt::Write as _;
+    let plan = &report.plan;
+    let mut out = String::new();
+
+    let _ = writeln!(
+        out,
+        "Acquire — \"have\" is derived from `artefacts` (ADR-007 §1), so nothing already held \
+         is fetched."
+    );
+    if plan.dry_run {
+        let _ = writeln!(
+            out,
+            "Dry run: no writes, no requests. Everything below is what would happen."
+        );
+    }
+    if plan.resume {
+        let _ = writeln!(
+            out,
+            "--resume: a gap whose `next_attempt_at` is in the future is deferred, not retried."
+        );
+    }
+
+    let _ = writeln!(
+        out,
+        "\n{:>6}  {:<20} {:>8} {:>8} {:>8}",
+        "wanted", "kind", "missing", "held", "queued"
+    );
+    let _ = writeln!(
+        out,
+        "{:>6}  {:<20} {:>8} {:>8} {:>8}",
+        "", plan.kind, plan.missing_total, plan.held_total, plan.queued_total
+    );
+    if plan.held_at_another_version > 0 {
+        let _ = writeln!(
+            out,
+            "\n{} of the {} missing are works we DO hold a full text for, at a version the want \
+             does not accept (ADR-007 §2 `wrong_version`).",
+            plan.held_at_another_version, plan.missing_total
+        );
+    }
+    if plan.human_action_total > 0 {
+        let _ = writeln!(
+            out,
+            "{} missing entr{} waiting on a person, not on a fetch — see `scitadel action_list`.",
+            plan.human_action_total,
+            if plan.human_action_total == 1 {
+                "y is"
+            } else {
+                "ies are"
+            }
+        );
+    }
+    if !plan.unmatched.is_empty() {
+        let _ = writeln!(
+            out,
+            "Named but not acquired: {} — no recorded want of this kind for {}.",
+            plan.unmatched.join(", "),
+            if plan.unmatched.len() == 1 {
+                "it"
+            } else {
+                "them"
+            }
+        );
+    }
+
+    if plan.works.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nNothing to fetch: every wanted {} is either held or waiting on a person.",
+            plan.kind
+        );
+    } else {
+        let verb = if plan.dry_run {
+            "Would fetch"
+        } else {
+            "Fetching"
+        };
+        let _ = writeln!(out, "\n{verb} ({})", plan.works.len());
+        for work in &plan.works {
+            let _ = writeln!(
+                out,
+                "  {}  {}  [{}]",
+                short_id(&work.paper_id),
+                work.publisher.as_deref().unwrap_or("—"),
+                work.status
+            );
+            if work.publisher.is_none()
+                && let Some(note) = &work.publisher_note
+            {
+                let _ = writeln!(out, "      {note}");
+            }
+        }
+    }
+    if plan.truncated_by_limit > 0 {
+        let _ = writeln!(
+            out,
+            "--limit {} left {} queued work(s) for a later run.",
+            plan.limit.unwrap_or(0),
+            plan.truncated_by_limit
+        );
+    }
+
+    if !plan.deferred.is_empty() {
+        let _ = writeln!(out, "\nDeferred until due ({})", plan.deferred.len());
+        for work in &plan.deferred {
+            let _ = writeln!(
+                out,
+                "  {}  [{}]  in {}s ({}), not requested",
+                short_id(&work.paper_id),
+                work.status,
+                work.retry_in_seconds,
+                work.next_attempt_at
+            );
+        }
+    }
+
+    if plan.dry_run {
+        return out;
+    }
+
+    let _ = writeln!(
+        out,
+        "\nacquired {}   failed {}   deferred {}   held {} (never requested)",
+        report.acquired(),
+        report.failed(),
+        plan.deferred.len(),
+        plan.held_total
+    );
+    for outcome in &report.outcomes {
+        match outcome.outcome {
+            scitadel_adapters::acquire::FetchOutcome::Acquired => {
+                let _ = writeln!(
+                    out,
+                    "  + {}  {} via {}  {} bytes",
+                    short_id(&outcome.paper_id),
+                    outcome.access.as_deref().unwrap_or(""),
+                    outcome.route.as_deref().unwrap_or("?"),
+                    outcome.bytes.unwrap_or(0)
+                );
+            }
+            scitadel_adapters::acquire::FetchOutcome::Failed => {
+                // The status is the walk's, and the reason enumerates the
+                // routes it considered. Printing `error` without it would be
+                // the report-overstates-the-evidence failure #260 was filed
+                // for.
+                let _ = writeln!(
+                    out,
+                    "  ! {}  [{}]{}",
+                    short_id(&outcome.paper_id),
+                    outcome.status.as_deref().unwrap_or("?"),
+                    outcome
+                        .next_attempt_at
+                        .as_deref()
+                        .map(|at| format!("  retry at {at}"))
+                        .unwrap_or_default()
+                );
+                if let Some(reason) = &outcome.reason {
+                    let _ = writeln!(out, "      {reason}");
+                }
+            }
+            scitadel_adapters::acquire::FetchOutcome::NotAttempted => {
+                let _ = writeln!(
+                    out,
+                    "  - {}  not attempted: {}",
+                    short_id(&outcome.paper_id),
+                    outcome.error.as_deref().unwrap_or("")
+                );
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod bib_diff_tests {
     //! Unit tests for the CLI's `bib diff` plumbing. The pure-logic
@@ -2470,8 +2709,10 @@ mod coverage_action_list_tests {
             wanted_version: "vor".into(),
             status: status.into(),
             reason: Some(format!("why {status} happened on {paper_id}")),
+            publisher: None,
             hint_url: Some("https://doi.org/10.1039/d0nr01234a".into()),
             drop_path: None,
+            next_attempt_at: None,
             updated_at: NOW.into(),
         })
         .unwrap();

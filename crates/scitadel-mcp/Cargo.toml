@@ -33,6 +33,13 @@ sha2 = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = { workspace = true }
+# Only for `acquire`'s test seam. An MCP `acquire` that reached the network
+# would be untestable, and the test has to *count requests* to prove which
+# works were asked for — so it builds its own `PacedClient` and points the
+# ladder at a wiremock server. Neither crate is a runtime dependency: the tool
+# itself goes through `scitadel-adapters`' public `PaperDownloader`.
+scitadel-http = { path = "../scitadel-http", version = "0.8.0" } # x-release-please-version
+wiremock = { workspace = true }
 
 [lints]
 workspace = true

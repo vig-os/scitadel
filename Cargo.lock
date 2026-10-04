@@ -3021,6 +3021,7 @@ dependencies = [
  "scitadel-core",
  "scitadel-db",
  "scitadel-export",
+ "scitadel-http",
  "scitadel-scoring",
  "scraper",
  "serde",
@@ -3030,6 +3031,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]

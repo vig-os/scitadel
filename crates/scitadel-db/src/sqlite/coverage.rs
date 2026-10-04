@@ -1181,8 +1181,13 @@ mod tests {
             wanted_version: wanted_version.into(),
             status: status.into(),
             reason: None,
+            // No publisher and no retry time: this helper is about the *want*,
+            // and a fixture that stored a publisher would let a test pass on a
+            // publisher it never meant to exercise.
+            publisher: None,
             hint_url: None,
             drop_path: None,
+            next_attempt_at: None,
             updated_at: NOW.into(),
         }
     }

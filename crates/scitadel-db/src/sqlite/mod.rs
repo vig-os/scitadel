@@ -24,9 +24,9 @@ pub use annotations::{SqliteAnnotationRepository, resolve_anchor};
 /// flat-layout importer (`scitadel_adapters::import_flat`).
 pub use artefacts::{
     ACCESS_BASIS_MANUAL, ArtefactWrite, BlobWrite, DownloadWrite, FULLTEXT_LOCATOR, FulltextKind,
-    ROUTE_IMPORT_FLAT, StateWrite, VERSION_UNKNOWN, WriteMode, artefact_id,
-    delete_acquisition_states_at, fulltext_kind, has_fulltext_artefact, record_download,
-    write_acquisition_states, write_artefacts, write_artefacts_in,
+    ROUTE_IMPORT_FLAT, StateRow, StateWrite, VERSION_UNKNOWN, WriteMode, artefact_id,
+    delete_acquisition_states_at, fulltext_kind, has_fulltext_artefact, read_acquisition_state,
+    record_download, write_acquisition_states, write_artefacts, write_artefacts_in,
 };
 pub use assessments::SqliteAssessmentRepository;
 /// ADR-007 §1 "Storage": the content-addressed blob store.
@@ -290,6 +290,23 @@ impl Database {
         let mut conn = self.pool.get()?;
         artefacts::write_acquisition_states(&mut conn, std::slice::from_ref(row))?;
         Ok(())
+    }
+
+    /// ADR-007 §1: read back the want row for `(paper_id, kind, locator)`.
+    ///
+    /// Exists so a caller outside this crate can read a gap and write it back
+    /// without taking a direct `rusqlite` dependency — `acquire`'s
+    /// read-modify-write of `next_attempt_at` is the caller that needs it.
+    /// `None` means no want is recorded, which says nothing about whether the
+    /// artefact is held: only [`Self::coverage_report`] can say that.
+    pub fn acquisition_state(
+        &self,
+        paper_id: &str,
+        kind: &str,
+        locator: &str,
+    ) -> Result<Option<StateRow>, DbError> {
+        let conn = self.pool.get()?;
+        artefacts::read_acquisition_state(&conn, paper_id, kind, locator)
     }
 
     /// ADR-007 §1 "Have": does this work already hold a full text?

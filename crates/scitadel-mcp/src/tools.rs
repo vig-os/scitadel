@@ -2296,6 +2296,97 @@ pub fn bib_diff_tool(
     serde_json::to_string(&diff).map_err(|e| e.to_string())
 }
 
+// ===== acquire (ADR-007 §2 "Status vocabulary", §3 "Routes and the ladder")
+
+/// `acquire` MCP tool — fetch the full texts the library wants and does not
+/// hold.
+///
+/// Full text only: every ADR-007 §3 route is a full-text route, so no other
+/// want kind can be closed by a fetch. Gaps that need a *person*
+/// (`needs_ill`, `needs_login`, `not_entitled`, `identity_mismatch`,
+/// `wrong_version`, …) are not fetched either — `action_list` owns those, and
+/// re-asking a publisher about a work whose obstacle is an ILL request is
+/// waste, not caution.
+///
+/// Which works are eligible is decided from the derived "have" before
+/// anything is fetched, so re-running this over a library that already holds
+/// its full texts makes **no network calls at all**. `dry_run: true` returns
+/// that decision as the `plan` with an empty `outcomes` list and writes
+/// nothing.
+///
+/// The result is the same JSON the CLI's `scitadel acquire --json` prints, so
+/// an agent and a person read one shape.
+pub async fn acquire_tool(
+    paper_ids: Vec<String>,
+    dry_run: Option<bool>,
+    resume: Option<bool>,
+    limit: Option<u32>,
+) -> Result<String, String> {
+    let config = load_config();
+    // One database for both halves of ADR-007: the pacing ledger the
+    // downloader spends from, and the rows a completed download is written
+    // into. Same reason as `download_paper_tool`.
+    let db = open_db()?;
+    let downloader =
+        scitadel_adapters::download::PaperDownloader::new(db.clone(), config.openalex.auth(), 60.0)
+            .map_err(|e| e.to_string())?;
+    let request = scitadel_adapters::acquire::AcquireRequest {
+        paper_ids,
+        kind: None,
+        limit: limit.map(|l| l as usize),
+        resume: resume.unwrap_or(false),
+        dry_run: dry_run.unwrap_or(false),
+    };
+    acquire_with(&db, &downloader, &config.papers_dir(), &request).await
+}
+
+/// [`acquire_tool`] over a caller-supplied downloader and destination.
+///
+/// The seam exists for the test that proves the queue drains **only** the
+/// enqueued works: pointing the ladder at a `wiremock` server and counting
+/// requests is the only way to assert which works were asked for, and an agent
+/// cannot be trusted to reach the network in a test at all.
+pub(crate) async fn acquire_with(
+    db: &Database,
+    downloader: &scitadel_adapters::download::PaperDownloader,
+    papers_dir: &std::path::Path,
+    request: &scitadel_adapters::acquire::AcquireRequest,
+) -> Result<String, String> {
+    let report = scitadel_adapters::acquire::run(db, downloader, papers_dir, request)
+        .await
+        .map_err(|e| e.to_string())?;
+    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
+}
+
+/// `acquire_queue_add` MCP tool — put works in the `acquire` queue.
+///
+/// ADR-007 §2 calls `pending` "the `acquire` queue", so this records a
+/// `pending` full-text want for each id: a work nobody asked for has no
+/// recorded gap, and `acquire` will not invent one. Pair with `acquire`.
+///
+/// A work that already has a want row is **left alone** — in particular a
+/// `needs_ill` row, which is a human decision — and reported under
+/// `already_queued`. Ids that match no work are reported under `unknown`
+/// rather than aborting the batch. Re-enqueueing writes nothing.
+///
+/// A work whose full text is already held is still enqueued, and that costs
+/// nothing: the ADR-007 §1 derivation reads the new want as satisfied, so it
+/// is never reported missing and `acquire` never requests it.
+pub fn acquire_queue_add_tool(paper_ids: Vec<String>) -> Result<String, String> {
+    let db = open_db()?;
+    acquire_queue_add_with(&db, &paper_ids)
+}
+
+/// [`acquire_queue_add_tool`] over a caller-supplied database — the same test
+/// seam as [`acquire_with`], and the reason this tool takes no downloader.
+pub(crate) fn acquire_queue_add_with(
+    db: &Database,
+    paper_ids: &[String],
+) -> Result<String, String> {
+    let report = scitadel_adapters::acquire::queue_add(db, paper_ids).map_err(|e| e.to_string())?;
+    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
