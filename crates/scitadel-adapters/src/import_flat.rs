@@ -272,8 +272,13 @@ pub fn import_flat_tree(
 
 /// Which slot of the flat layout a directory (or the paper directory
 /// itself) is.
+///
+/// Public because `scitadel scan` and `scitadel attach` classify a directory
+/// tree with the **same** slot vocabulary: `si/`, `tables/`, `figures/` mean the
+/// same thing to both commands, and two classifiers for them would eventually
+/// disagree about what `supplements/` is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Slot {
+pub enum Slot {
     FullText,
     Si,
     Table,
@@ -283,7 +288,7 @@ enum Slot {
 impl Slot {
     /// The `artefacts.kind` this slot produces, or `None` for the
     /// full-text slot, whose kind comes from the file extension.
-    const fn kind(self) -> Option<&'static str> {
+    pub const fn kind(self) -> Option<&'static str> {
         match self {
             Self::FullText => None,
             Self::Si => Some("si"),
@@ -295,33 +300,37 @@ impl Slot {
 
 /// One file found in the tree, before hashing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Candidate {
+pub(crate) struct Candidate {
     /// Absolute, as walked. For a figure reference with no bytes this is
     /// the caption sidecar, which is where its information came from —
     /// and therefore what `imported_from` records.
-    path: PathBuf,
+    pub(crate) path: PathBuf,
     /// `false` only for a figure that exists solely as a caption
     /// (ADR-007 §1 "Artefact rules": `sha256 IS NULL` for exactly this
     /// case).
-    has_bytes: bool,
-    slot: Slot,
+    pub(crate) has_bytes: bool,
+    pub(crate) slot: Slot,
     /// The resolved `artefacts.kind`.
-    kind: &'static str,
+    pub(crate) kind: &'static str,
     /// The file's own stem — the human label (`Supplementary Table 1`).
-    label: String,
+    pub(crate) label: String,
     /// Normalised, stable locator (`supplementary-table-1`).
-    locator: String,
+    pub(crate) locator: String,
     /// Lowercased extension; `None` for a caption-only reference.
-    format: Option<String>,
-    caption: Option<String>,
+    pub(crate) format: Option<String>,
+    pub(crate) caption: Option<String>,
 }
 
 /// The result of walking the tree.
+///
+/// `pub(crate)` because `scitadel scan` walks the identical tree and reuses this
+/// walk wholesale: two crawlers over one layout would disagree about which files
+/// exist, which is the whole content of `imported_from`.
 #[derive(Debug, Default)]
-struct Scan {
-    candidates: Vec<Candidate>,
-    refused: Vec<PathBuf>,
-    unrecognised: Vec<PathBuf>,
+pub(crate) struct Scan {
+    pub(crate) candidates: Vec<Candidate>,
+    pub(crate) refused: Vec<PathBuf>,
+    pub(crate) unrecognised: Vec<PathBuf>,
 }
 
 /// What a file name means in a given slot.
@@ -403,7 +412,7 @@ fn looks_like_paper_dir(dir: &Path, stem: &str) -> bool {
 /// `canonical_root` is the paper directory after symlink resolution;
 /// anything whose canonical path is not inside it is refused without
 /// being read.
-fn scan_tree(paper_dir: &Path, canonical_root: &Path, stem: &str) -> Scan {
+pub(crate) fn scan_tree(paper_dir: &Path, canonical_root: &Path, stem: &str) -> Scan {
     let mut scan = Scan::default();
     let mut stack = vec![(paper_dir.to_path_buf(), Slot::FullText, 0_usize)];
     // (slot, label) → caption text, folded onto the file it describes
@@ -556,7 +565,13 @@ fn sort_candidates(candidates: &mut [Candidate]) {
     });
 }
 
-/// True when `path` — canonicalised — is `root` or lives under it.
+/// True when `path` — resolved — is `root` or lives under it.
+///
+/// The **one** containment check in the workspace. Public because
+/// `scitadel scan` walks the same kind of untrusted tree and must not
+/// reimplement this: the bug the docs below describe (canonicalising one side of
+/// the comparison and not the other, so every legitimate file on macOS was
+/// refused) is a bug you get once, here, rather than once per caller.
 ///
 /// Is `path` inside `root`, after resolving both the same way?
 ///
@@ -582,7 +597,7 @@ fn sort_candidates(candidates: &mut [Candidate]) {
 /// refused, because the symlink is followed before the comparison rather than
 /// after it. `Path::starts_with` compares whole components, so
 /// `/lib/papers/other` never passes for a child of `/lib/papers/this`.
-fn within_root(root: &Path, path: &Path) -> bool {
+pub fn within_root(root: &Path, path: &Path) -> bool {
     let resolved_root = resolve_best_effort(root);
     let resolved = resolve_best_effort(path);
     resolved == resolved_root || resolved.starts_with(&resolved_root)
@@ -590,13 +605,17 @@ fn within_root(root: &Path, path: &Path) -> bool {
 
 /// Canonicalise as much of `path` as exists, then re-attach the rest.
 ///
+/// Public as the other half of [`within_root`]: a caller that resolves paths for
+/// its own logging or reporting must resolve them the same way the containment
+/// check did, or its output disagrees with the decision.
+///
 /// `canonicalize` is all-or-nothing: it fails outright on a dangling symlink,
 /// a path with a missing component, or a path whose parent is unreadable.
 /// Those are exactly the cases the importer must still reason about, so this
 /// walks up to the deepest ancestor that resolves and rebuilds downwards.
 /// The `..` in a path are resolved by the ancestor's own canonicalisation, so
 /// `tables/../../secrets.csv` cannot slip through.
-fn resolve_best_effort(path: &Path) -> PathBuf {
+pub fn resolve_best_effort(path: &Path) -> PathBuf {
     if let Ok(resolved) = std::fs::canonicalize(path) {
         return resolved;
     }
@@ -740,7 +759,7 @@ fn split_supplement_marker(lower_name: &str) -> Option<String> {
     (!label.is_empty()).then(|| label.to_string())
 }
 
-fn is_manifest(lower_name: &str) -> bool {
+pub fn is_manifest(lower_name: &str) -> bool {
     matches!(
         lower_name,
         "meta.json" | "tables.json" | "manifest.json" | "figures.json"
@@ -749,7 +768,7 @@ fn is_manifest(lower_name: &str) -> bool {
 
 /// The slot a subdirectory name implies. Case-insensitive, so a tree
 /// written `Tables/` is recognised as readily as `tables/`.
-fn slot_for_dir(name: &str) -> Option<Slot> {
+pub fn slot_for_dir(name: &str) -> Option<Slot> {
     match name.to_ascii_lowercase().as_str() {
         "si" | "supplement" | "supplementary" | "supplements" => Some(Slot::Si),
         "tables" | "table" => Some(Slot::Table),
@@ -805,7 +824,7 @@ fn caption_sidecar(slot: Slot, file_name: &str) -> Option<(Slot, String)> {
 /// Never empty: a name made only of punctuation falls back to a
 /// punctuation-preserving form, which is still stable.
 #[must_use]
-fn normalise_label(raw: &str) -> String {
+pub fn normalise_label(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut pending_separator = false;
     for ch in raw.chars() {
@@ -837,7 +856,7 @@ fn normalise_label(raw: &str) -> String {
 /// keeps the bare locator and the rest take the extension, then an
 /// index. Candidates are walked in sorted order, so the same tree always
 /// produces the same locators.
-fn disambiguate(candidates: Vec<Candidate>) -> Vec<Candidate> {
+pub(crate) fn disambiguate(candidates: Vec<Candidate>) -> Vec<Candidate> {
     let mut candidates = candidates;
     let mut taken: BTreeSet<(Slot, String)> = candidates
         .iter()
@@ -961,7 +980,7 @@ fn plan(
 /// cannot say. `retrieved_at` is *when the content was retrieved*, so it
 /// has to come from the file: stamping it with "now" would make every
 /// re-import of an unchanged tree a change.
-fn modified_at(path: &Path) -> Option<DateTime<Utc>> {
+pub(crate) fn modified_at(path: &Path) -> Option<DateTime<Utc>> {
     std::fs::metadata(path)
         .ok()?
         .modified()
@@ -1025,7 +1044,11 @@ fn record_gaps(
 
 /// MIME type for an imported file's extension. SI is unbounded, so this
 /// falls back to `application/octet-stream` rather than refusing.
-fn mime_for(ext: &str) -> &'static str {
+///
+/// Public because the answer is stored in `blobs.mime` and read back by anything
+/// that serves a stored artefact: two tables would give one blob two MIMEs
+/// depending on which command put it there.
+pub fn mime_for(ext: &str) -> &'static str {
     match ext {
         "pdf" => "application/pdf",
         "html" | "htm" | "xhtml" => "text/html",

@@ -101,6 +101,18 @@ use serde::Serialize;
 
 use crate::download::PaperDownloader;
 use crate::error::AdapterError;
+use crate::manifest;
+
+/// ADR-007, #253's last acceptance criterion: "raid's `p1`/`p3` NDJSON
+/// acquisition fields import via `acquire --from works.ndjson` (curation statuses
+/// stay raid's)". The importer lives beside this module and is re-exported here,
+/// because the queue import is part of *acquire* rather than a second way into
+/// `acquisition_state` — an imported gap must become actionable by
+/// [`plan`], which is only true if it arrived through the same table this
+/// module reads.
+pub use crate::acquire_ndjson::{
+    IdentityDisagreement, NdjsonImport, PreservedStatus, import_ndjson_queue, stored_status,
+};
 
 /// The one `acquisition_state.kind` this ladder can close.
 ///
@@ -118,6 +130,10 @@ const WANTED_VERSION: &str = "vor";
 
 /// `acquisition_state.status` for a queued work nobody has tried yet.
 const STATUS_PENDING: &str = "pending";
+
+/// How long a work's lease is held for while its ladder walk runs. ADR-007 §1's
+/// own default; see [`scitadel_db::sqlite::leases`].
+pub const LEASE_TTL_MS: i64 = scitadel_db::sqlite::LEASE_TTL_MS;
 
 /// How long a transient failure waits before `acquire --resume` retries it.
 ///
@@ -634,6 +650,27 @@ async fn one(
         }
     };
 
+    // ADR-007 §1 "Leases": claim the work before a single request leaves the
+    // process, so two `acquire` runs over one library never fetch the same work
+    // concurrently. A live holder is an ordinary outcome, reported as
+    // `NotAttempted` rather than as a failure — see the ADR's "No row returned
+    // means another live process holds the lease".
+    let owner = scitadel_db::sqlite::new_lease_owner();
+    if db
+        .acquire_lease(&work.paper_id, &owner, LEASE_TTL_MS)?
+        .is_none()
+    {
+        return Ok(outcome(
+            work,
+            FetchOutcome::NotAttempted,
+            None,
+            Some(format!(
+                "another live process holds the lease on {}, so nothing was fetched",
+                work.paper_id
+            )),
+        ));
+    }
+
     tracing::info!(
         paper_id = %work.paper_id,
         status = %work.status,
@@ -641,7 +678,51 @@ async fn one(
         "acquire: walking the ladder"
     );
 
-    match downloader.download_paper(&paper, papers_dir).await {
+    // ADR-007 §1 "Leases": "The holder renews while fetching." The renewal runs
+    // on a timer **while the request is in flight**, not after it — a paced
+    // fetch against a publisher host is minutes long, and a claim that expired
+    // in the middle of one is a claim a second process is entitled to take. The
+    // fetch future is pinned once, so a renewal tick never restarts a request
+    // that is already in progress.
+    let fetch = downloader.download_paper(&paper, papers_dir);
+    tokio::pin!(fetch);
+    let mut renew = tokio::time::interval(std::time::Duration::from_millis(
+        scitadel_db::sqlite::LEASE_RENEW_EVERY_MS,
+    ));
+    let fetched = loop {
+        tokio::select! {
+            result = &mut fetch => break result,
+            _ = renew.tick() => {
+                if !db.renew_lease(&work.paper_id, &owner, LEASE_TTL_MS)? {
+                    // The work was taken over. Dropping the in-flight request is
+                    // safe: nothing is written until `record_download` commits,
+                    // which is after the whole body has arrived.
+                    tracing::warn!(
+                        paper_id = %work.paper_id,
+                        "lost the lease mid-fetch; abandoning this attempt"
+                    );
+                    break Err(AdapterError::Other(format!(
+                        "lost the lease on {} to another live process mid-fetch, so nothing was \
+                         filed by this run",
+                        work.paper_id
+                    )));
+                }
+            }
+        }
+    };
+
+    // The manifest, after the commit the ladder already made, and before the
+    // claim is given up — ADR-007 §1: "written only by the lease holder, after
+    // the DB commit". A mirror that cannot be written is not a failed fetch: the
+    // database is right, and the next lease holder regenerates it.
+    if fetched.is_ok()
+        && let Err(e) = manifest::write(db, &paper, &owner)
+    {
+        tracing::warn!(error = %e, "could not write the manifest mirror");
+    }
+    let _ = db.release_lease(&work.paper_id, &owner);
+
+    match fetched {
         Ok(result) => Ok(WorkOutcome {
             paper_id: work.paper_id.clone(),
             outcome: FetchOutcome::Acquired,
@@ -668,6 +749,30 @@ async fn one(
             Ok(out)
         }
     }
+}
+
+/// `acquire --from <queue.ndjson>`: import raid's queue, then drain it.
+///
+/// The import runs **first** and separately from the drain, because it is a
+/// reconciliation of a file and the drain is a reconciliation of the library —
+/// two different idempotence stories. Importing them would make a dry run
+/// ambiguous: `--dry-run` promises no writes, and a queue import is a write.
+pub async fn run_from_ndjson(
+    db: &Database,
+    downloader: &PaperDownloader,
+    papers_dir: &Path,
+    request: &AcquireRequest,
+    source: &Path,
+) -> Result<(NdjsonImport, AcquireReport), AcquireError> {
+    if request.dry_run {
+        return Err(AcquireError::UnsupportedKind(format!(
+            "`--from {}` imports a queue, which writes `acquisition_state` rows, so it cannot              run under --dry-run: the flag promises no writes. Run it without --dry-run to import              the queue, then `scitadel acquire --dry-run` to see what would be fetched.",
+            source.display()
+        )));
+    }
+    let import = import_ndjson_queue(db, source)?;
+    let report = run(db, downloader, papers_dir, request).await?;
+    Ok((import, report))
 }
 
 /// A [`WorkOutcome`] with everything but the retry time filled in.
@@ -820,7 +925,10 @@ pub fn queue_add(db: &Database, paper_ids: &[String]) -> Result<QueueAddReport, 
 ///
 /// The prefix arm exists because every other scitadel surface accepts one
 /// (#232): an id a tool printed must work on the way back in.
-fn paper_of(db: &Database, id: &str) -> Result<Option<Paper>, scitadel_core::error::CoreError> {
+pub(crate) fn paper_of(
+    db: &Database,
+    id: &str,
+) -> Result<Option<Paper>, scitadel_core::error::CoreError> {
     let (paper_repo, _, _, _, _) = db.repositories();
     if let Some(paper) = paper_repo.get(id)? {
         return Ok(Some(paper));
@@ -2346,6 +2454,303 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["p-plain"],
             "the satisfied want is not fetched, and the human's row is not ours"
+        );
+    }
+
+    /// #253's last acceptance criterion: "raid's `p1`/`p3` NDJSON acquisition
+    /// fields import via `acquire --from works.ndjson` (curation statuses stay
+    /// raid's)".
+    ///
+    /// Asserted on both halves, because the flag is one sentence with a clause in
+    /// each half:
+    ///
+    /// - **imports** — the gap arrives and becomes *actionable*, which is the part
+    ///   that could silently not happen. [`plan`] reads the same table this
+    ///   importer writes, so the imported work shows up in `plan.works` with
+    ///   nothing else changed. That is the criterion's "so an imported gap becomes
+    ///   actionable by the existing plan".
+    /// - **curation statuses stay raid's** — a raid status scitadel has no word
+    ///   for is stored verbatim in the gap's `reason` and listed in the report,
+    ///   while `status` holds `pending`. A reader who assumed the importer
+    ///   re-labelled raid's verdicts would find the verdict text intact and the
+    ///   report naming it; one who assumed scitadel dropped it would find it in
+    ///   `reason`.
+    #[tokio::test]
+    async fn acquire_from_ndjson_imports_the_gap_and_preserves_raids_status() {
+        let fx = Fixture::new().await;
+        // A work scitadel already holds, with the DOI raid's queue file names.
+        fx.paper("p-raid", Some(UNKNOWN_DOI));
+
+        let queue = fx.dir.path().join("works.ndjson");
+        std::fs::write(
+            &queue,
+            // A blank line, one line naming a work this library does not have, and
+            // one raid row: a top-level curation status raid invented, one
+            // per-artefact status that happens to be one of ADR-007 §2's own
+            // words, and a field this build does not read.
+            // NDJSON: one complete object per line. The raid row is deliberately
+            // one long line, because a pretty-printed object is two lines and the
+            // format does not allow it.
+            format!(
+                "\n{{\"doi\": \"10.99999/not-in-this-library\", \"artefacts\": [\"fulltext\"]}}\n\
+                 {{\"doi\": \"https://doi.org/{UNKNOWN_DOI}\", \"curation_status\": \
+                 \"accepted_by_reviewer\", \"curation_note\": \"screen\", \"artefacts\": \
+                 [{{\"kind\": \"fulltext\"}}, {{\"kind\": \"si\", \"label\": \"Supporting \
+                 Information S1\", \"status\": \"needs_ill\", \"hint_url\": \
+                 \"https://example.org/s1\"}}]}}\n"
+            ),
+        )
+        .expect("write the queue");
+
+        // Nothing is queued yet: the import is what creates the gaps.
+        assert!(
+            plan(&fx.db, &AcquireRequest::queue())
+                .expect("plan")
+                .works
+                .is_empty()
+        );
+
+        let import = import_ndjson_queue(&fx.db, &queue).expect("import");
+
+        // ---- the import half ----
+        assert_eq!(import.rows_read, 2, "{import:?}");
+        assert_eq!(import.gaps_written, 2, "one fulltext want, one si want");
+        assert_eq!(
+            import.works,
+            vec!["p-raid".to_string()],
+            "and both belong to the one work raid named"
+        );
+        assert_eq!(
+            import.unknown,
+            vec!["10.99999/not-in-this-library".to_string()],
+            "a work this library does not hold is reported, not created"
+        );
+
+        // ---- "curation statuses stay raid's" ----
+        // Every curation status the import read is listed, in file order.
+        assert_eq!(import.preserved_statuses.len(), 2, "{import:?}");
+
+        // The fulltext want inherited the row-level status, which is raid's own
+        // vocabulary and has no scitadel equivalent.
+        let fulltext = &import.preserved_statuses[0];
+        assert_eq!(fulltext.kind, "fulltext");
+        assert_eq!(
+            fulltext.raid_status, "accepted_by_reviewer",
+            "character for character — raid's own word, never normalised"
+        );
+        assert_eq!(
+            fulltext.stored_as, "pending",
+            "`pending` is a claim about scitadel — never tried by us — not a translation of \
+             raid's verdict"
+        );
+        assert!(
+            fulltext.in_reason,
+            "and raid's own words are preserved verbatim beside it"
+        );
+
+        // The SI's status was already ADR-007 §2's own word, so it passes through
+        // with nothing else to preserve.
+        let si = &import.preserved_statuses[1];
+        assert_eq!(si.kind, "si");
+        assert_eq!(si.locator, "supporting-information-s1");
+        assert_eq!(si.raid_status, "needs_ill");
+        assert_eq!(
+            si.stored_as, "needs_ill",
+            "raid's word, verbatim — not re-spelled, not re-cased"
+        );
+        assert!(
+            !si.in_reason,
+            "and `status` already carries it, so `reason` adds nothing"
+        );
+
+        // Read the rows back off disk: the verdict must be *in the database*, not
+        // only in the report.
+        let fulltext_gap = fx
+            .db
+            .acquisition_state("p-raid", FULLTEXT_KIND, FULLTEXT_LOCATOR)
+            .expect("read")
+            .expect("a want");
+        assert_eq!(fulltext_gap.status, "pending");
+        let reason = fulltext_gap
+            .reason
+            .clone()
+            .expect("the verdict was preserved");
+        assert!(
+            reason.contains("accepted_by_reviewer"),
+            "raid's curation status survives verbatim: {reason}"
+        );
+        assert!(
+            !fulltext_gap.status.contains("review"),
+            "and nothing invented a scitadel-sounding status for it"
+        );
+
+        let si_gap = fx
+            .db
+            .acquisition_state("p-raid", "si", "supporting-information-s1")
+            .expect("read")
+            .expect("a want");
+        assert_eq!(
+            si_gap.status, "needs_ill",
+            "raid's word, stored as it stands"
+        );
+        assert_eq!(
+            si_gap.hint_url.as_deref(),
+            Some("https://example.org/s1"),
+            "and the acquisition half imported too"
+        );
+
+        // ---- the field this build does not read is reported, not dropped ----
+        assert_eq!(
+            import.unknown_fields.iter().cloned().collect::<Vec<_>>(),
+            vec!["curation_note".to_string()],
+            "#247's \"covers raid's queue files without loss\" is a question about this list"
+        );
+
+        // ---- "actionable by the existing plan" ----
+        // The point of the criterion: the imported want is in the queue that
+        // `acquire` already drains, with no new code path between them. `plan` is
+        // pure reads, so the request count stays at zero and this says nothing
+        // about the network.
+        let actionable = plan(&fx.db, &AcquireRequest::queue()).expect("plan");
+        assert_eq!(
+            actionable
+                .works
+                .iter()
+                .map(|w| w.paper_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["p-raid"],
+            "the imported fulltext want is queued for the ladder, and nothing else is"
+        );
+        assert_eq!(actionable.works[0].status, "pending");
+        assert_eq!(
+            fx.request_count().await,
+            0,
+            "planning is pure reads, so this measured nothing about the wire"
+        );
+
+        // The `si` want imported too, and lands where ADR-007 §2 says it does: not
+        // in the fetch queue (no fetch closes an `si`), but in `action_list`.
+        let action_list = fx.db.action_list().expect("action_list");
+        assert!(
+            action_list
+                .groups
+                .iter()
+                .any(|group| group.count() == 1 && group.status == "needs_ill"),
+            "the imported SI want is a human action: {:?}",
+            action_list.groups
+        );
+
+        // And re-importing the same file writes nothing.
+        let before = fx.state_rows();
+        let again = import_ndjson_queue(&fx.db, &queue).expect("re-import");
+        assert_eq!(again.gaps_written, 0);
+        assert_eq!(
+            again.untouched_existing_gaps, 2,
+            "both wants were left as they stood"
+        );
+        assert_eq!(fx.state_rows(), before, "an unchanged queue writes nothing");
+    }
+
+    /// `--from` under `--dry-run` is refused rather than quietly writing: the flag
+    /// promises no writes, and an import is a write.
+    /// ADR-007 §1 "Leases" as the fetch path uses it: a work another live
+    /// process holds is **not fetched at all**, and a work this run fetches is
+    /// claimed and then released.
+    ///
+    /// Both halves, because "no row returned means another live process holds the
+    /// lease" is only useful if the second half is not quietly skipped — a runner
+    /// that ignored the claim would be the two-process failure the table exists to
+    /// prevent, and it would still pass a test that only checked the refusal.
+    ///
+    /// The mount is live for the refused work, so "not fetched" is a measurement.
+    #[tokio::test]
+    async fn a_work_another_process_holds_is_not_fetched_and_our_claim_is_released() {
+        let fx = Fixture::new().await;
+        fx.serve_unpaywall_pdf(UNKNOWN_DOI).await;
+        fx.serve_unpaywall_pdf(NATURE_DOI).await;
+        fx.paper("p-free", Some(UNKNOWN_DOI));
+        fx.paper("p-taken", Some(NATURE_DOI));
+        fx.gap("p-free", "pending", None, None);
+        fx.gap("p-taken", "pending", None, None);
+
+        // Another process holds one of them, with a live lease.
+        let holder = scitadel_db::sqlite::new_lease_owner();
+        assert!(
+            fx.db
+                .acquire_lease("p-taken", &holder, LEASE_TTL_MS)
+                .unwrap()
+                .is_some()
+        );
+
+        let report = fx.acquire(&AcquireRequest::queue()).await;
+        // Both works are planned — `plan` reads the gaps, not the leases — but
+        // only one is attempted. A runner that dropped the leased work from the
+        // plan instead would report it as "nothing to do", which reads like a
+        // healthy queue; reporting it as `NotAttempted` with the reason is what
+        // makes "another process has it" visible.
+        let leased = report
+            .outcomes
+            .iter()
+            .find(|o| o.paper_id == "p-taken")
+            .expect("an outcome for the leased work");
+        assert_eq!(leased.outcome, FetchOutcome::NotAttempted);
+        assert_eq!(leased.status, None, "and nothing was written for it");
+        assert!(
+            leased
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("holds the lease")),
+            "and it says why: {leased:?}"
+        );
+        assert_eq!(report.acquired(), 1, "the free work was acquired");
+        assert_eq!(
+            report.attempted(),
+            1,
+            "`attempted` counts the work put on the wire, and the leased work never was"
+        );
+
+        // Every lease this run took is gone again, so a later run is not blocked
+        // by this one having happened.
+        let held = fx.db.leases().unwrap();
+        assert_eq!(
+            held.iter().map(|l| l.paper_id.as_str()).collect::<Vec<_>>(),
+            vec!["p-taken"],
+            "only the other process's claim survives: {held:?}"
+        );
+
+        // And the manifest for the work we fetched is on disk, written after the
+        // commit by the claim this run held.
+        let (paper_repo, _, _, _, _) = fx.db.repositories();
+        let paper = paper_repo.get("p-free").unwrap().unwrap();
+        let mirror = crate::manifest::manifest_path(fx.dir.path(), &paper);
+        assert!(mirror.exists(), "{}", mirror.display());
+        let body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&mirror).unwrap()).unwrap();
+        assert_eq!(body["work"]["paper_id"], "p-free");
+        assert_eq!(
+            body["artefacts"].as_array().map(Vec::len),
+            Some(1),
+            "and it describes the artefact the commit left behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_queue_import_is_refused_under_dry_run() {
+        let fx = Fixture::new().await;
+        let queue = fx.dir.path().join("works.ndjson");
+        std::fs::write(&queue, "{}\n").unwrap();
+        let err = run_from_ndjson(
+            &fx.db,
+            &fx.downloader(),
+            &fx.papers_dir(),
+            &AcquireRequest::queue().planning(),
+            &queue,
+        )
+        .await
+        .expect_err("refused");
+        assert!(
+            err.to_string().contains("--dry-run"),
+            "the message says why: {err}"
         );
     }
 

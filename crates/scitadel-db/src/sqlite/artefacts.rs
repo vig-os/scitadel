@@ -782,6 +782,139 @@ pub fn delete_acquisition_states_at(
     )?)
 }
 
+/// One `artefacts` row **as stored**, joined with its blob — the reader's
+/// mirror of [`ArtefactWrite`].
+///
+/// A whole row rather than a projected subset for the same reason [`StateRow`] is
+/// one: every caller that reads an artefact has to be able to describe it
+/// faithfully somewhere else, and a subset invites a caller to invent the values
+/// for the columns it did not read. The manifest mirror is the caller today
+/// (`scitadel_adapters::manifest`), and a provenance document that quietly omits
+/// `license_url` because the reader did not select it is worse than no document.
+///
+/// The licence columns are here because ADR-007 §1 says `license_url` is
+/// "licence + provenance" and the consumer decides redistribution from it; a
+/// mirror that left it out would make the mirror unusable for the one purpose it
+/// exists.
+///
+/// `bytes` and `blob_rel_path` come from a `LEFT JOIN` on `blobs`, so a figure
+/// reference with no bytes (`sha256 IS NULL`) and an artefact whose blob row is
+/// absent both read as `None` rather than dropping the row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtefactRow {
+    pub id: String,
+    pub paper_id: String,
+    pub kind: String,
+    pub version: String,
+    pub locator: String,
+    pub sha256: Option<String>,
+    pub format: Option<String>,
+    pub access_status: String,
+    pub route: String,
+    pub access_basis: String,
+    pub label: Option<String>,
+    pub caption: Option<String>,
+    pub source_url: Option<String>,
+    pub publisher: Option<String>,
+    pub publisher_note: Option<String>,
+    pub imported_from: Option<String>,
+    pub retrieved_at: String,
+    pub missing_on_disk: bool,
+    pub license_url: Option<String>,
+    pub license_content_version: Option<String>,
+    pub license_start: Option<String>,
+    pub license_source: Option<String>,
+    /// The blob's size, or `None` when there are no bytes.
+    pub bytes: Option<i64>,
+    /// The blob's **root-relative** path (ADR-007 §1 "Storage"), or `None`.
+    pub blob_rel_path: Option<String>,
+}
+
+/// Every artefact row for `paper_id`, in `(kind, locator)` order.
+///
+/// The order is `coverage.rs`'s, so a projection of this list and a projection of
+/// the report cannot disagree about which artefact comes first.
+pub fn read_artefacts_for_paper(
+    conn: &Connection,
+    paper_id: &str,
+) -> Result<Vec<ArtefactRow>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT a.id, a.paper_id, a.kind, a.version, a.locator, a.sha256, a.format,
+                a.access_status, a.route, a.access_basis, a.label, a.caption, a.source_url,
+                a.publisher, a.publisher_note, a.imported_from, a.retrieved_at,
+                a.missing_on_disk, a.license_url, a.license_content_version, a.license_start,
+                a.license_source, b.bytes, b.rel_path
+           FROM artefacts a
+           LEFT JOIN blobs b ON b.sha256 = a.sha256
+          WHERE a.paper_id = ?1
+          ORDER BY a.kind, a.locator",
+    )?;
+    let rows = stmt.query_map(params![paper_id], |row| {
+        Ok(ArtefactRow {
+            id: row.get(0)?,
+            paper_id: row.get(1)?,
+            kind: row.get(2)?,
+            version: row.get(3)?,
+            locator: row.get(4)?,
+            sha256: row.get(5)?,
+            format: row.get(6)?,
+            access_status: row.get(7)?,
+            route: row.get(8)?,
+            access_basis: row.get(9)?,
+            label: row.get(10)?,
+            caption: row.get(11)?,
+            source_url: row.get(12)?,
+            publisher: row.get(13)?,
+            publisher_note: row.get(14)?,
+            imported_from: row.get(15)?,
+            retrieved_at: row.get(16)?,
+            missing_on_disk: row.get(17)?,
+            license_url: row.get(18)?,
+            license_content_version: row.get(19)?,
+            license_start: row.get(20)?,
+            license_source: row.get(21)?,
+            bytes: row.get(22)?,
+            blob_rel_path: row.get(23)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Delete the **drop-path** gap rows for `(paper_id, kind, locator)` — the gaps
+/// that a file arriving closes.
+///
+/// The companion to [`delete_acquisition_states_at`], and deliberately a different
+/// scope: that one matches an exact `drop_path` string, which is what the
+/// flat-layout importer needs (it knows which path it recorded). This one matches
+/// the **want**, not the path, because a drop-in is recorded from a directory
+/// that has been resolved (`/private/var/…` on macOS, wherever a symlink led) and
+/// a string comparison against an unresolved path retracts nothing at all — a
+/// silent no-op that leaves `coverage` reporting a file we are already holding.
+///
+/// Two clauses keep it off rows that are not ours:
+///
+/// - `kind` and `locator` name exactly one want, so a `table` drop-in never
+///   closes the full-text gap beside it;
+/// - `drop_path IS NOT NULL` is the drop-in signature — the acquisition ladder's
+///   `pending` row has no `drop_path` and is closed by a **fetch**, through
+///   `record_download`'s own retraction, not by a person dropping a file.
+pub fn delete_drop_path_states(
+    conn: &Connection,
+    paper_id: &str,
+    kind: &str,
+    locator: &str,
+) -> Result<usize, DbError> {
+    Ok(conn.execute(
+        "DELETE FROM acquisition_state
+          WHERE paper_id = ?1 AND kind = ?2 AND locator = ?3 AND drop_path IS NOT NULL",
+        params![paper_id, kind, locator],
+    )?)
+}
+
 /// Distinct blob digests among `rows`, for a log line ("how many new
 /// blobs did this cost?").
 #[must_use]

@@ -28,6 +28,36 @@ pub const BLOB_DIR: &str = "blobs";
 /// store itself, which is what makes the final `rename` atomic.
 pub const BLOB_TMP_DIR: &str = ".tmp";
 
+/// ADR-007 §1 "Storage", the size-cap table: a file over its cap is recorded
+/// as an attempt with outcome `too_large`, and no artefact is created.
+pub const CAP_FULLTEXT_BYTES: i64 = 100 * 1024 * 1024;
+/// A single supplementary file. The largest of the three, because SI is
+/// unbounded in kind and routinely a 180-page PDF or a full supplementary
+/// workbook.
+pub const CAP_SI_BYTES: i64 = 250 * 1024 * 1024;
+/// One figure or table image.
+pub const CAP_FIGURE_BYTES: i64 = 20 * 1024 * 1024;
+
+/// The cap that applies to an `artefacts.kind`, in bytes.
+///
+/// `None` for a kind with no cap in ADR-007 §1's table. Deliberately a
+/// **function of the artefact kind and not of its format**, so a 300 MB
+/// supplementary workbook cannot be filed as a `figure` to get under the
+/// smaller cap.
+///
+/// The `fulltext_*` kinds share one cap; `table` shares the figure cap, because
+/// a table artefact is a published image of a table and nothing in the ADR's
+/// table promises otherwise.
+#[must_use]
+pub fn cap_for_kind(kind: &str) -> Option<i64> {
+    Some(match kind {
+        "fulltext_pdf" | "fulltext_html" | "fulltext_xml" => CAP_FULLTEXT_BYTES,
+        "si" => CAP_SI_BYTES,
+        "figure" | "table" => CAP_FIGURE_BYTES,
+        _ => return None,
+    })
+}
+
 /// The library root: the absolute parent directory of the DB file.
 /// `None` for an in-memory database, whose `PRAGMA database_list` file
 /// is the empty string — such a DB gets no blobs (ADR-007 §1
@@ -172,6 +202,22 @@ mod tests {
         assert_eq!(file_extension("../../etc/passwd.pdf"), "pdf");
         assert_eq!(file_extension("no-extension"), "");
         assert_eq!(file_extension("trailing."), "");
+    }
+
+    /// ADR-007 §1 "Storage"'s table, pinned so a later edit to one cap cannot
+    /// quietly change another. The caps are policy, and policy that moves
+    /// without a test is policy nobody reviewed.
+    #[test]
+    fn the_size_caps_are_the_adrs_table() {
+        assert_eq!(cap_for_kind("fulltext_pdf"), Some(100 * 1024 * 1024));
+        assert_eq!(cap_for_kind("fulltext_html"), Some(100 * 1024 * 1024));
+        assert_eq!(cap_for_kind("fulltext_xml"), Some(100 * 1024 * 1024));
+        assert_eq!(cap_for_kind("si"), Some(250 * 1024 * 1024));
+        assert_eq!(cap_for_kind("figure"), Some(20 * 1024 * 1024));
+        // SI is the unbounded kind, so it gets the largest cap by a wide
+        // margin — and no other kind borrows it.
+        assert!(cap_for_kind("si") > cap_for_kind("figure"));
+        assert_eq!(cap_for_kind("nonsense"), None);
     }
 
     #[test]

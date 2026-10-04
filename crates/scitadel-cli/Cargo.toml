@@ -35,6 +35,11 @@ tracing-subscriber = { workspace = true }
 rpassword = { workspace = true }
 
 [dev-dependencies]
+# The `scan` / `attach` / `gc` integration test seeds a `blobs` row no writer
+# produces (an unreferenced one — every real writer writes it in the same
+# transaction as the artefact that names it) and reads rows back through SQL.
+# rusqlite is already in the workspace graph; this is a dev-only edge.
+rusqlite = { workspace = true }
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
 tempfile = { workspace = true }

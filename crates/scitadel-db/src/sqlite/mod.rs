@@ -5,7 +5,9 @@ mod assessments;
 mod blobs;
 mod citations;
 mod coverage;
+mod gc;
 mod identity;
+mod leases;
 mod migrations;
 mod pacer;
 mod paper_aliases;
@@ -24,15 +26,18 @@ pub use annotations::{SqliteAnnotationRepository, resolve_anchor};
 /// `acquisition_state` writers. Shared by the legacy backfill and the
 /// flat-layout importer (`scitadel_adapters::import_flat`).
 pub use artefacts::{
-    ACCESS_BASIS_MANUAL, ArtefactWrite, BlobWrite, DownloadWrite, FULLTEXT_LOCATOR, FulltextKind,
-    ROUTE_IMPORT_FLAT, StateRow, StateWrite, VERSION_UNKNOWN, WriteMode, artefact_id,
-    delete_acquisition_states_at, fulltext_kind, has_fulltext_artefact, read_acquisition_state,
-    record_download, write_acquisition_states, write_acquisition_states_in, write_artefacts,
-    write_artefacts_in,
+    ACCESS_BASIS_MANUAL, ArtefactRow, ArtefactWrite, BlobWrite, DownloadWrite, FULLTEXT_LOCATOR,
+    FulltextKind, ROUTE_IMPORT_FLAT, StateRow, StateWrite, VERSION_UNKNOWN, WriteMode, artefact_id,
+    delete_acquisition_states_at, distinct_blob_count, fulltext_kind, has_fulltext_artefact,
+    read_acquisition_state, read_artefacts_for_paper, record_download, write_acquisition_states,
+    write_acquisition_states_in, write_artefacts, write_artefacts_in,
 };
 pub use assessments::SqliteAssessmentRepository;
 /// ADR-007 §1 "Storage": the content-addressed blob store.
-pub use blobs::{blob_rel_path, file_extension, hash_file, library_root, store_blob};
+pub use blobs::{
+    BLOB_DIR, BLOB_TMP_DIR, CAP_FIGURE_BYTES, CAP_FULLTEXT_BYTES, CAP_SI_BYTES, blob_rel_path,
+    cap_for_kind, file_extension, hash_file, io_error, library_root, store_blob,
+};
 pub use citations::SqliteCitationRepository;
 /// ADR-007 §1 "Have" (derived) and §2 "Status vocabulary": the readers behind
 /// `coverage` and `action_list`. One computation, two projections.
@@ -40,6 +45,13 @@ pub use coverage::{
     ALL_STATUSES, ALL_WANT_KINDS, ActionGroup, ActionList, CoverageError, CoverageReport,
     DeferredGroup, FULLTEXT_ARTEFACT_KINDS, KindTotal, MissingEntry, PublisherKey, StatusVocab,
     UNTRACKED_VERSION_ROUTES, UnknownWantKind, status_vocab, version_satisfies,
+};
+/// ADR-007 §1 "Artefact rules": "Unreferenced blobs are collected by `scitadel
+/// gc`". The candidate query, the collection itself, and the path-shape check
+/// that keeps a hostile `rel_path` from aiming a delete outside the store.
+pub use gc::{
+    BlobRow, DEFAULT_MIN_AGE_HOURS, GcCandidate, GcError, GcReport, GcSkip, all_blobs, collect,
+    plan as plan_gc, referenced_digests,
 };
 /// ADR-007 §3, last paragraph: "Identity is checked twice, and a mismatch
 /// blocks filing anything under that DOI." The `paper_identity_checks` writer and
@@ -49,8 +61,16 @@ pub use identity::{
     ALL_ATTEMPT_OUTCOMES, ALL_PHASES, ALL_SOURCES, AttemptWrite, IdentityCheckRow,
     IdentityCheckWrite, IdentityError, IdentityOverride, IdentityOverrideReport, IdentityPhase,
     IdentitySource, IdentityStatus, IdentityWrite, correct_doi, identity_overrides,
-    latest_identity_check, override_identity, read_osti_id, record_attempt, write_identity_check,
-    write_osti_id,
+    latest_identity_check, override_identity, read_osti_id, read_pmcid, record_attempt,
+    write_identity_check, write_osti_id,
+};
+/// ADR-007 §1 "Leases": `acquisition_leases` had a table in migration 013 and
+/// **no writer in the workspace**. The upsert, the renewal, the release, and the
+/// owner token — the whole per-work claim, so two processes never fetch the same
+/// work and a crashed one never blocks it for good.
+pub use leases::{
+    LEASE_RENEW_EVERY_MS, LEASE_TTL_MS, LeaseRow, new_owner as new_lease_owner,
+    unix_millis as lease_clock_ms,
 };
 pub use migrations::run_migrations;
 pub use pacer::{PolicyLookup, SqlitePacer};
@@ -322,6 +342,28 @@ impl Database {
         artefacts::read_acquisition_state(&conn, paper_id, kind, locator)
     }
 
+    /// Every artefact row for `paper_id`, joined with its blob. The reader
+    /// behind the `papers/<stem>/manifest.json` mirror — see
+    /// `scitadel_adapters::manifest`.
+    pub fn artefacts_for_paper(&self, paper_id: &str) -> Result<Vec<ArtefactRow>, DbError> {
+        let conn = self.pool.get()?;
+        artefacts::read_artefacts_for_paper(&conn, paper_id)
+    }
+
+    /// ADR-007 §1: retract the drop-in gaps for `(paper_id, kind, locator)` —
+    /// the ones a file arriving closes, as opposed to the ladder's fetch-owned
+    /// rows. See [`artefacts::delete_drop_path_states`] for why this is scoped
+    /// by want rather than by path.
+    pub fn retract_drop_gaps(
+        &self,
+        paper_id: &str,
+        kind: &str,
+        locator: &str,
+    ) -> Result<usize, DbError> {
+        let conn = self.pool.get()?;
+        artefacts::delete_drop_path_states(&conn, paper_id, kind, locator)
+    }
+
     /// ADR-007 §1 "Have": does this work already hold a full text?
     pub fn has_fulltext_artefact(&self, paper_id: &str) -> Result<bool, DbError> {
         let conn = self.pool.get()?;
@@ -385,6 +427,17 @@ impl Database {
     pub fn record_attempt(&self, attempt: &AttemptWrite) -> Result<i64, DbError> {
         let conn = self.pool.get()?;
         identity::record_attempt(&conn, attempt)
+    }
+
+    /// `papers.pmcid` for `paper_id` — the Europe PMC / PMC OA identifier
+    /// ADR-007 §3 step 2 fetches by.
+    ///
+    /// A targeted single-column reader rather than a `Paper` field: `Paper` is
+    /// written back wholesale, so a `Paper` carrying `pmcid: None` for a work
+    /// that has one would null the column on the next save.
+    pub fn pmcid(&self, paper_id: &str) -> Result<Option<String>, DbError> {
+        let conn = self.pool.get()?;
+        identity::read_pmcid(&conn, paper_id)
     }
 
     /// `papers.osti_id` for `paper_id`; the identifier ADR-007 §3 step 3 fetches
