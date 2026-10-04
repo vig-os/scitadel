@@ -1835,7 +1835,17 @@ mod tests {
         assert!(mirror.written);
         assert_eq!(mirror.owner, report.lease.expect("we held the claim"));
         let path = dir.join(manifest::MANIFEST_FILENAME);
-        assert_eq!(mirror.path, path);
+        // Compare canonically on both sides. `mirror.path` comes back
+        // canonicalised (macOS resolves its temp dir from `/var` to
+        // `/private/var`), while `dir` is whatever the caller passed, so a
+        // raw comparison fails on macOS and passes on Linux — which is how a
+        // real path-alias bug in this area went unnoticed for one slice.
+        // This is the same trap `resolve_best_effort` exists to close.
+        assert_eq!(
+            import_flat::resolve_best_effort(&mirror.path),
+            import_flat::resolve_best_effort(&path),
+            "the mirror must land at the path the caller named"
+        );
         let body = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["work"]["paper_id"], "p-1");
