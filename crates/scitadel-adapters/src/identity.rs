@@ -188,7 +188,8 @@ impl Verdict {
 }
 
 /// One side of a title comparison, with the two facts that corroborate it.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct WorkIdentity {
     pub title: Option<String>,
     pub year: Option<i32>,

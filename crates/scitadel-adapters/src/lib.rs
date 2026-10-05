@@ -18,6 +18,8 @@ pub mod osti;
 pub mod patentsview;
 pub mod preprint;
 pub mod pubmed;
+pub mod registry;
+pub mod resolve;
 pub mod scan;
 
 use scitadel_core::config::OpenAlexAuth;

@@ -2878,9 +2878,15 @@ fn render_acquire(report: &scitadel_adapters::acquire::AcquireReport) -> String 
          is fetched."
     );
     if plan.dry_run {
+        // **Not** "no requests": the ranked plan cannot be shown without asking
+        // the four metadata registries, and ADR-007 §3's whole point is that the
+        // plan is inspectable before anything is fetched. What the flag still
+        // promises is what it can: no writes, and no publisher contact.
         let _ = writeln!(
             out,
-            "Dry run: no writes, no requests. Everything below is what would happen."
+            "Dry run: no writes, and no publisher is contacted. The metadata pass \
+             below is the real one (OpenAlex, Crossref, DataCite, Unpaywall), so \
+             the ranking is inspectable before anything is fetched."
         );
     }
     if plan.resume {
@@ -2959,6 +2965,14 @@ fn render_acquire(report: &scitadel_adapters::acquire::AcquireReport) -> String 
             {
                 let _ = writeln!(out, "      {note}");
             }
+            for line in work
+                .resolution
+                .as_ref()
+                .map(|resolution| resolution.plan_lines())
+                .unwrap_or_default()
+            {
+                let _ = writeln!(out, "    {line}");
+            }
         }
     }
     if plan.truncated_by_limit > 0 {
@@ -3026,6 +3040,19 @@ fn render_acquire(report: &scitadel_adapters::acquire::AcquireReport) -> String 
                 );
                 if let Some(reason) = &outcome.reason {
                     let _ = writeln!(out, "      {reason}");
+                }
+                // And what was *ranked* before the attempt — which is the half
+                // of the story the status alone cannot carry: which candidate was
+                // chosen out of how many, and which ones were left out and why. A
+                // failed work is the one a person most needs to see the plan for,
+                // because it is the one they may want to override.
+                for line in outcome
+                    .resolution
+                    .as_ref()
+                    .map(|resolution| resolution.plan_lines())
+                    .unwrap_or_default()
+                {
+                    let _ = writeln!(out, "    {line}");
                 }
             }
             scitadel_adapters::acquire::FetchOutcome::NotAttempted => {

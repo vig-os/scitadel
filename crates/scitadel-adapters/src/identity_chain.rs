@@ -88,7 +88,8 @@ pub const CHAIN: [IdentitySource; 3] = [
 ];
 
 /// One registry's answer about a work: what it is called, when, and by whom.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct ResolvedWork {
     pub identity: WorkIdentity,
     /// The registry that answered. Recorded verbatim in
@@ -98,21 +99,34 @@ pub struct ResolvedWork {
 }
 
 /// What one hop of the chain established.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Ord` is "how much this hop establishes", least to most: `NothingToAsk` <
+/// `NotRegistered` < `NotConsulted` < `Unreadable` < `Answered`. It exists for one
+/// caller — `resolve::MetadataPass` may ask OpenAlex twice (by DOI and by the
+/// record's id) and has to collapse the pair into the chain's single OpenAlex
+/// hop, taking the one that establishes more. Declaring the order rather than
+/// leaving it to a call site keeps "which of the two wins" a property of the
+/// vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HopOutcome {
-    /// This registry named the work, and the chain stopped here.
-    Answered,
-    /// A 404: this registry does not register the DOI. The next one was asked.
+    /// Nothing to ask with: the work has no DOI, so this registry could only
+    /// have been reached by an OpenAlex id and there was none to hand. The
+    /// **least** a hop can establish, and the first in `Ord`.
+    NothingToAsk,
+    /// A 404: this registry does not register the DOI. A fact, and the reason
+    /// the chain keeps walking — a `10.18434` or `10.5281` DOI is registered
+    /// here and only here.
     NotRegistered,
-    /// We could not find out — a 5xx, a transport failure, or a body we could
-    /// not read. The chain stopped, because the later registries' answers are
-    /// unknown rather than negative.
-    Unreadable,
     /// Never asked, because an earlier hop had already answered.
     NotConsulted,
-    /// Nothing to ask with: the work has no DOI, so this registry could only
-    /// have been reached by an OpenAlex id and there was none to hand.
-    NothingToAsk,
+    /// We could not find out — a 5xx, a transport failure, or a body we could
+    /// not read. **More** than `NotRegistered`, and the distinction is the
+    /// module's whole point: one is knowledge, the other is the absence of it.
+    Unreadable,
+    /// This registry named the work. The most a hop can establish, and the last
+    /// in `Ord`.
+    Answered,
 }
 
 impl HopOutcome {
@@ -134,14 +148,16 @@ impl HopOutcome {
 /// "not consulted" half are both claims that have to be checkable:
 /// `the_chain_is_ordered_openalex_then_crossref_then_datacite` reads this
 /// vector, and so does anyone debugging why a work came back `unverified`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct ChainHop {
     pub source: IdentitySource,
     pub outcome: HopOutcome,
 }
 
 /// The chain's result.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct ChainOutcome {
     /// The registry's answer, when one came. `None` means **no registry
     /// registers this DOI** (or none could be asked), which the caller records

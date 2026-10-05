@@ -312,6 +312,86 @@ fn year_from_date_parts(date: Option<&serde_json::Value>) -> Option<i32> {
     i32::try_from(year).ok()
 }
 
+// ============================================================================
+// ADR-007 §3's resolve-then-rank: the fields the identity pass never read.
+// ============================================================================
+
+/// The version Crossref declares for a record, from `message.type`.
+///
+/// This is the field #292's agents established and that the preprint leg's
+/// DOI-prefix inference exists only as a stand-in for: Crossref carries
+/// `type: posted-content` for every preprint its members deposit, which is a
+/// **statement by the publisher about its own DOI**, where a `10.1101` prefix
+/// is an inference from who registered it. The ranker prefers this and records
+/// that it did; see [`crate::resolve`].
+///
+/// `None` when the field is absent or is not a string — which is a fact about
+/// Crossref's deposit, not about the work, and is exactly the case the
+/// prefix-inference fallback exists for.
+#[must_use]
+pub fn type_signal(message: &serde_json::Value) -> Option<crate::registry::RegistryType> {
+    message
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|word| !word.is_empty())
+        .map(|word| crate::registry::RegistryType::of(word, crate::registry::Dialect::Crossref))
+}
+
+/// Every `link[]` entry Crossref carries, with the two facts the ranker reads.
+///
+/// `intended-application: text-mining` is the publisher's own statement that
+/// this URL is the sanctioned TDM route, which ADR-007 §3 step 5 turns on.
+/// `content-version` is the publisher's statement of *which* rendering the link
+/// serves — `vor` or `am` — which is the per-location version signal, the same
+/// role OpenAlex's `locations[].version` plays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossrefLink {
+    pub url: String,
+    pub content_type: Option<String>,
+    /// `intended-application`, e.g. `text-mining` or `similarity-checking`.
+    pub intended_application: Option<String>,
+    /// `content-version`, e.g. `vor` or `am`.
+    pub content_version: Option<String>,
+    pub version: Option<String>,
+}
+
+/// Read `message.link[]`, in Crossref's own array-of-objects shape.
+#[must_use]
+pub fn links(message: &serde_json::Value) -> Vec<CrossrefLink> {
+    message
+        .get("link")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let url = entry.get("URL").and_then(serde_json::Value::as_str)?;
+                    Some(CrossrefLink {
+                        url: url.trim().to_string(),
+                        content_type: entry
+                            .get("content-type")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string),
+                        intended_application: entry
+                            .get("intended-application")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string),
+                        content_version: entry
+                            .get("content-version")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string),
+                        version: entry
+                            .get("version")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// One Crossref author's name, in the `Family, Given` order
 /// [`crate::identity::surname`] reads.
 ///
