@@ -32,7 +32,7 @@ use std::collections::HashSet;
 
 use rusqlite::params;
 use rusqlite::{Connection, TransactionBehavior};
-use scitadel_core::models::{AccessStatus, RouteId};
+use scitadel_core::models::{AccessStatus, ArtefactVersion, RouteId};
 use scitadel_core::untrusted::UntrustedText;
 use sha2::{Digest, Sha256};
 
@@ -405,17 +405,35 @@ fn artefacts_insert(mode: WriteMode) -> String {
 
 /// One completed download, ready to be recorded against a work.
 ///
-/// Everything the caller *decided* is here; everything the schema
-/// *derives* is not. `kind`, `format` and `mime` come from `ext` through
-/// [`fulltext_kind`], and `version` / `access_basis` come from
-/// [`RouteId`] — so no caller can pair a route with another route's
-/// licence answer, which is the drift #261 exists to stop.
+/// Everything the caller *decided* is here; everything the schema *derives* is
+/// not. `kind`, `format` and `mime` come from `ext` through [`fulltext_kind`],
+/// and `access_basis` comes from [`RouteId`] — so no caller can pair a route
+/// with another route's licence answer, which is the drift #261 exists to stop.
+///
+/// `version` is the one field the caller may also set, through
+/// [`Self::version`], and the asymmetry is deliberate. See
+/// [`record_download`] for the precedence and for why the licence has no such
+/// field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadWrite {
     /// The work these bytes belong to. Must already be a `papers` row.
     pub paper_id: String,
     /// Which ladder step served them (ADR-007 §3).
     pub route: RouteId,
+    /// The version of the work these bytes **are**, when the caller established
+    /// one; `None` to fall back to [`RouteId::artefact_version`].
+    ///
+    /// `Some(ArtefactVersion::Unknown)` and `None` are *different* inputs and
+    /// they are not interchangeable: `None` says "I did not look, ask the
+    /// route", `Some(Unknown)` says "I looked and nothing stated a version". The
+    /// second is stronger and the resolver is the only producer of it, because
+    /// the resolver is the only thing that looked.
+    ///
+    /// Only a caller that compared the registries may set this. A caller that
+    /// invented a version here would be #261's overclaim with the licence
+    /// guard removed, so there is deliberately nowhere for a *guess* to go: the
+    /// field takes a closed vocabulary and nothing else.
+    pub version: Option<ArtefactVersion>,
     /// File extension of what we stored: `pdf`, `html`, `xml`…
     pub ext: String,
     pub access_status: AccessStatus,
@@ -508,15 +526,46 @@ pub fn record_download(conn: &mut Connection, write: &DownloadWrite) -> Result<(
             write.ext
         ))
     })?;
-    // `version` and `access_basis` are both NOT NULL, and both are route
-    // *answers* rather than defaults: a route that establishes neither is
-    // a pseudo-route, and a pseudo-route has no bytes to record.
-    let version = write.route.artefact_version().ok_or_else(|| {
-        DbError::Migration(format!(
-            "route {} establishes no artefact version — it is a pseudo-route that never fetches",
-            write.route.label()
-        ))
-    })?;
+    // `version` and `access_basis` are both NOT NULL, and both are *answers*
+    // rather than defaults.
+    //
+    // ## The version precedence, and why it is the caller's
+    //
+    // `write.version` wins when the caller set it, and
+    // `RouteId::artefact_version()` is the fallback. The caller is the resolve-
+    // then-rank pass, which compared the registries that registered this DOI and
+    // read a version word off the location it chose; the route knows what kind of
+    // server served the bytes and nothing about what those bytes turned out to
+    // be. `RouteId::artefact_version`'s own docs say the same.
+    //
+    // **This is load-bearing, not a convenience.** Filing the route's fallback
+    // `unknown` for a version-of-record fetch leaves `version_satisfies` false
+    // for a `vor` want — `UNTRACKED_VERSION_ROUTES` is `legacy`/`import_flat` —
+    // so `coverage` reports the want unsatisfied, the queue re-queues the work,
+    // and the next run ranks the same candidate and fetches the same document
+    // again, for ever. That loop is what
+    // `a_version_of_record_fetch_and_recorded_satisfies_a_vor_want` exists to
+    // close.
+    //
+    // ## Why the licence has no such field
+    //
+    // `access_basis` is derived from the route and **cannot** be overridden,
+    // because there is no second producer for it: nothing in the resolve pass
+    // establishes what we may reuse beyond "a grant the registries published, in
+    // force for this version", and that is recorded on the licence columns rather
+    // than invented here. #261's rule — no caller may pair a route with another
+    // route's licence answer — is therefore still enforced by there being
+    // nowhere to put one, and only the axis the resolver is *entitled* to answer
+    // gained a field.
+    let version = write
+        .version
+        .or_else(|| write.route.artefact_version())
+        .ok_or_else(|| {
+            DbError::Migration(format!(
+                "route {} establishes no artefact version — it is a pseudo-route that never fetches",
+                write.route.label()
+            ))
+        })?;
     let access_basis = write.route.access_basis().ok_or_else(|| {
         DbError::Migration(format!(
             "route {} establishes no access basis; access_basis is NOT NULL and \
@@ -537,7 +586,7 @@ pub fn record_download(conn: &mut Connection, write: &DownloadWrite) -> Result<(
         id: String::new(),
         paper_id: write.paper_id.clone(),
         kind: kind.kind.to_string(),
-        version: version.to_string(),
+        version: version.label().to_string(),
         locator: FULLTEXT_LOCATOR.to_string(),
         sha256: Some(blob.sha256.clone()),
         format: Some(kind.format.to_string()),
@@ -946,6 +995,159 @@ where
 mod tests {
     use super::*;
     use crate::sqlite::{Database, ROUTE_LEGACY};
+
+    /// A fixed stamp, so an assertion is about the value rather than the clock.
+    const NOW: &str = "2026-01-01T00:00:00+00:00";
+
+    /// A file-backed library with one `papers` row, for a real `record_download`.
+    fn library_with(paper_id: &str) -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("scitadel.db")).expect("open");
+        db.migrate().expect("migrate");
+        db.conn()
+            .expect("conn")
+            .execute(
+                "INSERT INTO papers (id, title, authors, created_at, updated_at)
+                 VALUES (?1, 'A work', '[]', ?2, ?2)",
+                [paper_id, NOW],
+            )
+            .expect("paper row");
+        // `TempDir` must outlive the connection: the pool opens lazily, so
+        // dropping the directory would let a later `conn()` create an empty one.
+        (dir, db)
+    }
+
+    /// **The version that reaches `artefacts.version`**, over a real library and
+    /// the real `record_download`, for all four ways a caller can pair a route
+    /// with a claim.
+    ///
+    /// This is the join [`RouteId::artefact_version`]'s docs point at and cannot
+    /// test, because `scitadel-db` depends on `scitadel-core` and the precedence
+    /// lives inside this function. The four rows are the whole contract:
+    ///
+    /// | caller `version` | route | column | why |
+    /// |---|---|---|---|
+    /// | `Some(vor)` | `Arxiv` | `vor` | **the disagreement case**, and the one that used to be a loop: a preprint server serving what the registries call the version of record. The resolver read the record; the route only knows it serves preprints. The resolver wins. |
+    /// | `Some(preprint)` | `Arxiv` | `preprint` | the agreeing case, so the winner is not just "anything the caller says" |
+    /// | `Some(Unknown)` | `Unpaywall` | `unknown` | *looked*, nothing stated — and still `unknown`, because the column has no other word for it |
+    /// | `None` | `Unpaywall` | `unknown` | the route's fallback, which is the same word for a different reason |
+    ///
+    /// The last two are both `unknown` and that is the point of keeping them
+    /// separate inputs: `Some(Unknown)` says the resolver asked, `None` says it
+    /// did not, and collapsing them would make "we looked and got no answer"
+    /// indistinguishable from "we never looked" in the recorded row.
+    ///
+    /// # Why this is not a licence-style hole (#261)
+    ///
+    /// `access_basis` is still derived from the route and still cannot be
+    /// overridden, because it has one producer. Version has two, and the second
+    /// is entitled to answer — but the field takes a closed
+    /// [`ArtefactVersion`] and nothing else, so there is nowhere for a *guess*
+    /// to go. `the_route_still_pairs_with_its_own_licence_answer` below holds
+    /// the other half of that.
+    #[test]
+    fn the_resolvers_version_outranks_the_routes_fallback() {
+        for (id, route, caller, expected) in [
+            (
+                "p-disagree",
+                RouteId::Arxiv,
+                Some(ArtefactVersion::VersionOfRecord),
+                "vor",
+            ),
+            (
+                "p-agree",
+                RouteId::Arxiv,
+                Some(ArtefactVersion::Preprint),
+                "preprint",
+            ),
+            (
+                "p-author-manuscript",
+                RouteId::Unpaywall,
+                Some(ArtefactVersion::AuthorManuscript),
+                "am",
+            ),
+            (
+                "p-looked-not-stated",
+                RouteId::Unpaywall,
+                Some(ArtefactVersion::Unknown),
+                "unknown",
+            ),
+            ("p-fell-back", RouteId::Unpaywall, None, "unknown"),
+        ] {
+            // `_dir` is bound and kept for the whole block: the pool opens
+            // connections lazily, so dropping the directory would let a later
+            // `conn()` create an empty, unmigrated database.
+            let (_dir, db) = library_with(id);
+            let mut conn = db.conn().expect("conn");
+            record_download(
+                &mut conn,
+                &DownloadWrite {
+                    paper_id: id.into(),
+                    route,
+                    version: caller,
+                    ext: "pdf".into(),
+                    access_status: AccessStatus::FullText,
+                    source_url: None,
+                    publisher: None,
+                    publisher_note: None,
+                    retrieved_at: NOW.into(),
+                    blob: Some(BlobWrite {
+                        sha256: format!("{id}-sha"),
+                        bytes: 1,
+                        mime: "application/pdf".into(),
+                        rel_path: format!("blobs/{id}.pdf"),
+                        created_at: NOW.into(),
+                    }),
+                },
+            )
+            .unwrap_or_else(|e| panic!("{id}: {e}"));
+
+            let row: (String, String, String) = conn
+                .query_row(
+                    "SELECT version, route, access_basis FROM artefacts WHERE paper_id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap_or_else(|e| panic!("{id}: read back: {e}"));
+            assert_eq!(
+                row.0, expected,
+                "{id}: route {route} + caller {caller:?} must write {expected:?}, got {:?}",
+                row.0
+            );
+            assert_eq!(
+                row.1,
+                route.label(),
+                "{id}: the route is recorded whatever the version was"
+            );
+            assert_eq!(
+                row.2,
+                route.access_basis().expect("a basis"),
+                "{id}: and the licence is still the route's own answer — a caller \
+                 that may set a version may not pair a route with another \
+                 route's licence"
+            );
+        }
+    }
+
+    /// A version a caller sets must not be able to smuggle in a value migration
+    /// 013 would have refused. The field is typed, so this is a compile-time
+    /// guarantee rather than a runtime one — the test exists to say so, and to
+    /// fail loudly if the field is ever widened to a string.
+    #[test]
+    fn a_caller_supplied_version_cannot_leave_the_check_vocabulary() {
+        for version in ArtefactVersion::ALL {
+            assert!(
+                ["vor", "am", "preprint", "unknown"].contains(&version.label()),
+                "{version:?} writes {:?}, which is not a migration-013 value",
+                version.label()
+            );
+        }
+        assert_eq!(
+            ArtefactVersion::parse("vor-and-am"),
+            None,
+            "and a value outside it does not parse rather than defaulting"
+        );
+    }
 
     /// A row with real bytes: `sha256` is a foreign key into `blobs`, so
     /// a row that claims content must bring the blob with it.
@@ -1363,6 +1565,11 @@ mod tests {
         DownloadWrite {
             paper_id: "p-1".into(),
             route,
+            // `None`: the fixture predates the resolve-then-rank version, and the
+            // route's static claim is the correct answer for a download that
+            // established nothing. `the_resolvers_version_outranks_the_routes_fallback`
+            // is the test that sets it.
+            version: None,
             ext: "pdf".into(),
             access_status: AccessStatus::FullText,
             source_url: Some("https://example.org/paper.pdf".into()),

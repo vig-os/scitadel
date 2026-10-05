@@ -641,6 +641,176 @@ pub fn doi_works_url(
     Ok(url)
 }
 
+// ============================================================================
+// ADR-007 §3's resolve-then-rank: the fields the identity pass never read.
+// ============================================================================
+
+/// The version OpenAlex declares for a work, read from `type`.
+///
+/// OpenAlex maintains `type` itself (`article`, `preprint`, `book`, `dataset`,
+/// …) and mirrors Crossref's word in `type_crossref`. `type` is read first and
+/// `type_crossref` second, because OpenAlex's own classification is the one
+/// OpenAlex indexes on — a work it files as `article` is the version of record
+/// in OpenAlex's own account, whatever Crossref's deposit says.
+///
+/// `None` when neither field is present or is not a string: an absent `type`
+/// is a gap in OpenAlex's record, and [`crate::resolve`] falls back to the next
+/// registry or to the DOI-prefix inference and **records that it did**.
+#[must_use]
+pub fn type_signal(
+    work: &serde_json::Value,
+) -> Option<(&'static str, crate::registry::RegistryType)> {
+    for (field, raw) in [
+        ("type", work.get("type")),
+        ("type_crossref", work.get("type_crossref")),
+    ] {
+        if let Some(word) = raw
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|w| !w.is_empty())
+        {
+            let classified =
+                crate::registry::RegistryType::of(word, crate::registry::Dialect::OpenAlex);
+            return Some((field, classified));
+        }
+    }
+    None
+}
+
+/// One OA location OpenAlex names, with the two facts the ranker needs from it.
+///
+/// `version` is OpenAlex's own word for *which* rendering this location is —
+/// `publishedVersion` (the version of record), `acceptedVersion` (the author
+/// manuscript) or `submittedVersion` (a preprint). It is the single best
+/// version signal available anywhere in this metadata pass, and it is
+/// **per-location**: the same work routinely has a `publishedVersion` at the
+/// publisher and a `submittedVersion` at arXiv, and treating the work's version
+/// as the location's version would rank both identically and re-introduce
+/// exactly the bug the ladder exists to remove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OaLocation {
+    /// `pdf_url` when the location has one, else `landing_page_url`.
+    pub url: String,
+    /// `pdf_url` specifically, kept apart because ADR-007 §3's fetch-order step
+    /// treats a landing page and a PDF as different things and because
+    /// `looks_like_pdf` decides the stored extension from this one.
+    pub pdf_url: Option<String>,
+    /// OpenAlex's `version` word: `publishedVersion`, `acceptedVersion` or
+    /// `submittedVersion`.
+    pub version_word: Option<String>,
+    /// The licence OpenAlex records for this location, when it records one.
+    pub licence: Option<String>,
+    /// `landing_page_url`, kept so a location with no PDF still yields a
+    /// candidate (an HTML landing page is a candidate the ladder can take).
+    pub landing_page_url: Option<String>,
+    /// `is_oa`, when the location declares it.
+    pub is_oa: Option<bool>,
+    /// Is this the `best_oa_location` rather than an entry from `locations[]`?
+    ///
+    /// Carried because the two deserve different treatment and only this field
+    /// tells them apart: `best_oa_location` is OpenAlex's assertion that *this*
+    /// is the open copy, while `locations[]` is every location OpenAlex
+    /// indexes — OA or not. See [`crate::resolve::LicenceFloor`].
+    pub is_best: bool,
+}
+
+impl OaLocation {
+    /// Does this location carry a URL we could fetch?
+    ///
+    /// `pdf_url` first, then `landing_page_url`: the full text is the point,
+    /// and a location with neither has nothing to offer. A location with neither
+    /// is **omitted** rather than recorded as an empty candidate, because an
+    /// unrankable candidate is supposed to mean "we found a place and could not
+    /// place it", not "we found a place with no URL in it".
+    #[must_use]
+    pub fn fetchable(&self) -> Option<&str> {
+        self.pdf_url.as_deref().or(self.landing_page_url.as_deref())
+    }
+}
+
+/// Every OA location OpenAlex names for a work, `locations[]` plus
+/// `best_oa_location`.
+///
+/// ADR-007 §3 names "OpenAlex (all `locations[]`)" explicitly — **all**, not
+/// just the best one — and that is the whole point of the metadata pass: the
+/// best location is whichever OpenAlex ranked first, and OpenAlex's ranking
+/// knows nothing about version of record. A work with a publisher VoR at
+/// location 4 and a preprint at location 1 has two candidates, and only the
+/// ranker can say which is which.
+///
+/// `best_oa_location` is deduplicated against `locations[]` by URL rather than
+/// appended unconditionally: OpenAlex usually lists the best location inside
+/// `locations[]` too, and a duplicate would be two candidates for one file.
+#[must_use]
+pub fn oa_locations(work: &serde_json::Value) -> Vec<OaLocation> {
+    let read = |value: &serde_json::Value| -> Option<OaLocation> {
+        let landing = value
+            .get("landing_page_url")
+            .and_then(serde_json::Value::as_str);
+        let pdf = value.get("pdf_url").and_then(serde_json::Value::as_str);
+        if pdf.is_none() && landing.is_none() {
+            return None;
+        }
+        Some(OaLocation {
+            is_best: false,
+            url: pdf.or(landing).unwrap_or_default().to_string(),
+            version_word: value
+                .get("version")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|word| !word.is_empty())
+                .map(str::to_string),
+            licence: value
+                .get("license")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|licence| !licence.is_empty())
+                .map(str::to_string),
+            landing_page_url: landing.map(str::to_string),
+            is_oa: value.get("is_oa").and_then(serde_json::Value::as_bool),
+            pdf_url: pdf.map(str::to_string),
+        })
+    };
+    let mut out: Vec<OaLocation> = work
+        .get("locations")
+        .and_then(serde_json::Value::as_array)
+        .map(|locations| locations.iter().filter_map(read).collect())
+        .unwrap_or_default();
+    if let Some(mut best) = work.get("best_oa_location").and_then(read) {
+        best.is_best = true;
+        if let Some(seen) = out.iter_mut().find(|seen| seen.url == best.url) {
+            // The same URL under both keys: keep the `best_oa_location`
+            // spelling and its credit, so there is one candidate for one file.
+            seen.is_best = true;
+            seen.version_word = seen.version_word.take().or(best.version_word);
+            seen.licence = seen.licence.take().or(best.licence);
+            seen.landing_page_url = seen.landing_page_url.take().or(best.landing_page_url);
+            seen.is_oa = seen.is_oa.or(best.is_oa);
+            if seen.pdf_url.is_none() {
+                seen.pdf_url = best.pdf_url.take();
+                seen.url = seen.url.clone();
+            }
+        } else {
+            out.push(best);
+        }
+    }
+    out
+}
+
+/// Whether OpenAlex declares this work open access at all.
+///
+/// A *work*-level flag, not a location's: `open_access.is_oa` says the work has
+/// some open copy somewhere. It cannot say which version that copy is, so it is
+/// used only as the licence floor for a location OpenAlex has already said is
+/// OA — never as a version claim.
+#[must_use]
+pub fn declares_open_access(work: &serde_json::Value) -> bool {
+    work.get("open_access")
+        .and_then(|oa| oa.get("is_oa"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// Reconstruct abstract text from OpenAlex inverted index format.
 pub fn reconstruct_abstract(inverted_index: &serde_json::Map<String, serde_json::Value>) -> String {
     let mut word_positions: Vec<(i64, &str)> = Vec::new();

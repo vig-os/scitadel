@@ -99,7 +99,7 @@ use scitadel_db::sqlite::{
 };
 use serde::Serialize;
 
-use crate::download::PaperDownloader;
+use crate::download::{PaperDownloader, RankedDownload};
 use crate::error::AdapterError;
 use crate::manifest;
 
@@ -259,7 +259,7 @@ impl AcquireRequest {
 
 /// One work `acquire` decided to fetch, and everything it knows about it
 /// **before** it fetched anything.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PlannedWork {
     pub paper_id: String,
     pub kind: String,
@@ -279,6 +279,21 @@ pub struct PlannedWork {
     /// available", because nothing evaluated one.
     pub publisher_note: Option<String>,
     pub doi: Option<String>,
+    /// ADR-007 §3's **ranked plan** for this work, or `None` when it was not
+    /// resolved.
+    ///
+    /// `None` for a work [`plan`] named but nobody could read a `papers` row
+    /// for, and `None` from [`plan`] itself — which is pure reads and resolves
+    /// nothing. [`run`] fills it in for **every** work, on both paths: a dry run
+    /// resolves and ranks and fetches nothing, and a real run takes the plan the
+    /// fetch used, so a failed work's report shows what was ranked and not merely
+    /// that one URL refused.
+    ///
+    /// This is what makes `acquire --dry-run` the cheapest possible test of the
+    /// ordering: the ranking is inspectable against a real corpus for four `Meta`
+    /// requests per work and **no publisher at all**.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<crate::resolve::Resolution>,
 }
 
 /// A work the plan left out under `--resume`, and when it becomes due.
@@ -311,7 +326,7 @@ pub enum FetchOutcome {
 ///
 /// [`Self::status`] is read back from the row the **walk** wrote, not chosen
 /// here, so `acquire` cannot report a verdict it did not reach (#260).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WorkOutcome {
     pub paper_id: String,
     pub outcome: FetchOutcome,
@@ -334,11 +349,19 @@ pub struct WorkOutcome {
     pub path: Option<String>,
     /// The error `download_paper` returned, verbatim.
     pub error: Option<String>,
+    /// ADR-007 §3's ranked plan, as the fetch used it.
+    ///
+    /// The same value the plan carries, and on the failure path the only place a
+    /// reader can see *which* candidate was chosen and which were not: the
+    /// recorded `reason` says what the routes did, and this says what the run
+    /// decided beforehand.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<crate::resolve::Resolution>,
 }
 
 /// What `acquire` decided to do, and — unless it was a dry run — what
 /// happened.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AcquireReport {
     /// The decision, computed from the derived "have" and nothing else.
     pub plan: AcquirePlan,
@@ -381,7 +404,7 @@ impl AcquireReport {
 /// Every number here is derived on read. [`Self::held_total`] is the count of
 /// wants ADR-007 §1 says we *already* have, and it is why a second run asks no
 /// publisher anything: those works are not in [`Self::works`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AcquirePlan {
     /// The resolved want kind. Always `"fulltext"`.
     pub kind: String,
@@ -562,6 +585,7 @@ pub fn plan(db: &Database, request: &AcquireRequest) -> Result<AcquirePlan, Acqu
             publisher,
             publisher_note,
             doi,
+            resolution: None,
         });
     }
 
@@ -605,8 +629,26 @@ pub async fn run(
     papers_dir: &Path,
     request: &AcquireRequest,
 ) -> Result<AcquireReport, AcquireError> {
-    let plan = plan(db, request)?;
+    let mut plan = plan(db, request)?;
+
     if request.dry_run {
+        // **A dry run resolves.** ADR-007 §3's ranked plan has to be inspectable
+        // before anything is fetched, and a plan that cannot be shown without
+        // asking the registries cannot be checked. So the dry run runs the
+        // metadata pass for every work it planned — four `Meta` requests each,
+        // against OpenAlex, Crossref, DataCite and Unpaywall, and **no publisher
+        // host**, which is the same guarantee the real walk makes and the one
+        // `the_metadata_pass_touches_no_publisher_host` asserts.
+        //
+        // It still writes nothing, which is the other half of the flag, and the
+        // difference from before is exactly one: a dry run now *reads four
+        // registries* where it used to read none. That is a cost worth naming —
+        // it spends metadata budget — and it is the only way the claim "the
+        // ranking is inspectable before anything is fetched" is true rather than
+        // aspirational.
+        for work in &mut plan.works {
+            work.resolution = rank_for(downloader, db, work).await;
+        }
         return Ok(AcquireReport {
             plan,
             outcomes: Vec::new(),
@@ -618,6 +660,21 @@ pub async fn run(
         outcomes.push(one(db, downloader, papers_dir, work).await?);
     }
     Ok(AcquireReport { plan, outcomes })
+}
+
+/// The ranked plan for one planned work, or `None` when it has no work row.
+///
+/// `None` rather than an error, and the reason is the same one `one()` gives:
+/// [`FetchOutcome::NotAttempted`] is how "another process holds this" is
+/// reported, so "there is no `papers` row to resolve" must not be a hard stop
+/// for the other works in a dry run.
+async fn rank_for(
+    downloader: &PaperDownloader,
+    db: &Database,
+    work: &PlannedWork,
+) -> Option<crate::resolve::Resolution> {
+    let paper = paper_of(db, &work.paper_id).ok().flatten()?;
+    Some(downloader.rank_candidates_for(&paper).await)
 }
 
 /// One work: read it, walk the ladder, report what the walk established.
@@ -684,7 +741,7 @@ async fn one(
     // in the middle of one is a claim a second process is entitled to take. The
     // fetch future is pinned once, so a renewal tick never restarts a request
     // that is already in progress.
-    let fetch = downloader.download_paper(&paper, papers_dir);
+    let fetch = downloader.download_paper_with_plan(&paper, papers_dir);
     tokio::pin!(fetch);
     let mut renew = tokio::time::interval(std::time::Duration::from_millis(
         scitadel_db::sqlite::LEASE_RENEW_EVERY_MS,
@@ -701,11 +758,17 @@ async fn one(
                         paper_id = %work.paper_id,
                         "lost the lease mid-fetch; abandoning this attempt"
                     );
-                    break Err(AdapterError::Other(format!(
-                        "lost the lease on {} to another live process mid-fetch, so nothing was \
-                         filed by this run",
-                        work.paper_id
-                    )));
+                    break RankedDownload {
+                        result: Err(AdapterError::Other(format!(
+                            "lost the lease on {} to another live process mid-fetch, so nothing \
+                             was filed by this run",
+                            work.paper_id
+                        ))),
+                        // Nothing was resolved: the walk abandoned the fetch
+                        // before the pass ran, and claiming a plan would be
+                        // inventing one.
+                        plan: crate::resolve::Resolution::empty(),
+                    };
                 }
             }
         }
@@ -715,17 +778,24 @@ async fn one(
     // claim is given up — ADR-007 §1: "written only by the lease holder, after
     // the DB commit". A mirror that cannot be written is not a failed fetch: the
     // database is right, and the next lease holder regenerates it.
-    if fetched.is_ok()
+    if fetched.result.is_ok()
         && let Err(e) = manifest::write(db, &paper, &owner)
     {
         tracing::warn!(error = %e, "could not write the manifest mirror");
     }
     let _ = db.release_lease(&work.paper_id, &owner);
 
-    match fetched {
+    // The plan travels out of the fetch either way, so a report carries what was
+    // ranked rather than only whether one URL served. `result` keeps its own
+    // status/reason reporting unchanged: those are the *walk's* conclusions,
+    // read back off the row it wrote (#260).
+    let RankedDownload { result, plan } = fetched;
+    // Recorded on the plan work too, so the plan and the outcome agree.
+    match result {
         Ok(result) => Ok(WorkOutcome {
             paper_id: work.paper_id.clone(),
             outcome: FetchOutcome::Acquired,
+            resolution: Some(plan),
             status: None,
             reason: None,
             // The gap is gone: `record_download` retracted the want row in the
@@ -746,6 +816,11 @@ async fn one(
             let next_attempt_at = schedule_retry(db, gap.as_ref())?;
             let mut out = outcome(work, FetchOutcome::Failed, gap, Some(error.to_string()));
             out.next_attempt_at = next_attempt_at;
+            // What was ranked, and what was deliberately not ranked. This is the
+            // half of a failed work's report that the single `error` line cannot
+            // carry: *which* candidate was chosen, out of how many, and which
+            // ones were left out and why.
+            out.resolution = Some(plan);
             Ok(out)
         }
     }
@@ -795,6 +870,7 @@ fn outcome(
         bytes: None,
         path: None,
         error,
+        resolution: None,
     }
 }
 
@@ -1146,11 +1222,30 @@ mod tests {
         /// Serve an OA PDF reachable through Unpaywall for `doi` — the
         /// smallest walk that actually succeeds.
         async fn serve_unpaywall_pdf(&self, doi: &str) {
+            self.serve_unpaywall_version(doi, None).await;
+        }
+
+        /// An Unpaywall location with the **version word** the ranker reads:
+        /// `publishedVersion`, `acceptedVersion` or `submittedVersion`.
+        ///
+        /// `None` leaves the field out entirely, which is what
+        /// `serve_unpaywall_pdf` has always meant and is the shape most of these
+        /// tests were written against. A stated word is a different case: it is
+        /// the only thing that lets the ranking place the candidate above
+        /// `Unstated`, so a test that wants a version of record has to say so.
+        async fn serve_unpaywall_version(&self, doi: &str, version: Option<&str>) {
             let pdf_route = format!("/oa/{}.pdf", doi.replace('/', "_"));
             let pdf_url = format!("{}{pdf_route}", self.server.uri());
+            let word = version.map_or(String::new(), |word| {
+                format!(r#","version":{}"#, json(word))
+            });
             self.serve(
                 &format!("/v2/{doi}"),
-                format!(r#"{{"best_oa_location":{{"url_for_pdf":"{pdf_url}"}}}}"#),
+                format!(
+                    r#"{{"best_oa_location":{{"url_for_pdf":{url}{word},"is_oa":true}},
+                        "oa_locations":[{{"url_for_pdf":{url}{word},"is_oa":true}}]}}"#,
+                    url = json(&pdf_url),
+                ),
             )
             .await;
             self.serve(&pdf_route, String::from_utf8_lossy(PDF_BYTES).to_string())
@@ -1588,6 +1683,107 @@ mod tests {
                 }],
             )
             .expect("write gap");
+        }
+
+        /// A want for `wanted_version` rather than the default `vor`.
+        ///
+        /// The three version pairs each need their **own** want, and a helper
+        /// that hard-codes `WANTED_VERSION` would make it impossible to write
+        /// the `am`-against-`am` and `preprint`-against-`preprint` halves of the
+        /// satisfaction test at all — which is the half that would catch a fix
+        /// that special-cased `vor`.
+        fn gap_for(&self, paper_id: &str, wanted_version: &str, status: &str) {
+            let mut conn = self.db.conn().expect("conn");
+            write_acquisition_states(
+                &mut conn,
+                &[StateWrite {
+                    paper_id: paper_id.into(),
+                    kind: FULLTEXT_KIND.into(),
+                    locator: FULLTEXT_LOCATOR.into(),
+                    wanted_version: wanted_version.into(),
+                    status: status.into(),
+                    reason: Some(format!("seeded {status} for {wanted_version}")),
+                    publisher: None,
+                    hint_url: None,
+                    drop_path: None,
+                    next_attempt_at: None,
+                    updated_at: "2026-01-01T00:00:00+00:00".into(),
+                }],
+            )
+            .expect("write gap");
+        }
+
+        /// Re-establish `paper_id`'s want **through the writer that owns it**.
+        ///
+        /// This matters, and it is not ceremony: `queue_add` writes `vor` and only
+        /// `vor`, so using it to re-queue an `am` or `preprint` want would change
+        /// the question being asked and make the test pass for the wrong reason.
+        /// The writers are:
+        ///
+        /// - `queue_add` for `vor` — what `acquire` and `acquire_queue_add` use;
+        /// - `import_ndjson_queue` for anything else — it is the only importer
+        ///   that honours an explicit `wanted_version`
+        ///   (`import_flat` hard-codes `vor`, and so does `queue_add`).
+        ///
+        /// So the second one is `acquire --from` re-importing the same queue
+        /// file, which is precisely what a second campaign run does.
+        fn requeue_want(&self, paper_id: &str, wanted_version: &str) {
+            if wanted_version == "vor" {
+                let report = queue_add(&self.db, &[paper_id.into()]).expect("queue_add");
+                assert_eq!(
+                    report.enqueued,
+                    vec![paper_id],
+                    "{wanted_version}: the queue took the work back on"
+                );
+                return;
+            }
+            let queue = self
+                .dir
+                .path()
+                .join(format!("queue-{wanted_version}.ndjson"));
+            std::fs::write(
+                &queue,
+                format!(
+                    // `wanted_version` belongs to the **artefact** object, not
+                    // the row: `wants_of` reads it per artefact, and a row-level
+                    // spelling is silently ignored — which is why the first draft
+                    // of this fixture re-imported a `vor` want and the test failed
+                    // for a reason that had nothing to do with the version write.
+                    "{{\"doi\": \"https://doi.org/{doi}\", \
+                     \"artefacts\": [{{\"kind\": \"fulltext\", \
+                       \"wanted_version\": \"{wanted_version}\"}}]}}\n",
+                    // Straight off the `papers` row, not through `coverage`:
+                    // the want was retracted by the download, so `coverage` has
+                    // no entry to read a DOI from, and this is a fact about the
+                    // work rather than about its wants.
+                    doi = self
+                        .db
+                        .repositories()
+                        .0
+                        .get(paper_id)
+                        .expect("read")
+                        .and_then(|paper| paper.doi)
+                        .unwrap_or_else(|| panic!("{paper_id} has a DOI to import"))
+                ),
+            )
+            .expect("write queue");
+            import_ndjson_queue(&self.db, &queue).expect("import");
+        }
+
+        /// ADR-007 §1's own count of "we hold a full text, but at a version the
+        /// want rejects" — the number `coverage` reports as
+        /// [`AcquirePlan::held_at_another_version`].
+        ///
+        /// Read through `coverage`'s derivation rather than re-derived, for the
+        /// reason `acquire.rs`'s module docs give: a second copy of "have" is how
+        /// #260/#261/#275 happened. `usize::MAX` on a filter error rather than 0,
+        /// so a broken filter cannot read as "nothing is wrong".
+        fn held_at_another_version(&self) -> usize {
+            self.db
+                .coverage_report(None)
+                .expect("coverage")
+                .filtered(Some(FULLTEXT_KIND))
+                .map_or_else(|_| usize::MAX, |scoped| scoped.held_at_another_version)
         }
 
         /// Hold a VoR full text for `paper_id`, bytes and all.
@@ -2167,16 +2363,33 @@ mod tests {
         );
     }
 
-    /// ADR-007 §3's order, read off the **wire**, and the
-    /// stop-at-the-first-answer rule that makes the order mean anything.
+    /// ADR-007 §3's order, read off the **wire**, and the one registry whose
+    /// answer becomes the work's identity.
     ///
-    /// The order assertion is on request paths in arrival order, not on the
-    /// code that issued them: a chain that asked DataCite first and Crossref
-    /// second would produce the same three verdals in a different order, and
-    /// only the wire distinguishes them. The two decoy records on the
-    /// un-consulted routes carry a *different title*, so a chain that asked one
-    /// of them anyway would also produce a `mismatch` — a louder failure than
-    /// a request count.
+    /// The order assertion is on request paths in arrival order, not on the code
+    /// that issued them: a pass that asked DataCite first and Crossref second
+    /// would produce the same three verdicts in a different order, and only the
+    /// wire distinguishes them.
+    ///
+    /// **The "stop at the first answer" half is deliberately gone, and this is
+    /// the documented place it goes.** The identity *chain* still stops —
+    /// `identity_chain.rs` is unchanged and its own tests pin it — because a
+    /// second registry's title is a different work with the same words. The
+    /// resolve-then-rank pass does not, because it is after *version and licence*
+    /// facts as well, and those are genuinely distributed: a Crossref
+    /// `license[]` and an OpenAlex `locations[].version` are the two strongest
+    /// signals ADR-007 §3 names and they live in different registries. So the
+    /// pass asks all three and the *identity* answer is still the first registry
+    /// in order that named the work, which is what the decoy records below prove
+    /// — they carry a different title on the routes that were consulted but did
+    /// not answer, and the recorded `source` is still the one that did.
+    ///
+    /// This **replaces** `the_chain_is_ordered_openalex_then_crossref_then_#
+    /// datacite`'s original assertion that a later registry "was not
+    /// consulted" once an earlier one answered. That assertion described the
+    /// old mechanism; under resolve-then-rank every registry is consulted and the
+    /// chain's stop-at-the-first-answer rule is enforced on the *answer*, not on
+    /// the requests.
     #[tokio::test]
     async fn the_chain_is_ordered_openalex_then_crossref_then_datacite() {
         const DOI: &str = "10.18434/m32154";
@@ -2199,14 +2412,23 @@ mod tests {
             .collect();
         assert_eq!(
             chain,
-            vec![format!("/works/doi:{}", encode(DOI)).as_str()],
-            "OpenAlex answered first, so neither Crossref nor DataCite was \
-             asked: {paths:?}"
+            vec![
+                format!("/works/doi:{}", encode(DOI)).as_str(),
+                format!("/cr/{}", encode(DOI)).as_str(),
+                format!("/dc/{}", encode(DOI)).as_str(),
+            ],
+            "all three registries are consulted, in ADR-007 §3's order — the pass \
+             needs a `license[]` and a `locations[].version`, and those live in \
+             different registries: {paths:?}"
         );
 
         let (status, source, _, resolved) = fx.pre_fetch("p-order");
         assert_eq!(status, "ok");
-        assert_eq!(source, "openalex", "the source is the one that answered");
+        assert_eq!(
+            source, "openalex",
+            "the identity answer is still the *first* registry in order that named \
+             the work, even though the later two were consulted"
+        );
         assert_eq!(
             resolved.as_deref(),
             Some(TITLE),
@@ -2240,10 +2462,19 @@ mod tests {
             vec![
                 format!("/works/doi:{}", encode("10.1101/2025.06.14.659707")),
                 format!("/cr/{}", encode("10.1101/2025.06.14.659707")),
+                format!("/dc/{}", encode("10.1101/2025.06.14.659707")),
             ],
-            "OpenAlex 404'd, so Crossref was asked second and DataCite not at all"
+            "OpenAlex 404'd and Crossref answered, and DataCite was still asked — \
+             the pass is after DataCite's `types.resourceTypeGeneral` and \
+             `rightsList` as well as the identity"
         );
-        assert_eq!(second.pre_fetch("p-order-2").1, "crossref");
+        assert_eq!(
+            second.pre_fetch("p-order-2").1,
+            "crossref",
+            "and in the second configuration the recorded source follows the \
+             *answer*, not the position — the decoy titles on the consulted \
+             routes did not take it"
+        );
     }
 
     /// The honest outcome, and the one ADR-007 §3 spends a paragraph on: no
@@ -2570,7 +2801,7 @@ mod tests {
     // 2. `--dry-run`.
     // =====================================================================
 
-    /// A dry run writes nothing and calls nothing.
+    /// A dry run writes nothing, and touches no publisher.
     ///
     /// "Writes nothing" is checked as whole-table equality — every column of
     /// `acquisition_state`, every artefact row, and every column of every `papers`
@@ -2578,14 +2809,45 @@ mod tests {
     /// idempotence bug takes. Whole `papers` rows rather than the three retired
     /// download columns: nothing writes those any more, so checking them would
     /// pass vacuously.
+    ///
+    /// **This replaces** `dry_run_writes_nothing_and_calls_nothing`, which
+    /// asserted `request_count == 0`. It could not survive resolve-then-rank,
+    /// and the reason is the requirement rather than a regression: ADR-007 §3's
+    /// ranked plan has to be inspectable **before** anything is fetched, so
+    /// `--dry-run` now runs the metadata pass for every work it planned. That is
+    /// a real cost — four `Meta` requests per work — and the reason the flag's
+    /// text says "no writes" rather than "no requests".
+    ///
+    /// So the assertion changed from "no request" to the claim that actually
+    /// matters and is *stronger*: a dry run spends **only** the four metadata
+    /// registries' budgets and reaches **no publisher host at all** — the
+    /// acceptance criterion #254 is filed on, asserted on the hosts that were
+    /// really contacted rather than on a promise in a doc comment.
     #[tokio::test]
-    async fn dry_run_writes_nothing_and_calls_nothing() {
+    async fn dry_run_writes_nothing_and_touches_no_publisher() {
         let fx = Fixture::new().await;
         fx.serve_unpaywall_pdf(UNKNOWN_DOI).await;
         fx.paper("p-queued", Some(UNKNOWN_DOI));
         fx.paper("p-human", Some(NATURE_DOI));
         fx.gap("p-queued", "pending", None, None);
         fx.gap("p-human", "needs_ill", None, None);
+        // Every publisher route ADR-007 §3 lists after the registries, mounted
+        // and answering, so "no publisher was contacted" is a measurement rather
+        // than an absence of capability.
+        Mock::given(method("GET"))
+            .and(path("/content/10.1101/2025.06.14.659707v1.full.pdf"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/pdf")
+                    .set_body_string("%PDF-1.7\nnever\n%%EOF\n"),
+            )
+            .mount(&fx.server)
+            .await;
+        fx.serve(
+            &format!("/doi/{UNKNOWN_DOI}"),
+            "<html><body>publisher page</body></html>".to_string(),
+        )
+        .await;
 
         let states = fx.state_rows();
         let artefacts = fx.artefacts();
@@ -2606,14 +2868,272 @@ mod tests {
             "a dry run attempts nothing, so it has no outcomes to report"
         );
 
-        assert_eq!(
-            fx.request_count().await,
-            0,
-            "a dry run put nothing on the wire"
+        // The ranked plan, which is the point of the exercise.
+        let resolution = report.plan.works[0]
+            .resolution
+            .as_ref()
+            .expect("a dry run resolves, so the ranked plan is inspectable");
+        assert!(
+            !resolution.ranked.is_empty(),
+            "the pass found a candidate to rank: {:?}",
+            resolution.plan_lines()
         );
+        assert_eq!(
+            resolution.chosen().expect("a choice").position,
+            1,
+            "and the first ranked candidate is the one a real run would fetch"
+        );
+        for line in resolution.plan_lines() {
+            assert!(
+                line.contains('1') || line.contains('2'),
+                "the plan line says which version won: {line}"
+            );
+        }
+
+        // No publisher, and only the four metadata registries.
+        let paths = fx.request_paths().await;
+        assert!(
+            !paths.iter().any(|p| p.starts_with("/doi/")),
+            "a dry run must not resolve a DOI to its publisher page: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.starts_with("/content/")),
+            "nor must it fetch from a preprint server: {paths:?}"
+        );
+        assert_eq!(
+            paths.len(),
+            4,
+            "the pass's own four metadata lookups, and nothing else: {paths:?}"
+        );
+        assert!(
+            paths.iter().all(|p| p.starts_with("/works/")
+                || p.starts_with("/cr/")
+                || p.starts_with("/dc/")
+                || p.starts_with("/v2/")),
+            "and every one of them is a metadata registry: {paths:?}"
+        );
+
         assert_eq!(fx.state_rows(), states, "acquisition_state is unchanged");
         assert_eq!(fx.artefacts(), artefacts, "artefacts is unchanged");
         assert_eq!(fx.papers_rows(), papers, "no `papers` row moved, at all");
+    }
+
+    // =====================================================================
+    // 2. The version that reaches `artefacts.version`, and the loop a
+    //    mismatch makes.
+    //
+    //    These are the tests #254's resolve-then-rank cannot be shipped
+    //    without: a ranked candidate whose version is *chosen* but not
+    //    *recorded* leaves a `vor` want open forever, so the queue runner
+    //    re-ranks and re-fetches the same document on every campaign.
+    // =====================================================================
+
+    /// **The loop, closed.** A version-of-record candidate fetched through a
+    /// route whose static claim is `unknown` must leave the library reading as
+    /// holding the version of record — otherwise `coverage`'s derivation reports
+    /// the want unsatisfied and the next run fetches the same bytes again.
+    ///
+    /// The second half is what makes this a loop test and not a happy-path one,
+    /// and it is why the want is **re-enqueued** between the two runs: a
+    /// successful download retracts its own want row in the same transaction, so
+    /// a second `acquire` plans nothing whether or not the version is right.
+    /// `queue_add` is what puts the want back, and it is the ordinary way a
+    /// campaign re-queues work (or how `acquire --from` re-imports it), so that
+    /// is the path the derivation has to answer correctly.
+    ///
+    /// Before the fix, `route = 'unpaywall'` + `version = 'unknown'` fails
+    /// `version_satisfies` for a `vor` want — `UNTRACKED_VERSION_ROUTES` is
+    /// `legacy`/`import_flat` only — so `held_at_another_version` reads 1, the
+    /// re-enqueued want is missing again, and the run below plans the work for a
+    /// third time.
+    #[tokio::test]
+    async fn a_version_of_record_fetch_and_recorded_satisfies_a_vor_want() {
+        const DOI: &str = "10.1038/s41586-020-2649-2";
+        let fx = Fixture::new().await;
+        fx.paper_with(
+            "p-vor",
+            "A work whose version of record is open access",
+            Some(2020),
+            &[],
+            Some(DOI),
+            None,
+        );
+        fx.gap_for("p-vor", "vor", "pending");
+        fx.serve_unpaywall_version(DOI, Some("publishedVersion"))
+            .await;
+
+        let first = fx.acquire(&AcquireRequest::queue()).await;
+        assert_eq!(first.acquired(), 1, "the ranked VoR candidate was fetched");
+
+        // ---- what reached the column ----
+        let rows = fx.artefacts();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(
+            rows[0].contains("|vor|"),
+            "the *ranked* version is what reaches `artefacts.version`, not the \
+             route's static `unknown`: {rows:?}"
+        );
+        assert!(
+            rows[0].contains("|unpaywall|"),
+            "and the route that served it is still recorded: {rows:?}"
+        );
+        assert!(
+            rows[0].contains("|unpaywall|"),
+            "and the route that served it is still recorded: {rows:?}"
+        );
+
+        // ---- the derivation, with no want row to hide behind ----
+        assert_eq!(
+            fx.held_at_another_version(),
+            0,
+            "the library reads as holding the version of record, not as holding \
+             something at a version the want rejects"
+        );
+
+        // ---- and the loop: re-enqueue, then run again ----
+        let requeued = queue_add(&fx.db, &["p-vor".into()]).expect("re-queue");
+        assert_eq!(
+            requeued.enqueued,
+            vec!["p-vor"],
+            "a want row was created: `queue_add` enqueues unconditionally, and \
+             this is how a campaign puts a work back on the queue"
+        );
+
+        let before = fx.request_count().await;
+        let second = fx.acquire(&AcquireRequest::queue()).await;
+        assert!(
+            second.plan.works.is_empty(),
+            "**the loop**: the re-queued `vor` want reads as already satisfied, so \
+             there is nothing to plan — {:?}",
+            second.plan.works
+        );
+        assert_eq!(
+            fx.request_count().await,
+            before,
+            "and nothing was put on the wire for it"
+        );
+        assert_eq!(
+            fx.artefacts().len(),
+            1,
+            "still exactly one artefact: no second copy of the same document"
+        );
+    }
+
+    /// The same round trip for the other two vocabulary pairs, because the fix
+    /// is a version *write* and a fix that special-cased `vor` would leave these
+    /// two broken.
+    ///
+    /// Both are cases the previous storage could not express **at all**: no
+    /// route's static claim was ever `am`, so an `am` want was unsatisfiable by
+    /// anything scitadel could fetch, and a preprint held from an OA repository
+    /// filed `unknown` where the want asked for `preprint`.
+    #[tokio::test]
+    async fn an_author_manuscript_and_a_preprint_each_satisfy_their_own_want() {
+        for (id, doi, version, wanted) in [
+            ("p-am", "10.18434/m32154", "acceptedVersion", "am"),
+            (
+                "p-preprint",
+                "10.5281/zenodo.23162961",
+                "submittedVersion",
+                "preprint",
+            ),
+        ] {
+            let fx = Fixture::new().await;
+            fx.paper_with(
+                id,
+                "A work held at one version",
+                Some(2023),
+                &[],
+                Some(doi),
+                None,
+            );
+            fx.gap_for(id, wanted, "pending");
+            fx.serve_unpaywall_version(doi, Some(version)).await;
+
+            let report = fx.acquire(&AcquireRequest::queue()).await;
+            assert_eq!(
+                report.acquired(),
+                1,
+                "{id}: the ranked candidate was fetched"
+            );
+
+            let rows = fx.artefacts();
+            assert_eq!(rows.len(), 1, "{id}: {rows:?}");
+            assert!(
+                rows[0].contains(&format!("|{wanted}|")),
+                "{id}: the ranked `{wanted}` reaches `artefacts.version`: {rows:?}"
+            );
+
+            // Re-queue and re-run: the loop half, for each pair, through the
+            // writer that owns that want.
+            fx.requeue_want(id, wanted);
+            let before = fx.request_count().await;
+            let second = fx.acquire(&AcquireRequest::queue()).await;
+            assert!(
+                second.plan.works.is_empty(),
+                "{id}: a `{wanted}` want satisfied by a `{wanted}` artefact leaves \
+                 nothing to plan: {:?}",
+                second.plan.works
+            );
+            assert_eq!(
+                fx.request_count().await,
+                before,
+                "{id}: and nothing was fetched again"
+            );
+            assert_eq!(fx.artefacts().len(), 1, "{id}: still one artefact");
+        }
+    }
+
+    /// The **negative** direction, which is what makes the write safe: a
+    /// preprint must not close a `vor` want, and must not close an `am` want
+    /// either.
+    ///
+    /// ADR-007 §1 says both — `coverage.rs` documents the second as deliberate
+    /// ("a held VoR does *not* satisfy an `am` want") — so a resolver that writes
+    /// what it ranked must not have broken the gate by writing it *accurately*.
+    ///
+    /// Asserted on `coverage`'s own `held_at_another_version` count rather than on
+    /// a second run's outcome. That is the honest scope: whether a work held at
+    /// the wrong version should be *re-fetched* is a separate question from
+    /// whether the derivation counts it as held, and ADR-007 §2 gives
+    /// `wrong_version` a human action, so re-fetching it is a policy decision
+    /// this slice does not make. What must hold — and what a fix that special-
+    /// cased `vor` would break — is that the artefact is `preprint` and the
+    /// derivation reports one want held at a version it rejects.
+    #[tokio::test]
+    async fn a_preprint_does_not_satisfy_a_vor_or_an_am_want() {
+        const DOI: &str = "10.5281/zenodo.23162962";
+        for wanted in ["vor", "am"] {
+            let fx = Fixture::new().await;
+            fx.paper_with(
+                "p-wrong",
+                "A work we only have a preprint of",
+                Some(2023),
+                &[],
+                Some(DOI),
+                None,
+            );
+            fx.gap_for("p-wrong", wanted, "pending");
+            fx.serve_unpaywall_version(DOI, Some("submittedVersion"))
+                .await;
+
+            let report = fx.acquire(&AcquireRequest::queue()).await;
+            assert_eq!(report.acquired(), 1, "{wanted}: the preprint was fetched");
+            let rows = fx.artefacts();
+            assert!(
+                rows[0].contains("|preprint|"),
+                "{wanted}: the artefact is the preprint the ranking chose: {rows:?}"
+            );
+
+            // Re-establish the want, so the derivation has a question to answer.
+            fx.requeue_want("p-wrong", wanted);
+            assert_eq!(
+                fx.held_at_another_version(),
+                1,
+                "{wanted}: a `preprint` must NOT satisfy a `{wanted}` want — \
+                 otherwise `coverage` reports the library as holding the article"
+            );
+        }
     }
 
     // =====================================================================

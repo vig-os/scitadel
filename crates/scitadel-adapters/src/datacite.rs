@@ -330,6 +330,59 @@ fn datacite_creator_name(creator: &serde_json::Value) -> Option<String> {
     name.filter(|name| name.contains(',')).map(str::to_string)
 }
 
+// ============================================================================
+// ADR-007 §3's resolve-then-rank: the fields the identity pass never read.
+// ============================================================================
+
+/// What DataCite says the record is, and which of its two type fields said so.
+///
+/// DataCite carries **two**: `types.resourceTypeGeneral` (a controlled
+/// vocabulary — `Text`, `Preprint`, `Dataset`) and `types.resourceType` (the
+/// submitter's own finer word — `JournalArticle`, `Book`, `Preprint`). The
+/// controlled one is read first because it is the one DataCite validates, and
+/// the finer one second because it is the one a repository actually types.
+///
+/// Which field produced the answer is carried in the return value rather than
+/// discarded, because the ranker records the signal it used: a record typed
+/// `Preprint` in the controlled vocabulary is a stronger statement than one
+/// where the submitter happened to write "preprint" in a free-text field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataCiteType {
+    pub classified: crate::registry::RegistryType,
+    /// The raw word, verbatim.
+    pub word: String,
+    /// Which field it came from: `resourceTypeGeneral` or `resourceType`.
+    pub field: &'static str,
+}
+
+/// Read `data.attributes.types`, or `None` when neither field is usable.
+///
+/// `None` is not "a dataset" and not "an article": it is this record carrying
+/// no type we can act on, which is what makes the ranker fall back and say so.
+#[must_use]
+pub fn type_signal(body: &serde_json::Value) -> Option<DataCiteType> {
+    let attributes = body.pointer("/data/attributes")?;
+    let types = attributes.get("types")?;
+    for field in ["resourceTypeGeneral", "resourceType"] {
+        if let Some(word) = types
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|word| !word.is_empty())
+        {
+            return Some(DataCiteType {
+                classified: crate::registry::RegistryType::of(
+                    word,
+                    crate::registry::Dialect::DataCite,
+                ),
+                word: word.to_string(),
+                field,
+            });
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

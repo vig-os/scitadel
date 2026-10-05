@@ -53,8 +53,95 @@
 
 use crate::ports::PaceTier;
 
+/// The `artefacts.version` vocabulary, as a type.
+///
+/// Four values and no others, because migration 013's CHECK constraint says so
+/// and a fifth would be a constraint violation at acquisition time rather than a
+/// compile error. It exists as an enum rather than as the `&'static str` it
+/// replaced because it now has **two producers** —
+///
+/// 1. [`RouteId::artefact_version`], the route's static claim: a preprint server
+///    serves a preprint, and every other route establishes nothing on its own;
+/// 2. the ranked candidate the resolve-then-rank pass chose, whose version came
+///    from the registries that described *this* document.
+///
+/// Two producers need a join type. With `&'static str` the join was a string
+/// comparison inside [`crate::sqlite::record_download`], which is exactly the
+/// kind of comparison that silently accepts a fifth spelling — and the point of
+/// `RouteId` existing at all, per this module's docs, is that
+/// `artefacts.route` has to survive a write/read round trip.
+///
+/// [`Self::Unknown`] is the fallback value and the *route's* answer, and the two
+/// are not the same thing: `Unknown` means "nothing established a version here",
+/// which is what [`RouteId::artefact_version`] returns for all but two routes. A
+/// candidate the ranker placed on its own `Unstated` rung also files `Unknown`,
+/// because there is no column value for "a rendering of this work, version not
+/// stated" — and inventing one would mean a second vocabulary, which is the
+/// failure this type is here to prevent. The *ranking* keeps the two apart; the
+/// column does not, and does not need to.
+///
+/// # Deliberately narrower than `access_basis`
+///
+/// `access_basis` stayed `Option<&'static str>`: it has exactly one producer
+/// (the route), so a type would buy nothing there, and #261's rule that a caller
+/// may not pair a route with another route's licence answer is enforced by there
+/// being nowhere to put one. Version is the axis the resolver is *entitled* to
+/// answer — it read the document's own record — so it is the one with a
+/// caller-settable field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtefactVersion {
+    /// The published version of record.
+    VersionOfRecord,
+    /// The author manuscript: the peer-reviewed text before a publisher's
+    /// typesetting. Better than a preprint, worse than the version of record.
+    AuthorManuscript,
+    /// Posted before or instead of peer review.
+    Preprint,
+    /// Nothing established which of the three this is.
+    Unknown,
+}
+
+impl ArtefactVersion {
+    /// Every value, so a vocabulary test can be exhaustive.
+    pub const ALL: [Self; 4] = [
+        Self::VersionOfRecord,
+        Self::AuthorManuscript,
+        Self::Preprint,
+        Self::Unknown,
+    ];
+
+    /// The `artefacts.version` column value.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::VersionOfRecord => "vor",
+            Self::AuthorManuscript => "am",
+            Self::Preprint => "preprint",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Parse a stored value back, for a manifest or a report that reads one.
+    ///
+    /// `None` for anything else rather than [`Self::Unknown`]: a value migration
+    /// 013 never wrote is a corrupt row, and reporting it as "we did not look"
+    /// would be the one answer this whole vocabulary exists to keep honest.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|version| version.label() == raw)
+    }
+}
+
+impl std::fmt::Display for ArtefactVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 /// Which route produced an artefact.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RouteId {
     // ---- Open access, free to read by construction (ADR-007 §3 steps 1-3) ----
     /// Europe PMC: `fullTextXML` (JATS) and `supplementaryFiles`.
@@ -215,27 +302,43 @@ impl RouteId {
         }
     }
 
-    /// The `artefacts.version` value a fetch on this route can support, or
-    /// `None` for a pseudo-route.
+    /// The `artefacts.version` this route establishes **on its own**, or `None`
+    /// for a pseudo-route.
     ///
     /// Only the two preprint-by-construction routes get to claim
-    /// `preprint`: a PDF served from arXiv or from bioRxiv/medRxiv *is* a
-    /// preprint, whatever the DOI says about its eventual journal version,
-    /// and the ADR's own "have" rule trusts `unknown` on
-    /// `route IN ('legacy','import_flat')` rows precisely because nothing
-    /// else should carry it. Every other route is `unknown` here and becomes
-    /// `vor`/`am` when S3's resolve-then-rank compares OpenAlex, Crossref and
-    /// DataCite against each other. Claiming `vor` from a single Unpaywall
-    /// location is the overclaiming #261 exists to stop.
+    /// [`ArtefactVersion::Preprint`]: a PDF served from arXiv or from
+    /// bioRxiv/medRxiv *is* a preprint, whatever the DOI says about its eventual
+    /// journal version, and the ADR's own "have" rule trusts `unknown` on
+    /// `route IN ('legacy','import_flat')` rows precisely because nothing else
+    /// should carry it.
+    ///
+    /// Every other route answers [`ArtefactVersion::Unknown`], and that answer is
+    /// **not** the whole story any more. It is the *fallback*, used when the
+    /// resolve-then-rank pass established nothing — and "established nothing" is a
+    /// much narrower condition than "is not a preprint server", because the pass
+    /// reads OpenAlex's `locations[].version`, Unpaywall's `version`, Crossref's
+    /// `type` and DataCite's `types.resourceTypeGeneral` before it fetches.
+    ///
+    /// **Which answer is authoritative when they disagree: the resolver's.** A
+    /// route knows what *kind* of document it serves — a preprint server serves
+    /// preprints — and knows nothing about what any particular URL turned out to
+    /// be. The resolver compared the registries that registered this DOI and read
+    /// the version word off the location it chose, which is a fact about the
+    /// bytes rather than an inference from the server they came off. A
+    /// disagreement is therefore the resolver being right and this being a
+    /// fallback, and it is not an inconsistency to reconcile.
+    ///
+    /// [`crate::sqlite::record_download`] holds that precedence in one place, so
+    /// the two are never compared at a call site.
     #[must_use]
-    pub fn artefact_version(self) -> Option<&'static str> {
+    pub fn artefact_version(self) -> Option<ArtefactVersion> {
         if self.never_fetches() {
             return None;
         }
         Some(if matches!(self, Self::Arxiv | Self::Biorxiv) {
-            "preprint"
+            ArtefactVersion::Preprint
         } else {
-            "unknown"
+            ArtefactVersion::Unknown
         })
     }
 
@@ -518,8 +621,9 @@ mod tests {
             );
             if let Some(version) = version {
                 assert!(
-                    VERSION_VOCABULARY.contains(&version),
-                    "{route} would write version {version:?}"
+                    VERSION_VOCABULARY.contains(&version.label()),
+                    "{route} would write version {:?}",
+                    version.label()
                 );
             }
             if let Some(basis) = route.access_basis() {
@@ -531,20 +635,52 @@ mod tests {
         }
     }
 
+    /// **The static route → version mapping, and nothing else.**
+    ///
     /// A PDF served from a preprint server is a preprint, by construction:
     /// arXiv (#S1's record-level leg) and bioRxiv/medRxiv (#260's DOI
-    /// transform). Nothing else in S1 can tell VoR from author manuscript, so
-    /// everything else stays `unknown`.
+    /// transform). Nothing a *route* alone can tell VoR from an author
+    /// manuscript from a preprint, so every other route stays
+    /// [`ArtefactVersion::Unknown`].
     ///
     /// The set is pinned rather than stated in prose because the failure mode
     /// is silent: a route added to the preprint arm of
     /// [`Self::artefact_version`] without being listed here would make a
     /// publisher's VoR masquerade as a preprint — the inverse of the
     /// overclaim this accessor exists to prevent.
+    ///
+    /// ## What this test is *not*, since #254
+    ///
+    /// It was **kept, not weakened**, and its scope **narrowed in its name**:
+    /// it pins the **mapping**, and the mapping is unchanged and still the
+    /// right answer to "what does this route establish on its own".
+    ///
+    /// What it is no longer the whole story about is which value reaches
+    /// `artefacts.version`, because resolve-then-rank gives that column a second
+    /// producer. That used to be recorded only as a claim in
+    /// `resolve::Version::label`, where nothing checked it; it is now the
+    /// storage precedence, and the next test pins it. So the two halves of "what
+    /// version does this artefact have" are pinned separately and neither is
+    /// folded into the other:
+    ///
+    /// - **this test**: the route's static claim, which is a fallback;
+    /// - [`Self::the_resolvers_version_outranks_the_routes_fallback`]: which of
+    ///   the two wins, and the loop that makes the answer matter.
+    ///
+    /// Renaming it to `a_route_establishes_a_version_only_if_it_serves_one_kind_of_document`
+    /// would say the same thing about a wider set of claims, but the name is the
+    /// cheap part and the split is the substance — so the name says "a version",
+    /// which is what it still asserts.
     #[test]
     fn only_the_preprint_servers_may_claim_a_version() {
-        assert_eq!(RouteId::Arxiv.artefact_version(), Some("preprint"));
-        assert_eq!(RouteId::Biorxiv.artefact_version(), Some("preprint"));
+        assert_eq!(
+            RouteId::Arxiv.artefact_version(),
+            Some(ArtefactVersion::Preprint)
+        );
+        assert_eq!(
+            RouteId::Biorxiv.artefact_version(),
+            Some(ArtefactVersion::Preprint)
+        );
         for route in RouteId::ALL
             .into_iter()
             .filter(|r| !r.never_fetches())
@@ -552,10 +688,61 @@ mod tests {
         {
             assert_eq!(
                 route.artefact_version(),
-                Some("unknown"),
+                Some(ArtefactVersion::Unknown),
                 "{route} must not claim a version it did not establish"
             );
         }
+    }
+
+    /// **The storage precedence is documented here and *pinned* in
+    /// `scitadel-db`** — at `the_resolvers_version_outranks_the_routes_fallback`,
+    /// in `sqlite/artefacts.rs`.
+    ///
+    /// It cannot be pinned from this crate: the join happens inside
+    /// [`crate::sqlite::record_download`], and `scitadel-db` depends on
+    /// `scitadel-core`, so the dependency runs the wrong way for a test here to
+    /// reach it. What this crate can own — and does, in
+    /// `only_the_preprint_servers_may_claim_a_version` above — is the **fallback**
+    /// side of the pair. The two halves of "what version does this artefact have"
+    /// are therefore pinned in two crates, which is where their subjects live,
+    /// and each test says which half it is so neither is mistaken for the whole.
+    ///
+    /// The precedence, restated so this file is not half the story:
+    ///
+    /// | resolver established | column gets |
+    /// |---|---|
+    /// | `Some(VersionOfRecord \| AuthorManuscript \| Preprint)` | **the resolver's** value |
+    /// | `Some(Unknown)` — looked, nothing stated | `unknown` |
+    /// | `None` — did not look | the route's [`Self::artefact_version`] |
+    ///
+    /// The middle row is why `Some(Unknown)` and `None` are different inputs:
+    /// both write `unknown` here, but only the second consults the route, and a
+    /// caller that cannot tell them apart has thrown away the distinction between
+    /// "we asked and got no answer" and "we never asked".
+    ///
+    /// [`ArtefactVersion`] and the column must not drift, in either direction.
+    ///
+    /// Round-tripped rather than listed twice, because the migration-013 CHECK
+    /// list is the third copy of this vocabulary and a hand-written third copy is
+    /// how two of them come to disagree.
+    #[test]
+    fn artefact_version_round_trips_its_own_column_values() {
+        const MIGRATION_013: [&str; 4] = ["vor", "am", "preprint", "unknown"];
+        for label in MIGRATION_013 {
+            let parsed = ArtefactVersion::parse(label)
+                .unwrap_or_else(|| panic!("{label} is a column value this type cannot read"));
+            assert_eq!(parsed.label(), label, "round trip for {label}");
+        }
+        assert_eq!(
+            ArtefactVersion::ALL.map(ArtefactVersion::label),
+            MIGRATION_013,
+            "and the vocabulary is exactly migration 013's, in order"
+        );
+        // A value the CHECK constraint would have refused anyway must not be
+        // laundered into "we did not look".
+        assert_eq!(ArtefactVersion::parse("draft"), None);
+        assert_eq!(ArtefactVersion::parse(""), None);
+        assert_eq!(ArtefactVersion::parse("VOR"), None);
     }
 
     /// The two SI-discovery routes discover where bytes live; they do not
