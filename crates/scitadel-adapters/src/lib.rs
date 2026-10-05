@@ -1,10 +1,13 @@
 pub mod acquire;
 pub mod acquire_ndjson;
 pub mod arxiv;
+pub mod crossref;
+pub mod datacite;
 pub mod download;
 pub mod epo;
 pub mod error;
 pub mod identity;
+pub mod identity_chain;
 pub mod import_flat;
 pub mod inspire;
 pub mod lens;
