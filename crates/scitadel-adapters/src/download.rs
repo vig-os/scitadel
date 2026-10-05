@@ -118,6 +118,7 @@ use scitadel_http::{
 
 use crate::error::AdapterError;
 use crate::identity::{self, WorkIdentity};
+use crate::identity_chain::{ChainHop, ChainOutcome, HopOutcome, IdentityChain, ResolvedWork};
 use crate::import_flat::resolve_best_effort;
 use crate::openalex::OPENALEX_API_URL;
 use crate::osti;
@@ -301,6 +302,20 @@ pub struct Endpoints {
     pub biorxiv_content: String,
     /// Base of `GET {base}/{openalex_id}?mailto=…&api_key=…`.
     pub openalex_api: String,
+    /// Base of `GET {base}/works/doi:<doi>` — ADR-007 §3's identity chain's
+    /// first hop, reached by DOI rather than by id.
+    ///
+    /// Separate from `openalex_api` only because the *lookup key* differs, not
+    /// because the host does: both resolve against the same `/works` route, and
+    /// the chain reuses the one base so a test cannot point the by-id leg and
+    /// the by-DOI hop at two different servers and call the chain covered.
+    pub openalex_works: String,
+    /// Base of `GET {base}/{doi}` — Crossref's single-record route, the chain's
+    /// second hop.
+    pub crossref_works: String,
+    /// Base of `GET {base}/{doi}` — DataCite's single-DOI route, the chain's
+    /// third hop.
+    pub datacite_dois: String,
     /// Root of OSTI, from which `GET {base}/servlets/purl/{osti_id}` and
     /// `{base}/biblio/{osti_id}` are built.
     ///
@@ -318,6 +333,9 @@ impl Default for Endpoints {
             arxiv_pdf: "https://arxiv.org/pdf".to_string(),
             biorxiv_content: PreprintBases::default().biorxiv_content,
             openalex_api: OPENALEX_API_URL.to_string(),
+            openalex_works: OPENALEX_API_URL.to_string(),
+            crossref_works: crate::crossref::CROSSREF_WORKS_URL.to_string(),
+            datacite_dois: crate::datacite::DATACITE_DOIS_URL.to_string(),
             osti_base: osti::OSTI_BASE.to_string(),
         }
     }
@@ -466,14 +484,14 @@ impl PaperDownloader {
             .try_preprint(&work, &normalized, &stem, output_dir)
             .await
         {
-            Ok(fetched) => return self.finish(None, fetched).await,
+            Ok(fetched) => return self.finish(&work, None, fetched).await,
             Err(e) => {
                 tracing::info!(doi = %normalized, error = %e, "preprint transform failed, falling back to Unpaywall");
             }
         }
 
         match self.try_unpaywall(&work, &normalized, output_dir).await {
-            Ok(fetched) => return self.finish(None, fetched).await,
+            Ok(fetched) => return self.finish(&work, None, fetched).await,
             Err(e) => {
                 tracing::info!(doi = %normalized, error = %e, "Unpaywall lookup failed, falling back to publisher");
             }
@@ -486,7 +504,7 @@ impl PaperDownloader {
             .download_publisher_html(&work, &normalized, output_dir)
             .await
             .map_err(LegError::into_adapter)?;
-        self.finish(None, fetched).await
+        self.finish(&work, None, fetched).await
     }
 
     /// Download a paper using every identifier available on the `Paper` record.
@@ -566,7 +584,7 @@ impl PaperDownloader {
 
         if let Some(id) = paper.arxiv_id.as_deref().filter(|s| !s.is_empty()) {
             match self.try_arxiv(&work, id, &stem, output_dir).await {
-                Ok(fetched) => return self.finish(Some(paper), fetched).await,
+                Ok(fetched) => return self.finish(&work, Some(paper), fetched).await,
                 Err(e) => {
                     tracing::info!(arxiv_id = %id, error = %e, "arxiv fallback failed");
                     ladder.record(Leg::ArxivId, e.outcome);
@@ -583,7 +601,7 @@ impl PaperDownloader {
                 .try_preprint(&work, normalized, &stem, output_dir)
                 .await
             {
-                Ok(fetched) => return self.finish(Some(paper), fetched).await,
+                Ok(fetched) => return self.finish(&work, Some(paper), fetched).await,
                 Err(e) => {
                     tracing::info!(doi = %normalized, error = %e, "preprint transform failed");
                     ladder.record(Leg::Preprint, e.outcome);
@@ -600,7 +618,7 @@ impl PaperDownloader {
         // `needs_ill` about — for a document that is free to read.
         match self.db.osti_id(paper.id.as_str()) {
             Ok(Some(osti_id)) => match self.try_osti(&work, &osti_id, &stem, output_dir).await {
-                Ok(fetched) => return self.finish(Some(paper), fetched).await,
+                Ok(fetched) => return self.finish(&work, Some(paper), fetched).await,
                 Err(e) => {
                     tracing::info!(osti_id = %osti_id, error = %e, "OSTI route failed");
                     ladder.record(Leg::Osti, e.outcome);
@@ -617,7 +635,7 @@ impl PaperDownloader {
 
         if let Some(id) = paper.openalex_id.as_deref().filter(|s| !s.is_empty()) {
             match self.try_openalex(&work, id, &stem, output_dir).await {
-                Ok(fetched) => return self.finish(Some(paper), fetched).await,
+                Ok(fetched) => return self.finish(&work, Some(paper), fetched).await,
                 Err(e) => {
                     tracing::info!(openalex_id = %id, error = %e, "openalex fallback failed");
                     ladder.record(Leg::OpenAlex, e.outcome);
@@ -629,7 +647,7 @@ impl PaperDownloader {
 
         if let Some(normalized) = doi.as_deref() {
             match self.try_unpaywall(&work, normalized, output_dir).await {
-                Ok(fetched) => return self.finish(Some(paper), fetched).await,
+                Ok(fetched) => return self.finish(&work, Some(paper), fetched).await,
                 Err(e) => {
                     tracing::info!(doi = %normalized, error = %e, "unpaywall fallback failed");
                     ladder.record(Leg::Unpaywall, e.outcome);
@@ -639,7 +657,7 @@ impl PaperDownloader {
                 .download_publisher_html(&work, normalized, output_dir)
                 .await
             {
-                Ok(fetched) => return self.finish(Some(paper), fetched).await,
+                Ok(fetched) => return self.finish(&work, Some(paper), fetched).await,
                 Err(e) => {
                     tracing::info!(doi = %normalized, error = %e, "publisher html fallback failed");
                     ladder.record(Leg::Publisher, e.outcome);
@@ -657,7 +675,7 @@ impl PaperDownloader {
                 .download_url_as_html(&work, url, &stem, output_dir)
                 .await
             {
-                Ok(fetched) => return self.finish(Some(paper), fetched).await,
+                Ok(fetched) => return self.finish(&work, Some(paper), fetched).await,
                 Err(e) => {
                     // The same error this walk has always returned for a
                     // failing last resort. The state row is extra
@@ -683,11 +701,13 @@ impl PaperDownloader {
     /// Both are recorded and **either** can refuse:
     ///
     /// - **pre-fetch**, when a leg resolved the work through a metadata
-    ///   registry: the stored paper's title against the registry's. Today that
-    ///   is [`RouteId::OpenAlex`], and it is the only registry on this path —
-    ///   ADR-007 §3's chain is "OpenAlex → Crossref → DataCite", Crossref and
-    ///   DataCite have no adapter yet (S3), and Unpaywall's `title` is a copy of
-    ///   the publisher-supplied title rather than a second opinion worth having.
+    ///   registry: the stored paper's title against the registry's. The
+    ///   registry is found by walking the chain — **OpenAlex → Crossref →
+    ///   DataCite** — and a leg that already holds an OpenAlex answer seeds its
+    ///   first hop rather than re-requesting it. Crossref and DataCite are not
+    ///   interchangeable extras: the three registries have genuinely disjoint
+    ///   coverage, and half of #260's measured misses are DOIs only DataCite
+    ///   registers. See [`crate::identity_chain`].
     /// - **post-fetch**, for every route: what the bytes themselves say they are
     ///   (`citation_title`, or a PDF's `/Title`) against what the metadata said.
     ///   This is the one that catches a redirect to the wrong paper.
@@ -698,8 +718,8 @@ impl PaperDownloader {
     /// continues, and the asymmetry is deliberate (see `crate::identity`): a
     /// mismatch is positive evidence that the bytes are another work, while an
     /// `unverified` is no evidence at all. Blocking on it would mean a PDF with
-    /// no `/Title` could never be acquired by any machine run — `unverified` is a
-    /// property of the data, so a blocked fetch would return it again forever.
+    /// no `/Title` could never be acquired by any machine run — `unverified` is
+    /// a property of the data, so a blocked fetch would return it again forever.
     /// The row is written either way, with both titles, so the reader can see
     /// what was not established.
     ///
@@ -708,10 +728,11 @@ impl PaperDownloader {
     /// Each phase's check in force is read before it runs, so a work a person
     /// has settled is not re-litigated by a later run — the check is not even
     /// recorded over the override.
-    fn gate_identity(
+    async fn gate_identity(
         &self,
         paper: &Paper,
         route: RouteId,
+        work: &WorkScope,
         bytes: &[u8],
         registry: Option<&ResolvedWork>,
     ) -> Result<(), AdapterError> {
@@ -723,28 +744,87 @@ impl PaperDownloader {
         let now = Utc::now().to_rfc3339();
 
         // ---- pre-fetch: the stored paper against the registry ----
+        //
+        // The chain is consulted when no leg brought an answer, and the
+        // pre-fetch row is written when there is something to say either way:
+        // a registry named the work, or the chain came back empty-handed after
+        // asking. A chain that had nothing to ask with (no DOI, no id) records
+        // nothing, because "we could not check" and "we checked and found
+        // nothing" are different facts and only one of them is evidence.
+        //
+        // `chain_answer` is carried out of the block so the post-fetch check
+        // compares the served bytes against **the registry that actually
+        // answered**, which after this change may be Crossref or DataCite and
+        // not OpenAlex. It is `Option` throughout rather than defaulted, so a
+        // work with no registry answer keeps the weaker post-fetch expectation
+        // it has always had.
         let mut refused = None;
-        if let Some(resolved) = registry
-            && !self.phase_is_settled(paper, IdentityPhase::PreFetch)
-        {
-            let checked = identity::verify(&expected, &resolved.identity);
-            self.record_check(
-                paper,
-                IdentityPhase::PreFetch,
-                ComparedSides {
-                    source: resolved.source,
-                    expected_title: Some(paper.title.clone()),
-                    resolved_title: resolved.identity.title.clone(),
-                },
-                &checked,
-                &now,
-            );
-            if !checked.verdict.allows_filing() {
-                refused = Some((
+        let mut chain_answer = registry.cloned();
+        if !self.phase_is_settled(paper, IdentityPhase::PreFetch) {
+            let outcome = match chain_answer.clone() {
+                Some(answer) => {
+                    let source = answer.source;
+                    ChainOutcome {
+                        hops: vec![ChainHop {
+                            source,
+                            outcome: HopOutcome::Answered,
+                        }],
+                        resolved: Some(answer),
+                    }
+                }
+                None => {
+                    self.identity_chain()
+                        .resolve(&self.client, work, paper.doi.as_deref(), None)
+                        .await
+                }
+            };
+            if outcome.consulted_any() {
+                chain_answer.clone_from(&outcome.resolved);
+                let resolved_title = outcome
+                    .resolved
+                    .as_ref()
+                    .and_then(|answer| answer.identity.title.clone());
+                let checked = match outcome.resolved.as_ref() {
+                    Some(answer) => identity::verify(&expected, &answer.identity),
+                    // Nobody named the work. `verify` against an empty
+                    // identity is the matcher's own honest `unverified` — "no
+                    // title on one side" — rather than a verdict this module
+                    // invented, and the row's `why` says so.
+                    None => identity::verify(&expected, &WorkIdentity::default()),
+                };
+                self.record_check(
+                    paper,
                     IdentityPhase::PreFetch,
-                    resolved.source.to_string(),
-                    checked,
-                ));
+                    ComparedSides {
+                        // The registry that actually answered, or the last one
+                        // consulted when none did. `recorded_source` never names
+                        // a registry that stayed silent; see the chain's docs.
+                        source: outcome
+                            .recorded_source()
+                            .unwrap_or(IdentitySource::OpenAlex),
+                        expected_title: Some(paper.title.clone()),
+                        resolved_title: resolved_title.clone(),
+                    },
+                    &checked,
+                    &now,
+                );
+                tracing::debug!(
+                    paper_id = %paper.id,
+                    source = ?outcome.recorded_source(),
+                    trace = %outcome.why(),
+                    "pre-fetch identity chain walked"
+                );
+                if !checked.verdict.allows_filing() {
+                    refused = Some((
+                        IdentityPhase::PreFetch,
+                        outcome
+                            .recorded_source()
+                            .unwrap_or(IdentitySource::OpenAlex)
+                            .to_string(),
+                        resolved_title,
+                        checked,
+                    ));
+                }
             }
         }
 
@@ -756,9 +836,10 @@ impl PaperDownloader {
             // ADR-007 §3: "the served page or PDF title against OpenAlex". With
             // no registry answer, the stored paper is the only expectation there
             // is — a weaker check, and the row says which expectation was used by
-            // carrying both titles.
+            // carrying both titles. With one, the expectation is that registry's
+            // answer, whichever of the three it was.
             let expected_side =
-                registry.map_or_else(|| expected.clone(), |resolved| resolved.identity.clone());
+                chain_answer.map_or_else(|| expected.clone(), |answer| answer.identity.clone());
             let checked = identity::verify(&expected_side, &served);
             self.record_check(
                 paper,
@@ -775,17 +856,49 @@ impl PaperDownloader {
                 refused = Some((
                     IdentityPhase::PostFetch,
                     "the served page or PDF".to_string(),
+                    served.title.clone(),
                     checked,
                 ));
             }
         }
 
-        let Some((phase, resolver, verdict)) = refused else {
+        let Some((phase, resolver, resolved_title, verdict)) = refused else {
             return Ok(());
         };
         Err(self.refuse_on_mismatch(
-            paper, route, phase, resolver, &expected, registry, bytes, &verdict, &now,
+            paper,
+            route,
+            phase,
+            resolver,
+            &expected,
+            resolved_title.as_deref(),
+            &verdict,
+            &now,
         ))
+    }
+
+    /// The pre-fetch identity chain, pointed at this downloader's endpoints.
+    ///
+    /// Built per call rather than held, for the same reason the adapters are
+    /// values: it is three base URLs and an `OpenAlexAuth`, and a field holding
+    /// it would be a second copy of the endpoint configuration that
+    /// [`Endpoints`] already is the single authority for.
+    ///
+    /// All **three** bases come from `Endpoints`, not just OpenAlex's. That is
+    /// not tidiness: it is the only reason a `wiremock`-backed test can assert
+    /// on this chain at all. A chain that defaulted Crossref and DataCite to
+    /// their production hosts would put requests on the real internet from
+    /// inside a test, and — because the real Crossref answers `200` for plenty
+    /// of DOIs — it would answer with a real record and produce a real
+    /// `mismatch` against a fixture paper named `"Paper p-unpaywall"`.
+    fn identity_chain(&self) -> IdentityChain {
+        IdentityChain::with_bases(
+            self.endpoints.openalex_works.clone(),
+            self.endpoints.crossref_works.clone(),
+            self.endpoints.datacite_dois.clone(),
+            self.openalex.clone(),
+            &self.openalex.email,
+        )
     }
 
     /// Has a person already settled this work's identity **for this phase**?
@@ -868,6 +981,13 @@ impl PaperDownloader {
     /// criterion for this slice is that a mismatch leaves the artefact table
     /// exactly as it found it, and the cheapest way to guarantee that is for this
     /// function to have no write that could reach it.
+    ///
+    /// Nine arguments, and the `#[allow]` is deliberate rather than a reflex:
+    /// this is the one function in the file whose whole job is to turn a
+    /// completed check into an audit row, an error and a gap, and every
+    /// argument is one of the pieces ADR-007 §3's two checks produce. Bundling
+    /// them into a struct would put a second spelling of the check's evidence
+    /// in the file, which is the class of change #253 was about.
     #[allow(clippy::too_many_arguments)]
     fn refuse_on_mismatch(
         &self,
@@ -876,20 +996,12 @@ impl PaperDownloader {
         phase: IdentityPhase,
         resolver: String,
         expected: &WorkIdentity,
-        registry: Option<&ResolvedWork>,
-        bytes: &[u8],
+        resolved_title: Option<&str>,
         checked: &identity::Checked,
         now: &str,
     ) -> AdapterError {
         let expected_title = expected.title.clone().unwrap_or_default();
-        let resolved_title = match (phase, registry) {
-            (IdentityPhase::PreFetch, Some(registry)) => {
-                registry.identity.title.clone().unwrap_or_default()
-            }
-            _ => identity::served_identity(bytes)
-                .and_then(|served| served.title)
-                .unwrap_or_default(),
-        };
+        let resolved_title = resolved_title.unwrap_or_default();
         let detail = format!(
             "{} check at {phase} against {resolver}: expected {expected_title:?}, got \
              {resolved_title:?} ({})",
@@ -924,7 +1036,7 @@ impl PaperDownloader {
             phase: phase.label(),
             expected: expected_title,
             resolver,
-            resolved: resolved_title,
+            resolved: resolved_title.to_string(),
             why: checked.why.clone(),
         }))
     }
@@ -1061,6 +1173,7 @@ impl PaperDownloader {
     /// `Ok` can rely on both having happened.
     async fn finish(
         &self,
+        work: &WorkScope,
         paper: Option<&Paper>,
         fetched: Fetched,
     ) -> Result<DownloadResult, AdapterError> {
@@ -1083,7 +1196,8 @@ impl PaperDownloader {
         // dropped on the floor — no blob, no `artefacts` row, no gap retraction,
         // and no file anywhere claiming to be this paper's.
         if let Some(paper) = paper {
-            self.gate_identity(paper, route, &bytes, resolved.as_ref())?;
+            self.gate_identity(paper, route, work, &bytes, resolved.as_ref())
+                .await?;
         }
 
         // The `kind` vocabulary is closed, so an extension outside it is a
@@ -1720,13 +1834,6 @@ struct ComparedSides {
     resolved_title: Option<String>,
 }
 
-/// One registry's answer about a work: what it is called, when, and by whom.
-#[derive(Debug, Clone, PartialEq)]
-struct ResolvedWork {
-    identity: WorkIdentity,
-    source: IdentitySource,
-}
-
 /// The two full-text serialisations these legs have ever stored.
 ///
 /// `fulltext_kind` turns each into the `kind` / `format` / `mime` triple on
@@ -2098,33 +2205,15 @@ fn classify_html(bytes: &[u8]) -> AccessStatus {
 /// What OpenAlex's `/works/{id}` says the work is, for the pre-fetch identity
 /// check.
 ///
-/// Read from the same envelope the leg already parsed rather than from a second
-/// request: `title` and `publication_year` are top-level fields, and the first
-/// authorship's `author.display_name` is the first author in the same order the
-/// registry lists them. A missing field yields `None` rather than a placeholder,
-/// because an absent fact must read as [`Verdict::Unverified`] and never as
-/// agreement.
+/// A thin alias, and the point of it is what it is **not**: the parse lives in
+/// [`crate::openalex::work_identity`], next to the module that defines the
+/// record's shape, because ADR-007 §3's chain reads the same fields off an
+/// OpenAlex answer reached two different ways (this leg, by id; the chain, by
+/// DOI). Two copies of that parse would be free to drift, and a drift would
+/// show up as a corpus of `unverified` rather than as a compile error.
 fn openalex_identity(work: &serde_json::Value) -> ResolvedWork {
-    let identity = WorkIdentity {
-        title: work
-            .get("title")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
-        year: work
-            .get("publication_year")
-            .and_then(serde_json::Value::as_i64)
-            .and_then(|year| i32::try_from(year).ok()),
-        first_author: work
-            .get("authorships")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|authorships| authorships.first())
-            .and_then(|authorship| authorship.get("author"))
-            .and_then(|author| author.get("display_name"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
-    };
     ResolvedWork {
-        identity,
+        identity: crate::openalex::work_identity(work),
         source: IdentitySource::OpenAlex,
     }
 }
@@ -2482,6 +2571,9 @@ mod tests {
                     arxiv_pdf: format!("{base}/pdf"),
                     biorxiv_content: format!("{base}/content"),
                     openalex_api: format!("{base}/works"),
+                    openalex_works: format!("{base}/works"),
+                    crossref_works: format!("{base}/cr"),
+                    datacite_dois: format!("{base}/dc"),
                     osti_base: base.clone(),
                 },
             )
@@ -2524,6 +2616,49 @@ mod tests {
                 .await
                 .into_iter()
                 .filter(|url| url.contains(needle))
+                .collect()
+        }
+
+        /// Is this request one of ADR-007 §3's pre-fetch identity **chain**
+        /// hops rather than a full-text leg?
+        ///
+        /// The chain is a different mechanism from the ladder, and conflating
+        /// the two would make every "the ladder made exactly N requests"
+        /// assertion wrong for the wrong reason. The three prefixes are the
+        /// chain's own routes in this fixture: the by-DOI OpenAlex lookup
+        /// (`/works/doi:…`, which the ladder never issues — the ladder's
+        /// OpenAlex leg asks `/works/{id}`) and the two new registry bases.
+        fn is_identity_chain_request(url: &str) -> bool {
+            let path = url
+                .split_once("://")
+                .and_then(|(_, rest)| rest.find('/').map(|at| &rest[at..]))
+                .unwrap_or(url);
+            path.starts_with("/works/doi:") || path.starts_with("/cr/") || path.starts_with("/dc/")
+        }
+
+        /// The requests the **ladder** put on the wire, with the identity
+        /// chain's metadata hops removed.
+        ///
+        /// What a test asserting on leg behaviour wants: "this work was served
+        /// by this URL and no other leg was tried" is a statement about the
+        /// full-text walk, and counting the chain's three `Meta` lookups into
+        /// it would obscure exactly the thing being pinned.
+        async fn ladder_requests(&self) -> Vec<String> {
+            self.requests()
+                .await
+                .into_iter()
+                .filter(|url| !Self::is_identity_chain_request(url))
+                .collect()
+        }
+
+        /// The requests the pre-fetch identity **chain** put on the wire, in
+        /// the order it made them — the hop order, read off the wire rather
+        /// than off the code that issued it.
+        async fn identity_chain_requests(&self) -> Vec<String> {
+            self.requests()
+                .await
+                .into_iter()
+                .filter(|url| Self::is_identity_chain_request(url))
                 .collect()
         }
 
@@ -3537,10 +3672,31 @@ mod tests {
 
         assert_eq!(result.route, RouteId::Publisher);
         let requests = fx.pacer.spending(Cost::Request);
+        // Four ladder legs, plus the pre-fetch identity chain's three metadata
+        // hops — seven `Request` permits, and **one** `Work` permit for the
+        // whole walk. The chain runs after the bytes are in hand, so it is
+        // three more requests against a budget the work was already charged
+        // for, which is the shape ADR-007 §4 wants: more traffic, not more
+        // works.
         assert_eq!(
             requests.len(),
-            4,
-            "four legs, one Request permit each: {:?}",
+            7,
+            "four legs plus the chain's three hops, one Request permit each: {:?}",
+            fx.pacer.grants()
+        );
+        assert_eq!(
+            requests.iter().filter(|g| g.tier == PaceTier::Oa).count(),
+            2,
+            "the arXiv PDF attempt and the doi.org landing page are the two \
+             `Oa` legs: {:?}",
+            fx.pacer.grants()
+        );
+        assert_eq!(
+            requests.iter().filter(|g| g.tier == PaceTier::Meta).count(),
+            5,
+            "OpenAlex by id and Unpaywall are two, and the identity chain's \
+             three are the other three — every one of them `Meta`, which is \
+             what keeps the chain off the repositories' budget: {:?}",
             fx.pacer.grants()
         );
         assert_eq!(
@@ -3582,12 +3738,22 @@ mod tests {
             .expect("download");
 
         let requests: Vec<_> = fx.pacer.spending(Cost::Request);
-        assert_eq!(requests.len(), 2, "lookup then PDF");
+        // Two requests on the Unpaywall route, then the identity chain's three
+        // — and the split that matters is by **tier**, not by route: the chain
+        // is metadata work like the lookup it follows, so folding it into this
+        // assertion would blur the very distinction the test exists to draw.
+        assert_eq!(requests.len(), 5, "lookup then PDF, then the chain's three");
         assert_eq!(requests[0].tier, PaceTier::Meta, "the API lookup");
         assert_eq!(
             requests[1].tier,
             PaceTier::Oa,
             "the resolved PDF, off an OA host"
+        );
+        assert!(
+            requests[2..].iter().all(|g| g.tier == PaceTier::Meta),
+            "and every identity-chain hop is metadata, so the chain spends the \
+             `Meta` budget rather than the repositories' `Oa` one: {:?}",
+            fx.pacer.grants()
         );
         // `RouteId::Unpaywall::fetch_tier()` is `Meta` — one value for the
         // whole route, which is exactly why the chain cannot derive the
@@ -3746,10 +3912,20 @@ mod tests {
             fx.requests().await
         );
         assert_eq!(
-            fx.requests().await.len(),
-            1,
-            "one request, one hop: {:?}",
+            fx.ladder_requests().await,
+            vec!["http://localhost/content/10.1101/2025.06.14.659707v1.full.pdf".to_string()],
+            "one request, one hop, to the verified URL: {:?}",
             fx.requests().await
+        );
+        // The identity chain is a *different* mechanism and is not part of the
+        // ladder: it walked all three registries and none named the work, so
+        // the pre-fetch check is `unverified` and the preprint is filed anyway
+        // (`unverified` never blocks — see `crate::identity`).
+        assert_eq!(
+            fx.identity_chain_requests().await.len(),
+            3,
+            "the pre-fetch chain asked OpenAlex, then Crossref, then DataCite: {:?}",
+            fx.identity_chain_requests().await
         );
 
         let row = fx.artefact("p-preprint").expect("an artefact row");
@@ -3789,10 +3965,18 @@ mod tests {
             "a work that was obtained records no gap: {:?}",
             fx.states("p-preprint")
         );
-        // One Request permit, at the OA tier: a preprint server is an OA host.
+        // One `Oa` permit for the full text — a preprint server is an OA host —
+        // and the identity chain's three `Meta` permits after it. The tier
+        // split is the point: the bytes came off an OA host and the metadata
+        // came off three metadata registries, and neither spent the other's
+        // budget.
         let requests = fx.pacer.spending(Cost::Request);
-        assert_eq!(requests.len(), 1, "{requests:?}");
-        assert_eq!(requests[0].tier, PaceTier::Oa);
+        assert_eq!(requests.len(), 4, "{requests:?}");
+        assert_eq!(requests[0].tier, PaceTier::Oa, "the bioRxiv PDF");
+        assert!(
+            requests[1..].iter().all(|g| g.tier == PaceTier::Meta),
+            "and the chain's three hops are all metadata: {requests:?}"
+        );
     }
 
     /// A DOI the preprint leg cannot serve must cost the walk a fall-through,
@@ -4113,10 +4297,23 @@ mod tests {
         assert_eq!(result.route, RouteId::Arxiv);
         assert_eq!(result.format, DownloadFormat::Pdf);
         assert_eq!(
-            fx.requests().await.len(),
+            fx.ladder_requests().await.len(),
             1,
             "one request, to the verified URL, and nothing else: {:?}",
             fx.requests().await
+        );
+        // "No index lookup" is a claim about the **full-text** walk, and it is
+        // still exactly true: the ladder reached arXiv by transforming the DOI
+        // and consulted no index for the bytes. The pre-fetch identity chain
+        // does query the three metadata registries, and that is a different
+        // question with a different budget (three `Meta` permits, not one
+        // `Oa`), so it is counted separately rather than folded in here.
+        assert_eq!(
+            fx.identity_chain_requests().await.len(),
+            3,
+            "the identity chain's own three lookups, which are not an index \\
+             lookup for the full text: {:?}",
+            fx.identity_chain_requests().await
         );
         // Asserted on the path rather than the whole URL: wiremock records
         // what arrived, so the authority is `localhost` with the default port

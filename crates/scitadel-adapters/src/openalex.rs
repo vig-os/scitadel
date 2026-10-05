@@ -571,6 +571,76 @@ fn work_to_candidate(work: &serde_json::Value, rank: i32) -> CandidatePaper {
     }
 }
 
+/// What an OpenAlex `/works` record says the work is, for the pre-fetch
+/// identity check (ADR-007 §3).
+///
+/// **One parser, two callers.** The download ladder reads it off the envelope
+/// its OpenAlex leg already fetched, and [`crate::identity_chain`] reads it off
+/// a by-DOI lookup when no leg asked OpenAlex — and the second reader is a
+/// preprint or a repository DOI, which is exactly where a second, subtly
+/// different copy of this would diverge and quietly report `unverified`. So it
+/// lives here, next to the module that defines the shape, and both call it.
+///
+/// Read from the record rather than re-requested: `title` and
+/// `publication_year` are top-level fields, and the first authorship's
+/// `author.display_name` is the first author in the order the registry lists
+/// them. A missing field yields `None` rather than a placeholder, because an
+/// absent fact must read as [`crate::identity::Verdict::Unverified`] and never
+/// as agreement.
+#[must_use]
+pub fn work_identity(work: &serde_json::Value) -> crate::identity::WorkIdentity {
+    crate::identity::WorkIdentity {
+        title: work
+            .get("title")
+            .or_else(|| work.get("display_name"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|title| !title.trim().is_empty())
+            .map(str::to_string),
+        year: work
+            .get("publication_year")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|year| i32::try_from(year).ok()),
+        first_author: work
+            .get("authorships")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|authorships| authorships.first())
+            .and_then(|authorship| authorship.get("author"))
+            .and_then(|author| author.get("display_name"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .map(str::to_string),
+    }
+}
+
+/// The `/works/doi:<doi>` URL, percent-encoded.
+///
+/// The encoded and the raw spellings both answer `200` against the live API
+/// (measured 2026-10), so the encoding is a correctness choice: it keeps a
+/// segmented identifier's `/` inside one segment and stops a `#` or `?` in a
+/// suffix from truncating the path. `Url`'s own encoder is used rather than a
+/// hand-spliced string for the reason [`crate::crossref`] gives.
+///
+/// # Errors
+///
+/// Only if `base_url` will not parse.
+pub fn doi_works_url(
+    base_url: &str,
+    doi: &str,
+) -> Result<reqwest::Url, scitadel_core::error::CoreError> {
+    use scitadel_core::error::CoreError;
+    let mut url = reqwest::Url::parse(base_url)
+        .map_err(|e| CoreError::Adapter("openalex".into(), format!("invalid base URL: {e}")))?;
+    url.path_segments_mut()
+        .map_err(|()| {
+            CoreError::Adapter(
+                "openalex".into(),
+                "the /works base URL cannot be a base".to_string(),
+            )
+        })?
+        .extend([format!("doi:{}", scitadel_core::models::normalize_doi(doi))]);
+    Ok(url)
+}
+
 /// Reconstruct abstract text from OpenAlex inverted index format.
 pub fn reconstruct_abstract(inverted_index: &serde_json::Map<String, serde_json::Value>) -> String {
     let mut word_positions: Vec<(i64, &str)> = Vec::new();

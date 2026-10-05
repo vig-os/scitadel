@@ -1022,6 +1022,50 @@ mod tests {
     /// Classified (Nature), for the contrast half of the publisher test.
     const NATURE_DOI: &str = "10.1038/s41586-020-2649-2";
 
+    /// A JSON string literal, for the registry fixtures below.
+    fn json(value: &str) -> String {
+        serde_json::to_string(value).expect("json")
+    }
+
+    /// The form a DOI takes in a request path: the adapters put it there with
+    /// `Url::path_segments_mut`, so the fixture has to mount the **encoded**
+    /// path or wiremock matches nothing and every chain test sees three 404s.
+    fn encode(doi: &str) -> String {
+        doi.replace('/', "%2F")
+    }
+
+    /// A title that is *not* the stored paper's, for the decoy records a
+    /// `chain_work` mounts on the registries that must not be consulted. A
+    /// chain that asked one of them anyway would produce a `mismatch` here,
+    /// which is a louder failure than a request count.
+    const TITLE_FOR_OTHERS: &str = "A different work, which no hop should ever resolve";
+
+    fn openalex_work(title: &str) -> String {
+        format!(
+            r#"{{"id":"https://openalex.org/W-decoy","title":{t},"publication_year":1999,
+                 "authorships":[{{"author":{{"display_name":"Wrong, A."}}}}]}}"#,
+            t = json(title)
+        )
+    }
+
+    fn crossref_work(title: &str) -> String {
+        format!(
+            r#"{{"status":"ok","message":{{"title":[{t}],
+                 "published":{{"date-parts":[[1999]]}},
+                 "author":[{{"given":"A","family":"Wrong"}}]}}}}"#,
+            t = json(title)
+        )
+    }
+
+    fn datacite_work(title: &str) -> String {
+        format!(
+            r#"{{"data":{{"attributes":{{"titles":[{{"title":{t}}}],
+                 "publicationYear":1999,
+                 "creators":[{{"name":"Wrong, A."}}]}}}}}}"#,
+            t = json(title)
+        )
+    }
+
     /// Grants everything, immediately. The ledger's behaviour is
     /// `scitadel-db`'s to test, not this file's.
     #[derive(Debug, Default)]
@@ -1091,6 +1135,9 @@ mod tests {
                     arxiv_pdf: format!("{base}/pdf"),
                     biorxiv_content: format!("{base}/content"),
                     openalex_api: format!("{base}/works"),
+                    openalex_works: format!("{base}/works"),
+                    crossref_works: format!("{base}/cr"),
+                    datacite_dois: format!("{base}/dc"),
                     osti_base: base.clone(),
                 },
             )
@@ -1116,6 +1163,216 @@ mod tests {
                 .respond_with(ResponseTemplate::new(200).set_body_string(body))
                 .mount(&self.server)
                 .await;
+        }
+
+        // =================================================================
+        // ADR-007 §3's identity chain, over one server with three prefixes.
+        //
+        // The fixture's `Endpoints` route the chain at `/works` (by DOI),
+        // `/cr` and `/dc`, so a test can say which registry answered without
+        // three servers and without asserting on a pacer log.
+        // =================================================================
+
+        /// A DataCite record, in DataCite's **own** envelope.
+        ///
+        /// `data.attributes` with a scalar `publicationYear` and
+        /// `titles[0].title` — none of which is where Crossref keeps its
+        /// equivalents, and a test that served one envelope to both registries
+        /// would pass for the wrong reason.
+        async fn serve_datacite_doi(
+            &self,
+            doi: &str,
+            title: Option<&str>,
+            year: Option<i32>,
+            author: Option<&str>,
+        ) {
+            let mut fields: Vec<String> = Vec::new();
+            if let Some(title) = title {
+                fields.push(format!(r#""titles":[{{"title":{}}}]"#, json(title)));
+            }
+            if let Some(year) = year {
+                fields.push(format!(r#""publicationYear":{year}"#));
+            }
+            if let Some(author) = author {
+                fields.push(format!(r#""creators":[{{"name":{}}}]"#, json(author)));
+            }
+            self.serve(
+                &format!("/dc/{}", encode(doi)),
+                format!(r#"{{"data":{{"attributes":{{{}}}}}}}"#, fields.join(",")),
+            )
+            .await;
+        }
+
+        /// A Crossref record, in Crossref's own envelope: `title` an array of
+        /// strings, the year under `published.date-parts[0][0]`, the author an
+        /// object with `family`/`given`.
+        ///
+        /// The fields are collected and **joined** rather than each pushed with
+        /// a trailing comma: a trailing comma is invalid JSON, and a fixture
+        /// that does not parse exercises the adapter's error path while
+        /// claiming to exercise its success path.
+        async fn serve_crossref_work(
+            &self,
+            doi: &str,
+            title: Option<&str>,
+            year: Option<i32>,
+            family: Option<&str>,
+        ) {
+            let mut fields: Vec<String> = Vec::new();
+            if let Some(title) = title {
+                fields.push(format!(r#""title":[{}]"#, json(title)));
+            }
+            if let Some(year) = year {
+                fields.push(format!(r#""published":{{"date-parts":[[{year}]]}}"#));
+            }
+            if let Some(family) = family {
+                fields.push(format!(
+                    r#""author":[{{"given":"A","family":{}}}]"#,
+                    json(family)
+                ));
+            }
+            self.serve(
+                &format!("/cr/{}", encode(doi)),
+                format!(r#"{{"status":"ok","message":{{{}}}}}"#, fields.join(",")),
+            )
+            .await;
+        }
+
+        /// An OpenAlex work object, in OpenAlex's own envelope — the bare work,
+        /// with no `message`/`data` wrapper, reached **by DOI**.
+        async fn serve_openalex_doi(
+            &self,
+            doi: &str,
+            title: Option<&str>,
+            year: Option<i32>,
+            author: Option<&str>,
+        ) {
+            let mut fields = vec![r#""id":"https://openalex.org/W-doi""#.to_string()];
+            if let Some(title) = title {
+                fields.push(format!(r#""title":{}"#, json(title)));
+            }
+            if let Some(year) = year {
+                fields.push(format!(r#""publication_year":{year}"#));
+            }
+            if let Some(author) = author {
+                fields.push(format!(
+                    r#""authorships":[{{"author":{{"display_name":{}}}}}]"#,
+                    json(author)
+                ));
+            }
+            self.serve(
+                &format!("/works/doi:{}", encode(doi)),
+                format!("{{{}}}", fields.join(",")),
+            )
+            .await;
+        }
+
+        /// Crossref's measured 404, or DataCite's: a `404` whose body is a JSON
+        /// error object, which is the trap a lenient parser turns into a
+        /// record of three null fields.
+        async fn miss_with_json_error(&self, route: &str) {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(
+                    ResponseTemplate::new(404)
+                        .insert_header("content-type", "application/json")
+                        .set_body_string(
+                            r#"{"errors":[{"status":"404","title":"The resource you are looking for doesn't exist."}]}"#,
+                        ),
+                )
+                .mount(&self.server)
+                .await;
+        }
+
+        /// A plain `404` for a chain route, Crossref's measured shape.
+        async fn miss_plain(&self, route: &str) {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(
+                    ResponseTemplate::new(404)
+                        .insert_header("content-type", "text/plain")
+                        .set_body_string("Resource not found.\n"),
+                )
+                .mount(&self.server)
+                .await;
+        }
+
+        /// A queued, **acquirable** work, plus a coverage map for ADR-007
+        /// §3's three registries.
+        ///
+        /// Two decisions in here, and both are about keeping each test about
+        /// one thing:
+        ///
+        /// - The work is made acquirable through **Unpaywall** rather than
+        ///   through the preprint transform, so the full-text walk succeeds for
+        ///   any DOI prefix — including the `10.18434` and `10.5281` ones that
+        ///   no deterministic transform claims. Otherwise a repository DOI
+        ///   would fail to fetch, `finish` would never run, and the identity
+        ///   row these tests are about would never be written. The bytes are a
+        ///   PDF with no `/Title`, so the post-fetch check has nothing to
+        ///   compare and the pre-fetch check is unambiguously the interesting
+        ///   one.
+        /// - Every registry record carries the **same** first author as the
+        ///   stored paper, so a test that varies *which registry answered*
+        ///   cannot accidentally also vary the author and get a `mismatch` for
+        ///   a reason that has nothing to do with the chain.
+        ///
+        /// `answers` names the one registry that names the work; `None` makes
+        /// all three answer 404. The other two are given each registry's own
+        /// measured miss shape — Crossref's plain text, DataCite's JSON error
+        /// object — so a test cannot pass by accident because one route happened
+        /// to be unmounted.
+        async fn chain_work(&self, id: &str, doi: &str, title: &str, answers: Option<&str>) {
+            const AUTHOR: &str = "Passaro, Saro";
+            let year = 2023;
+            self.paper_with(id, title, Some(year), &[AUTHOR], Some(doi), None);
+            self.gap(id, "pending", None, None);
+            self.serve_unpaywall_pdf(doi).await;
+
+            // OpenAlex, by DOI — the chain's first hop.
+            if answers == Some("openalex") {
+                self.serve_openalex_doi(doi, Some(title), Some(year), Some(AUTHOR))
+                    .await;
+            } else {
+                self.miss_plain(&format!("/works/doi:{}", encode(doi)))
+                    .await;
+            }
+            // Crossref, whose measured miss is 19 bytes of `text/plain`.
+            if answers == Some("crossref") {
+                self.serve_crossref_work(doi, Some(title), Some(year), Some("Passaro"))
+                    .await;
+            } else {
+                self.miss_plain(&format!("/cr/{}", encode(doi))).await;
+            }
+            // DataCite, whose measured miss is 87 bytes of JSON.
+            if answers == Some("datacite") {
+                self.serve_datacite_doi(doi, Some(title), Some(year), Some(AUTHOR))
+                    .await;
+            } else {
+                self.miss_with_json_error(&format!("/dc/{}", encode(doi)))
+                    .await;
+            }
+            // A record nobody asked for, on the routes that were not the
+            // answer, so a chain that consulted a later registry anyway would
+            // be caught by a *title* difference rather than only by a request
+            // count. Mounted last, so it never shadows the answer above.
+            if let Some(answering) = answers {
+                for (route, body) in [
+                    ("cr", crossref_work(TITLE_FOR_OTHERS)),
+                    ("dc", datacite_work(TITLE_FOR_OTHERS)),
+                ] {
+                    if route != answering {
+                        self.serve(&format!("/{route}/{}", encode(doi)), body).await;
+                    }
+                }
+                if answering != "openalex" {
+                    self.serve(
+                        &format!("/works/doi:{}", encode(doi)),
+                        openalex_work(TITLE_FOR_OTHERS),
+                    )
+                    .await;
+                }
+            }
         }
 
         /// A 404 for a path **including** its query string — wiremock refuses to
@@ -1226,6 +1483,52 @@ mod tests {
             stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
                 .expect("query")
                 .map(Result::unwrap)
+                .collect()
+        }
+
+        /// `paper_identity_checks.source` for one phase — the registry the
+        /// recorded `source` spelling names.
+        ///
+        /// A separate reader from [`Self::identity_checks`] on purpose: "the
+        /// check is `ok`" and "the check is `ok` **because DataCite said so**"
+        /// are different claims, and ADR-007 §3's override rule depends on the
+        /// second one not being laundered through the first.
+        fn identity_source(&self, paper_id: &str, phase: &str) -> Option<String> {
+            let conn = self.db.conn().expect("conn");
+            conn.query_row(
+                "SELECT source FROM paper_identity_checks
+                  WHERE paper_id = ?1 AND phase = ?2",
+                (paper_id, phase),
+                |r| r.get(0),
+            )
+            .ok()
+        }
+
+        /// The `pre_fetch` row for one work, as `(status, source, expected,
+        /// resolved)` — the shape the chain's outcome has to land in.
+        fn pre_fetch(&self, paper_id: &str) -> (String, String, Option<String>, Option<String>) {
+            let conn = self.db.conn().expect("conn");
+            conn.query_row(
+                "SELECT status, source, expected_title, resolved_title
+                   FROM paper_identity_checks
+                  WHERE paper_id = ?1 AND phase = 'pre_fetch'",
+                [paper_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("a pre_fetch row")
+        }
+
+        /// The paths every request put on the wire, in arrival order.
+        ///
+        /// The identity chain's hop order, read off the wire rather than off
+        /// the code that issued it — so a reordering of the chain fails here.
+        async fn request_paths(&self) -> Vec<String> {
+            self.server
+                .received_requests()
+                .await
+                .expect("wiremock recorded")
+                .iter()
+                .map(|r| r.url.path().to_string())
                 .collect()
         }
 
@@ -1563,19 +1866,40 @@ mod tests {
         );
 
         // The other half of "a mismatch": the reason has to be *visible*.
+        //
+        // Two rows, and both belong here. The `post_fetch` `mismatch` is the
+        // served page naming another paper — the verdict that stopped the
+        // fetch. The `pre_fetch` `unverified` is ADR-007 §3's chain having
+        // asked OpenAlex, Crossref and DataCite about this DOI and had none of
+        // them register it: a fact about coverage, recorded as no evidence
+        // rather than as a pass, and it is what the chain is *for*.
         let checks = fx.identity_checks();
-        assert_eq!(checks.len(), 1, "the check is recorded: {checks:?}");
-        let (phase, status, expected, resolved) = &checks[0];
-        assert_eq!(phase, "post_fetch");
-        assert_eq!(status, "mismatch");
+        assert_eq!(checks.len(), 2, "both phases recorded: {checks:?}");
+        let post = checks
+            .iter()
+            .find(|(phase, ..)| phase == "post_fetch")
+            .expect("a post_fetch row");
+        let pre = checks
+            .iter()
+            .find(|(phase, ..)| phase == "pre_fetch")
+            .expect("a pre_fetch row");
+        assert_eq!(post.1, "mismatch");
         assert_eq!(
-            expected.as_deref(),
+            post.2.as_deref(),
             Some("Deep learning for radiopharmaceutical image reconstruction"),
             "both titles are stored, or the row cannot be acted on"
         );
         assert_eq!(
-            resolved.as_deref(),
+            post.3.as_deref(),
             Some("Total-body PET scanners for theranostics")
+        );
+        assert_eq!(
+            pre.1, "unverified",
+            "no registry registers this DOI, which is not `ok`: {pre:?}"
+        );
+        assert_eq!(
+            pre.3, None,
+            "and no resolved title, because none of the three named the work"
         );
 
         // ADR-007 §2's status for exactly this, which is a human action — so
@@ -1712,6 +2036,370 @@ mod tests {
             fx.attempts().is_empty(),
             "nothing was refused, so nothing is recorded as refused"
         );
+    }
+
+    // =====================================================================
+    // 2. ADR-007 §3's identity chain: OpenAlex → Crossref → DataCite.
+    //
+    // The reason this slice exists, end to end through the real ladder. The
+    // work in every test is a **preprint DOI**: one no full-text route derives
+    // a URL from, so the only identity evidence available is a registry's —
+    // which is why the chain is not an extra and why a chain of one was a gap.
+    // =====================================================================
+
+    /// The corpus case: a repository DOI that **no** registry in the first two
+    /// positions registers, corroborated by the third.
+    ///
+    /// `10.18434/m32154` is a real OSTI/NIST DOI from #260's own evidence, and
+    /// a live probe on 2026-10 measured Crossref `404` (19 bytes of
+    /// `text/plain`) and DataCite `200` for it. The fixture serves exactly that
+    /// split, so the assertion is about a coverage gap that is **real** rather
+    /// than one invented for the test.
+    ///
+    /// The behaviour under test is the fall-through: **a 404 is not a failure.**
+    /// A chain that treated Crossref's inevitable `404` as the end of the walk
+    /// would leave every repository DOI in the library permanently
+    /// `unverified` — and `unverified` is a claim about the metadata, not about
+    /// the work.
+    #[tokio::test]
+    async fn a_preprint_doi_is_corroborated_by_datacite_after_crossref_404s() {
+        const DOI: &str = "10.18434/m32154";
+        const TITLE: &str =
+            "NIST SRD 46. Critically Selected Stability Constants of Metal Complexes";
+
+        let fx = Fixture::new().await;
+        fx.chain_work("p-datacite", DOI, TITLE, Some("datacite"))
+            .await;
+
+        let report = fx.acquire(&AcquireRequest::queue()).await;
+        assert_eq!(report.acquired(), 1, "the fetch is not blocked: {report:?}");
+
+        // Both of Crossref's hops were tried and both 404'd, and the row is
+        // about the third — read off the wire, not off the code that issued it.
+        assert!(
+            fx.request_paths()
+                .await
+                .contains(&format!("/cr/{}", encode(DOI))),
+            "Crossref really was asked, and its 404 did not end the walk: {:?}",
+            fx.request_paths().await
+        );
+
+        let (status, source, expected, resolved) = fx.pre_fetch("p-datacite");
+        assert_eq!(
+            status, "ok",
+            "the titles match and DataCite's year and author corroborate them"
+        );
+        assert_eq!(source, "datacite", "the source is the one that answered");
+        assert_eq!(expected.as_deref(), Some(TITLE), "the stored paper's title");
+        assert_eq!(resolved.as_deref(), Some(TITLE), "and DataCite's, verbatim");
+    }
+
+    /// The trap, end to end: a `404` carrying a **JSON error object** is "this
+    /// registry has never heard of it", not a record of three nulls.
+    ///
+    /// DataCite's measured 404 is exactly
+    /// `{"errors":[{"status":"404","title":"…"}]}` — 87 bytes of valid JSON — so
+    /// a parser that runs before it inspects the status parses it
+    /// successfully, finds no `data` key, and (if it defaults rather than
+    /// refusing) hands the matcher a `WorkIdentity` with no title, no year and
+    /// no author. The matcher answers that `unverified`, which would make every
+    /// unregistered DOI read as "a work whose metadata we could not read" —
+    /// and, worse, would stop the chain one hop early, on exactly the
+    /// preprints and repository DOIs the chain exists to corroborate.
+    ///
+    /// The negative case is the half that is easy to get wrong, so it is in
+    /// the same test: with **no** registry naming the work, the honest answer
+    /// is `unverified` with no resolved title — never a null-field record read
+    /// as metadata, and never `ok`.
+    #[tokio::test]
+    async fn a_crossref_404_body_is_not_read_as_metadata() {
+        const DOI: &str = "10.18434/m32154";
+        const TITLE: &str =
+            "NIST SRD 46. Critically Selected Stability Constants of Metal Complexes";
+
+        let fx = Fixture::new().await;
+        fx.chain_work("p-trap", DOI, TITLE, Some("datacite")).await;
+        fx.acquire(&AcquireRequest::queue()).await;
+        let (status, source, _, resolved) = fx.pre_fetch("p-trap");
+        assert_eq!(
+            status, "ok",
+            "a JSON error body on a 404 must not become an `unverified` record: \
+             the chain fell through and DataCite corroborated the work"
+        );
+        assert_eq!(source, "datacite", "the one that answered");
+        assert_eq!(
+            resolved.as_deref(),
+            Some(TITLE),
+            "a real title, not a null-field fabrication"
+        );
+
+        // Now the same 404 shape on **all three** routes, so no registry names
+        // the work. `chain_work` gives Crossref its measured plain-text 404 and
+        // DataCite its JSON one; the OpenAlex hop gets the JSON shape too, to
+        // prove the trap is not registry-specific.
+        let bare = Fixture::new().await;
+        bare.paper_with(
+            "p-trap-bare",
+            TITLE,
+            Some(2023),
+            &["Passaro, Saro"],
+            Some(DOI),
+            None,
+        );
+        bare.gap("p-trap-bare", "pending", None, None);
+        bare.serve_unpaywall_pdf(DOI).await;
+        bare.miss_with_json_error(&format!("/works/doi:{}", encode(DOI)))
+            .await;
+        bare.miss_with_json_error(&format!("/cr/{}", encode(DOI)))
+            .await;
+        bare.miss_with_json_error(&format!("/dc/{}", encode(DOI)))
+            .await;
+        bare.acquire(&AcquireRequest::queue()).await;
+        let (status, source, _, resolved) = bare.pre_fetch("p-trap-bare");
+        assert_eq!(status, "unverified", "nobody named it, so nothing is `ok`");
+        assert_eq!(
+            resolved, None,
+            "and no title was invented from an error document"
+        );
+        assert_eq!(
+            source, "datacite",
+            "the last hop consulted, whose 404 made the verdict final"
+        );
+    }
+
+    /// ADR-007 §3's order, read off the **wire**, and the
+    /// stop-at-the-first-answer rule that makes the order mean anything.
+    ///
+    /// The order assertion is on request paths in arrival order, not on the
+    /// code that issued them: a chain that asked DataCite first and Crossref
+    /// second would produce the same three verdals in a different order, and
+    /// only the wire distinguishes them. The two decoy records on the
+    /// un-consulted routes carry a *different title*, so a chain that asked one
+    /// of them anyway would also produce a `mismatch` — a louder failure than
+    /// a request count.
+    #[tokio::test]
+    async fn the_chain_is_ordered_openalex_then_crossref_then_datacite() {
+        const DOI: &str = "10.18434/m32154";
+        const TITLE: &str =
+            "NIST SRD 46. Critically Selected Stability Constants of Metal Complexes";
+
+        let fx = Fixture::new().await;
+        fx.chain_work("p-order", DOI, TITLE, Some("openalex")).await;
+
+        let report = fx.acquire(&AcquireRequest::queue()).await;
+        assert_eq!(report.acquired(), 1, "no decoy was consulted: {report:?}");
+
+        let paths = fx.request_paths().await;
+        let chain: Vec<&str> = paths
+            .iter()
+            .map(String::as_str)
+            .filter(|p| {
+                p.starts_with("/works/doi:") || p.starts_with("/cr/") || p.starts_with("/dc/")
+            })
+            .collect();
+        assert_eq!(
+            chain,
+            vec![format!("/works/doi:{}", encode(DOI)).as_str()],
+            "OpenAlex answered first, so neither Crossref nor DataCite was \
+             asked: {paths:?}"
+        );
+
+        let (status, source, _, resolved) = fx.pre_fetch("p-order");
+        assert_eq!(status, "ok");
+        assert_eq!(source, "openalex", "the source is the one that answered");
+        assert_eq!(
+            resolved.as_deref(),
+            Some(TITLE),
+            "OpenAlex's title, not either of the two that were never requested"
+        );
+
+        // The same claim with Crossref second, so "first" is not read as
+        // "always OpenAlex": a `10.1101` preprint is answered by Crossref in
+        // this configuration, and the recorded source must follow the answer
+        // rather than the position.
+        let second = Fixture::new().await;
+        second
+            .chain_work(
+                "p-order-2",
+                "10.1101/2025.06.14.659707",
+                TITLE,
+                Some("crossref"),
+            )
+            .await;
+        second.acquire(&AcquireRequest::queue()).await;
+        let chain: Vec<String> = second
+            .request_paths()
+            .await
+            .into_iter()
+            .filter(|p| {
+                p.starts_with("/works/doi:") || p.starts_with("/cr/") || p.starts_with("/dc/")
+            })
+            .collect();
+        assert_eq!(
+            chain,
+            vec![
+                format!("/works/doi:{}", encode("10.1101/2025.06.14.659707")),
+                format!("/cr/{}", encode("10.1101/2025.06.14.659707")),
+            ],
+            "OpenAlex 404'd, so Crossref was asked second and DataCite not at all"
+        );
+        assert_eq!(second.pre_fetch("p-order-2").1, "crossref");
+    }
+
+    /// The honest outcome, and the one ADR-007 §3 spends a paragraph on: no
+    /// registry naming the work is `unverified`, **not** `ok`.
+    ///
+    /// The two are indistinguishable from the fetch's point of view — both let
+    /// the bytes be filed — and the difference is entirely in what the library
+    /// claims afterwards. `ok` means "the identity was corroborated"; reading
+    /// "nobody objected" as that would make the one verdict that must never be
+    /// downgraded, `mismatch`, reachable only by positive disproof.
+    #[tokio::test]
+    async fn a_doi_unknown_to_both_is_unverified_not_ok() {
+        const DOI: &str = "10.99999/not.in.any.registry.12345";
+        const TITLE: &str = "A work no registry has ever heard of";
+
+        let fx = Fixture::new().await;
+        fx.chain_work("p-unknown", DOI, TITLE, None).await;
+
+        let report = fx.acquire(&AcquireRequest::queue()).await;
+        assert_eq!(
+            report.acquired(),
+            1,
+            "`unverified` is not a block — see the module docs on `crate::identity`"
+        );
+        assert_eq!(
+            fx.artefacts().len(),
+            1,
+            "and the full text is filed: nothing was established against it"
+        );
+
+        let (status, source, expected, resolved) = fx.pre_fetch("p-unknown");
+        assert_eq!(
+            status, "unverified",
+            "three 404s establish that no registry corroborates the work, which \
+             is no evidence that the DOI names it"
+        );
+        assert_ne!(status, "ok", "never `ok` on an absence of evidence");
+        assert_eq!(
+            expected.as_deref(),
+            Some(TITLE),
+            "the expected title is stored"
+        );
+        assert_eq!(
+            resolved, None,
+            "and there is no resolved title, because nobody answered"
+        );
+        assert_eq!(source, "datacite", "the last hop, whose 404 was final");
+        assert!(
+            fx.attempts().is_empty(),
+            "nothing was refused: an `unverified` is not a mismatch"
+        );
+    }
+
+    /// Each adapter parses a well-formed record into the three facts the
+    /// matcher consumes, and a malformed one into "we could not read this" —
+    /// through the real ladder, so the parsers see the bytes a server actually
+    /// sent rather than a hand-built `Value`.
+    ///
+    /// The malformed half matters more than the well-formed half: a body that
+    /// cannot be read must not become a `WorkIdentity` of three `None`s, and
+    /// the observable consequence of getting that wrong is a corpus of
+    /// `unverified` rows for works nobody was ever in doubt about.
+    #[tokio::test]
+    async fn each_adapter_parses_a_well_formed_record_and_refuses_a_malformed_one() {
+        const TITLE: &str = "A preprint or a dataset, named by a registry";
+        for (label, doi, route) in [
+            ("crossref", "10.1101/2025.06.14.659707", "cr"),
+            ("datacite", "10.5281/zenodo.23162961", "dc"),
+        ] {
+            // -- well-formed: corroborates, and the source is that registry --
+            let good = Fixture::new().await;
+            good.chain_work("p-good", doi, TITLE, Some(label)).await;
+            good.acquire(&AcquireRequest::queue()).await;
+            let (status, source, _, resolved) = good.pre_fetch("p-good");
+            assert_eq!(status, "ok", "{label}: a well-formed record corroborates");
+            assert_eq!(source, label, "{label}: and it is the one that answered");
+            assert_eq!(resolved.as_deref(), Some(TITLE), "{label}: its title");
+
+            // -- malformed: a 200 that is not a record at all --
+            //
+            // Valid JSON, so a lenient parser gets past the parse, and no
+            // `message` / `data.attributes` envelope, so the adapter must
+            // refuse it rather than default three fields to `None`. The
+            // *other* registry's 404 shape then ends the walk, and the honest
+            // answer is `unverified`.
+            let bad = Fixture::new().await;
+            bad.paper_with(
+                "p-bad",
+                TITLE,
+                Some(2023),
+                &["Passaro, Saro"],
+                Some(doi),
+                None,
+            );
+            bad.gap("p-bad", "pending", None, None);
+            bad.serve_unpaywall_pdf(doi).await;
+            bad.miss_plain(&format!("/works/doi:{}", encode(doi))).await;
+            bad.serve(
+                &format!("/{route}/{}", encode(doi)),
+                r#"{"status":"failed","message":"Resource not found.","data":null}"#.to_string(),
+            )
+            .await;
+            if route == "cr" {
+                bad.miss_with_json_error(&format!("/dc/{}", encode(doi)))
+                    .await;
+            } else {
+                bad.miss_plain(&format!("/cr/{}", encode(doi))).await;
+            }
+            bad.acquire(&AcquireRequest::queue()).await;
+            let (status, _, _, resolved) = bad.pre_fetch("p-bad");
+            assert_eq!(
+                status, "unverified",
+                "{label}: a 200 that is not a record cannot corroborate anything"
+            );
+            assert_eq!(
+                resolved, None,
+                "{label}: and it must not become a record of three null fields"
+            );
+        }
+    }
+
+    /// `paper_identity_checks.source` is the registry that **actually
+    /// answered**, for every position in the chain.
+    ///
+    /// Asserted per-source rather than once, because the failure this guards
+    /// against is a hard-coded `IdentitySource::OpenAlex` — which would look
+    /// correct for every OpenAlex-answering corpus in the pre-existing tests and
+    /// wrong for exactly the works this slice adds. The three DOIs are real and
+    /// the three answers are the ones measured on 2026-10.
+    #[tokio::test]
+    async fn the_recorded_source_is_the_registry_that_actually_answered() {
+        const TITLE: &str = "The same work, named by three different registries";
+        for (doi, answering) in [
+            // OpenAlex carries the bioRxiv preprint (#260's first miss).
+            ("10.1101/2025.06.14.659707", "openalex"),
+            // Crossref carries the ChemRxiv preprint.
+            ("10.26434/chemrxiv.15000484/v1", "crossref"),
+            // DataCite carries the Zenodo record — the measured row no other
+            // registry knows.
+            ("10.5281/zenodo.23162961", "datacite"),
+        ] {
+            let fx = Fixture::new().await;
+            fx.chain_work("p-source", doi, TITLE, Some(answering)).await;
+            fx.acquire(&AcquireRequest::queue()).await;
+
+            let (status, source, _, _) = fx.pre_fetch("p-source");
+            assert_eq!(status, "ok", "{answering}: corroborated");
+            assert_eq!(
+                fx.identity_source("p-source", "pre_fetch").as_deref(),
+                Some(answering),
+                "{answering}: `paper_identity_checks.source` must name the \
+                 registry that answered, using the existing `IdentitySource` \
+                 spelling and no new one"
+            );
+            assert_eq!(source, answering, "{answering}: the row agrees with itself");
+        }
     }
 
     /// #253's escape hatch, end to end: a person settles the identity, and a

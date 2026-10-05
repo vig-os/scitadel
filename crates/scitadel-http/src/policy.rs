@@ -106,6 +106,22 @@ const BUCKETS: &[BucketSpec] = &[
         // list limit is the one that applies to every call shape it uses.
         // Crossref publishes no daily cap, so the 24 h figure is scitadel's
         // own per-user ceiling — a policy choice, not a published limit.
+        //
+        // **Re-measured 2026-10 for #254**, on the single-record route this
+        // slice's adapter uses, and the headers are now part of the
+        // provenance: `x-rate-limit-limit: 10`, `x-rate-limit-interval: 1s`,
+        // `x-concurrency-limit: 3`, `x-api-pool: polite-single`. The 350 ms
+        // interval is the **tighter** of the two documented figures (3/s ≈
+        // 333 ms for list queries, 10/s = 100 ms for single records), because
+        // 350 ms also sits above the ~3.3 req/s implied by the DataCite
+        // ceiling recorded on the `doi.org` row — so one number holds for
+        // every call shape scitadel makes to Crossref, rather than two
+        // numbers that could be applied to the wrong one.
+        //
+        // Where the polite pool **is** observable: the response carries
+        // `x-api-pool: polite-single`, so a misconfigured `mailto` (a blank
+        // one, or none) is visible in a single probe rather than only as a
+        // surprise 429 later.
         name: "crossref",
         policy: BucketPolicy::new(350, 50_000, 50_000),
         hosts: &["api.crossref.org", "crossref.org", "doi.crossref.org"],
@@ -119,6 +135,19 @@ const BUCKETS: &[BucketSpec] = &[
         // allowance. That window shape cannot be expressed in a 24 h cap,
         // and DataCite publishes no daily cap, so the 24 h figure is again a
         // scitadel policy choice.
+        //
+        // **Re-probed 2026-10 for #254.** DataCite publishes **no**
+        // rate-limit response headers on the single-DOI route — the probe
+        // returned `x-anonymous-consumer`, `x-request-id` and `etag` and
+        // nothing about a limit — so unlike the Crossref row above, this
+        // interval cannot be corroborated from an observed header and rests
+        // entirely on the published figure. That asymmetry is recorded here
+        // rather than smoothed over, because it decides which of the two rows
+        // would notice a configuration error on its own: neither.
+        //
+        // The probe *did* confirm the identified tier is reachable: a
+        // `mailto` query parameter is accepted on `/dois/<doi>` alongside the
+        // path-encoded DOI.
         name: "datacite",
         policy: BucketPolicy::new(310, 100_000, 100_000),
         hosts: &["api.datacite.org", "datacite.org"],
@@ -633,6 +662,61 @@ mod tests {
             );
             assert!(spec.policy.request_cap > 0, "{} has no cap", spec.name);
         }
+    }
+
+    /// #254: the hosts the new Crossref and DataCite adapters actually put on
+    /// the wire must be **routed**, and the assertion is on the *policy* rather
+    /// than the bucket name — for the same reason the `doi.org` test is.
+    ///
+    /// Unrouted, both hosts would already resolve to a bucket named after their
+    /// own registrable domain (`api.crossref.org`, `api.datacite.org`), so a
+    /// check on the name alone would report them handled while they silently
+    /// carried the unknown-host 5 s / 500-request policy. That is a real cost
+    /// on the identity chain's hot path rather than a hypothetical one: the
+    /// chain consults both registries for every DOI-bearing work whose
+    /// full-text route brings no registry answer of its own, and 5 s between two
+    /// of them would dominate a campaign.
+    ///
+    /// The two policy shapes also differ, and the difference is asserted: an
+    /// unrouted host would collapse them to the same 5 000 ms, so a test that
+    /// only compared them to the default would pass even if one of them were
+    /// quietly unrouted.
+    #[test]
+    fn the_identity_chain_hosts_are_routed_to_their_own_policies() {
+        let table = BucketPolicyTable::new();
+        let unknown = table
+            .resolve(&Url::parse("https://unlisted.example/x").unwrap())
+            .policy;
+
+        let crossref =
+            table.resolve(&Url::parse("https://api.crossref.org/works/10.18434%2Fm32154").unwrap());
+        let datacite =
+            table.resolve(&Url::parse("https://api.datacite.org/dois/10.18434%2Fm32154").unwrap());
+
+        for (route, bucket) in [(&crossref, "crossref"), (&datacite, "datacite")] {
+            assert_eq!(route.bucket.as_str(), bucket, "{bucket} bucket name");
+            assert_ne!(
+                route.policy.min_interval_ms, unknown.min_interval_ms,
+                "{bucket} still carries the unknown-host interval"
+            );
+            assert_ne!(
+                route.policy.request_cap, unknown.request_cap,
+                "{bucket} still carries the unknown-host cap"
+            );
+        }
+
+        // The two registries keep their own, different, sourced figures: 350 ms
+        // (3 req/s, Crossref's list limit) and 310 ms (1000 per 5 minutes,
+        // DataCite's identified tier). Asserting they differ guards against a
+        // future "harmonise the two rows" edit that would quietly replace two
+        // sourced numbers with one unsourced one.
+        assert_ne!(
+            crossref.policy.min_interval_ms, datacite.policy.min_interval_ms,
+            "the two rows are sourced separately and must not be collapsed into \
+             one number"
+        );
+        assert_eq!(crossref.policy.min_interval_ms, 350);
+        assert_eq!(datacite.policy.min_interval_ms, 310);
     }
 
     /// The cap is a scitadel policy choice and must not drift upward silently:
