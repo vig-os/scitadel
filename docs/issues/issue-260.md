@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-10-02T12:20:49Z
-updated: 2026-10-03T22:38:16Z
+updated: 2026-10-05T13:58:17Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/260
-comments: 1
+comments: 2
 labels: bug, effort:medium, priority:high
 assignees: none
 milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-10-04T07:34:06.244Z
+synced: 2026-10-06T08:17:52.361Z
 ---
 
 # [Issue 260]: [fix(acquire): preprint and publisher-direct OA routes are missing — 52 free papers reported unreachable (bioRxiv 3/3 missed)](https://github.com/vig-os/scitadel/issues/260)
@@ -80,5 +80,32 @@ What *did* change for those papers: they now record `pending`/`error` instead of
 Also still open: the `coverage`/`action_list` **commands** do not read `acquisition_state` yet (#253). #280 fixes the data they will read.
 
 Keeping this open for the 52-DOI half.
+
+
+---
+
+# [Comment #2]() by [gerchowl]()
+
+_Posted on October 5, 2026 at 01:58 PM_
+
+**Correction to my previous comment on this issue.** I wrote that six of ten unresolvable DOIs were preprints/repository DOIs "that Crossref 404s", and concluded that DataCite — not Crossref — holds the preprint-server prefixes. **That is wrong**, and the re-probe in #292 corrected it:
+
+| DOI | Crossref | DataCite |
+|---|---|---|
+| `10.1101/…` (bioRxiv/medRxiv) | **200** | 404 |
+| `10.26434/chemrxiv.…` (ChemRxiv) | **200** | 404 |
+| `10.18434/m32154` (OSTI) | 404 | **200** |
+| `10.5281/zenodo.…` | 404 | **200** |
+
+`10.1101` and `10.26434` are registered to **Crossref** — `10.26434` has 56,845 `posted-content` records as a Crossref member. Crossref has taken over bioRxiv/medRxiv registration. DataCite holds the *repository* DOIs, not the preprint servers.
+
+My method was the flaw, not just the conclusion: I inferred registry ownership from which API 404'd, on a sample where half the DOIs were ones I had invented. A 404 is evidence that an API lacks a record, not evidence about who owns the prefix.
+
+**The conclusion survives on half the evidence, which is the half that matters:**
+
+- `10.18434` (this issue's own example) and `10.5281` are **only resolvable by DataCite**. Crossref has no second opinion for them at all, so an identity chain without DataCite cannot corroborate them. That case is now covered — #292 adds the adapters and the chain.
+- The `10.1101` papers were **never failing on identity**. Crossref answered 200 for all three. They failed on **routing**, which #280 fixed with the deterministic preprint transforms. So this issue's premise — that preprints were missed for want of a lookup — was half wrong: they were missed for want of a *URL*.
+
+The 52-DOI publisher set in the original report is untouched by any of this and still needs the index routes.
 
 
