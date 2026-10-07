@@ -1089,7 +1089,7 @@ mod tests {
     use scitadel_core::ports::{Bucket, Cost, PaceDenied, PaceTier, Pacer, Permit};
     use scitadel_db::sqlite::{ACCESS_BASIS_MANUAL, ArtefactWrite, BlobWrite, WriteMode};
     use scitadel_http::{BucketPolicyTable, PacedClient};
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const PDF_BYTES: &[u8] = b"%PDF-1.7\nacquired body\n%%EOF\n";
@@ -1215,6 +1215,8 @@ mod tests {
                     crossref_works: format!("{base}/cr"),
                     datacite_dois: format!("{base}/dc"),
                     osti_base: base.clone(),
+                    europepmc_rest: format!("{base}/epmc"),
+                    pmc_oa_bucket: format!("{base}/pmcoa"),
                 },
             )
         }
@@ -1223,6 +1225,20 @@ mod tests {
         /// smallest walk that actually succeeds.
         async fn serve_unpaywall_pdf(&self, doi: &str) {
             self.serve_unpaywall_version(doi, None).await;
+        }
+
+        /// Unpaywall asserting the work **is** open access while naming no
+        /// location — `{"is_oa": true}` with no `best_oa_location`.
+        ///
+        /// Needed by every test whose subject is the DOI resolver's landing page:
+        /// ADR-007 §3 step 6 offers it "for OA works only", so a work nobody has
+        /// declared open access produces no `RouteId::Publisher` candidate at all
+        /// (#254 wave 3). Declaring the work OA is what makes the landing page a
+        /// candidate; it does not name one, so the tests about *what the page
+        /// said* are unaffected.
+        async fn serve_open_access_without_a_location(&self, doi: &str) {
+            self.serve(&format!("/v2/{doi}"), r#"{"is_oa":true}"#.to_string())
+                .await;
         }
 
         /// An Unpaywall location with the **version word** the ranker reads:
@@ -1470,20 +1486,7 @@ mod tests {
             }
         }
 
-        /// A 404 for a path **including** its query string — wiremock refuses to
-        /// match a `?` in a path, so this splits it into a path plus a
-        /// `query_param` matcher.
-        async fn miss_with_query(&self, route: &str) {
-            let (route_path, query) = route.split_once('?').expect("a query string");
-            let (key, value) = query.split_once('=').expect("k=v");
-            Mock::given(method("GET"))
-                .and(path(route_path))
-                .and(query_param(key, value))
-                .respond_with(ResponseTemplate::new(404))
-                .mount(&self.server)
-                .await;
-        }
-
+        /// A 404 for a path, which `wiremock` matches without its query string.
         async fn miss(&self, route: &str) {
             Mock::given(method("GET"))
                 .and(path(route))
@@ -2029,10 +2032,11 @@ mod tests {
             None,
         );
         fx.gap("p-mismatch", "pending", None, None);
-        // Unpaywall names no location; the DOI resolver lands on a page whose
-        // own metadata says it is a different article.
-        fx.miss_with_query(&format!("/v2/{UNKNOWN_DOI}?email=polite@example.org"))
-            .await;
+        // The work is open access but Unpaywall names no location; the DOI
+        // resolver lands on a page whose own metadata says it is a different
+        // article. Both halves are needed: step 6 offers the landing page only
+        // for an OA work, and this test needs a candidate to fetch.
+        fx.serve_open_access_without_a_location(UNKNOWN_DOI).await;
         fx.serve(
             &format!("/doi/{UNKNOWN_DOI}"),
             r#"<!doctype html><html><head>
@@ -2652,8 +2656,7 @@ mod tests {
             None,
         );
         fx.gap("p-override", "pending", None, None);
-        fx.miss_with_query(&format!("/v2/{UNKNOWN_DOI}?email=polite@example.org"))
-            .await;
+        fx.serve_open_access_without_a_location(UNKNOWN_DOI).await;
         fx.serve(
             &format!("/doi/{UNKNOWN_DOI}"),
             r#"<meta name="citation_title" content="Total-body PET scanners for theranostics">"#
@@ -2819,7 +2822,7 @@ mod tests {
     /// text says "no writes" rather than "no requests".
     ///
     /// So the assertion changed from "no request" to the claim that actually
-    /// matters and is *stronger*: a dry run spends **only** the four metadata
+    /// matters and is *stronger*: a dry run spends **only** the metadata
     /// registries' budgets and reaches **no publisher host at all** — the
     /// acceptance criterion #254 is filed on, asserted on the hosts that were
     /// really contacted rather than on a promise in a doc comment.
@@ -2890,7 +2893,7 @@ mod tests {
             );
         }
 
-        // No publisher, and only the four metadata registries.
+        // No publisher, and only the metadata sources.
         let paths = fx.request_paths().await;
         assert!(
             !paths.iter().any(|p| p.starts_with("/doi/")),
@@ -2902,15 +2905,16 @@ mod tests {
         );
         assert_eq!(
             paths.len(),
-            4,
-            "the pass's own four metadata lookups, and nothing else: {paths:?}"
+            5,
+            "the pass's own five metadata lookups, and nothing else: {paths:?}"
         );
         assert!(
             paths.iter().all(|p| p.starts_with("/works/")
                 || p.starts_with("/cr/")
                 || p.starts_with("/dc/")
-                || p.starts_with("/v2/")),
-            "and every one of them is a metadata registry: {paths:?}"
+                || p.starts_with("/v2/")
+                || p.starts_with("/epmc")),
+            "and every one of them is a metadata source: {paths:?}"
         );
 
         assert_eq!(fx.state_rows(), states, "acquisition_state is unchanged");

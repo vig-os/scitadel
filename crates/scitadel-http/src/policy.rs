@@ -164,6 +164,40 @@ const BUCKETS: &[BucketSpec] = &[
         hosts: &["ebi.ac.uk", "europepmc.org"],
     },
     BucketSpec {
+        // The PMC Cloud Service, `pmc-oa-opendata` — ADR-007 §3 step 2 and
+        // #254's replacement for the retired `oa.fcgi`. **A bucket, not an API**,
+        // and the difference is worth stating because the numbers below are the
+        // ones that apply.
+        //
+        // NCBI publishes no per-second limit and no daily cap for the bucket: it
+        // is anonymous public S3 served by CloudFront, and the terms
+        // (registry.opendata.aws/ncbi-pmc, the bucket's own `README.txt`)
+        // require no key and no account. A probe on 2026-10-07 of ten sequential
+        // object reads took 5.2 s wall-clock including client setup and returned
+        // no rate-limit header of any kind — which is evidence of the service
+        // being unmetered for this access pattern, not a measured limit.
+        //
+        // So the interval is a **policy choice**, and it is a tight one: 100 ms,
+        // the same figure the `europepmc` row uses for the same reason (an
+        // unmetered public endpoint gets scitadel's conservative rate, not its
+        // fastest). The 24 h figure mirrors the request cap for the same reason
+        // the Unpaywall row does: no published cap to enter, so the request cap
+        // is the one that binds. A campaign that needs more should spend the
+        // *inventory* CSV once rather than reading per-version JSON per work —
+        // which is also what the bucket's README recommends, and the reason the
+        // per-version read is a `Meta` tier rather than a bulk operation.
+        //
+        // The two `.s3` aliases are listed because a bucket is reachable by more
+        // than one name, and a CDN alias must not be able to multiply the
+        // allowance — the reason ADR-007 §4 says buckets are platforms.
+        name: "pmc_oa",
+        policy: BucketPolicy::new(100, 100_000, 100_000),
+        hosts: &[
+            "pmc-oa-opendata.s3.amazonaws.com",
+            "pmc-oa-opendata.s3.us-east-1.amazonaws.com",
+        ],
+    },
+    BucketSpec {
         // Unpaywall: 100 000 calls/day (unpaywall.org/products/api, consulted
         // 2026-10). It publishes no per-second figure, so the interval is a
         // conservative 10/s rather than a documented limit.
@@ -446,9 +480,54 @@ mod tests {
                 "https://www.ebi.ac.uk/europepmc/webservices/rest/search",
                 "europepmc",
             ),
+            (
+                "https://pmc-oa-opendata.s3.amazonaws.com/metadata/PMC7759461.1.json",
+                "pmc_oa",
+            ),
+            (
+                "https://pmc-oa-opendata.s3.us-east-1.amazonaws.com/?list-type=2",
+                "pmc_oa",
+            ),
         ] {
             assert_eq!(table.bucket_for(&url(host)), Bucket(want.into()), "{host}");
         }
+    }
+
+    /// The two PMC sources get **separate budgets**, and the reason is
+    /// operational rather than cosmetic (#254 wave 3).
+    ///
+    /// Europe PMC's REST API and the `pmc-oa-opendata` bucket are both operated
+    /// by NCBI, and it would be reasonable to spend one budget for both. But they
+    /// fail differently and at different rates: an S3 read that 503s or times out
+    /// says nothing about whether EBI's search is answering, and a merged bucket
+    /// would make one service's outage report as the other's — the ambiguity the
+    /// registrable-domain default for unknown hosts already avoids, and the one
+    /// the ADR's "buckets are publisher platforms" rule exists to prevent. One
+    /// registry's outage must not consume another's allowance.
+    #[test]
+    fn the_two_pmc_sources_spend_different_budgets() {
+        let table = BucketPolicyTable::new();
+        let search = table.bucket_for(&url(
+            "https://www.ebi.ac.uk/europepmc/webservices/rest/search",
+        ));
+        let dataset = table.bucket_for(&url(
+            "https://pmc-oa-opendata.s3.amazonaws.com/metadata/PMC7759461.1.json",
+        ));
+        assert_ne!(
+            search, dataset,
+            "an S3 read that fails must not spend EBI's allowance, or vice versa"
+        );
+        assert_eq!(search, Bucket("europepmc".into()));
+        assert_eq!(dataset, Bucket("pmc_oa".into()));
+        // And the CDN alias is the *same* bucket, so a second spelling of one
+        // host cannot double its allowance.
+        assert_eq!(
+            table.bucket_for(&url(
+                "https://pmc-oa-opendata.s3.us-east-1.amazonaws.com/PMC1.1/PMC1.1.pdf"
+            )),
+            dataset,
+            "a bucket is a platform, not a hostname"
+        );
     }
 
     /// An unknown host gets a bucket named after its registrable domain and the

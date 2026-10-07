@@ -68,15 +68,24 @@ pub enum Registry {
     Crossref,
     DataCite,
     Unpaywall,
+    /// Europe PMC's REST search. ADR-007 §3's fifth metadata source
+    /// ("Europe PMC (`isOpenAccess`, `inEPMC`)"), added by #254's wave 3.
+    EuropePmc,
+    /// The `pmc-oa-opendata` bucket's per-version JSON. ADR-007 §3 step 2, and
+    /// **not** a registry of records: it keys on a PMCID plus a version number
+    /// and answers for one stored file rather than for a work.
+    PmcOa,
 }
 
 impl Registry {
     /// Every registry, so a vocabulary test can be exhaustive.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 6] = [
         Self::OpenAlex,
         Self::Crossref,
         Self::DataCite,
         Self::Unpaywall,
+        Self::EuropePmc,
+        Self::PmcOa,
     ];
 
     /// The lowercase spelling, for a log line or a report.
@@ -87,24 +96,38 @@ impl Registry {
             Self::Crossref => "crossref",
             Self::DataCite => "datacite",
             Self::Unpaywall => "unpaywall",
+            Self::EuropePmc => "europepmc",
+            Self::PmcOa => "pmc_oa",
         }
     }
 
     /// The `paper_identity_checks.source` spelling, where one exists.
     ///
-    /// `None` for Unpaywall, and **not** `Some(OpenAlex)`: ADR-007 §3's
-    /// identity chain does not include it, and
-    /// [`crate::download`] already documents that Unpaywall's `title` is a copy
-    /// of the publisher-supplied title it was handed, so naming it as an
-    /// identity resolver would launder the publisher's own string through a
-    /// verification the verification did not do.
+    /// `None` for everything outside ADR-007 §3's identity chain, and **not**
+    /// `Some(OpenAlex)` for any of them:
+    ///
+    /// - **Unpaywall** — the chain does not include it, and
+    ///   [`crate::download`] documents that its `title` is a copy of the
+    ///   publisher-supplied title it was handed, so naming it as an identity
+    ///   resolver would launder the publisher's own string through a
+    ///   verification the verification did not do.
+    /// - **Europe PMC** — an aggregator, so its `title` is *another
+    ///   aggregator's or a publisher's* title. It would be a fourth laundering
+    ///   of the same string, and Europe PMC is in the resolve pass for what it
+    ///   says about *versions and licences*, which the three identity registries
+    ///   cannot say anything about.
+    /// - **The PMC OA dataset** — not a registry of records at all. It has no
+    ///   title vocabulary to corroborate: its JSON carries a `title` copied from
+    ///   the same deposit Europe PMC indexes, and using it as an identity source
+    ///   would make the identity check corroborate a publisher's string with
+    ///   that publisher's string.
     #[must_use]
     pub fn identity_source(self) -> Option<IdentitySource> {
         match self {
             Self::OpenAlex => Some(IdentitySource::OpenAlex),
             Self::Crossref => Some(IdentitySource::Crossref),
             Self::DataCite => Some(IdentitySource::DataCite),
-            Self::Unpaywall => None,
+            Self::Unpaywall | Self::EuropePmc | Self::PmcOa => None,
         }
     }
 
@@ -115,15 +138,83 @@ impl Registry {
             Self::OpenAlex => Dialect::OpenAlex,
             Self::Crossref => Dialect::Crossref,
             Self::DataCite => Dialect::DataCite,
-            // Unpaywall is **not** an OpenAlex-speaking registry and this arm is
-            // a fallback rather than a statement: it is not a registration agency
-            // and carries no `type` field at all, so `RegistryType::of` is never
-            // called on its behalf and its classification comes from the
-            // *licence* and the location it names. The arm exists only to keep
-            // the match total, and the panic makes "someone started reading a
-            // type out of Unpaywall" loud rather than silent.
+            // The three aggregators and repositories are **not**
+            // registration-agency-speaking registries, and these arms are a
+            // fallback rather than a statement: none carries a `type` field, so
+            // `RegistryType::of` is never called on their behalf and their
+            // classification comes from the *licence*, the version flag and the
+            // location each names. The arms exist only to keep the match total,
+            // and the panics make "someone started reading a type out of
+            // Unpaywall / Europe PMC / the PMC OA dataset" loud rather than
+            // silent — which matters more for the two PMC sources, because they
+            // *do* carry a type-shaped field (`source: MED | PPR`) that is a
+            // statement about which database harvested the record, not about
+            // the work. Reading that as a work type would rank every `MED`
+            // record as a version of record on the strength of a MEDLINE index.
             Self::Unpaywall => unimplemented!("unpaywall carries no type field"),
+            Self::EuropePmc => unimplemented!("europe pmc carries no registry type field"),
+            Self::PmcOa => unimplemented!("the pmc oa dataset carries no type field"),
         }
+    }
+}
+
+/// Which rendering of a work a biomedical repository says it holds.
+///
+/// **Not** a variant of [`RegistryType`], and the difference is the point:
+/// `RegistryType` is what a record *is* (`posted-content`, `journal-article`),
+/// while this is what a repository says about **the copy it will serve you**.
+/// A work has one record-level type and several copies, so the second question
+/// is the one the ranker actually needs — and only a repository can answer it.
+///
+/// Four states, and the fourth is the load-bearing one:
+///
+/// | state | what said it |
+/// |---|---|
+/// | [`Self::VersionOfRecord`] | PMC-OA's `is_manuscript: false` |
+/// | [`Self::AuthorManuscript`] | any of Europe PMC's three `*AuthMan` flags, or `is_manuscript: true` |
+/// | [`Self::Preprint`] | a Europe PMC `source: PPR` record with no manuscript flag |
+/// | [`Self::Unstated`] | a `MED` record with every flag `N` — nothing said |
+///
+/// The last row is why this is a type and not a bool. Europe PMC answering
+/// "I hold full text, and none of my manuscript flags is set" is **not** a
+/// statement that its copy is the typeset article, and mapping that silence to
+/// a version of record would file whatever bytes we fetched as the article of
+/// record on no one's word. It maps to [`crate::resolve::Version::Unstated`],
+/// which is the ladder's bottom rung — ranked, fetched only if nothing better
+/// exists, and recorded as unstated rather than guessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepositoryVersion {
+    /// The published, typeset article.
+    VersionOfRecord,
+    /// The peer-reviewed text before a publisher's typesetting.
+    AuthorManuscript,
+    /// Posted before or instead of peer review.
+    Preprint,
+    /// A repository named the copy and did not say which version it is.
+    Unstated,
+}
+
+impl RepositoryVersion {
+    /// The `repository_version` this state maps to in [`crate::resolve`].
+    ///
+    /// The one-way mapping [`crate::resolve::Version::as_artefact_version`]
+    /// needs: `Unstated` has no rung of its own and falls through to the route's
+    /// fallback, for the reason that function documents.
+    #[must_use]
+    pub fn as_version(self) -> crate::resolve::Version {
+        use crate::resolve::Version;
+        match self {
+            Self::VersionOfRecord => Version::VersionOfRecord,
+            Self::AuthorManuscript => Version::AuthorManuscript,
+            Self::Preprint => Version::Preprint,
+            Self::Unstated => Version::Unstated,
+        }
+    }
+}
+
+impl From<RepositoryVersion> for crate::resolve::Version {
+    fn from(value: RepositoryVersion) -> Self {
+        value.as_version()
     }
 }
 
@@ -427,6 +518,65 @@ impl LicenceOffer {
             })
     }
 
+    /// Read Europe PMC's `license` short code, or the PMC OA dataset's
+    /// `license_code`.
+    ///
+    /// **A code, not a URL**, and that is the whole reason this is its own
+    /// constructor rather than a reuse of [`Self::from_entry`]: Europe PMC
+    /// writes `cc by-nc-nd` where Crossref writes
+    /// `https://creativecommons.org/licenses/by-nc-nd/4.0/`. Measured values
+    /// across a `MED` record, a `PPR` record and two PMC-OA versions:
+    ///
+    /// | source | codes seen |
+    /// |---|---|
+    /// | Europe PMC `license` | `cc by`, `cc by-nc`, `cc by-nc-sa`, `cc by-nd`, `cc by-sa`, `cc0` |
+    /// | PMC OA `license_code` | `CC BY`, `CC BY-NC-ND`, `CC0`, `TDM` |
+    ///
+    /// The code names a **licence family**, not a version, so the URL this
+    /// synthesises carries the version the Creative Commons licence was
+    /// published at rather than one the repository chose. That is a deliberate
+    /// narrowing: the allow-list checks host plus path *shape* precisely so a
+    /// new CC version appearing cannot start being refused, so the version in
+    /// the URL cannot change any verdict, and inventing one is cheaper than
+    /// refusing a grant a repository plainly stated.
+    ///
+    /// **`TDM` is not a licence and must not become one.** The bucket's own
+    /// README defines it: author manuscripts "where the full text is available
+    /// for text mining, and where the full text may also be used consistent
+    /// with the principles of fair use". That is a text-mining permission, and
+    /// reading it as a reuse grant would put `access_basis = 'oa_license'` on
+    /// bytes nobody granted reuse of — #261's bug, reached through a code that
+    /// looks like the others. It returns `None`, which is the honest answer and
+    /// is what puts the candidate on `FreeToRead`.
+    #[must_use]
+    pub fn from_pmc_code(code: &str, registry: Registry) -> Option<Self> {
+        let normalised = code
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', '_', ' '], "");
+        // `cc0` normalises to `cc0` and `CC0` to `cc0`; the `TDM` case is the
+        // one that must fall through, and it does so by not being in the table
+        // rather than by a special arm — a special arm would be one more place
+        // to forget the rule.
+        let path = match normalised.as_str() {
+            "cc0" | "cczero" => "publicdomain/zero/1.0",
+            "ccby" => "licenses/by/4.0",
+            "ccby-sa" | "ccbysa" => "licenses/by-sa/4.0",
+            "ccby-nd" | "ccbynd" => "licenses/by-nd/4.0",
+            "ccby-nc" | "ccbync" => "licenses/by-nc/4.0",
+            "ccby-nc-sa" | "ccbyncsa" => "licenses/by-nc-sa/4.0",
+            "ccby-nc-nd" | "ccbyncnd" => "licenses/by-nc-nd/4.0",
+            _ => return None,
+        };
+        Some(Self {
+            url: format!("https://creativecommons.org/{path}/"),
+            content_version: None,
+            start: None,
+            delay_in_days: None,
+            registry,
+        })
+    }
+
     fn from_entry(entry: &serde_json::Value, registry: Registry) -> Option<Self> {
         let url = entry.get("URL").and_then(serde_json::Value::as_str)?;
         Some(Self {
@@ -724,25 +874,150 @@ mod tests {
         }
     }
 
-    /// `Registry` and `IdentitySource` overlap on three spellings and must not
-    /// drift on them — and the fourth must be refused rather than laundered.
+    /// `Registry` and `IdentitySource` overlap on exactly the three registries
+    /// ADR-007 §3's identity chain names, and the three that are *not* in that
+    /// chain must be refused rather than laundered onto another's spelling.
     #[test]
     fn the_two_registry_vocabularies_overlap_exactly_where_the_identity_chain_does() {
         let labels: HashSet<&str> = Registry::ALL.iter().map(|r| r.label()).collect();
         assert_eq!(
             labels,
-            HashSet::from(["openalex", "crossref", "datacite", "unpaywall"])
+            HashSet::from([
+                "openalex",
+                "crossref",
+                "datacite",
+                "unpaywall",
+                "europepmc",
+                "pmc_oa"
+            ]),
+            "six sources, and no two of them share a spelling"
         );
         for registry in Registry::ALL {
             match registry.identity_source() {
                 Some(source) => assert_eq!(source.label(), registry.label(), "{registry}"),
-                None => assert_eq!(
-                    registry,
-                    Registry::Unpaywall,
-                    "only Unpaywall is outside ADR-007 §3's identity chain, and it \
-                     must not borrow a registry's spelling: {registry}"
+                None => assert!(
+                    matches!(
+                        registry,
+                        Registry::Unpaywall | Registry::EuropePmc | Registry::PmcOa
+                    ),
+                    "only the three sources ADR-007 §3's identity chain does not \
+                     name may borrow no spelling, and they must not borrow a \
+                     registry's: {registry}"
                 ),
             }
+        }
+    }
+
+    /// The two PMC sources are in the resolve pass for what they say about
+    /// **versions and licences**, and neither is an identity source — so their
+    /// `dialect()` is a loud panic rather than a guess.
+    ///
+    /// Europe PMC carries a `source: MED | PPR | PMC` field that looks like a
+    /// type and is not one: it names the database the record was harvested from,
+    /// so reading it as a work type would rank every `MED` record as a version of
+    /// record on the strength of a MEDLINE index entry.
+    #[test]
+    #[should_panic(expected = "europe pmc carries no registry type field")]
+    fn europe_pmc_carries_no_registry_type_field() {
+        let _ = Registry::EuropePmc.dialect();
+    }
+
+    #[test]
+    #[should_panic(expected = "the pmc oa dataset carries no type field")]
+    fn the_pmc_oa_dataset_carries_no_type_field() {
+        let _ = Registry::PmcOa.dialect();
+    }
+
+    /// `is_manuscript: false` is the **only** thing in the whole metadata pass
+    /// that says a specific file is the version of record, and it is a statement
+    /// about a copy rather than about a record.
+    ///
+    /// Asserted as a mapping rather than through the ranker because the ranker's
+    /// contribution is `Version` itself, which the resolve module owns; what is
+    /// new here is the four-state vocabulary and the fact that silence is its
+    /// own state rather than a version of record.
+    #[test]
+    fn a_repository_states_which_copy_it_holds_in_four_states() {
+        use RepositoryVersion::*;
+        assert_eq!(
+            VersionOfRecord.as_version(),
+            crate::resolve::Version::VersionOfRecord
+        );
+        assert_eq!(
+            AuthorManuscript.as_version(),
+            crate::resolve::Version::AuthorManuscript
+        );
+        assert_eq!(Preprint.as_version(), crate::resolve::Version::Preprint);
+        // And the fourth state is the load-bearing one: a repository naming a
+        // copy and not characterising it is `Unstated`, **not** a version of
+        // record.
+        assert_eq!(Unstated.as_version(), crate::resolve::Version::Unstated);
+        assert_ne!(
+            Unstated.as_version(),
+            crate::resolve::Version::VersionOfRecord,
+            "mapping 'the repository did not say' onto `vor` is the overclaim \
+             #261 is about: it files whatever bytes came back as the article of \
+             record on nobody's word"
+        );
+        assert_eq!(
+            Unstated.as_version().as_artefact_version(),
+            None,
+            "and `Unstated` writes no column value, falling through to the \
+             route's own claim — the same precedence the resolve ladder uses"
+        );
+    }
+
+    /// The measured Creative Commons short codes, and the one that is **not** a
+    /// licence.
+    ///
+    /// `TDM` is the case that matters: it marks an author manuscript available
+    /// for text mining under fair use, and reading it as a reuse grant would put
+    /// `access_basis = 'oa_license'` on bytes nobody granted reuse of. It returns
+    /// `None` rather than a special-cased refusal, so a code added later is
+    /// refused the same way by construction.
+    #[test]
+    fn a_pmc_licence_code_becomes_a_cc_grant_and_tdm_becomes_nothing() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 1).expect("a date");
+        for (code, want) in [
+            ("cc by", "licenses/by"),
+            ("CC BY", "licenses/by"),
+            ("cc by-nc-nd", "licenses/by-nc-nd"),
+            ("CC BY-NC-ND", "licenses/by-nc-nd"),
+            ("cc by-nc-sa", "licenses/by-nc-sa"),
+            ("cc by-sa", "licenses/by-sa"),
+            ("cc by-nc", "licenses/by-nc"),
+            ("cc by-nd", "licenses/by-nd"),
+            ("cc0", "publicdomain/zero"),
+            ("CC0", "publicdomain/zero"),
+        ] {
+            let offer = LicenceOffer::from_pmc_code(code, Registry::EuropePmc)
+                .unwrap_or_else(|| panic!("{code} is a measured CC code"));
+            assert!(
+                offer.url.contains(want),
+                "{code} -> {want}, got {}",
+                offer.url
+            );
+            assert!(
+                offer.counts_for("vor", today).is_none(),
+                "{code} must count as an in-force grant: {:?}",
+                offer.counts_for("vor", today)
+            );
+        }
+        // The text-mining marker, and every code nobody has mapped.
+        for code in [
+            "TDM",
+            "tdm",
+            "",
+            "   ",
+            "CC BY-XYZ",
+            "10.15223/policy-a",
+            "public domain",
+        ] {
+            assert_eq!(
+                LicenceOffer::from_pmc_code(code, Registry::PmcOa),
+                None,
+                "{code:?} is not an allow-listed reuse grant"
+            );
         }
     }
 
