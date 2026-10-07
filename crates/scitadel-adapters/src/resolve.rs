@@ -62,15 +62,26 @@
 //!
 //! # The three-stage origin chain, and why the fallback is recorded
 //!
-//! [`VersionSource`] is the provenance of a [`Version`] claim and it is
-//! exhaustive over four cases, in strict preference order:
+//! [`VersionSource`] is the provenance of a [`Version`] claim, in strict
+//! preference order:
 //!
 //! | order | source | what it is |
 //! |---|---|---|
-//! | 1 | [`VersionSource::Registry`] | the registry's own `type` / `resourceTypeGeneral` |
-//! | 2 | [`VersionSource::Route`] | the route serves preprints by construction |
-//! | 3 | [`VersionSource::DoiPrefix`] | the DOI prefix, the #260 fallback |
-//! | 4 | [`VersionSource::None`] | nothing established it — see below |
+//! | 1 | [`VersionSource::Repository`] | Europe PMC's manuscript flags, or the PMC OA dataset's per-version `is_manuscript` |
+//! | 2 | [`VersionSource::LocationVersion`] | a location's own `version` word — OpenAlex, Unpaywall, Crossref |
+//! | 3 | [`VersionSource::Registry`] | the registry's own `type` / `resourceTypeGeneral` |
+//! | 4 | [`VersionSource::Route`] | the route serves preprints by construction |
+//! | 5 | [`VersionSource::DoiPrefix`] | the DOI prefix, the #260 fallback |
+//! | — | [`VersionSource::Unstated`] | a source named a copy and declined to characterise it |
+//! | — | [`VersionSource::None`] | nothing established it — see below |
+//!
+//! **The repository row is first, and it is a different kind of claim.** Rows 2–5
+//! are all statements about a *work* or about a *URL an index catalogued*; row 1
+//! is a statement about **the file we would fetch** — `is_manuscript: false` is
+//! PMC saying this object is the typeset article, which no DOI registry can say
+//! and no DOI prefix can imply. It outranks them because it answers the question
+//! the ranker is asking; see [`version_from_repository`] for why it is a
+//! separate variant rather than a widened [`version_from_location_word`].
 //!
 //! The registry signal is preferred over the prefix inference *because it is a
 //! statement by the publisher about its own DOI*, where a `10.1101` prefix is a
@@ -243,6 +254,25 @@ pub enum VersionSource {
         /// The verbatim value: `posted-content`, `Preprint`, `journal-article`.
         signal: String,
     },
+    /// A biomedical repository said which **copy it holds** — Europe PMC's
+    /// `*AuthMan` flags, or the PMC OA dataset's per-version `is_manuscript`.
+    ///
+    /// A separate variant rather than a widened [`Self::LocationVersion`], and
+    /// the reason is that the two are different kinds of claim.
+    /// `LocationVersion` is a *word from a shared three-word vocabulary*, which
+    /// OpenAlex and Unpaywall spell identically because Unpaywall's location
+    /// shape is OpenAlex's. A repository flag is not a fourth word in that
+    /// vocabulary: it is a boolean about one stored file, from a service with a
+    /// different field name, and it answers a **stronger** question — not "how
+    /// does this index classify that URL" but "is this file the typeset
+    /// article". `VersionSource` exists to say which of those produced a
+    /// claim, so the two cannot share a variant.
+    ///
+    /// `signal` carries the field and its value verbatim (`is_manuscript=false`,
+    /// `source=PPR`, `no manuscript flag is set`) so a plan line names what was
+    /// read, which is what makes the claim checkable against PMC rather than
+    /// against us.
+    Repository { registry: Registry, signal: String },
     /// The route serves this version by construction — arXiv and bioRxiv serve
     /// preprints whatever the DOI says, and OSTI's `purl` serves a report's own
     /// authoritative publication. `RouteId::artefact_version` and
@@ -309,6 +339,9 @@ impl VersionSource {
             Self::Registry { registry, signal } => {
                 format!("{registry} types it `{signal}`")
             }
+            Self::Repository { registry, signal } => {
+                format!("{registry} says `{signal}`")
+            }
             Self::Route { route } => {
                 format!("{route} serves this version by construction")
             }
@@ -360,6 +393,66 @@ pub fn version_from_location_word(
 #[must_use]
 pub fn version_from_content_version(word: &str) -> Option<(Version, VersionSource)> {
     version_from_location_word(word, Registry::Crossref)
+}
+
+/// A biomedical repository's statement about the copy it will serve.
+///
+/// **This is the (a) branch of #254's wave-3 choice**, and it is (a)
+/// because of what the alternative would mean. Option (b) was to extend
+/// [`version_from_location_word`] to recognise a manuscript signal — and
+/// that function's whole contract, stated at its definition, is that its
+/// input is "the same three words in both indexes, measured". Europe PMC's
+/// `epmcAuthMan: Y` and PMC-OA's `is_manuscript: false` are not a fourth
+/// word in that vocabulary; they are **booleans about a copy**, in two
+/// different vocabularies, from two services that do not share a field
+/// name. Widening the word table to hold them would make the table a
+/// mixture of words and flags and would leave the *comparator* looking at
+/// three-sources-agree spelling for a claim one source made.
+///
+/// So the chain gains a **variant** instead, and it is a variant rather
+/// than a reuse of [`Self::LocationVersion`] for the same reason: the
+/// provenance differs in kind, not in wording. `LocationVersion` is an
+/// index saying `publishedVersion` about a URL it indexed — a word from a
+/// shared vocabulary. A repository saying `is_manuscript: false` is saying
+/// something strictly stronger: *this file, in this archive, is the
+/// typeset article*. Keeping it in its own variant means the `why()` a plan
+/// line prints names the field that was read, so a reader can check PMC's
+/// answer rather than ours.
+///
+/// The [`Rank`] comparator is untouched, and that is the property option (a)
+/// buys: [`Version`] and [`LicenceStrength`] keep their meaning and their
+/// `Ord`, so `ranked_order_is_documented_and_pinned` still pins the same
+/// claim it pinned before PMC-OA existed.
+///
+/// # The `Unstated` case is the one that matters
+///
+/// A Europe PMC `MED` record with every manuscript flag `N` maps to
+/// [`RepositoryVersion::Unstated`], and this function turns that into
+/// `(Version::Unstated, …)` — **a rung, not a hole**. It is *not* `None`:
+/// Europe PMC named a real, fetchable copy and merely did not say which
+/// version it is, which is a positive statement about a location. Mapping
+/// that silence to `Version::VersionOfRecord` would file whatever came back
+/// as the article of record on nobody's word, and returning `None` would say
+/// Europe PMC vouched for nothing at all, which is false — it vouched for
+/// the copy and declined to characterise it. Both errors are overclaims, in
+/// opposite directions, and #261 is about both.
+#[must_use]
+pub fn version_from_repository(
+    registry: Registry,
+    stated: crate::registry::RepositoryVersion,
+) -> (Version, VersionSource) {
+    let version = stated.as_version();
+    let source = VersionSource::Repository {
+        registry,
+        signal: match stated {
+            crate::registry::RepositoryVersion::VersionOfRecord => "is_manuscript=false",
+            crate::registry::RepositoryVersion::AuthorManuscript => "is_manuscript=true",
+            crate::registry::RepositoryVersion::Preprint => "source=PPR",
+            crate::registry::RepositoryVersion::Unstated => "no manuscript flag is set",
+        }
+        .to_string(),
+    };
+    (version, source)
 }
 
 /// The registrant prefix a DOI would be inferred from, or `None`.
@@ -550,7 +643,7 @@ pub struct Resolution {
     /// assertion: `the_metadata_pass_touches_no_publisher_host` checks this
     /// against [`METADATA_BUCKETS`], and a caller can print it.
     pub hosts_contacted: BTreeSet<String>,
-    /// Candidates named by a source other than the four registries: a DOI
+    /// Candidates named by a source other than the six registries: a DOI
     /// transform, the record's own URL, OSTI's `purl`. Carried so a plan can
     /// show a route that no registry vouched for.
     pub derived_routes: Vec<RouteId>,
@@ -590,12 +683,30 @@ pub struct ConsultedRegistry {
 
 /// The buckets a metadata pass is allowed to spend from.
 ///
-/// ADR-007 §3 lists them: "It may hit OpenAlex, Crossref, DataCite,
-/// Unpaywall." A pass that spent a permit from any other bucket would have
-/// touched a host that serves articles, and the ranked plan would depend on a
-/// publisher's response time — the failure ADR-007 §3's "resolve, then rank"
-/// exists to remove.
-pub const METADATA_BUCKETS: [&str; 4] = ["openalex", "crossref", "datacite", "unpaywall"];
+/// ADR-007 §3 names five sources for the resolve pass: OpenAlex, Unpaywall,
+/// Crossref, DataCite and **Europe PMC** (`isOpenAccess`, `inEPMC`), plus the
+/// `pmc-oa-opendata` dataset in step 2. A pass that spent a permit from any
+/// other bucket would have touched a host that serves articles, and the ranked
+/// plan would depend on a publisher's response time — the failure ADR-007 §3's
+/// "resolve, then rank" exists to remove.
+///
+/// **The PMC-OA bucket is the one that needed arguing for.** It is not a
+/// registry, it is an anonymous S3 bucket, and a listing of eight million
+/// objects is not what a "metadata API" sounds like. It is in this list for two
+/// reasons that both matter: it is where the *only* per-version
+/// `is_manuscript` in the whole pass lives, and it is reached **without**
+/// credentials and without any redirect — so it is as far from a publisher as
+/// anything this pass touches. The alternative, spending the `europepmc`
+/// bucket for it, would merge a public dataset into EBI's metadata budget and
+/// make one service's outage report as another's.
+pub const METADATA_BUCKETS: [&str; 6] = [
+    "openalex",
+    "crossref",
+    "datacite",
+    "unpaywall",
+    "europepmc",
+    "pmc_oa",
+];
 
 /// Rank candidates into ADR-007 §3's order.
 ///
@@ -883,6 +994,18 @@ pub struct MetadataBases {
     pub datacite_dois: String,
     /// Base of Unpaywall's `/v2/<doi>`.
     pub unpaywall_api: String,
+    /// Base of Europe PMC's REST service, `/search` below it. A **base and not
+    /// the full URL**, because the pass builds three shapes below it — the
+    /// search, and (in a later slice) `fullTextXML` and `supplementaryFiles` —
+    /// and a base is what stops a test pointing one at a server and another at
+    /// the live service.
+    pub europepmc_rest: String,
+    /// Base of the `pmc-oa-opendata` bucket's HTTPS endpoint. Both the
+    /// version listing and the per-version JSON are built from it, and the
+    /// guard that refuses a URL outside it is what keeps the bucket's own
+    /// `pdf_url` — an *absolute* URL in a third party's JSON — from becoming a
+    /// request this pass makes.
+    pub pmc_oa_bucket: String,
 }
 
 impl Default for MetadataBases {
@@ -892,12 +1015,14 @@ impl Default for MetadataBases {
             crossref_works: crate::crossref::CROSSREF_WORKS_URL.to_string(),
             datacite_dois: crate::datacite::DATACITE_DOIS_URL.to_string(),
             unpaywall_api: "https://api.unpaywall.org/v2".to_string(),
+            europepmc_rest: crate::europepmc::EUROPE_PMC_REST_URL.to_string(),
+            pmc_oa_bucket: crate::pmc_oa::PMC_OA_BUCKET_URL.to_string(),
         }
     }
 }
 
 impl MetadataBases {
-    /// The four registry bases out of a downloader's [`crate::download::Endpoints`].
+    /// The six registry bases out of a downloader's [`crate::download::Endpoints`].
     ///
     /// One authority for the configuration: a pass built from anything else
     /// would be a second copy of the endpoint list, and #292's `IdentityChain`
@@ -909,6 +1034,8 @@ impl MetadataBases {
             crossref_works: endpoints.crossref_works.clone(),
             datacite_dois: endpoints.datacite_dois.clone(),
             unpaywall_api: endpoints.unpaywall_api.clone(),
+            europepmc_rest: endpoints.europepmc_rest.clone(),
+            pmc_oa_bucket: endpoints.pmc_oa_bucket.clone(),
         }
     }
 
@@ -919,6 +1046,8 @@ impl MetadataBases {
             Registry::Crossref => &self.crossref_works,
             Registry::DataCite => &self.datacite_dois,
             Registry::Unpaywall => &self.unpaywall_api,
+            Registry::EuropePmc => &self.europepmc_rest,
+            Registry::PmcOa => &self.pmc_oa_bucket,
         }
     }
 
@@ -1014,6 +1143,17 @@ pub struct WorkRefs<'a> {
     /// second metadata mechanism — the thing #292's `seeded` argument is
     /// against.
     pub openalex_id: Option<&'a str>,
+    /// The record's own `papers.pmcid`, read by a targeted query rather than
+    /// carried on [`scitadel_core::models::Paper`].
+    ///
+    /// Read separately for the reason
+    /// [`scitadel_db::sqlite::identity::read_pmcid`] documents: `Paper` is
+    /// written back wholesale, so a model field would be nulled on the next
+    /// save for a work that *has* a PMCID. It is also the **only** handle the
+    /// PMC OA dataset accepts — the bucket is keyed on a PMCID, not a DOI — so
+    /// without it that leg is unreachable for every work Europe PMC does not
+    /// answer for.
+    pub pmcid: Option<&'a str>,
 }
 
 /// The metadata pass, and the ranker it feeds.
@@ -1030,6 +1170,11 @@ pub struct MetadataPass {
     bases: MetadataBases,
     sources: CandidateSources,
     openalex: scitadel_core::config::OpenAlexAuth,
+    /// The PMC-OA URL builder, held beside [`Self::bases`] rather than inside
+    /// it so that the base and the shapes built from it cannot be configured
+    /// apart — the #292 bug, where `IdentityChain::new` ignored the bases it was
+    /// handed.
+    pmc_oa: crate::pmc_oa::PmcOaAdapter,
 }
 
 impl MetadataPass {
@@ -1040,6 +1185,8 @@ impl MetadataPass {
             bases: MetadataBases::default(),
             sources: CandidateSources::default(),
             openalex: openalex_with_mailto(openalex, mailto),
+            pmc_oa: crate::pmc_oa::PmcOaAdapter::new()
+                .with_base_url(&MetadataBases::default().pmc_oa_bucket),
         }
     }
 
@@ -1054,19 +1201,27 @@ impl MetadataPass {
         mailto: &str,
     ) -> Self {
         Self {
+            pmc_oa: crate::pmc_oa::PmcOaAdapter::new().with_base_url(&bases.pmc_oa_bucket),
             bases,
             sources,
             openalex: openalex_with_mailto(openalex, mailto),
         }
     }
 
-    /// The four hosts this pass may request.
+    /// The six hosts this pass may request.
     #[must_use]
     pub fn bases(&self) -> &MetadataBases {
         &self.bases
     }
 
-    /// Run the pass: ask the four registries, then rank everything found.
+    /// The four hosts this pass may **name** a candidate against without
+    /// requesting it.
+    #[must_use]
+    pub fn sources(&self) -> &CandidateSources {
+        &self.sources
+    }
+
+    /// Run the pass: ask the six sources, then rank everything found.
     ///
     /// The order of the requests is ADR-007 §3's identity chain order, and the
     /// order candidates are collected in is ADR-007 §3's **fetch** order —
@@ -1104,6 +1259,12 @@ impl MetadataPass {
         // did. That is why the four reads happen before the first candidate.
         let mut work_level: Option<(Version, VersionSource)> = None;
         let mut work_licences: Vec<LicenceOffer> = Vec::new();
+        // Whether **any** source has asserted the work is open access. Not the
+        // same as "some candidate carries an OpenLicence" — it is the work-level
+        // assertion ADR-007 §3 step 6 gates the publisher landing page on, and it
+        // is what stops that page from being a blanket last resort. `false` means
+        // "nobody said", which is why the gate is `false`-closed.
+        let mut work_is_open_access = false;
         // The identity answer, kept beside the version and licence facts the
         // same bodies carry. One read, three uses — asking a registry a second
         // time for the title it already sent would spend the same hop twice,
@@ -1136,6 +1297,7 @@ impl MetadataPass {
                     version_from_registry(Registry::OpenAlex, classified, &word)
                 });
                 let is_oa = crate::openalex::declares_open_access(&body);
+                work_is_open_access |= is_oa;
                 for (at, location) in crate::openalex::oa_locations(&body).iter().enumerate() {
                     let Some(url) = location.fetchable() else {
                         continue;
@@ -1165,7 +1327,9 @@ impl MetadataPass {
                                 format!("{} locations[{}]", Registry::OpenAlex, at + 1)
                             },
                             version_word: location.version_word.clone(),
+                            version_flag: None,
                             location_licence: location.licence.clone(),
+                            location_pmc_code: None,
                             free_to_read: best || is_oa,
                             licence_floor: if best {
                                 LicenceFloor::RouteBasis
@@ -1233,6 +1397,7 @@ impl MetadataPass {
                     })
                 });
                 let is_oa = crate::openalex::declares_open_access(&body);
+                work_is_open_access |= is_oa;
                 for (at, location) in crate::openalex::oa_locations(&body).iter().enumerate() {
                     let Some(url) = location.fetchable() else {
                         continue;
@@ -1249,7 +1414,9 @@ impl MetadataPass {
                                 format!("{} {short} locations[{}]", Registry::OpenAlex, at + 1)
                             },
                             version_word: location.version_word.clone(),
+                            version_flag: None,
                             location_licence: location.licence.clone(),
+                            location_pmc_code: None,
                             free_to_read: best || is_oa,
                             licence_floor: if best {
                                 LicenceFloor::RouteBasis
@@ -1307,7 +1474,9 @@ impl MetadataPass {
                             url: link.url.clone(),
                             named_by: format!("{} link[{}]", Registry::Crossref, at + 1),
                             version_word: link.content_version.clone(),
+                            version_flag: None,
                             location_licence: None,
+                            location_pmc_code: None,
                             free_to_read: false,
                             // `RouteId::Crossref::access_basis()` is `None` on
                             // purpose — a `link[]` entry answers "where do the
@@ -1367,7 +1536,9 @@ impl MetadataPass {
                             url: url.to_string(),
                             named_by: format!("{} attributes.url", Registry::DataCite),
                             version_word: None,
+                            version_flag: None,
                             location_licence: None,
+                            location_pmc_code: None,
                             free_to_read: false,
                             licence_floor: LicenceFloor::RouteBasis,
                         },
@@ -1402,6 +1573,13 @@ impl MetadataPass {
             consulted.push(hop.record());
             hosts.extend(hop.hosts);
             if let Some(body) = hop.body {
+                // Unpaywall's own record-level `is_oa`, which is the assertion
+                // step 6 is gated on. Read before the locations because the
+                // locations are the consequence of it.
+                work_is_open_access |= body
+                    .get("is_oa")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
                 let mut locations: Vec<serde_json::Value> = body
                     .get("best_oa_location")
                     .filter(|best| best.is_object())
@@ -1444,10 +1622,12 @@ impl MetadataPass {
                                 .get("version")
                                 .and_then(serde_json::Value::as_str)
                                 .map(str::to_string),
+                            version_flag: None,
                             location_licence: location
                                 .get("license")
                                 .and_then(serde_json::Value::as_str)
                                 .map(str::to_string),
+                            location_pmc_code: None,
                             // Unpaywall lists a location under `oa_locations`
                             // **because** it is open, so `is_oa` needs no
                             // further corroboration here. OpenAlex gets no such
@@ -1472,14 +1652,207 @@ impl MetadataPass {
             });
         }
 
-        // ---- 5. The derived routes: named from identifiers, never requested. ----
+        // ---- 5. Europe PMC: `isOpenAccess`, `license`, and the manuscript flags. ----
+        //
+        // Asked **after** the four registration registries and **before** the
+        // PMC-OA lookup below, and the order is load-bearing in both
+        // directions. Europe PMC answers "is this work open access" — which is
+        // what gates the PMC-OA read entirely — and the DOI prefix fallback has
+        // already had its chance, so a `10.1101` preprint that Europe PMC says
+        // is a manuscript is placed by the repository rather than by string
+        // arithmetic.
+        let mut pmcids: BTreeSet<String> = refs
+            .pmcid
+            .and_then(crate::pmc_oa::normalise_pmcid)
+            .into_iter()
+            .collect();
+        if let Some(doi) = doi.as_deref() {
+            let hop = self
+                .read(
+                    client,
+                    scope,
+                    Registry::EuropePmc,
+                    crate::europepmc::EuropePmcAdapter::new(&self.openalex.email)
+                        .with_base_url(&self.bases.europepmc_rest)
+                        .search_url(doi)
+                        .map_err(|e| e.to_string()),
+                )
+                .await;
+            consulted.push(hop.record());
+            hosts.extend(hop.hosts);
+            if let Some(body) = hop.body.clone()
+                && let crate::europepmc::EuropePmcAnswer::Found(records) =
+                    crate::europepmc::parse_search(&body)
+            {
+                for record in &records {
+                    work_is_open_access |= record.is_open_access;
+                    if let Some(pmcid) = &record.pmcid {
+                        pmcids.insert(pmcid.clone());
+                    }
+                    for (at, location) in record.full_text_urls.iter().enumerate() {
+                        if !location.is_repository_document() {
+                            continue;
+                        }
+                        if !is_fetchable_url(&location.url) {
+                            tracing::info!(
+                                url = %location.url,
+                                "europe pmc named a full-text URL that cannot be \
+                                 fetched; it is not offered as a candidate"
+                            );
+                            continue;
+                        }
+                        candidates.push(Self::location_candidate(
+                            today,
+                            CandidateSeed {
+                                route: RouteId::EuropePmc,
+                                url: location.url.clone(),
+                                named_by: format!(
+                                    "{} record {} fullTextUrl[{}]",
+                                    Registry::EuropePmc,
+                                    record.id,
+                                    at + 1
+                                ),
+                                version_word: None,
+                                version_flag: Some(version_from_repository(
+                                    Registry::EuropePmc,
+                                    record.version,
+                                )),
+                                location_licence: None,
+                                location_pmc_code: record.licence.clone(),
+                                free_to_read: record.is_open_access,
+                                licence_floor: LicenceFloor::RouteBasis,
+                            },
+                            refs.doi,
+                            work_level.as_ref(),
+                            &work_licences,
+                        ));
+                    }
+                }
+            }
+        } else {
+            consulted.push(ConsultedRegistry {
+                registry: Registry::EuropePmc,
+                outcome: crate::identity_chain::HopOutcome::NothingToAsk,
+            });
+        }
+
+        // ---- 6. The PMC OA dataset: one candidate per stored version. ----
+        //
+        // The most expensive read in the pass — a listing plus one JSON per
+        // version — and it runs **only** for a PMCID, which comes either from
+        // `papers.pmcid` or from the Europe PMC record above. A work with
+        // neither has nothing to ask this bucket: it is keyed on a PMCID, not a
+        // DOI, and the id converter that would turn one into the other is a
+        // fifth mechanism this pass deliberately does not have.
+        for pmcid in &pmcids {
+            let listed = self
+                .read_text(
+                    client,
+                    scope,
+                    Registry::PmcOa,
+                    self.pmc_oa
+                        .versions_url(pmcid)
+                        .ok_or_else(|| format!("{pmcid} is not a PMCID")),
+                )
+                .await;
+            consulted.push(listed.record());
+            hosts.extend(listed.hosts);
+            // `read_text` parks a non-JSON body as a `Value::String`, which is
+            // the one place a raw body survives into this module — the listing is
+            // XML and re-serialising it through `serde_json` would be a
+            // round-trip that could only lose information.
+            let Some(serde_json::Value::String(body)) = listed.body else {
+                continue;
+            };
+            // Every stored version, in the bucket's order. Not the last and not
+            // the first: the bucket's README is explicit that the version number
+            // says nothing about which is the author manuscript, which is why
+            // the JSON below is read at all.
+            for key in crate::pmc_oa::parse_versions(&body) {
+                let version = key.version;
+                let hop = self
+                    .read(
+                        client,
+                        scope,
+                        Registry::PmcOa,
+                        self.pmc_oa
+                            .metadata_url(&key.pmcid, version)
+                            .ok_or_else(|| format!("{key} is not a version")),
+                    )
+                    .await;
+                consulted.push(hop.record());
+                hosts.extend(hop.hosts);
+                let Some(version_body) = hop.body else {
+                    continue;
+                };
+                let Some(record) =
+                    crate::pmc_oa::parse_version(&self.pmc_oa, &key.pmcid, version, &version_body)
+                else {
+                    continue;
+                };
+                // The PDF is the artefact, and its absence is measured rather
+                // than hypothetical (PMC8238499.1 licenses the XML and not the
+                // PDF), so a version with no `pdf_url` contributes nothing and
+                // says so.
+                let Some(url) = record.pdf_url.clone() else {
+                    tracing::info!(
+                        pmcid = %record.pmcid,
+                        version,
+                        "pmc oa version has no pdf_url; it licenses the XML and \
+                         not the PDF, so it is not offered as a full-text candidate"
+                    );
+                    continue;
+                };
+                work_is_open_access |= record.is_pmc_openaccess;
+                candidates.push(Self::location_candidate(
+                    today,
+                    CandidateSeed {
+                        route: RouteId::PmcOa,
+                        url,
+                        named_by: format!(
+                            "{} {pmcid}.{version} ({})",
+                            Registry::PmcOa,
+                            if record.is_manuscript {
+                                "author manuscript"
+                            } else {
+                                "not a manuscript"
+                            }
+                        ),
+                        version_word: None,
+                        version_flag: Some(version_from_repository(
+                            Registry::PmcOa,
+                            crate::pmc_oa::version_of(&record),
+                        )),
+                        location_licence: None,
+                        location_pmc_code: record.license_code.clone(),
+                        // `is_pmc_openaccess` is the dataset's own statement
+                        // that the version is in the OA subset. An author
+                        // manuscript can be in the dataset and *not* be (the
+                        // `TDM` case), so the two are read separately.
+                        free_to_read: record.is_pmc_openaccess,
+                        licence_floor: LicenceFloor::RouteBasis,
+                    },
+                    refs.doi,
+                    work_level.as_ref(),
+                    &work_licences,
+                ));
+            }
+        }
+        if pmcids.is_empty() {
+            consulted.push(ConsultedRegistry {
+                registry: Registry::PmcOa,
+                outcome: crate::identity_chain::HopOutcome::NothingToAsk,
+            });
+        }
+
+        // ---- 7. The derived routes: named from identifiers, never requested. ----
         //
         // ADR-007 §3's fetch order after the registries: arXiv for preprints,
         // DOE OSTI for national-lab reports, then the publisher's landing page,
         // then the record's own URL. Collected **last**, so a preprint-server
         // candidate loses a tie to a registry location ADR puts earlier — the
         // tiebreak is the ADR's own sequence.
-        let derived = self.derived_candidates(refs, work_level.as_ref());
+        let derived = self.derived_candidates(refs, work_level.as_ref(), work_is_open_access);
         let derived_routes: Vec<RouteId> = derived.iter().map(|c| c.route).collect();
         candidates.extend(derived);
 
@@ -1622,6 +1995,7 @@ impl MetadataPass {
         &self,
         refs: WorkRefs<'_>,
         work_level: Option<&(Version, VersionSource)>,
+        work_is_open_access: bool,
     ) -> Vec<Candidate> {
         let mut out: Vec<Candidate> = Vec::new();
         // One normalisation, so the four candidate kinds below cannot disagree
@@ -1698,14 +2072,28 @@ impl MetadataPass {
             });
         }
 
-        // The DOI resolver's landing page. **No version signal at all**, and
-        // that is deliberate and is the honest answer: a publisher's landing
-        // page serves whatever rendering the paywall happens to serve, and
-        // nothing in a metadata pass establishes which. It is therefore an
-        // *unrankable* candidate unless a registry typed the work — which is
-        // what keeps ADR-007 §3's step 6 ("landing-page HTML, for OA works
-        // only") honest without this module having to invent a version.
-        if let Some(normalised) = doi {
+        // The DOI resolver's landing page, **only for an open-access work** —
+        // ADR-007 §3 step 6: "Landing-page HTML, for OA works only, after TDM."
+        //
+        // The gate is the load-bearing part of this branch, and it is what stops
+        // the landing page from becoming a blanket last resort. Without it, every
+        // work with a DOI produced a `RouteId::Publisher` candidate, and the
+        // ranker's bottom rung made it *reachable*: a work with no OA copy
+        // anywhere would fetch a publisher's page, which is a publisher host on
+        // the wire for a document that a human could not have read for free
+        // either. `is_oa` from Unpaywall, `open_access.is_oa` from OpenAlex,
+        // Europe PMC's `isOpenAccess` and the dataset's `is_pmc_openaccess` are
+        // the four sources that can open the gate; none of them opening it means
+        // nobody asserted the work is open access, and a landing page is then not
+        // a candidate at all.
+        //
+        // **No version signal from the page itself**, which remains deliberate and
+        // honest: a publisher's landing page serves whatever rendering the
+        // paywall happens to serve, and nothing in a metadata pass establishes
+        // which. It is therefore an *unrankable* candidate unless a registry typed
+        // the work — which is what keeps step 6 honest without this module having
+        // to invent a version.
+        if let Some(normalised) = doi.filter(|_| work_is_open_access) {
             out.push(Candidate {
                 route: RouteId::Publisher,
                 url: format!(
@@ -1741,6 +2129,13 @@ impl MetadataPass {
 
         // The record's own `url`, last: ADR-007 §3 calls it the last resort and
         // the tiebreak follows suit.
+        //
+        // **Not** gated on open access, and deliberately so where the landing page
+        // is: this URL came from the work's own record — a person, an import or an
+        // adapter put it there — and dropping it for a work nobody has declared OA
+        // would silently discard the one thing a human supplied. It ranks on
+        // `Unstated` and `SubscriptionRead`, so it only wins when nothing else
+        // exists, which is where a last resort belongs.
         if let Some(url) = refs.url.map(str::trim).filter(|url| !url.is_empty()) {
             out.push(Candidate {
                 route: RouteId::ManualUrl,
@@ -1794,17 +2189,24 @@ impl MetadataPass {
         work_licences: &[LicenceOffer],
     ) -> Candidate {
         let named = seed.named_by.clone();
+        // Taken by value first: the chain below moves the two licence fields out
+        // of `seed`, and reading `seed.route` after that would be a use of a
+        // moved value — so the two decisions that depend on the route are taken
+        // here, while `seed` is whole.
+        let route = seed.route;
+        let registry_hint = seed.registry_hint();
         let (version, version_source) = seed
-            .version_word
-            .as_deref()
-            .and_then(|word| {
-                if seed.route == RouteId::Crossref {
-                    version_from_content_version(word)
-                } else if seed.route == RouteId::Unpaywall {
-                    version_from_location_word(word, Registry::Unpaywall)
-                } else {
-                    version_from_location_word(word, Registry::OpenAlex)
-                }
+            .version_flag
+            .or_else(|| {
+                seed.version_word.as_deref().and_then(|word| {
+                    if route == RouteId::Crossref {
+                        version_from_content_version(word)
+                    } else if route == RouteId::Unpaywall {
+                        version_from_location_word(word, Registry::Unpaywall)
+                    } else {
+                        version_from_location_word(word, Registry::OpenAlex)
+                    }
+                })
             })
             .or_else(|| work_level.cloned())
             .or_else(|| doi.and_then(version_from_doi_prefix))
@@ -1840,10 +2242,19 @@ impl MetadataPass {
                     content_version: None,
                     start: None,
                     delay_in_days: None,
-                    registry: seed.registry_hint(),
+                    registry: registry_hint,
                 }]
             })
             .unwrap_or_default();
+        // A code is only an offer if it names a licence we recognise. `TDM` and
+        // an unmapped code both land here as `None`, which is the honest answer
+        // and puts the candidate on `FreeToRead` — free to read, with no reuse
+        // grant established.
+        if let Some(code) = seed.location_pmc_code.as_deref()
+            && let Some(offer) = LicenceOffer::from_pmc_code(code, registry_hint)
+        {
+            offers.push(offer);
+        }
         offers.extend(work_licences.iter().cloned());
         let counting: Vec<LicenceOffer> = offers
             .into_iter()
@@ -1913,40 +2324,125 @@ impl MetadataPass {
         registry: Registry,
         url: Result<reqwest::Url, String>,
     ) -> RegistryHop {
+        let text = self.fetch_text(client, scope, registry, url).await;
+        let (outcome, body, detail, hosts) = match text {
+            Err((outcome, detail, hosts)) => (outcome, None, detail, hosts),
+            Ok((raw, host)) => match serde_json::from_str::<serde_json::Value>(&raw) {
+                Ok(body) => (
+                    crate::identity_chain::HopOutcome::Answered,
+                    Some(body),
+                    format!("{registry} answered"),
+                    BTreeSet::from([host]),
+                ),
+                Err(error) => (
+                    crate::identity_chain::HopOutcome::Unreadable,
+                    None,
+                    format!("{registry} answered 200 that is not JSON: {error}"),
+                    BTreeSet::from([host]),
+                ),
+            },
+        };
+        RegistryHop {
+            registry,
+            outcome,
+            body,
+            hosts,
+            detail,
+        }
+    }
+
+    /// [`Self::read`] for a body that is **not** JSON.
+    ///
+    /// Exists for the PMC-OA version listing, which is an S3
+    /// `<ListBucketResult>` XML document. Split rather than generalised because
+    /// the failure modes differ in a way the caller has to act on: a non-JSON
+    /// body from a registry is an *unreadable answer*, while the same body from
+    /// the bucket is the shape the bucket serves, and folding them together
+    /// would mean either a second content-type branch inside `read` or a
+    /// "parsed as JSON or gave up" rule that swallows the distinction.
+    async fn read_text(
+        &self,
+        client: &scitadel_http::PacedClient,
+        scope: &scitadel_http::WorkScope,
+        registry: Registry,
+        url: Result<reqwest::Url, String>,
+    ) -> RegistryHop {
+        match self.fetch_text(client, scope, registry, url).await {
+            Err((outcome, detail, hosts)) => RegistryHop {
+                registry,
+                outcome,
+                body: None,
+                hosts,
+                detail,
+            },
+            Ok((raw, host)) => RegistryHop {
+                registry,
+                outcome: crate::identity_chain::HopOutcome::Answered,
+                body: Some(serde_json::Value::String(raw)),
+                hosts: BTreeSet::from([host]),
+                detail: format!("{registry} answered"),
+            },
+        }
+    }
+
+    /// One paced GET, guarded by the registry's configured base.
+    ///
+    /// Two properties are structural here rather than promised in prose:
+    ///
+    /// - **one `Request` permit per hop**, out of that registry's own bucket,
+    ///   because `PacedClient` spends it (`ADR-007 §4`). Six sources are six
+    ///   platforms' budgets.
+    /// - **the URL is checked against the registry's configured base** before
+    ///   the request, and a mismatch is an `Unreadable` answer rather than a
+    ///   request. A pass that could reach a publisher host would make "the
+    ///   metadata pass touches no publisher host" a property of which endpoint a
+    ///   caller configured; this makes it a property of the code.
+    ///
+    /// The base check is load-bearing for the PMC-OA leg in a way it is not for
+    /// the other five: that bucket's `pdf_url` values are **absolute `s3://`
+    /// URIs in a third party's JSON**, so without the guard a JSON field would
+    /// be the thing that decides which host this pass contacts. The `pdf_url` is
+    /// rewritten to the bucket's own HTTPS base before it becomes a candidate,
+    /// and the guard is what proves it.
+    ///
+    /// The error arm carries `(outcome, detail, hosts)` rather than a
+    /// [`RegistryHop`] so both readers above build the hop themselves; a caller
+    /// that forgets to record the hosts would then not compile, and a hop with
+    /// no hosts is what makes `hosts_contacted` quietly wrong.
+    async fn fetch_text(
+        &self,
+        client: &scitadel_http::PacedClient,
+        scope: &scitadel_http::WorkScope,
+        registry: Registry,
+        url: Result<reqwest::Url, String>,
+    ) -> Result<(String, String), (crate::identity_chain::HopOutcome, String, BTreeSet<String>)>
+    {
         let url = match url {
             Ok(url) => url,
             Err(reason) => {
                 tracing::info!(%registry, %reason, "could not build a metadata URL");
-                return RegistryHop {
-                    registry,
-                    outcome: crate::identity_chain::HopOutcome::Unreadable,
-                    body: None,
-                    hosts: BTreeSet::new(),
-                    detail: reason,
-                };
+                return Err((
+                    crate::identity_chain::HopOutcome::Unreadable,
+                    reason,
+                    BTreeSet::new(),
+                ));
             }
         };
         if !self.bases.allows(registry, &url) {
-            // Unreachable through the four call sites above, which each build a
-            // URL from their own registry's base. It is here so that a future
-            // fifth call site cannot turn a metadata pass into a resolve that
-            // reaches a publisher, and so that the guarantee is checkable.
             let host = url.host_str().unwrap_or("(no host)").to_string();
             tracing::warn!(
                 %registry,
                 %host,
                 "refusing to request a URL outside this registry's configured base"
             );
-            return RegistryHop {
-                registry,
-                outcome: crate::identity_chain::HopOutcome::Unreadable,
-                body: None,
-                hosts: BTreeSet::new(),
-                detail: format!(
+            return Err((
+                crate::identity_chain::HopOutcome::Unreadable,
+                format!(
                     "{host} is not {registry}'s configured base, so the metadata \
                      pass did not contact it"
                 ),
-            };
+                BTreeSet::new(),
+            ));
         }
 
         let host = match url.host_str().map(str::to_ascii_lowercase) {
@@ -1972,51 +2468,27 @@ impl MetadataPass {
             // everything else is *we could not find out*, which must never be
             // reported as a fact about the work.
             Err(scitadel_http::FetchError::Status { code: 404, .. }) => {
-                return RegistryHop {
-                    registry,
-                    outcome: crate::identity_chain::HopOutcome::NotRegistered,
-                    body: None,
-                    hosts: BTreeSet::from([host]),
-                    detail: format!("{registry} does not register this DOI"),
-                };
+                return Err((
+                    crate::identity_chain::HopOutcome::NotRegistered,
+                    format!("{registry} has no record here"),
+                    BTreeSet::from([host]),
+                ));
             }
             Err(error) => {
-                return RegistryHop {
-                    registry,
-                    outcome: crate::identity_chain::HopOutcome::Unreadable,
-                    body: None,
-                    hosts: BTreeSet::from([host]),
-                    detail: format!("{registry} could not be asked: {error}"),
-                };
+                return Err((
+                    crate::identity_chain::HopOutcome::Unreadable,
+                    format!("{registry} could not be asked: {error}"),
+                    BTreeSet::from([host]),
+                ));
             }
         };
-        let text = match response.text().await {
-            Ok(text) => text,
-            Err(error) => {
-                return RegistryHop {
-                    registry,
-                    outcome: crate::identity_chain::HopOutcome::Unreadable,
-                    body: None,
-                    hosts: BTreeSet::from([host]),
-                    detail: format!("{registry} answered and the body would not read: {error}"),
-                };
-            }
-        };
-        match serde_json::from_str::<serde_json::Value>(&text) {
-            Ok(body) => RegistryHop {
-                registry,
-                outcome: crate::identity_chain::HopOutcome::Answered,
-                body: Some(body),
-                hosts: BTreeSet::from([host]),
-                detail: format!("{registry} answered"),
-            },
-            Err(error) => RegistryHop {
-                registry,
-                outcome: crate::identity_chain::HopOutcome::Unreadable,
-                body: None,
-                hosts: BTreeSet::from([host]),
-                detail: format!("{registry} answered 200 that is not JSON: {error}"),
-            },
+        match response.text().await {
+            Ok(text) => Ok((text, host)),
+            Err(error) => Err((
+                crate::identity_chain::HopOutcome::Unreadable,
+                format!("{registry} answered and the body would not read: {error}"),
+                BTreeSet::from([host]),
+            )),
         }
     }
 }
@@ -2059,8 +2531,29 @@ struct CandidateSeed {
     named_by: String,
     /// The location's own `version` word, when the naming registry gave one.
     version_word: Option<String>,
-    /// A licence on *this* location, as the naming registry spelled it.
+    /// A version a repository stated **as a flag about this copy**, already
+    /// resolved. Consulted **before** `version_word` and before the work-level
+    /// chain, because it is the strongest signal in the pass: it is a statement
+    /// about the file we would fetch, where a word from an index is a statement
+    /// about a URL the index catalogued and a work-level type is a statement
+    /// about the work.
+    version_flag: Option<(Version, VersionSource)>,
+    /// A licence on *this* location, as the naming registry spelled it — a
+    /// **URL**, for Crossref `link[]`, DataCite and Unpaywall.
     location_licence: Option<String>,
+    /// A licence on *this* location, as Europe PMC and the PMC OA dataset
+    /// spell it: a **short code** (`cc by-nc-nd`, `CC0`, `TDM`).
+    ///
+    /// A separate field rather than a flag on `location_licence` because the
+    /// two are not the same thing and the difference decides a verdict: a URL
+    /// goes to [`LicenceOffer::from_entry`] and is checked against the
+    /// allow-list by host and path, while a code goes to
+    /// [`LicenceOffer::from_pmc_code`], which has to recognise a family name
+    /// and must refuse `TDM`. Squeezing both into one `Option<String>` would
+    /// mean deciding which reader to use at the far end, from the shape of a
+    /// string — which is exactly the guess `LicenceOffer`'s three separate
+    /// constructors exist to avoid.
+    location_pmc_code: Option<String>,
     /// Whether the naming index asserted the location is free to read.
     free_to_read: bool,
     /// Where the licence falls back when no grant was offered. See
@@ -2076,6 +2569,8 @@ impl CandidateSeed {
             RouteId::Crossref => Registry::Crossref,
             RouteId::DataCite => Registry::DataCite,
             RouteId::Unpaywall => Registry::Unpaywall,
+            RouteId::EuropePmc => Registry::EuropePmc,
+            RouteId::PmcOa => Registry::PmcOa,
             _ => Registry::OpenAlex,
         }
     }
@@ -2673,16 +3168,38 @@ mod tests {
     // The metadata pass's own contract.
     // =====================================================================
 
-    /// The acceptance criterion as a constant: four buckets, none of which
+    /// The acceptance criterion as a constant: six buckets, none of which
     /// serves articles. A publisher bucket in this list would be a
     /// resolve-then-rank that resolves *through* the publisher, which is the
     /// behaviour being replaced.
     #[test]
-    fn the_metadata_pass_is_allowed_exactly_four_buckets() {
+    fn the_metadata_pass_is_allowed_exactly_adrs_five_sources_and_the_dataset() {
         assert_eq!(
             METADATA_BUCKETS,
-            ["openalex", "crossref", "datacite", "unpaywall"],
-            "ADR-007 §3: 'It may hit OpenAlex, Crossref, DataCite, Unpaywall'"
+            [
+                "openalex",
+                "crossref",
+                "datacite",
+                "unpaywall",
+                "europepmc",
+                "pmc_oa"
+            ],
+            "ADR-007 §3 names OpenAlex, Unpaywall, Crossref, DataCite and \
+             Europe PMC for the resolve pass, and the `pmc-oa-opendata` dataset \
+             in step 2"
+        );
+        // The two PMC sources earn their place on two separate grounds, and
+        // either alone would not be enough — so they are asserted separately
+        // rather than as "two more entries".
+        assert!(
+            METADATA_BUCKETS.contains(&"europepmc"),
+            "Europe PMC is the only source that reports `isOpenAccess`, \
+             `license` and the manuscript flags for a work"
+        );
+        assert!(
+            METADATA_BUCKETS.contains(&"pmc_oa"),
+            "and the dataset is the only source that reports `is_manuscript` per \
+             *stored version*, which is the strongest version signal available"
         );
         for bucket in METADATA_BUCKETS {
             assert!(
@@ -2826,25 +3343,33 @@ mod tests {
         )
     }
 
-    /// Four `wiremock` servers, one per registry, each answering with that
-    /// registry's own envelope.
+    /// One `wiremock` server per [`METADATA_BUCKETS`] entry, each answering
+    /// with that source's own envelope.
     ///
-    /// **Four servers, not one**, and that is the point: `scitadel-http`'s policy
+    /// **Six servers, not one**, and that is the point: `scitadel-http`'s policy
     /// table keys on **host**, so a single server cannot host two platforms and a
     /// path-prefix "route" would test a table production never builds. Production
     /// separates these by host too — `api.openalex.org`, `api.crossref.org`,
-    /// `api.datacite.org`, `api.unpaywall.org` — so this reproduces the real
+    /// `api.datacite.org`, `api.unpaywall.org`, `www.ebi.ac.uk`,
+    /// `pmc-oa-opendata.s3.amazonaws.com` — so this reproduces the real
     /// separation instead of simulating it, which is what makes
     /// `the_metadata_pass_touches_no_publisher_host` a claim about hosts.
-    struct FourRegistries {
+    struct MetadataSources {
         servers: Vec<MockServer>,
         table: scitadel_http::BucketPolicyTable,
     }
 
-    impl FourRegistries {
+    impl MetadataSources {
+        /// One server per [`METADATA_BUCKETS`] entry, each routed to that
+        /// bucket's name.
+        ///
+        /// The count comes from the constant rather than a literal, so adding a
+        /// metadata source cannot leave this fixture serving one fewer host than
+        /// the pass asks — which would make `hosts_contacted` compare equal
+        /// while a real hop went somewhere unwatched.
         async fn new() -> Self {
             let mut servers: Vec<MockServer> = Vec::new();
-            for _ in 0..4 {
+            for _ in 0..METADATA_BUCKETS.len() {
                 servers.push(MockServer::start().await);
             }
             let mut table = scitadel_http::BucketPolicyTable::new();
@@ -2860,7 +3385,18 @@ mod tests {
                 crossref_works: self.servers[1].uri(),
                 datacite_dois: self.servers[2].uri(),
                 unpaywall_api: self.servers[3].uri(),
+                europepmc_rest: self.servers[4].uri(),
+                pmc_oa_bucket: self.servers[5].uri(),
             }
+        }
+
+        /// One server per metadata source, by bucket name.
+        fn server(&self, bucket: &str) -> &MockServer {
+            let at = METADATA_BUCKETS
+                .iter()
+                .position(|name| *name == bucket)
+                .unwrap_or_else(|| panic!("{bucket} is not a metadata bucket"));
+            &self.servers[at]
         }
 
         /// The authority each server actually listens on — `host:port`, which is
@@ -2906,7 +3442,7 @@ mod tests {
         }
     }
 
-    fn pass_for(registries: &FourRegistries) -> MetadataPass {
+    fn pass_for(registries: &MetadataSources) -> MetadataPass {
         MetadataPass::with_bases(
             registries.bases(),
             CandidateSources {
@@ -2925,7 +3461,6 @@ mod tests {
             "polite@example.org",
         )
     }
-
     /// **The acceptance criterion: the metadata pass touches no publisher host.**
     ///
     /// Asserted three ways, and each catches a different failure: on the hosts
@@ -2935,24 +3470,30 @@ mod tests {
     /// [`crate::resolve::MetadataBases::allows`] — the check that makes the first
     /// two true by construction rather than by diligence.
     ///
+    /// **Every source is asked, Europe PMC and the PMC-OA dataset included**
+    /// (#254 wave 3), and the fixture gives the work a `pmcid` so the bucket leg
+    /// is a real read rather than a `NothingToAsk` — a pass that never asked the
+    /// bucket would satisfy "touched no publisher host" trivially, which is the
+    /// green-test-that-tested-nothing shape.
+    ///
     /// The fixture's preprint, OSTI and DOI-resolver bases point at a port nothing
     /// listens on, so a pass that *did* try to name-check one would fail the whole
     /// test rather than silently succeed against a live host.
     #[tokio::test]
     async fn the_metadata_pass_touches_no_publisher_host() {
-        let registries = FourRegistries::new().await;
-        // Each registry answers 404 — the pass collects no candidates, and the
+        let sources = MetadataSources::new().await;
+        // Each source answers 404 — the pass collects no candidates, and the
         // question here is only which hosts it asked.
-        for server in &registries.servers {
+        for server in &sources.servers {
             Mock::given(wiremock::matchers::method("GET"))
                 .respond_with(ResponseTemplate::new(404).set_body_string("no\n"))
                 .mount(server)
                 .await;
         }
         let pacer = Arc::new(RecordingPacer::default());
-        let client = recording_client(&pacer, registries.table.clone());
+        let client = recording_client(&pacer, sources.table.clone());
 
-        let resolution = pass_for(&registries)
+        let resolution = pass_for(&sources)
             .resolve(
                 &client,
                 &WorkScope::new(),
@@ -2962,12 +3503,13 @@ mod tests {
                     osti_id: Some("1234567"),
                     url: Some("https://example.invalid/paper"),
                     openalex_id: Some("W1"),
+                    pmcid: Some("PMC7759461"),
                 },
             )
             .await;
 
         // The pass's own record of which authorities it contacted, against the
-        // four the servers actually listen on. Comparing the two rather than
+        // six the servers actually listen on. Comparing the two rather than
         // trusting either alone is what makes this a measurement: a publisher
         // host would be an *extra* entry here, not a missing one.
         assert_eq!(
@@ -2976,9 +3518,9 @@ mod tests {
                 .iter()
                 .cloned()
                 .collect::<Vec<String>>(),
-            registries.authorities(),
-            "the pass contacted exactly the four registry authorities and nothing \
-             else — a publisher host would appear as a fifth: {:?}",
+            sources.authorities(),
+            "the pass contacted exactly the six metadata authorities and nothing \
+             else — a publisher host would appear as a seventh: {:?}",
             resolution.hosts_contacted
         );
         assert!(
@@ -2990,28 +3532,29 @@ mod tests {
             resolution.hosts_contacted
         );
 
-        // Every registry was asked, and only the registries. Five hops for four
-        // registries, and the fifth is OpenAlex asked twice: the by-DOI read
+        // Every source was asked, and only the sources. Seven hops for six
+        // sources, and the extra one is OpenAlex asked twice: the by-DOI read
         // 404'd, so the by-id read ran as well — one work, one OpenAlex budget,
         // two requests, and both of them `Meta`.
-        let registries_consulted: std::collections::BTreeSet<Registry> = resolution
+        let sources_consulted: std::collections::BTreeSet<Registry> = resolution
             .consulted
             .iter()
             .map(|hop| hop.registry)
             .collect();
         assert_eq!(
-            registries_consulted,
+            sources_consulted,
             Registry::ALL
                 .into_iter()
                 .collect::<std::collections::BTreeSet<_>>(),
-            "all four registries, in ADR-007 §3's order: {:?}",
+            "all six sources, in ADR-007 §3's order: {:?}",
             resolution.consulted
         );
         assert_eq!(
             resolution.consulted.len(),
-            5,
-            "four registries, five hops: OpenAlex by DOI and by id, Crossref, \
-             DataCite, Unpaywall — and nothing else: {:?}",
+            7,
+            "six sources, seven hops: OpenAlex by DOI and by id, Crossref, \
+             DataCite, Unpaywall, Europe PMC, and the PMC-OA version listing — \
+             and nothing else: {:?}",
             resolution.consulted
         );
         assert_eq!(
@@ -3025,24 +3568,26 @@ mod tests {
              which is why `hosts_contacted` is a set and not a list"
         );
         assert_eq!(
-            registries.request_counts().await,
-            vec![2, 1, 1, 1],
+            sources.request_counts().await,
+            vec![2, 1, 1, 1, 1, 1],
             "every server was asked, and only OpenAlex twice: {:?}",
-            registries.request_counts().await
+            sources.request_counts().await
         );
 
         // The budgets are the sharper half: no publisher bucket was spent.
-        let buckets = FourRegistries::buckets_spent(&pacer);
+        let buckets = MetadataSources::buckets_spent(&pacer);
         assert_eq!(
             buckets,
             vec![
                 "crossref".to_string(),
                 "datacite".to_string(),
+                "europepmc".to_string(),
                 "openalex".to_string(),
                 "openalex".to_string(),
+                "pmc_oa".to_string(),
                 "unpaywall".to_string(),
             ],
-            "five `Request` permits — one per hop, OpenAlex's two out of one \
+            "seven `Request` permits — one per hop, OpenAlex's two out of one \
              bucket — and **no publisher bucket at all**: {buckets:?}"
         );
         let distinct: std::collections::BTreeSet<&str> =
@@ -3053,8 +3598,7 @@ mod tests {
                 .iter()
                 .copied()
                 .collect::<std::collections::BTreeSet<_>>(),
-            "and the distinct buckets are exactly ADR-007 §3's four metadata \
-             registries: {buckets:?}"
+            "and the distinct buckets are exactly ADR-007 §3's metadata sources: {buckets:?}"
         );
         for (bucket, tier) in pacer.0.lock().expect("lock").iter() {
             assert_eq!(*tier, PaceTier::Meta, "{bucket} must be metadata work");
@@ -3063,24 +3607,743 @@ mod tests {
         // And the guard that makes the first two true by construction.
         for registry in Registry::ALL {
             assert!(
-                !registries.bases().allows(
+                !sources.bases().allows(
                     registry,
                     &reqwest::Url::parse("http://127.0.0.1:9/content/x.full.pdf").expect("a url")
                 ),
-                "{registry}'s base must refuse a preprint-server URL, which is \\
-                 what makes 'the pass cannot reach a publisher' a property of \\
+                "{registry}'s base must refuse a preprint-server URL, which is \
+                 what makes 'the pass cannot reach a publisher' a property of \
                  [`MetadataBases::allows`] rather than of this test"
             );
         }
         assert!(
-            registries.bases().allows(
+            sources.bases().allows(
                 Registry::OpenAlex,
-                &reqwest::Url::parse(&format!("{}/doi:10.1101/x", registries.servers[0].uri()))
+                &reqwest::Url::parse(&format!("{}/doi:10.1101/x", sources.servers[0].uri()))
                     .expect("a url")
             ),
-            "and it still allows its own registry's URL, so the guard is not \\
+            "and it still allows its own registry's URL, so the guard is not \
              simply refusing everything"
         );
+    }
+
+    /// **Every Europe PMC location the record names becomes a candidate**, and
+    /// each carries the repository's own version claim rather than an inferred
+    /// one — the shape #254's wave 3 exists to produce.
+    ///
+    /// The fixture is the measured NumPy envelope. Every assertion below is about
+    /// what the *plan* says, because that is what a user reads and what a future
+    /// change to the comparator would be caught by:
+    ///
+    /// - both served styles become candidates, and the DOI resolver's page does
+    ///   not (it is the publisher route's candidate, not Europe PMC's);
+    /// - each candidate's version comes from the repository, and a `MED` record
+    ///   with every manuscript flag `N` says `unstated` — **not** a version of
+    ///   record, which is the overclaim this slice exists to avoid;
+    /// - `license: cc by` becomes an open licence, because Europe PMC stated a
+    ///   licence and `inEPMC: Y` alone never would.
+    #[tokio::test]
+    async fn a_europe_pmc_record_names_a_location_per_served_document() {
+        let sources = MetadataSources::new().await;
+        for server in &sources.servers {
+            if server.address().port() == sources.server("europepmc").address().port() {
+                continue;
+            }
+            Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(ResponseTemplate::new(404).set_body_string("no\n"))
+                .mount(server)
+                .await;
+        }
+        Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/search"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(crate::europepmc::tests::NUMPY_ENVELOPE),
+            )
+            .mount(sources.server("europepmc"))
+            .await;
+        let pacer = Arc::new(RecordingPacer::default());
+        let resolution = pass_for(&sources)
+            .resolve(
+                &recording_client(&pacer, sources.table.clone()),
+                &WorkScope::new(),
+                WorkRefs {
+                    doi: Some("10.1038/s41586-020-2649-2"),
+                    ..WorkRefs::default()
+                },
+            )
+            .await;
+
+        let locations: Vec<&Candidate> = resolution
+            .candidates()
+            .filter(|candidate| candidate.route == RouteId::EuropePmc)
+            .collect();
+        assert_eq!(
+            locations.len(),
+            2,
+            "one candidate per served document — the html render and the pdf — \
+             and not the `site: DOI` landing page: {:?}",
+            resolution.plan_lines()
+        );
+        for location in &locations {
+            assert_eq!(
+                location.version,
+                Some(Version::Unstated),
+                "a `MED` record with every manuscript flag `N` states no \
+                 version, and that is the bottom rung rather than a version of \
+                 record"
+            );
+            assert!(
+                matches!(location.version_source, VersionSource::Repository { .. }),
+                "and the source is the repository's own field, not a DOI-prefix \
+                 inference: {:?}",
+                location.version_source
+            );
+            assert_eq!(
+                location.licence,
+                LicenceStrength::OpenLicence,
+                "`license: cc by` is a grant Europe PMC stated, so it counts: {:?}",
+                resolution.plan_lines()
+            );
+            // And the reason a plan line prints says which field was read.
+            assert!(
+                location.version_source.why().contains("manuscript"),
+                "the reason names the field the answer came from: {}",
+                location.version_source.why()
+            );
+        }
+        assert!(
+            !resolution
+                .candidates()
+                .any(|candidate| candidate.url.contains("doi.org/10.1038")
+                    && candidate.route == RouteId::EuropePmc),
+            "the DOI resolver's page is not a Europe PMC location: {:?}",
+            resolution.plan_lines()
+        );
+    }
+
+    /// **The two signals must disagree somewhere, and here is where**: a PMC-OA
+    /// version of record and an OpenAlex location typed `acceptedVersion` for the
+    /// same work.
+    ///
+    /// The repository's `is_manuscript: false` wins, and the reason is the chain's
+    /// first row rather than a tiebreak: `is_manuscript` is a statement about
+    /// **the file at this URL**, while OpenAlex's `acceptedVersion` is a statement
+    /// about a URL OpenAlex catalogued — which may be a *different* file, on a
+    /// different host. A work with a publisher copy at one location and a
+    /// repository manuscript at another has one work-level record and two
+    /// locations, so a record-level type cannot separate them and a per-location
+    /// word from an index can only be right by accident. Preferring the
+    /// repository here is what stops a `coverage` report claiming the library
+    /// holds an author manuscript when the bytes are the typeset article.
+    ///
+    /// Asserted on the **rank**, not on the parse: the parse is the adapter's
+    /// test, and what this module has to get right is which claim wins.
+    #[tokio::test]
+    async fn a_repository_version_of_record_beats_an_index_author_manuscript() {
+        let sources = MetadataSources::new().await;
+        for server in &sources.servers {
+            let is_openalex =
+                server.address().port() == sources.server("openalex").address().port();
+            let is_bucket = server.address().port() == sources.server("pmc_oa").address().port();
+            if is_openalex || is_bucket {
+                continue;
+            }
+            Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(ResponseTemplate::new(404).set_body_string("no\n"))
+                .mount(server)
+                .await;
+        }
+        // OpenAlex types the *record* `article` and names one location with the
+        // word `acceptedVersion`.
+        Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path_regex("^/doi:10[.]1038"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(
+                        r#"{"id":"W1","type":"article","open_access":{"is_oa":true},
+                            "best_oa_location":{"is_oa":true,"version":"acceptedVersion",
+                              "pdf_url":"https://example.invalid/manuscript.pdf"},
+                            "locations":[{"is_oa":true,"version":"acceptedVersion",
+                              "pdf_url":"https://example.invalid/manuscript.pdf"}]}"#,
+                    ),
+            )
+            .mount(sources.server("openalex"))
+            .await;
+        Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/xml")
+                    .set_body_string(
+                        "<ListBucketResult><CommonPrefixes><Prefix>PMC7759461.1/</Prefix></CommonPrefixes></ListBucketResult>",
+                    ),
+            )
+            .mount(sources.server("pmc_oa"))
+            .await;
+        Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/metadata/PMC7759461.1.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(
+                        r#"{"pmcid":"PMC7759461","version":1,"is_manuscript":false,
+                            "is_pmc_openaccess":true,"license_code":"CC BY",
+                            "pdf_url":"s3://pmc-oa-opendata/PMC7759461.1/PMC7759461.1.pdf?md5=ab"}"#,
+                    ),
+            )
+            .mount(sources.server("pmc_oa"))
+            .await;
+        let pacer = Arc::new(RecordingPacer::default());
+        let resolution = pass_for(&sources)
+            .resolve(
+                &recording_client(&pacer, sources.table.clone()),
+                &WorkScope::new(),
+                WorkRefs {
+                    doi: Some("10.1038/s41586-020-2649-2"),
+                    pmcid: Some("PMC7759461"),
+                    ..WorkRefs::default()
+                },
+            )
+            .await;
+
+        let openalex = resolution
+            .candidates()
+            .find(|candidate| candidate.route == RouteId::OpenAlex)
+            .expect("OpenAlex named a location");
+        assert_eq!(
+            openalex.version,
+            Some(Version::AuthorManuscript),
+            "the index's own `acceptedVersion` word, honoured as a claim about \
+             the URL it catalogued"
+        );
+        let dataset = resolution
+            .candidates()
+            .find(|candidate| candidate.route == RouteId::PmcOa)
+            .expect("the stored version is a candidate");
+        assert_eq!(dataset.version, Some(Version::VersionOfRecord));
+
+        // The repository's file wins, on version — not on licence, which is the
+        // axis the dominance rule exists to keep from crossing a version
+        // boundary.
+        let ranked: Vec<(&str, Version, LicenceStrength)> = resolution
+            .ranked
+            .iter()
+            .map(|entry| {
+                (
+                    entry.candidate.route.label(),
+                    entry.rank.version,
+                    entry.rank.licence,
+                )
+            })
+            .collect();
+        assert_eq!(
+            ranked.first(),
+            Some(&(
+                "pmc_oa",
+                Version::VersionOfRecord,
+                LicenceStrength::OpenLicence
+            )),
+            "a repository-stated version of record outranks an index-stated \
+             author manuscript: {ranked:?}"
+        );
+        let manuscript_position = ranked
+            .iter()
+            .position(|(route, ..)| *route == "openalex")
+            .expect("the OpenAlex candidate is ranked");
+        assert!(
+            manuscript_position > 0,
+            "and the index's manuscript is below it: {ranked:?}"
+        );
+    }
+
+    /// **A `TDM` manuscript is free to read and nothing more** — and the
+    /// assertion is that it is *not* an open licence.
+    ///
+    /// The PMC OA dataset's own `README.txt` defines the code: author manuscripts
+    /// "where the full text is available for text mining, and where the full text
+    /// may also be used consistent with the principles of fair use". That is a
+    /// text-mining permission. Reading it as a reuse grant would write
+    /// `access_basis = 'oa_license'` on bytes nobody granted reuse of — #261's
+    /// bug, reached through a code that looks exactly like the CC codes beside
+    /// it.
+    #[tokio::test]
+    async fn a_tdm_author_manuscript_is_free_to_read_and_not_licensed() {
+        let sources = MetadataSources::new().await;
+        for server in &sources.servers {
+            if server.address().port() == sources.server("pmc_oa").address().port() {
+                continue;
+            }
+            Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(ResponseTemplate::new(404).set_body_string("no\n"))
+                .mount(server)
+                .await;
+        }
+        Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/xml")
+                    .set_body_string(
+                        "<ListBucketResult><CommonPrefixes><Prefix>PMC7759461.1/</Prefix></CommonPrefixes></ListBucketResult>",
+                    ),
+            )
+            .mount(sources.server("pmc_oa"))
+            .await;
+        Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/metadata/PMC7759461.1.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(
+                        r#"{"pmcid":"PMC7759461","version":1,"is_manuscript":true,
+                            "is_pmc_openaccess":false,"is_retracted":false,
+                            "license_code":"TDM",
+                            "pdf_url":"s3://pmc-oa-opendata/PMC7759461.1/PMC7759461.1.pdf?md5=ab"}"#,
+                    ),
+            )
+            .mount(sources.server("pmc_oa"))
+            .await;
+        let pacer = Arc::new(RecordingPacer::default());
+        let resolution = pass_for(&sources)
+            .resolve(
+                &recording_client(&pacer, sources.table.clone()),
+                &WorkScope::new(),
+                WorkRefs {
+                    doi: Some("10.1038/s41586-020-2649-2"),
+                    pmcid: Some("PMC7759461"),
+                    ..WorkRefs::default()
+                },
+            )
+            .await;
+
+        let manuscript = resolution
+            .candidates()
+            .find(|candidate| candidate.route == RouteId::PmcOa)
+            .expect("the stored version is a candidate");
+        assert_eq!(
+            manuscript.version,
+            Some(Version::AuthorManuscript),
+            "`is_manuscript: true` is the strongest version evidence in the pass"
+        );
+        assert_eq!(
+            manuscript.licence,
+            LicenceStrength::FreeToRead,
+            "`TDM` is a text-mining permission, not a reuse grant — so the \
+             candidate is free to read and carries no licence we may apply"
+        );
+        assert_ne!(
+            manuscript.licence,
+            LicenceStrength::OpenLicence,
+            "and above all it is not an open licence, which is the whole claim"
+        );
+        assert_eq!(
+            manuscript.licence.access_basis(),
+            Some("oa_license"),
+            "…which is `FreeToRead`'s honest column value: free to read, no grant"
+        );
+    }
+
+    /// **The repository's own claim beats a DOI-prefix inference**, which is the
+    /// whole point of #254's wave 3 and the reason the repository row sits first
+    /// in the chain.
+    ///
+    /// The case is real and it is the mirror image of #260's: PMC says this
+    /// stored file is an author manuscript, and the DOI's prefix says `10.1101`,
+    /// which the fallback would read as "preprint". Both are about this work and
+    /// both are true — the manuscript is the preprint's own author-submitted text
+    /// — but they name different rungs, and preferring the weaker one would place
+    /// a repository-stated author manuscript **below** a preprint. ADR-007 §3's
+    /// ladder is `OA VoR > AM > preprint`, so the manuscript must rank first, and
+    /// only the flag can put it there.
+    ///
+    /// Without the repository row this candidate would sit on
+    /// [`Version::Preprint`] from [`VersionSource::DoiPrefix`], and the plan line
+    /// would name the prefix as the reason.
+    #[tokio::test]
+    async fn a_manuscript_flag_outranks_the_doi_prefix_fallback() {
+        // Pure, and first: the two claims side by side.
+        let (manuscript, source) = version_from_repository(
+            Registry::PmcOa,
+            crate::registry::RepositoryVersion::AuthorManuscript,
+        );
+        let (preprint, _) = version_from_doi_prefix("10.1101/2020.01.30.927871")
+            .expect("a 10.1101 DOI has a verified preprint transform");
+        assert_eq!(manuscript, Version::AuthorManuscript);
+        assert_eq!(preprint, Version::Preprint);
+        // `Version`'s derived `Ord` is best-first, so `am < preprint` here means
+        // the manuscript ranks *ahead* — which is ADR-007 §3's `OA VoR > AM >
+        // preprint`. Written this way because the comparison's direction is the
+        // one thing a reader has to get right, and `>` would read as the claim.
+        assert!(
+            manuscript < preprint,
+            "ADR-007 §3's ladder is `vor > am > preprint` and `Version`'s `Ord` \
+             is best-first, so a repository's `is_manuscript: true` must sort \
+             **before** the prefix's preprint inference"
+        );
+        assert!(matches!(source, VersionSource::Repository { .. }));
+
+        // And through the pass, with no registry typing the work and a `10.1101`
+        // DOI, so the prefix fallback is the only competing claim.
+        let sources = MetadataSources::new().await;
+        for server in &sources.servers {
+            if server.address().port() == sources.server("pmc_oa").address().port() {
+                continue;
+            }
+            Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(ResponseTemplate::new(404).set_body_string("no\n"))
+                .mount(server)
+                .await;
+        }
+        Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/xml")
+                    .set_body_string(
+                        "<ListBucketResult><CommonPrefixes><Prefix>PMC7759461.1/</Prefix></CommonPrefixes></ListBucketResult>",
+                    ),
+            )
+            .mount(sources.server("pmc_oa"))
+            .await;
+        Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/metadata/PMC7759461.1.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(
+                        r#"{"pmcid":"PMC7759461","version":1,"is_manuscript":true,
+                            "is_pmc_openaccess":false,"license_code":"TDM",
+                            "pdf_url":"s3://pmc-oa-opendata/PMC7759461.1/PMC7759461.1.pdf?md5=ab"}"#,
+                    ),
+            )
+            .mount(sources.server("pmc_oa"))
+            .await;
+        let pacer = Arc::new(RecordingPacer::default());
+        let resolution = pass_for(&sources)
+            .resolve(
+                &recording_client(&pacer, sources.table.clone()),
+                &WorkScope::new(),
+                WorkRefs {
+                    doi: Some("10.1101/2020.01.30.927871"),
+                    pmcid: Some("PMC7759461"),
+                    ..WorkRefs::default()
+                },
+            )
+            .await;
+
+        let dataset = resolution
+            .candidates()
+            .find(|candidate| candidate.route == RouteId::PmcOa)
+            .expect("the stored version is a candidate");
+        assert_eq!(
+            dataset.version,
+            Some(Version::AuthorManuscript),
+            "not the prefix's preprint: {:?}",
+            resolution.plan_lines()
+        );
+        assert!(
+            matches!(dataset.version_source, VersionSource::Repository { .. }),
+            "and the reason names the repository's field, not the prefix: {}",
+            dataset.version_source.why()
+        );
+        // The derived bioRxiv transform is still a candidate, still a preprint —
+        // and now ranks *below* the manuscript, which is the point.
+        let bio = resolution
+            .candidates()
+            .find(|candidate| candidate.route == RouteId::Biorxiv)
+            .expect("the 10.1101 transform is still derived");
+        assert_eq!(bio.version, Some(Version::Preprint));
+        let ranked: Vec<&str> = resolution
+            .ranked
+            .iter()
+            .map(|entry| entry.candidate.route.label())
+            .collect();
+        assert_eq!(
+            ranked.first(),
+            Some(&"pmc_oa"),
+            "the repository-stated manuscript is ranked first, and the preprint \
+             transform below it: {ranked:?}"
+        );
+    }
+
+    /// **The publisher landing page is offered only for an open-access work**,
+    /// and this is the test of the gate rather than of the fetch (ADR-007 §3
+    /// step 6: "Landing-page HTML, for OA works only, after TDM").
+    ///
+    /// The failure this prevents is the one that made the landing page a
+    /// **blanket last resort**: with it ungated, every work carrying a DOI
+    /// produced a `RouteId::Publisher` candidate, and the ranker's bottom rung —
+    /// [`Version::Unstated`] — made it reachable. A work with no OA copy anywhere
+    /// then fetched a publisher's page, which is a publisher host on the wire for
+    /// a document no reader could have reached for free either. The pass would
+    /// report `subscription_read` and `coverage` would read the library as
+    /// holding something it does not.
+    ///
+    /// Three fixtures, three answers, and the middle one is the load-bearing
+    /// case: a work no source declared open access gets **no landing page at
+    /// all**, not a degraded one.
+    #[tokio::test]
+    async fn the_publisher_landing_page_is_offered_only_for_an_open_access_work() {
+        // ---- (a) Unpaywall says the work is OA and names no location ----
+        let open = MetadataSources::new().await;
+        // The catch-all 404 goes on **every other** server, and not before the
+        // specific mock: `wiremock` resolves to the first registered match, so a
+        // blanket mock mounted first would swallow the answer this test is about.
+        for server in &open.servers {
+            if server.address().port() == open.server("unpaywall").address().port() {
+                continue;
+            }
+            Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(ResponseTemplate::new(404).set_body_string("no\n"))
+                .mount(server)
+                .await;
+        }
+        Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/10.99999/some.suffix.12345"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(r#"{"doi":"10.99999/some.suffix.12345","is_oa":true}"#),
+            )
+            .mount(open.server("unpaywall"))
+            .await;
+        let pacer = Arc::new(RecordingPacer::default());
+        let resolution = pass_for(&open)
+            .resolve(
+                &recording_client(&pacer, open.table.clone()),
+                &WorkScope::new(),
+                WorkRefs {
+                    doi: Some("10.99999/some.suffix.12345"),
+                    ..WorkRefs::default()
+                },
+            )
+            .await;
+        assert!(
+            resolution
+                .candidates()
+                .any(|candidate| candidate.route == RouteId::Publisher),
+            "an open-access work with no OA copy named still gets its landing \
+             page, which is exactly what step 6 permits: {:?}",
+            resolution.plan_lines()
+        );
+
+        // ---- (b) nothing says the work is open access ----
+        let closed = MetadataSources::new().await;
+        for server in &closed.servers {
+            if server.address().port() == closed.server("unpaywall").address().port() {
+                continue;
+            }
+            Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(ResponseTemplate::new(404).set_body_string("no\n"))
+                .mount(server)
+                .await;
+        }
+        // Unpaywall answers 200 with a **well-formed** record that says `is_oa:
+        // false` and names no location — the shape #260 was filed over. A silent
+        // 404 would not prove the gate: it would prove nothing was read.
+        Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/10.99999/some.suffix.12345"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(r#"{"doi":"10.99999/some.suffix.12345","is_oa":false,"best_oa_location":null}"#),
+            )
+            .mount(closed.server("unpaywall"))
+            .await;
+        let pacer = Arc::new(RecordingPacer::default());
+        let resolution = pass_for(&closed)
+            .resolve(
+                &recording_client(&pacer, closed.table.clone()),
+                &WorkScope::new(),
+                WorkRefs {
+                    doi: Some("10.99999/some.suffix.12345"),
+                    ..WorkRefs::default()
+                },
+            )
+            .await;
+        assert_eq!(
+            resolution
+                .candidates()
+                .filter(|candidate| candidate.route == RouteId::Publisher)
+                .count(),
+            0,
+            "a work nobody declared open access gets **no** landing-page \
+             candidate — not a ranked-last one, because reaching a publisher \
+             over a free-to-read budget is what step 6 forbids: {:?}",
+            resolution.plan_lines()
+        );
+
+        // ---- (c) the record's own url is NOT gated, and why ----
+        //
+        // The same work, but the record carries a URL a person or an importer
+        // put there. It survives the gate, because dropping it would silently
+        // discard the one thing a human supplied; it ranks on `Unstated` and
+        // `SubscriptionRead`, so it only wins when nothing else exists.
+        let pacer = Arc::new(RecordingPacer::default());
+        let resolution = pass_for(&closed)
+            .resolve(
+                &recording_client(&pacer, closed.table.clone()),
+                &WorkScope::new(),
+                WorkRefs {
+                    doi: Some("10.99999/some.suffix.12345"),
+                    url: Some("https://example.invalid/paper"),
+                    ..WorkRefs::default()
+                },
+            )
+            .await;
+        let manual = resolution
+            .candidates()
+            .find(|candidate| candidate.route == RouteId::ManualUrl)
+            .expect("the record's own url is still a candidate");
+        assert_eq!(
+            manual.version,
+            Some(Version::Unstated),
+            "and it ranks on the bottom rung, where a last resort belongs: {:?}",
+            resolution.plan_lines()
+        );
+        assert_eq!(manual.licence, LicenceStrength::SubscriptionRead);
+    }
+
+    /// **A third party's absolute URL cannot choose this process's network
+    /// targets**, which is the new half of "no publisher host" (#254 wave 3).
+    ///
+    /// The PMC-OA bucket's own JSON hands the pass **absolute `s3://` URLs**, one
+    /// per stored version. If the bucket's configured base were not the authority
+    /// for what this pass may request, that JSON field would be the thing that
+    /// decides which host gets contacted — and it is the *bucket's* JSON, not the
+    /// work's record, so it is a stranger's URL picking this process's route. That
+    /// is the exact shape ADR-007 §3's resolve-then-rank exists to prevent, arrived
+    /// at from a direction nobody was looking.
+    ///
+    /// Three assertions: the bucket was genuinely asked (a pass that skipped it
+    /// would satisfy the criterion trivially), nothing outside it was contacted,
+    /// and no candidate carries an `s3://` URL — because the rewritten `pdf_url`
+    /// is an absolute URL that lands in `artefacts.source_url`.
+    #[tokio::test]
+    async fn the_pmc_oa_buckets_own_absolute_urls_cannot_redirect_the_pass() {
+        let sources = MetadataSources::new().await;
+        // The bucket answers with a listing naming two versions, and each version's
+        // JSON carries an `s3://` `pdf_url` for a *different* host — the shape a
+        // compromised or rewritten dataset would have.
+        Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/xml")
+                    .set_body_string(
+                        "<ListBucketResult><CommonPrefixes><Prefix>PMC7759461.1/</Prefix></CommonPrefixes></ListBucketResult>",
+                    ),
+            )
+            .mount(sources.server("pmc_oa"))
+            .await;
+        Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/metadata/PMC7759461.1.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(
+                        r#"{"pmcid":"PMC7759461","version":1,"is_manuscript":false,
+                            "is_pmc_openaccess":true,"license_code":"CC BY",
+                            "pdf_url":"s3://pmc-oa-opendata/PMC7759461.1/PMC7759461.1.pdf?md5=4b3fc3a0a63cf2c7c4df3cc1b3d3d25e"}"#,
+                    ),
+            )
+            .mount(sources.server("pmc_oa"))
+            .await;
+        for server in &sources.servers {
+            if server.address().port() == sources.server("pmc_oa").address().port() {
+                continue;
+            }
+            Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(ResponseTemplate::new(404).set_body_string("no\n"))
+                .mount(server)
+                .await;
+        }
+        let pacer = Arc::new(RecordingPacer::default());
+        let client = recording_client(&pacer, sources.table.clone());
+
+        let resolution = pass_for(&sources)
+            .resolve(
+                &client,
+                &WorkScope::new(),
+                WorkRefs {
+                    doi: Some("10.1038/s41586-020-2649-2"),
+                    pmcid: Some("PMC7759461"),
+                    ..WorkRefs::default()
+                },
+            )
+            .await;
+
+        // The bucket was asked twice — the listing and the one version — and both
+        // hops are recorded as answered, so "no publisher host" was not satisfied
+        // by not trying.
+        assert_eq!(
+            resolution
+                .consulted
+                .iter()
+                .filter(|hop| hop.registry == Registry::PmcOa)
+                .count(),
+            2,
+            "a listing and one per-version read: {:?}",
+            resolution.consulted
+        );
+        let bucket_port = sources.server("pmc_oa").address().port();
+        assert_eq!(
+            resolution
+                .hosts_contacted
+                .iter()
+                .filter(|host| *host == &format!("127.0.0.1:{bucket_port}"))
+                .count(),
+            1,
+            "one authority, though two requests: {:?}",
+            resolution.hosts_contacted
+        );
+
+        // And the version's PDF became a candidate — on the bucket's own host.
+        let pmc_oa = resolution
+            .candidates()
+            .find(|candidate| candidate.route == RouteId::PmcOa)
+            .expect("the version's PDF is a candidate");
+        assert_eq!(
+            pmc_oa.url,
+            format!(
+                "{}/PMC7759461.1/PMC7759461.1.pdf?md5=4b3fc3a0a63cf2c7c4df3cc1b3d3d25e",
+                sources.server("pmc_oa").uri()
+            ),
+            "`s3://` is rewritten to the bucket's configured HTTPS base, which is \
+             what makes the candidate fetchable *and* what stops the dataset \
+             naming this process's host"
+        );
+        assert!(
+            !pmc_oa.url.starts_with("s3://"),
+            "and no candidate ever carries an `s3://` URL: {:?}",
+            resolution.plan_lines()
+        );
+        // The version claim and the licence are the two things this slice exists
+        // for, asserted through the ranked plan rather than through the parser.
+        assert_eq!(
+            pmc_oa.version,
+            Some(Version::VersionOfRecord),
+            "`is_manuscript: false` is the version of record — PMC's own \
+             statement about this file, and the strongest evidence in the pass"
+        );
+        assert_eq!(pmc_oa.licence, LicenceStrength::OpenLicence);
+
+        // The guard itself, on the URL the bucket's JSON would have handed us.
+        for foreign in [
+            "http://127.0.0.1:9/PMC7759461.1.pdf",
+            "https://pmc-oa-opendata.s3.amazonaws.com.evil.test/x.pdf",
+        ] {
+            assert!(
+                !sources.bases().allows(
+                    Registry::PmcOa,
+                    &reqwest::Url::parse(foreign).expect("a url")
+                ),
+                "{foreign} is outside the bucket's configured authority"
+            );
+        }
     }
 
     /// **No malformed URL can reach the candidate set**, which is the structural
@@ -3125,7 +4388,7 @@ mod tests {
 
         // And through the pass: Unpaywall naming a relative location yields no
         // candidate at all, rather than a ranked one.
-        let registries = FourRegistries::new().await;
+        let registries = MetadataSources::new().await;
         Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path_regex("^/"))
             .respond_with(
@@ -3133,7 +4396,7 @@ mod tests {
                     .insert_header("content-type", "application/json")
                     .set_body_string(r#"{"best_oa_location":{"url_for_pdf":"{}","is_oa":true}}"#),
             )
-            .mount(&registries.servers[3])
+            .mount(registries.server("unpaywall"))
             .await;
         let pacer = Arc::new(RecordingPacer::default());
         let client = recording_client(&pacer, registries.table.clone());
@@ -3178,7 +4441,7 @@ mod tests {
         use LicenceStrength::OpenLicence;
 
         // ---- (a) the winner answers: one request, and it is the top-ranked ----
-        let first = FourRegistries::new().await;
+        let first = MetadataSources::new().await;
         Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/vor.pdf"))
             .respond_with(
@@ -3186,7 +4449,7 @@ mod tests {
                     .insert_header("content-type", "application/pdf")
                     .set_body_string("%PDF-1.7\n"),
             )
-            .mount(&first.servers[3])
+            .mount(first.server("unpaywall"))
             .await;
         // A preprint copy, lower-ranked, also answering.
         Mock::given(wiremock::matchers::method("GET"))
@@ -3196,7 +4459,7 @@ mod tests {
                     .insert_header("content-type", "application/pdf")
                     .set_body_string("%PDF-1.7\n"),
             )
-            .mount(&first.servers[3])
+            .mount(first.server("unpaywall"))
             .await;
         Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/dc/10.1101%2Fx"))
@@ -3223,12 +4486,12 @@ mod tests {
                             "oa_locations":[
                               {"url_for_pdf":"VOR","version":"publishedVersion","is_oa":true},
                               {"url_for_pdf":"PREPRINT","version":"submittedVersion","is_oa":true}]}"#
-                            .replace("VOR", &format!("{}/vor.pdf", first.servers[3].uri()))
-                            .replace("PREPRINT", &format!("{}/preprint.pdf", first.servers[3].uri()))
+                            .replace("VOR", &format!("{}/vor.pdf", first.server("unpaywall").uri()))
+                            .replace("PREPRINT", &format!("{}/preprint.pdf", first.server("unpaywall").uri()))
                             .as_str(),
                     ),
             )
-            .mount(&first.servers[3])
+            .mount(first.server("unpaywall"))
             .await;
 
         let pacer = Arc::new(RecordingPacer::default());
@@ -3251,7 +4514,7 @@ mod tests {
         );
         assert_eq!(
             resolution.chosen().expect("a choice").candidate.url,
-            format!("{}/vor.pdf", first.servers[3].uri()),
+            format!("{}/vor.pdf", first.server("unpaywall").uri()),
             "the version of record is first: {:?}",
             resolution.plan_lines()
         );
@@ -3292,11 +4555,11 @@ mod tests {
         );
 
         // ---- (b) the winner 404s: still one attempt, and the next is untouched ----
-        let second = FourRegistries::new().await;
+        let second = MetadataSources::new().await;
         Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/vor.pdf"))
             .respond_with(ResponseTemplate::new(404))
-            .mount(&second.servers[3])
+            .mount(second.server("unpaywall"))
             .await;
         Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/preprint.pdf"))
@@ -3305,7 +4568,7 @@ mod tests {
                     .insert_header("content-type", "application/pdf")
                     .set_body_string("%PDF-1.7\n"),
             )
-            .mount(&second.servers[3])
+            .mount(second.server("unpaywall"))
             .await;
         Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path_regex("^/10[.]1101/x"))
@@ -3317,12 +4580,12 @@ mod tests {
                             "oa_locations":[
                               {"url_for_pdf":"VOR","version":"publishedVersion","is_oa":true},
                               {"url_for_pdf":"PREPRINT","version":"submittedVersion","is_oa":true}]}"#
-                            .replace("VOR", &format!("{}/vor.pdf", second.servers[3].uri()))
-                            .replace("PREPRINT", &format!("{}/preprint.pdf", second.servers[3].uri()))
+                            .replace("VOR", &format!("{}/vor.pdf", second.server("unpaywall").uri()))
+                            .replace("PREPRINT", &format!("{}/preprint.pdf", second.server("unpaywall").uri()))
                             .as_str(),
                     ),
             )
-            .mount(&second.servers[3])
+            .mount(second.server("unpaywall"))
             .await;
         Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/cr/10.1101%2Fx"))
@@ -3363,7 +4626,8 @@ mod tests {
                 .await
                 .is_err();
             assert!(refused, "the ranked candidate refused");
-            let asked = second.servers[3]
+            let asked = second
+                .server("unpaywall")
                 .received_requests()
                 .await
                 .expect("recorded");

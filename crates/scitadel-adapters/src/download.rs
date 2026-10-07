@@ -325,6 +325,15 @@ pub struct Endpoints {
     /// the route's shape and a test should not be able to change one without the
     /// other.
     pub osti_base: String,
+    /// Base of Europe PMC's REST service (`GET {base}/search`, `GET
+    /// {base}/{id}/fullTextXML`). #254 wave 3: the resolve pass asks Europe PMC
+    /// for each work's `isOpenAccess`, its `license` and its manuscript flags,
+    /// and none of the four registration registries reports any of those.
+    pub europepmc_rest: String,
+    /// Base of the `pmc-oa-opendata` bucket's HTTPS endpoint (`GET {base}/?list-type=2…`,
+    /// `GET {base}/metadata/{pmcid}.{v}.json`). #254 wave 3, and ADR-007 §3 step
+    /// 2's replacement for the `oa.fcgi` service retired on 2026-08-25.
+    pub pmc_oa_bucket: String,
 }
 
 impl Default for Endpoints {
@@ -339,6 +348,8 @@ impl Default for Endpoints {
             crossref_works: crate::crossref::CROSSREF_WORKS_URL.to_string(),
             datacite_dois: crate::datacite::DATACITE_DOIS_URL.to_string(),
             osti_base: osti::OSTI_BASE.to_string(),
+            europepmc_rest: crate::europepmc::EUROPE_PMC_REST_URL.to_string(),
+            pmc_oa_bucket: crate::pmc_oa::PMC_OA_BUCKET_URL.to_string(),
         }
     }
 }
@@ -583,7 +594,7 @@ impl PaperDownloader {
     /// ranks every queued work and prints the result, so the ordering can be
     /// checked against a real corpus without spending one byte request.
     ///
-    /// It contacts the four metadata registries and **no publisher host** — the
+    /// It contacts the metadata sources and **no publisher host** — the
     /// same guarantee the real walk makes, and the reason
     /// `the_metadata_pass_touches_no_publisher_host` can assert on hosts rather
     /// than on a code comment. No gap row is recorded: nothing was tried, so
@@ -596,6 +607,7 @@ impl PaperDownloader {
             .filter(|doi| !doi.trim().is_empty())
             .and_then(|doi| validate_doi_detailed(doi).ok());
         let osti_id = self.db.osti_id(paper.id.as_str()).ok().flatten();
+        let pmcid = self.db.pmcid(paper.id.as_str()).ok().flatten();
         self.metadata_pass()
             .resolve(
                 &self.client,
@@ -606,6 +618,7 @@ impl PaperDownloader {
                     osti_id: osti_id.as_deref(),
                     url: paper.url.as_deref(),
                     openalex_id: paper.openalex_id.as_deref(),
+                    pmcid: pmcid.as_deref(),
                 },
             )
             .await
@@ -678,6 +691,19 @@ impl PaperDownloader {
             }
         };
 
+        // `papers.pmcid`, read the same targeted way. It is the **only** handle
+        // the PMC-OA dataset accepts, so a work that has one and a pass that
+        // cannot read it loses a whole leg — but a ledger we cannot read is
+        // still not a reason to fetch something, and Europe PMC can supply a
+        // PMCID from its own record when this comes back empty.
+        let pmcid = match self.db.pmcid(paper.id.as_str()) {
+            Ok(found) => found,
+            Err(e) => {
+                tracing::warn!(paper_id = %paper.id, error = %e, "could not read pmcid");
+                None
+            }
+        };
+
         // ---- steps 1 and 2: the metadata pass, then the ranking ----
         let resolution = self
             .metadata_pass()
@@ -690,6 +716,7 @@ impl PaperDownloader {
                     osti_id: osti_id.as_deref(),
                     url: paper.url.as_deref(),
                     openalex_id: paper.openalex_id.as_deref(),
+                    pmcid: pmcid.as_deref(),
                 },
             )
             .await;
@@ -1890,6 +1917,12 @@ enum Leg {
     DataCite,
     /// Unpaywall `/v2/{doi}` and the locations it names.
     Unpaywall,
+    /// Europe PMC's REST search, and the full-text locations each record names.
+    /// ADR-007 §3 step 1.
+    EuropePmc,
+    /// The `pmc-oa-opendata` bucket's per-version JSON, one candidate per stored
+    /// version. ADR-007 §3 step 2.
+    PmcOa,
     /// The publisher page the DOI resolver lands on.
     Publisher,
     /// The paper record's own `url`.
@@ -1907,6 +1940,8 @@ impl Leg {
             Self::Crossref => "crossref",
             Self::DataCite => "datacite",
             Self::Unpaywall => "unpaywall",
+            Self::EuropePmc => "europe pmc",
+            Self::PmcOa => "pmc oa dataset",
             Self::Publisher => "doi.org publisher page",
             Self::ManualUrl => "record url",
         }
@@ -1917,11 +1952,21 @@ impl Leg {
 ///
 /// Total, on purpose: every [`RouteId`] needs a name in the recorded reason, and
 /// a route invented here rather than in [`Leg`] is a spelling nothing else
-/// checks. The three sanctioned TDM platforms and the browser session map to
-/// [`Leg::Unpaywall`] because this slice does not wire them up — ADR-007 §3
-/// steps 5 and 7 — and reporting them as a distinct evaluated route would
-/// claim an evaluation this slice did not perform, which is #261's overclaim in
-/// a new place.
+/// checks.
+///
+/// **Europe PMC and the PMC-OA dataset have legs of their own** (#254 wave 3),
+/// and the reason is the one #261 states in the other direction: they *are*
+/// evaluated routes now. The resolve pass asks Europe PMC per work and reads
+/// the PMC-OA bucket's per-version JSON, and both of those reads can answer
+/// "named no location" or "could not be read" as honestly as any other leg —
+/// so folding them into [`Leg::Unpaywall`] would file an evaluation this slice
+/// performed under a route whose name it is not, which is the same overclaim as
+/// the other way round.
+///
+/// The three sanctioned TDM platforms and the browser session still map to
+/// [`Leg::Unpaywall`], because ADR-007 §3 steps 5 and 7 are genuinely not wired
+/// up and reporting them as evaluated would claim an evaluation this slice did
+/// not perform.
 fn leg_of(route: RouteId) -> Leg {
     match route {
         // arXiv and bioRxiv are one leg, because `preprint.rs` documents them
@@ -1932,19 +1977,17 @@ fn leg_of(route: RouteId) -> Leg {
         RouteId::OpenAlex => Leg::OpenAlex,
         RouteId::Crossref => Leg::Crossref,
         RouteId::DataCite => Leg::DataCite,
-        // ADR-007 §3's steps 5 (sanctioned TDM), 7 (the browser session) and the
-        // two OA steps 1-2 are **not** wired up here, so those candidates have no
-        // leg of their own and share the index leg's name; reporting them as a
-        // distinct evaluated route would claim an evaluation this slice did not
-        // perform, which is #261's overclaim in a new place. The storage
-        // pseudo-routes are here for the same reason: they never fetch.
+        RouteId::EuropePmc => Leg::EuropePmc,
+        RouteId::PmcOa => Leg::PmcOa,
+        // ADR-007 §3's steps 5 (sanctioned TDM) and 7 (the browser session) are
+        // **not** wired up here, so those candidates have no leg of their own and
+        // share the index leg's name. The storage pseudo-routes are here for the
+        // same reason: they never fetch.
         RouteId::Unpaywall
         | RouteId::ElsevierTdm
         | RouteId::WileyTdm
         | RouteId::SpringerTdm
         | RouteId::BrowserSession
-        | RouteId::EuropePmc
-        | RouteId::PmcOa
         | RouteId::Legacy
         | RouteId::ImportFlat
         | RouteId::Manual => Leg::Unpaywall,
@@ -1964,6 +2007,8 @@ fn leg_of_registry(registry: crate::registry::Registry) -> Leg {
         crate::registry::Registry::Crossref => Leg::Crossref,
         crate::registry::Registry::DataCite => Leg::DataCite,
         crate::registry::Registry::Unpaywall => Leg::Unpaywall,
+        crate::registry::Registry::EuropePmc => Leg::EuropePmc,
+        crate::registry::Registry::PmcOa => Leg::PmcOa,
     }
 }
 
@@ -2270,6 +2315,8 @@ impl Ladder {
                 Leg::Crossref,
                 Leg::DataCite,
                 Leg::Unpaywall,
+                Leg::EuropePmc,
+                Leg::PmcOa,
                 Leg::Preprint,
                 Leg::Publisher,
             ] {
@@ -2287,7 +2334,7 @@ impl Ladder {
             return;
         }
 
-        // ---- the four metadata registries ----
+        // ---- the metadata sources ----
         for hop in &resolution.consulted {
             let leg = leg_of_registry(hop.registry);
             let candidates = resolution
@@ -2337,7 +2384,7 @@ impl Ladder {
                         ),
                     },
                 ),
-                // Unreachable in this pass: it asks all four registries, so a hop
+                // Unreachable in this pass: it asks every source, so a hop
                 // is `NotConsulted` only when the pass did not consult it — which
                 // is spelled by there being no hop at all.
                 HopOutcome::NotConsulted => {
@@ -2849,6 +2896,8 @@ mod tests {
                     crossref_works: format!("{base}/cr"),
                     datacite_dois: format!("{base}/dc"),
                     osti_base: base.clone(),
+                    europepmc_rest: format!("{base}/epmc"),
+                    pmc_oa_bucket: format!("{base}/pmcoa"),
                 },
             )
         }
@@ -2919,6 +2968,11 @@ mod tests {
                 || path.starts_with("/cr/")
                 || path.starts_with("/dc/")
                 || path.starts_with("/v2/")
+                // ADR-007 §3's fifth source and its dataset (#254 wave 3). Both
+                // are metadata reads, and classifying them as byte requests would
+                // make "exactly one fetch" count the metadata pass's own traffic.
+                || path.starts_with("/epmc")
+                || path.starts_with("/pmcoa")
         }
 
         /// Is this request one of ADR-007 §3's **identity chain** hops?
@@ -3248,6 +3302,17 @@ mod tests {
     /// ends on it, so a fixture that "meant no location" would have been a
     /// fixture that meant an unbuildable one.
     const NO_UNPAYWALL_LOCATION: &str = "{}";
+
+    /// Unpaywall asserting the work **is** open access while naming no location
+    /// — `{"is_oa": true}` with no `best_oa_location`.
+    ///
+    /// A separate fixture from [`NO_UNPAYWALL_LOCATION`] because the two differ
+    /// on the one thing ADR-007 §3 step 6 gates the publisher landing page on: a
+    /// work nobody has declared open access gets **no** `RouteId::Publisher`
+    /// candidate, so a test about a landing page has to declare the work open
+    /// access or it is testing a candidate that does not exist. `is_oa: false`
+    /// and an absent `is_oa` are the same answer, and both are the honest one.
+    const UNPAYWALL_OPEN_ACCESS_NO_LOCATION: &str = r#"{"is_oa":true}"#;
 
     /// An Unpaywall location in Unpaywall's own shape, with the version word the
     /// ranker reads: `publishedVersion` (the version of record),
@@ -3987,14 +4052,19 @@ mod tests {
             .respond_with(ResponseTemplate::new(404))
             .mount(&fx.server)
             .await;
-        fx.serve("/v2/10.1038/s41586-020-2649-2", NO_UNPAYWALL_LOCATION)
-            .await;
+        // `is_oa: true` with no location: the work is open access, so ADR-007
+        // §3's step 6 permits the landing page even though no OA copy was named.
+        fx.serve(
+            "/v2/10.1038/s41586-020-2649-2",
+            UNPAYWALL_OPEN_ACCESS_NO_LOCATION,
+        )
+        .await;
         fx.serve("/doi/10.1038/s41586-020-2649-2", HTML_BYTES).await;
 
         // No `arxiv_id`: under resolve-then-rank a failing candidate is **not**
         // followed by the next one, so a record carrying one would end the walk
         // at its 404 and the claim below could not be made at all. What is left
-        // is the shape the claim is about — four metadata hops, then one fetch.
+        // is the shape the claim is about — five metadata hops, then one fetch.
         let paper = save(
             &fx,
             "p-walk",
@@ -4011,15 +4081,15 @@ mod tests {
 
         assert_eq!(result.route, RouteId::Publisher);
         let requests = fx.pacer.spending(Cost::Request);
-        // Four ladder legs, plus the pre-fetch identity chain's three metadata
-        // hops — seven `Request` permits, and **one** `Work` permit for the
-        // whole walk. The chain runs after the bytes are in hand, so it is
-        // three more requests against a budget the work was already charged
-        // for, which is the shape ADR-007 §4 wants: more traffic, not more
-        // works.
+        // The pass's five metadata hops, the one ranked fetch, and the
+        // pre-fetch identity chain's three metadata hops — eight `Request`
+        // permits, and **one** `Work` permit for the whole walk. The chain runs
+        // after the bytes are in hand, so it is three more requests against a
+        // budget the work was already charged for, which is the shape ADR-007 §4
+        // wants: more traffic, not more works.
         assert_eq!(
             requests.len(),
-            6,
+            7,
             "the pass's five metadata hops plus the one ranked fetch: {:?}",
             fx.pacer.grants()
         );
@@ -4031,8 +4101,8 @@ mod tests {
         );
         assert_eq!(
             requests.iter().filter(|g| g.tier == PaceTier::Meta).count(),
-            5,
-            "and five `Meta` requests, all of them the metadata pass — which is \
+            6,
+            "and six `Meta` requests, all of them the metadata pass — which is \
              what keeps resolve-then-rank off the repositories' budget: {:?}",
             fx.pacer.grants()
         );
@@ -4075,24 +4145,29 @@ mod tests {
             .expect("download");
 
         let requests: Vec<_> = fx.pacer.spending(Cost::Request);
-        // Five requests: the pass's four `Meta` lookups — OpenAlex, Crossref and
-        // DataCite all 404, then Unpaywall, which answers — and then the one
-        // fetch. The split that matters is by **tier**, not by route and not by
-        // position: every metadata request is `Meta` and the resolved PDF is
-        // `Oa`, so resolve-then-rank spends the metadata budget on the pass and
-        // the repositories' budget on the bytes.
+        // Six requests: the pass's five `Meta` lookups — OpenAlex, Crossref,
+        // DataCite and Europe PMC all 404, then Unpaywall, which answers — and
+        // then the one fetch. The split that matters is by **tier**, not by route
+        // and not by position: every metadata request is `Meta` and the resolved
+        // PDF is `Oa`, so resolve-then-rank spends the metadata budget on the
+        // pass and the repositories' budget on the bytes.
+        //
+        // The fifth metadata source is Europe PMC (ADR-007 §3's fifth, #254 wave
+        // 3), and it is here in a test written before it existed because the
+        // count is the claim: adding a source must show up as one more `Meta`
+        // request, not as one more fetch.
         assert_eq!(
             requests.len(),
-            5,
-            "the pass's four metadata lookups, then the one ranked fetch"
+            6,
+            "the pass's five metadata lookups, then the one ranked fetch"
         );
         assert!(
-            requests[..4].iter().all(|g| g.tier == PaceTier::Meta),
+            requests[..5].iter().all(|g| g.tier == PaceTier::Meta),
             "every metadata request is `Meta`: {:?}",
             fx.pacer.grants()
         );
         assert_eq!(
-            requests[4].tier,
+            requests[5].tier,
             PaceTier::Oa,
             "and the resolved PDF, off an OA host, is the one `Oa` request"
         );
@@ -4150,6 +4225,14 @@ mod tests {
             <button>Purchase access</button>
             <button>Institutional sign in</button>
             </body></html>";
+        // The work must be declared open access for step 6 to offer its landing
+        // page at all — so it is declared here, and the point of the test (what
+        // the stub is classified as) is unaffected.
+        fx.serve(
+            "/v2/10.99999/some.suffix.12345",
+            UNPAYWALL_OPEN_ACCESS_NO_LOCATION,
+        )
+        .await;
         fx.serve("/doi/10.99999/some.suffix.12345", stub).await;
         let paper = save(
             &fx,
@@ -4666,8 +4749,9 @@ mod tests {
         // fetch" claim.
         assert_eq!(
             fx.metadata_requests().await.len(),
-            5,
-            "OpenAlex by DOI and by id, Crossref, DataCite and Unpaywall: {:?}",
+            6,
+            "OpenAlex by DOI and by id, Crossref, DataCite, Unpaywall and \
+             Europe PMC: {:?}",
             fx.metadata_requests().await
         );
         assert_eq!(
