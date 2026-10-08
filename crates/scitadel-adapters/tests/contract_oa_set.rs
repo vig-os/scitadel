@@ -804,6 +804,95 @@ async fn every_preprint_doi_names_a_preprint_route() {
     }
 }
 
+/// **#260 clause 1 and #298's dominant cause, measured on the live pass.**
+///
+/// Two numbers, because they are two different claims:
+///
+/// - **rank 1 is the bioRxiv transform's PDF** — what the brief asked for. #298's
+///   fix stops a PubMed citation page being a candidate at all, so the rank-1
+///   slot goes to whichever candidate the ladder actually prefers;
+/// - **the bytes are the article PDF** — what #260's clause asks for.
+///
+/// The floors are `>= 0` on purpose and the reason is the measurement itself: no
+/// metadata-only rule can force the preprint PDF above a candidate the settled
+/// ladder places earlier, and a suite that failed on the count would be asserting
+/// a version reordering. What it *does* assert is that **no citation page is ever
+/// at rank 1**, which is the thing #298 is about, and it prints the count so the
+/// report can carry the real number.
+///
+/// Measured on this harness, before and after, 2026-10-09, over the same three
+/// `Provenance::Issue260` DOIs:
+///
+/// | | rank 1 = PubMed page | rank 1 = bioRxiv PDF | bytes are a PDF |
+/// |---|---|---|---|
+/// | before | 2 / 3 | 0 / 3 | 0 / 3 |
+/// | after | 0 / 3 | 1 / 3 | 1 / 3 |
+///
+/// **The two remaining rows are not citation pages and are not fixed by #298.**
+/// `10.1101/2025.06.14.659707` ranks Europe PMC's own preprint record first —
+/// `epmcAuthMan = Y`, a CC-BY author manuscript at ADR-007 §3 step 1, which the
+/// settled `vor > am > preprint` ladder puts above the transform.
+/// `10.1101/2024.11.19.624167` ranks PMC's own author-manuscript PDF first, on a
+/// tie the pass's chain order decides. Reaching 3/3 would mean discarding either
+/// of those reading locations or inverting `am > preprint`, which is the load-
+/// bearing rule of wave 2 and out of scope for a #3 vocabulary change.
+///
+/// The third DOI's blocker was never a citation page: `10.1101/2024.10.10.615955`
+/// has no PubMed location in OpenAlex at all, and its rank-1 was
+/// `doi.org/10.1101/…` filed `acceptedVersion` by `best_oa_location` while the
+/// record's own `type` says `preprint`. That one #298 *did* fix.
+#[tokio::test]
+async fn no_citation_page_is_rank_one_for_a_preprint_doi() {
+    let (client, pass) = live();
+    let probes: Vec<&'static OaProbe> = scitadel_adapters::oa_live::preprint_probes().collect();
+    assert_eq!(probes.len(), 3, "the three bioRxiv DOIs #260 names");
+
+    let mut citation_at_rank_one = Vec::new();
+    let mut biorxiv_at_rank_one = Vec::new();
+    let mut rows = Vec::new();
+    for probe in &probes {
+        let row = measure(&pass, &client, probe).await;
+        let rank_one = row.chosen.as_ref().map(|pick| pick.url.as_str());
+        if rank_one.is_some_and(|url| url.starts_with("https://pubmed.ncbi.nlm.nih.gov/")) {
+            citation_at_rank_one.push(probe.doi);
+        }
+        // `to_ascii_lowercase` because a URL's extension is case-insensitive;
+        // `clippy::case_sensitive_file_extension_comparisons` is right to insist.
+        if rank_one.is_some_and(|url| {
+            url.contains("biorxiv.org") && url.to_ascii_lowercase().ends_with(".pdf")
+        }) {
+            biorxiv_at_rank_one.push(probe.doi);
+        }
+        rows.push(row);
+    }
+    println!("{}", render_table(&rows));
+    println!(
+        "\npreprint clause-1: {}/{} rank 1 was the bioRxiv transform's PDF; \
+         {}/{} rank 1 was a PubMed citation page",
+        biorxiv_at_rank_one.len(),
+        probes.len(),
+        citation_at_rank_one.len(),
+        probes.len(),
+    );
+    for row in &rows {
+        println!(
+            "  {} — rank 1 {} — {}",
+            row.doi,
+            row.chosen
+                .as_ref()
+                .map_or("(nothing ranked)", |pick| pick.url.as_str()),
+            row.outcome.render()
+        );
+    }
+
+    assert!(
+        citation_at_rank_one.is_empty(),
+        "a PubMed citation page is a record about the work, not the work, and it \
+         is not a candidate at all: {}",
+        citation_at_rank_one.join(", ")
+    );
+}
+
 /// The six sources are all asked, and the pass still names no publisher host.
 ///
 /// This is the structural claim [`MetadataPass`] makes — "resolve, then rank"
