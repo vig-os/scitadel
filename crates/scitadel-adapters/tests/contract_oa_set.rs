@@ -80,7 +80,28 @@ struct ChosenPick {
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
     /// A 2xx and a byte count.
-    Obtained { status: u16, bytes: usize },
+    Obtained {
+        status: u16,
+        bytes: usize,
+        /// The served `Content-Type`, when the response carried one.
+        ///
+        /// **Recorded because "obtained" is not "obtained the article."** A
+        /// ranged GET against a PubMed abstract page answers `203` with several
+        /// thousand bytes of HTML, and a byte count cannot tell that from a PDF.
+        /// #260's clause is "obtains the PDF", so the report needs to be able to
+        /// separate the two, and a harness that cannot is one whose number can
+        /// rise for the wrong reason without anybody noticing.
+        content_type: Option<String>,
+        /// What the bytes we actually received **are**, from
+        /// [`scitadel_adapters::magic::sniff`].
+        ///
+        /// Sniffed rather than read off the `Content-Type`, and the reason is
+        /// `binary/octet-stream`: S3 serves the PMC-OA dataset's PDFs with no
+        /// content type at all, so a declared-type rule reports the only genuine
+        /// PDFs in this table as *not* articles. The bytes were in hand and were
+        /// being discarded.
+        sniffed: scitadel_adapters::magic::Magic,
+    },
     /// We asked; the status says no.
     NotObtained { status: u16, note: String },
     /// We could not ask. Never reported as unreachable.
@@ -94,9 +115,37 @@ impl Outcome {
         matches!(self, Self::Obtained { .. })
     }
 
+    /// Whether the bytes are the **article** rather than a page about it.
+    ///
+    /// A `Markup` or `Json` body is a landing page, an abstract page or a dataset
+    /// manifest, and #260's "obtains the PDF" is not satisfied by any of them
+    /// however many bytes arrived.
+    fn obtained_article(&self) -> bool {
+        match self {
+            Self::Obtained { sniffed, .. } => {
+                matches!(sniffed, scitadel_adapters::magic::Magic::Pdf)
+            }
+            _ => false,
+        }
+    }
+
     fn render(&self) -> String {
         match self {
-            Self::Obtained { status, bytes } => format!("OBTAINED http {status}, {bytes} bytes"),
+            Self::Obtained {
+                status,
+                bytes,
+                content_type,
+                sniffed,
+            } => format!(
+                "OBTAINED http {status}, {bytes} bytes, {}{} — the bytes are {}",
+                content_type.as_deref().unwrap_or("(no content-type)"),
+                if self.obtained_article() {
+                    " [ARTICLE]"
+                } else {
+                    ""
+                },
+                sniffed.describe(),
+            ),
             Self::NotObtained { status, note } => format!("NOT-OBTAINED http {status} ({note})"),
             Self::NetworkError { note } => format!("NETWORK-ERROR ({note})"),
             Self::NoCandidate { note } => format!("NO-CANDIDATE ({note})"),
@@ -235,14 +284,25 @@ async fn fetch_chosen(
     match client.get_in_work(scope, url, PaceTier::Oa, headers).await {
         Ok(response) => {
             let status = response.status.as_u16();
-            let bytes = response.bytes().await.map_or(0, |body| body.len());
+            // Read before the body, because `bytes()` consumes the response.
+            let content_type = response.content_type().unwrap_or("(none)").to_string();
+            let body = response.bytes().await.unwrap_or_default();
+            let bytes = body.len();
             if bytes == 0 {
                 Outcome::NotObtained {
                     status,
                     note: "a 2xx with an empty body is not an article".to_string(),
                 }
             } else {
-                Outcome::Obtained { status, bytes }
+                Outcome::Obtained {
+                    status,
+                    bytes,
+                    content_type: Some(content_type),
+                    // Sniff the bytes we were going to throw away. A ranged GET
+                    // gives 1 KB, which is more than enough for every signature
+                    // in `magic` — `%PDF-` is five.
+                    sniffed: scitadel_adapters::magic::sniff(&body),
+                }
             }
         }
         Err(FetchError::Status { code, .. }) => Outcome::NotObtained {
@@ -420,6 +480,149 @@ async fn every_probe_produces_a_classified_row() {
             );
         }
     }
+}
+
+/// The floors the two ranker changes were measured against, and why they are
+/// floors.
+///
+/// **Recorded prior measurements, not expectations.** Recorded 2026-10-07 on this
+/// file's own harness, at `807d0ff` — before the Crossref
+/// `link[intended-application]` filter and before ADR-007 §3's fetch order became
+/// the tiebreak:
+///
+/// | | bytes obtained | of which the bytes are a PDF |
+/// |---|---|---|
+/// | before | 4 / 16 | 1 / 16 |
+/// | after | 15 / 16 | 6 / 16 |
+///
+/// Two numbers, not one, because on this table the two ranker changes moved both
+/// and only one of them is what #260 is about. The eleven new byte-wins include
+/// nine that are **not** the article: PubMed and NCBI landing pages, and two
+/// `doi.org` resolutions that end at a DataCite JSON manifest. They are real
+/// 2xx responses and the pre-change harness scored them, which is precisely why
+/// a byte count alone is not this file's claim. `obtained_article` and the second
+/// floor exist so the number cannot be banked twice.
+///
+/// The assertions are **strictly greater than**, which is the only stateless way
+/// to say "went up". Deliberately not `assert_eq!`: publisher bot walls move, OUP
+/// changes its CDN, and a contract test that turns red because a publisher
+/// changed something is a test nobody trusts — which is how this file gets
+/// deleted.
+///
+/// The corollary is that a large *fall* is tolerated, because these floors are low
+/// and MDPI alone owns three rows. What they catch is the regression that is a
+/// code defect: the ranker picking a candidate that cannot be served at all, or
+/// picking a page when the article was sitting at rank 2. That is the regression
+/// worth failing on, and it is the one these changes removed.
+const OBTAINED_BYTES_FLOOR: usize = 4;
+const OBTAINED_PDF_FLOOR: usize = 1;
+
+#[tokio::test]
+async fn the_obtained_count_went_up_from_what_the_ranker_used_to_choose() {
+    let (client, pass) = live();
+    let mut rows = Vec::new();
+    for probe in OA_260_PROBES {
+        rows.push(measure(&pass, &client, probe).await);
+    }
+
+    let obtained = rows.iter().filter(|row| row.outcome.obtained()).count();
+    let articles = rows
+        .iter()
+        .filter(|row| row.outcome.obtained_article())
+        .count();
+    println!("{}", render_table(&rows));
+    println!(
+        "\nobtained bytes {obtained}/{} (floor {OBTAINED_BYTES_FLOOR}); \
+         obtained **as a PDF** {articles}/{} (floor {OBTAINED_PDF_FLOOR})",
+        OA_260_PROBES.len(),
+        OA_260_PROBES.len(),
+    );
+    for row in &rows {
+        if row.outcome.obtained() && !row.outcome.obtained_article() {
+            println!(
+                "  ! {} — {} bytes, but not the article: {}",
+                row.doi,
+                row.outcome.render(),
+                row.chosen.as_ref().map_or("-", |pick| pick.url.as_str())
+            );
+        }
+    }
+
+    assert!(
+        obtained > OBTAINED_BYTES_FLOOR,
+        "only {obtained} of {} probes obtained bytes, which is not more than the \
+         {OBTAINED_BYTES_FLOOR} this harness measured before ADR-007 §3's fetch \
+         order became the tiebreak and Crossref stopped offering its own \
+         plagiarism-detection endpoint as a candidate. Either the ranker is \
+         choosing a location that cannot be served again, or something upstream \
+         stopped answering — both are defects, and neither is a publisher having \
+         a bad day.\n\n{}",
+        OA_260_PROBES.len(),
+        render_table(&rows),
+    );
+
+    assert!(
+        articles > OBTAINED_PDF_FLOOR,
+        "only {articles} of {} probes served a PDF, which is not more than the \
+         {OBTAINED_PDF_FLOOR} measured before the two ranker changes. This is \
+         the assertion that matters: #260's clause is 'obtains the PDF', and the \
+         byte count can be satisfied by a landing page.\n\n{}",
+        OA_260_PROBES.len(),
+        render_table(&rows),
+    );
+}
+
+/// The two ranker changes, asserted on the **plan** rather than on a fetch.
+///
+/// The measurement above is about bytes, and bytes are a moving target. This is
+/// about the thing the changes actually are, and it is stable:
+///
+/// - a `link[]` Crossref offers as `similarity-checking` is **not** a candidate,
+///   so no plan line may name `syndication.highwire.org` or `harvest.aps.org`;
+/// - on an exact version-and-licence tie, the candidate on the earlier ADR-007
+///   §3 step is the one `Resolution::chosen` returns.
+///
+/// Both are asserted over the live pass, so they fail the moment the metadata
+/// changes shape rather than the moment a publisher does.
+#[tokio::test]
+async fn no_similarity_checking_endpoint_is_ever_a_candidate() {
+    let (client, pass) = live();
+    let mut offenders = Vec::new();
+    for probe in OA_260_PROBES {
+        let resolution = pass
+            .resolve(
+                &client,
+                &WorkScope::new(),
+                WorkRefs {
+                    doi: Some(probe.doi),
+                    arxiv_id: None,
+                    osti_id: None,
+                    url: None,
+                    openalex_id: None,
+                    pmcid: None,
+                },
+            )
+            .await;
+        for entry in resolution.ranked {
+            if entry.candidate.route != scitadel_core::models::RouteId::Crossref {
+                continue;
+            }
+            // A `RouteId::Crossref` candidate can only exist now if it came from a
+            // `text-mining` link, so its URL is the check.
+            offenders.push(format!(
+                "{} #{} {}",
+                probe.doi, entry.position, entry.candidate.url
+            ));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "a Crossref-named candidate survived for: {}. ADR-007 §3's resolve bullet \
+         admits `link[intended-application=text-mining]` only; \
+         `syndication.highwire.org` and `harvest.aps.org` are Crossref's own \
+         plagiarism-detection endpoints and 403 an anonymous client.",
+        offenders.join("; ")
+    );
 }
 
 /// **Diagnostic, not the measurement.** For every probe whose rank-1 fetch

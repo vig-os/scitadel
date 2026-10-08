@@ -486,17 +486,275 @@ pub fn version_from_doi_prefix(doi: &str) -> Option<(Version, VersionSource)> {
     None
 }
 
+/// ADR-007 §3's fetch order, as one comparable position on a ladder.
+///
+/// **This is the ADR's own ordering, which the ranker was not implementing.**
+/// ADR-007 §3 says, under "Fetch order within the ranked candidates":
+///
+/// 1. Europe PMC: `fullTextXML` (JATS) and `supplementaryFiles` …
+/// 2. The PMC OA dataset (`pmc-oa-opendata` S3, anonymous HTTPS) …
+/// 3. OA repository locations from OpenAlex and Unpaywall, arXiv for
+///    preprints, and DOE OSTI for national-lab reports.
+/// 4. SI discovery …
+/// 5. Tier 2 (sanctioned TDM) …
+/// 6. the publisher landing page ("for OA works only")
+/// 7. the browser session (last resort)
+///
+/// Two candidates that tie on version *and* licence are the same document of the
+/// same strength, and the ADR has already decided between them. The ranker had no
+/// notion of the order at all, so the winner was whichever registry the pass
+/// happened to ask first — and on #260's probe table that was the wrong one every
+/// time: a PMC-OA copy sat below the publisher's own copy of the same VoR, and
+/// the publisher's copy was a bot wall.
+///
+/// Derived `Ord` follows **declaration order**, which is why the variants are
+/// declared in §3's numbering. [`every_route_id_is_placed_on_the_adr_fetch_order`]
+/// pins that against the ADR's own digits rather than against this file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FetchStep {
+    /// §3 step 1.
+    EuropePmc,
+    /// §3 step 2.
+    PmcOa,
+    /// §3 step 3.
+    RepositoryLocation,
+    /// §3 step 4.
+    SupplementDiscovery,
+    /// §3 step 5.
+    SanctionedTdm,
+    /// §3 step 6.
+    PublisherLandingPage,
+    /// §3 step 7, the last resort.
+    BrowserSession,
+    /// **Not a rung on §3's ladder** — deliberately the weakest position, and
+    /// the only one with no ADR step number.
+    ///
+    /// It holds a route that records where a file came from rather than where to
+    /// fetch it: `RouteId::Legacy`, `RouteId::ImportFlat` and `RouteId::Manual`,
+    /// which [`RouteId::never_fetches`] is the existing name for. There is no
+    /// honest middle rung for "this is not a route at all", so these land last —
+    /// and the alternative, inventing a rung between two numbered steps, would be
+    /// claiming an ADR position the ADR does not take.
+    ///
+    /// §3 step 8 is the ladder running out ("otherwise the work lands in
+    /// `needs_ill`…"), which is an outcome rather than a route, so it is not a
+    /// variant here either.
+    NotAFetchRoute,
+}
+
+impl FetchStep {
+    /// Every rung, in §3's order, strongest first.
+    pub const ALL: [Self; 8] = [
+        Self::EuropePmc,
+        Self::PmcOa,
+        Self::RepositoryLocation,
+        Self::SupplementDiscovery,
+        Self::SanctionedTdm,
+        Self::PublisherLandingPage,
+        Self::BrowserSession,
+        Self::NotAFetchRoute,
+    ];
+
+    /// ADR-007 §3's own step number, or `0` for the rung that is not on the
+    /// ladder. The `0` is what keeps [`Self::NotAFetchRoute`] from being
+    /// presented as something the ADR numbered.
+    #[must_use]
+    pub fn adr_step(self) -> u8 {
+        match self {
+            Self::EuropePmc => 1,
+            Self::PmcOa => 2,
+            Self::RepositoryLocation => 3,
+            Self::SupplementDiscovery => 4,
+            Self::SanctionedTdm => 5,
+            Self::PublisherLandingPage => 6,
+            Self::BrowserSession => 7,
+            Self::NotAFetchRoute => 0,
+        }
+    }
+
+    /// The phrase a plan line uses, so a reader can see which rung decided a
+    /// placement without reading the ADR.
+    #[must_use]
+    pub fn why(self) -> String {
+        match self {
+            Self::EuropePmc => String::from(
+                "ADR-007 §3 step 1: Europe PMC, which serves the full text and its \
+                 supplementary files itself",
+            ),
+            Self::PmcOa => String::from(
+                "ADR-007 §3 step 2: the PMC OA dataset, anonymous HTTPS with no \
+                 publisher in the path",
+            ),
+            Self::RepositoryLocation => {
+                String::from("ADR-007 §3 step 3: an OA repository's own copy of the work")
+            }
+            Self::SupplementDiscovery => String::from(
+                "ADR-007 §3 step 4: supplementary material, which travels separately \
+                 from the article",
+            ),
+            Self::SanctionedTdm => String::from(
+                "ADR-007 §3 step 5: a publisher's sanctioned text-and-data-mining \
+                 endpoint",
+            ),
+            Self::PublisherLandingPage => String::from(
+                "ADR-007 §3 step 6: the publisher's own landing page, which is a \
+                 document of last resort",
+            ),
+            Self::BrowserSession => String::from(
+                "ADR-007 §3 step 7: a human's browser session, the last resort of \
+                 the last resort",
+            ),
+            Self::NotAFetchRoute => String::from(
+                "not on ADR-007 §3's fetch order: this route records where a file \
+                 came from rather than where to fetch it",
+            ),
+        }
+    }
+}
+
+/// Where a candidate sits on [`FetchStep`], from its route and its URL.
+///
+/// **Route-primary, URL as the override, and only for the three routes that are
+/// identity sources.** `RouteId::Crossref`, `RouteId::DataCite` and
+/// `RouteId::OpenAlex` answer "what does this DOI refer to"; a candidate they
+/// name can be a repository location (step 3), the PMC-OA dataset (step 2) or a
+/// publisher's page (step 6), and the route says nothing about which. So for
+/// those three the URL decides — but only for hosts the ADR itself names, because
+/// a host list of "repositories we recognise" would be a reliability heuristic
+/// wearing a typing hat, and #260 is not a licence to invent one.
+///
+/// [`the_step_is_derived_from_the_url_where_the_route_is_only_an_identity_source`]
+/// pins every branch, including the one that is a **known limitation**: an
+/// index-named URL on a publisher's own host stays step 3, because nothing in the
+/// URL says it is a publisher.
+#[must_use]
+pub fn fetch_step_for(route: RouteId, url: &str) -> FetchStep {
+    use RouteId as R;
+
+    // The three identity sources first, and only for hosts ADR-007 §3 names.
+    if matches!(
+        route,
+        R::Crossref | R::DataCite | R::OpenAlex | R::Unpaywall
+    ) {
+        // §3 step 2 names this bucket outright, so a route that names it is
+        // step 2 whatever route named it.
+        if url_has_host(url, &["pmc-oa-opendata.s3.amazonaws.com"]) {
+            return FetchStep::PmcOa;
+        }
+        // §3 step 1's service, whichever index catalogued it.
+        if url_has_host(url, &["europepmc.org"]) {
+            return FetchStep::EuropePmc;
+        }
+        // The DOI resolver's landing page **is** §3 step 6's document: "the
+        // publisher landing page". Recognising the resolver rather than a
+        // publisher is what makes this rule provable rather than a guess.
+        if url_has_host(url, &["doi.org", "dx.doi.org"]) {
+            return FetchStep::PublisherLandingPage;
+        }
+    }
+
+    match route {
+        // Route-named, so the ADR names the step: step 1 names Europe PMC and
+        // step 2 names the dataset.
+        R::EuropePmc => FetchStep::EuropePmc,
+        R::PmcOa => FetchStep::PmcOa,
+        // Step 5, and the mapping is the ADR's resolve bullet rather than a
+        // judgement: after `link[intended-application=text-mining]`, §3 step 5 is
+        // what such a link is *for*. `RouteId::Crossref` also names step 4's
+        // `is-supplemented-by` check, but that path builds no candidate today —
+        // see the comment on the `SupplementDiscovery` arm.
+        R::Crossref | R::ElsevierTdm | R::WileyTdm | R::SpringerTdm => FetchStep::SanctionedTdm,
+        // Step 3, by ADR: "OA repository locations from OpenAlex and Unpaywall,
+        // arXiv for preprints, and DOE OSTI for national-lab reports".
+        //
+        // `RouteId::Biorxiv` is **not named in §3 step 3**, which lists arXiv and
+        // OSTI and no other preprint server. It is placed here rather than left
+        // unplaced because step 3 is the only rung in the ADR that means "a
+        // preprint server's own copy of the work", and leaving the bioRxiv route
+        // below the publisher landing page would invert #260's preprint clause.
+        // The placement is a reading of §3 and it is on the record as one.
+        //
+        // `RouteId::DataCite` is here too, and that is a **gap in the ADR**: §3
+        // names DataCite for step 4's `IsSupplementTo` and for nothing else, while
+        // this resolver also builds a `RouteId::DataCite` candidate from
+        // `attributes.url` — the work's **own** landing page, which is not on
+        // §3's ladder at all. Measured on `10.18434/*`, `attributes.url` is
+        // `data.nist.gov/od/id/mds2-…`, a repository landing page for a
+        // national-lab deposit, so step 3 is the honest placement. The gap is
+        // reported rather than papered over with a default.
+        R::OpenAlex | R::Unpaywall | R::Arxiv | R::Biorxiv | R::Osti | R::DataCite => {
+            FetchStep::RepositoryLocation
+        }
+        // Step 6. `RouteId::ManualUrl` is here too: a URL a person or a reference
+        // manager supplied is the publisher's own page in the ordinary case, and
+        // the resolver already emits `RouteId::Publisher` first for the same
+        // document — so the two tie and the pass's order keeps them apart. The
+        // existing code calls ManualUrl "the last resort"; §3's own last resort is
+        // step 7, and claiming that would be claiming a browser session for a
+        // plain HTTP GET.
+        R::Publisher | R::ManualUrl => FetchStep::PublisherLandingPage,
+        // Step 7, verbatim.
+        R::BrowserSession => FetchStep::BrowserSession,
+        // Not on the ladder at all: these three record where a file came from
+        // rather than where to fetch it, which is [`RouteId::never_fetches`]'s
+        // existing name for the property.
+        //
+        // **No arm returns [`FetchStep::SupplementDiscovery`]**, and that is the
+        // honest state of §3 step 4: the ADR numbers it, but nothing in this
+        // resolver builds a candidate from `IsSupplementTo` or
+        // `is-supplemented-by` — `RouteId::Crossref` and `RouteId::DataCite` are
+        // used for `link[]` and `attributes.url` instead. The rung is kept
+        // because a supplement is fetched differently from the article it
+        // accompanies, and an empty rung is a gap in the implementation rather
+        // than a fabricated position. `the_step_4_rung_is_numbered_and_empty`
+        // pins that it is empty, so a future arm cannot be added silently.
+        R::Legacy | R::ImportFlat | R::Manual => FetchStep::NotAFetchRoute,
+    }
+}
+
+/// Whether a URL's host is one of `hosts`, exactly or as a subdomain of one.
+///
+/// A `bool` rather than a returned host so nothing has to outlive a parsed
+/// [`reqwest::Url`]. `parse` rather than a string scan: a malformed candidate URL
+/// is exactly the case where guessing at the host would be the wrong answer.
+fn url_has_host(url: &str, hosts: &[&str]) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    // The trailing dot is a legal absolute name and `doi.org.` resolves, so it is
+    // normalised away rather than treated as a different host.
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    hosts.iter().any(|wanted| {
+        host == *wanted
+            || (host.len() > wanted.len()
+                && host.ends_with(wanted)
+                && host.as_bytes()[host.len() - wanted.len() - 1] == b'.')
+    })
+}
+
 /// ADR-007 §3's ordering, as one comparable value.
 ///
-/// Two fields and a derived `Ord`, which is where **version strictly dominates
+/// Three fields and a derived `Ord`, which is where **version strictly dominates
 /// licence** lives: the version is compared first and the licence is read only
 /// when the versions are equal. [`ranked_order_is_documented_and_pinned`] pins
 /// it against hand-written expectations so the dominance cannot be changed by
 /// someone reordering the fields.
+///
+/// [`FetchStep`] is third, so it is read **only on an exact version *and* licence
+/// tie** — the property
+/// [`the_fetch_order_never_reorders_across_a_version_or_licence_difference`]
+/// pins. It cannot reach across a version boundary or a licence boundary, because
+/// a derived `Ord` returns at the first field that differs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct Rank {
     pub version: Version,
     pub licence: LicenceStrength,
+    /// ADR-007 §3's position for this candidate's route. The tiebreak.
+    pub fetch_step: FetchStep,
 }
 
 /// ADR-007 §3's licence strength, best-first, matching [`Rank`]'s `Ord`.
@@ -775,14 +1033,16 @@ pub fn rank_candidates(mut candidates: Vec<Candidate>) -> Resolution {
 /// The key [`rank_candidates`] sorts on.
 ///
 /// A named function rather than an inline closure because the *ordering* is a
-/// claim about the world — version strictly dominates licence — and a claim
-/// with no name is a claim nobody reviews when it changes.
+/// claim about the world — version strictly dominates licence, and ADR-007 §3's
+/// fetch order breaks an exact tie between them — and a claim with no name is a
+/// claim nobody reviews when it changes.
 fn rank_by(candidate: &Candidate) -> Rank {
     Rank {
         version: candidate
             .version
             .expect("rank_candidates only sorts candidates that carry a version"),
         licence: candidate.licence,
+        fetch_step: fetch_step_for(candidate.route, &candidate.url),
     }
 }
 
@@ -829,6 +1089,11 @@ impl Resolution {
     /// `acquire --dry-run` prints this, so the ranking is inspectable before
     /// anything is fetched — which is also the cheapest possible test of the
     /// ordering, since a dry run puts no publisher on the wire.
+    ///
+    /// Each line carries its ADR-007 §3 step, because that step is now a third
+    /// sort key and a reader asking "why did the PMC-OA copy win?" cannot answer
+    /// it from a version and a licence alone — those two said the candidates were
+    /// equal.
     #[must_use]
     pub fn plan_lines(&self) -> Vec<String> {
         let mut out: Vec<String> = self
@@ -836,8 +1101,9 @@ impl Resolution {
             .iter()
             .map(|entry| {
                 format!(
-                    "  {}. [{} > {}] {}",
+                    "  {}. [step {} of ADR-007 §3: {} > {}] {}",
                     entry.position,
+                    entry.rank.fetch_step.adr_step(),
                     entry.rank.version,
                     entry.rank.licence_phrase(),
                     entry.candidate.why(),
@@ -1469,6 +1735,27 @@ impl MetadataPass {
                 work_licences.extend(LicenceOffer::from_crossref(message));
                 let links = crate::crossref::links(message);
                 for (at, link) in links.iter().enumerate() {
+                    // ADR-007 §3's resolve bullet reads
+                    // `link[intended-application=text-mining]` — a filter the ADR
+                    // already specifies and this pass was not applying. The other
+                    // values are Crossref's own services: `similarity-checking` is
+                    // plagiarism detection, `syndication` is content
+                    // redistribution, and `unspecified` records that the publisher
+                    // declined to say. None is somewhere a person or a library
+                    // reads from, and the `similarity-checking` case is worse than
+                    // useless: it is stamped `content-version: vor` on a record
+                    // whose own `type` is `posted-content`, so it outranks the
+                    // preprint every registry agrees on and then 403s.
+                    if !link.is_reading_route() {
+                        tracing::debug!(
+                            url = link.url,
+                            intended_application =
+                                link.intended_application.as_deref().unwrap_or("(absent)"),
+                            "crossref named a link that is not a reading route; \
+                             ADR-007 §3 admits only text-mining"
+                        );
+                        continue;
+                    }
                     if !is_fetchable_url(&link.url) {
                         continue;
                     }
@@ -2655,27 +2942,38 @@ mod tests {
     /// article of record.
     #[test]
     fn ranked_order_is_documented_and_pinned() {
+        use FetchStep::RepositoryLocation;
         use LicenceStrength::{FreeToRead, OpenLicence, SubscriptionRead, Unknown};
         use Version::{AuthorManuscript, Preprint, Unstated, VersionOfRecord};
 
+        // Every `Rank` here pins the fetch step, because this test is about the
+        // **first two** keys only. Letting the third vary would not weaken the
+        // claim below, it would change it — so the two are separated, and
+        // `version_still_dominates_licence_with_the_fetch_step_free_to_vary`
+        // proves the same dominance with the tiebreak free to move.
+        //
         // Strict domination, both directions.
         assert!(
             Rank {
                 version: VersionOfRecord,
-                licence: Unknown
+                licence: Unknown,
+                fetch_step: RepositoryLocation
             } < Rank {
                 version: AuthorManuscript,
-                licence: OpenLicence
+                licence: OpenLicence,
+                fetch_step: RepositoryLocation
             },
             "an unknown-licence VoR outranks a CC-BY author manuscript"
         );
         assert!(
             Rank {
                 version: AuthorManuscript,
-                licence: Unknown
+                licence: Unknown,
+                fetch_step: RepositoryLocation
             } < Rank {
                 version: Preprint,
-                licence: OpenLicence
+                licence: OpenLicence,
+                fetch_step: RepositoryLocation
             },
             "an unknown-licence AM outranks a CC-BY preprint"
         );
@@ -2687,6 +2985,7 @@ mod tests {
                 .map(|licence| Rank {
                     version,
                     licence: *licence,
+                    fetch_step: RepositoryLocation,
                 })
                 .collect::<Vec<_>>();
             by_licence.sort();
@@ -2713,6 +3012,7 @@ mod tests {
                 LicenceStrength::ALL.iter().map(move |licence| Rank {
                     version: *version,
                     licence: *licence,
+                    fetch_step: RepositoryLocation,
                 })
             })
             .collect();
@@ -2722,14 +3022,16 @@ mod tests {
             every[0],
             Rank {
                 version: VersionOfRecord,
-                licence: OpenLicence
+                licence: OpenLicence,
+                fetch_step: RepositoryLocation
             }
         );
         assert_eq!(
             every[15],
             Rank {
                 version: Unstated,
-                licence: Unknown
+                licence: Unknown,
+                fetch_step: RepositoryLocation
             },
             "the weakest of the weakest is last"
         );
@@ -2754,6 +3056,92 @@ mod tests {
         // keep, and a stronger one than knowing nothing.
         assert!(FreeToRead < SubscriptionRead);
         assert!(SubscriptionRead < LicenceStrength::Unknown);
+    }
+
+    /// The **companion** to `ranked_order_is_documented_and_pinned`, and the one
+    /// that a third sort key actually threatens.
+    ///
+    /// Adding [`FetchStep`] to [`Rank`] cannot reorder across a version or a
+    /// licence — a derived `Ord` returns at the first field that differs — but
+    /// "cannot" is a claim about `Ord`'s implementation, so it is tested rather
+    /// than asserted. The grid is the full four-by-four-by-eight, all 128 cells,
+    /// and version must still be the outer axis: every cell of a version of record
+    /// sorts ahead of every cell of an author manuscript, whatever the fetch step
+    /// in either.
+    #[test]
+    fn version_still_dominates_licence_with_the_fetch_step_free_to_vary() {
+        const LICENCES: [LicenceStrength; 4] = LicenceStrength::ALL;
+        const VERSIONS: [Version; 4] = Version::ALL;
+
+        let mut every: Vec<Rank> = VERSIONS
+            .iter()
+            .flat_map(|version| {
+                LICENCES.iter().flat_map(move |licence| {
+                    FetchStep::ALL
+                        .iter()
+                        .map(move |fetch_step| Rank {
+                            version: *version,
+                            licence: *licence,
+                            fetch_step: *fetch_step,
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        every.sort();
+
+        let expected = VERSIONS.len() * LICENCES.len() * FetchStep::ALL.len();
+        assert_eq!(every.len(), expected, "four by four by eight");
+        for (at, cell) in every.iter().enumerate() {
+            assert_eq!(
+                cell.version,
+                VERSIONS[at / (LICENCES.len() * FetchStep::ALL.len())],
+                "cell {at} must still belong to the version block it sorted into: \
+                 the fetch step is the *last* key, so it cannot reorder the outer \
+                 two"
+            );
+        }
+        // And the extremes, so the assertion is not vacuous: the weakest
+        // `Unstated`/`Unknown` cell at the best fetch step still precedes the
+        // strongest `VersionOfRecord`/`OpenLicence` cell at the worst one.
+        assert_eq!(
+            every[0],
+            Rank {
+                version: Version::VersionOfRecord,
+                licence: LicenceStrength::OpenLicence,
+                fetch_step: FetchStep::EuropePmc
+            }
+        );
+        assert_eq!(
+            every[expected - 1],
+            Rank {
+                version: Version::Unstated,
+                licence: LicenceStrength::Unknown,
+                fetch_step: FetchStep::NotAFetchRoute
+            }
+        );
+    }
+
+    /// §3 step 4 is **numbered and currently empty**, and that is a fact about
+    /// the implementation rather than a gap papered over with a default.
+    ///
+    /// Nothing in the resolver builds a candidate from DataCite's
+    /// `IsSupplementTo` or Crossref's `is-supplemented-by`, so no route maps to
+    /// `FetchStep::SupplementDiscovery`. The rung exists because the ADR numbers
+    /// it and because a supplement is fetched differently from the article it
+    /// accompanies; asserting it is empty means the day someone wires SI
+    /// discovery up, this fails and asks them to say where on the ladder it goes.
+    #[test]
+    fn the_step_4_rung_is_numbered_and_empty() {
+        for route in RouteId::ALL {
+            assert_ne!(
+                fetch_step_for(route, "https://example.invalid/supp.pdf"),
+                FetchStep::SupplementDiscovery,
+                "{route} now maps to §3 step 4; say in this test which route it is \
+                 and why a supplement ranks there"
+            );
+        }
+        assert_eq!(FetchStep::SupplementDiscovery.adr_step(), 4);
     }
 
     /// The reason the ladder is not a weighted score: interleaving licence and
@@ -2805,6 +3193,239 @@ mod tests {
                 "{weaker:?} must not outrank {stronger:?} at the same version"
             );
         }
+    }
+
+    // =====================================================================
+    // ADR-007 §3's fetch order, as the tiebreak on an exact version+licence tie.
+    // =====================================================================
+
+    /// **The thing #260 exists to change**, in the shape the live probe table
+    /// found it in: a PMC-OA copy of the version of record and a publisher's own
+    /// copy of the version of record, same version, same `OpenLicence`, so the
+    /// two-key `Rank` called them equal and the winner was whichever registry
+    /// answered first.
+    ///
+    /// Both orders are exercised, because "stable sort kept the pass's order"
+    /// would make this test pass with the tiebreak absent if the repository
+    /// candidate happened to be emitted first.
+    #[test]
+    fn a_repository_copy_beats_a_publisher_copy_of_the_same_version_and_licence() {
+        use LicenceStrength::OpenLicence;
+        use Version::VersionOfRecord;
+
+        for repository_first in [true, false] {
+            let repository = candidate(RouteId::PmcOa, Some(VersionOfRecord), OpenLicence);
+            let publisher = candidate(RouteId::Unpaywall, Some(VersionOfRecord), OpenLicence);
+            assert_eq!(
+                (repository.version, repository.licence),
+                (publisher.version, publisher.licence),
+                "the fixture only means anything if the two tie exactly, which is \
+                 the only condition under which ADR-007 §3's fetch order applies"
+            );
+
+            let resolution = rank_candidates(if repository_first {
+                vec![repository, publisher]
+            } else {
+                vec![publisher, repository]
+            });
+
+            assert_eq!(
+                resolution.ranked[0].candidate.route,
+                RouteId::PmcOa,
+                "repository_first={repository_first}: the pmc-oa dataset is \
+                 ADR-007 §3 step 2 and the publisher's own copy is a later step, \
+                 and on an exact tie the ADR's own ordering decides"
+            );
+            assert_eq!(resolution.ranked[1].candidate.route, RouteId::Unpaywall);
+        }
+    }
+
+    /// The **half** of the requirement that is easy to get wrong: the fetch
+    /// order must not reach across a version or licence boundary. Wave 2 fixed
+    /// version-over-licence dominance (#293) and that is settled; a third sort
+    /// key that could reorder *across* either of the first two would undo it
+    /// silently, because a fetch-order-first comparator still "dominates
+    /// version" on every sample that happens to share a step.
+    #[test]
+    fn the_fetch_order_never_reorders_across_a_version_or_licence_difference() {
+        use LicenceStrength::{FreeToRead, OpenLicence};
+        use Version::{Preprint, VersionOfRecord};
+
+        // A publisher copy is a later fetch step than the repository copy, so
+        // these are the pairs the tiebreak would reorder if it were allowed to.
+        // Each holds **one** axis equal and makes the other decide, which is
+        // what "never reorder across a difference" has to mean.
+        for (stronger, weaker) in [
+            // Across a licence difference: same version, and the repository copy
+            // has the stronger licence.
+            (
+                candidate(RouteId::PmcOa, Some(VersionOfRecord), OpenLicence),
+                candidate(RouteId::Unpaywall, Some(VersionOfRecord), FreeToRead),
+            ),
+            // Across a version difference: same licence, and the repository copy
+            // is the version of record.
+            (
+                candidate(RouteId::PmcOa, Some(VersionOfRecord), FreeToRead),
+                candidate(RouteId::Unpaywall, Some(Preprint), FreeToRead),
+            ),
+        ] {
+            assert_ne!(
+                stronger.route, weaker.route,
+                "the fixture must exercise two different fetch steps"
+            );
+            assert_eq!(
+                fetch_step_for(stronger.route, &stronger.url),
+                FetchStep::PmcOa,
+                "the fixture's premise: the repository copy is §3 step 2"
+            );
+            assert!(
+                fetch_step_for(weaker.route, &weaker.url) > FetchStep::PmcOa,
+                "the fixture's premise: the weaker candidate is on a later rung"
+            );
+
+            let resolution = rank_candidates(vec![weaker.clone(), stronger.clone()]);
+            assert_eq!(
+                resolution.ranked[0].candidate.route, stronger.route,
+                "{stronger:?} must beat {weaker:?} on version or licence alone: \
+                 §3's order is the *tiebreak*, not the primary key"
+            );
+            // And the tie-break is what does decide once the two are equal, so
+            // the assertion above is not passing because the tie-break is inert.
+            assert_ne!(
+                (stronger.version, stronger.licence),
+                (weaker.version, weaker.licence),
+                "each fixture pair must differ on at least one of the first two keys"
+            );
+        }
+    }
+
+    /// Every route that can produce a candidate lands on a rung, and the rungs
+    /// are §3's own seven plus the weakest position for a route that is not a
+    /// fetch route at all. Exhaustive over [`RouteId::ALL`] so a new variant
+    /// cannot be added without being placed — the compiler's exhaustiveness
+    /// would catch the match, and this catches the *ordering* of the rungs.
+    #[test]
+    fn every_route_id_is_placed_on_the_adr_fetch_order() {
+        for route in RouteId::ALL {
+            let step = crate::resolve::fetch_step_for(route, "https://example.invalid/x.pdf");
+            assert!(
+                crate::resolve::FetchStep::ALL.contains(&step),
+                "{route} mapped to a step outside the ladder"
+            );
+        }
+
+        // §3's own order, best first. Pinned by hand against the ADR's
+        // numbering rather than against the implementation, because the claim
+        // under test is that the enum *is* the ADR's list.
+        let ordered = [
+            (crate::resolve::FetchStep::EuropePmc, 1),
+            (crate::resolve::FetchStep::PmcOa, 2),
+            (crate::resolve::FetchStep::RepositoryLocation, 3),
+            (crate::resolve::FetchStep::SupplementDiscovery, 4),
+            (crate::resolve::FetchStep::SanctionedTdm, 5),
+            (crate::resolve::FetchStep::PublisherLandingPage, 6),
+            (crate::resolve::FetchStep::BrowserSession, 7),
+            (crate::resolve::FetchStep::NotAFetchRoute, 0),
+        ];
+        for (step, adr_step) in ordered {
+            assert_eq!(
+                step.adr_step(),
+                adr_step,
+                "{step:?} does not carry ADR-007 §3 step {adr_step}"
+            );
+        }
+        let mut weakest_first = crate::resolve::FetchStep::ALL;
+        weakest_first.sort();
+        assert_eq!(
+            weakest_first,
+            crate::resolve::FetchStep::ALL,
+            "FetchStep::ALL must already be in §3's order, strongest first"
+        );
+    }
+
+    /// The never-fetch routes are not a rung *above* the browser session, and
+    /// the resolver never offers one as a candidate at all. `leg_of` already
+    /// gives them no leg of their own for the same reason; this is the
+    /// ranking-side half of that, and it is asserted against the property that
+    /// matters rather than against the enum: nothing that cannot be fetched can
+    /// be the one candidate `acquire` fetches.
+    #[test]
+    fn a_route_that_never_fetches_is_never_the_chosen_candidate() {
+        for route in [RouteId::Legacy, RouteId::ImportFlat, RouteId::Manual] {
+            assert_eq!(
+                crate::resolve::fetch_step_for(route, "https://example.invalid/x.pdf"),
+                crate::resolve::FetchStep::NotAFetchRoute,
+                "{route} records where a file came from rather than where to fetch \
+                 it, so it has no place on §3's fetch ladder"
+            );
+            assert!(
+                route.never_fetches(),
+                "{route} should be declared provenance-only"
+            );
+        }
+        assert_eq!(
+            crate::resolve::fetch_step_for(
+                RouteId::BrowserSession,
+                "https://example.invalid/x.pdf"
+            ),
+            crate::resolve::FetchStep::BrowserSession,
+            "ADR-007 §3 step 7 is the last resort and is still a fetch route"
+        );
+    }
+
+    /// **Where the URL, not the route, decides** — the brief's case, and the
+    /// only place [`fetch_step_for`] consults the URL at all.
+    ///
+    /// `RouteId::Crossref` is step 5 because ADR-007 §3's resolve bullet reads
+    /// `link[intended-application=text-mining]` and step 5 is what a `text-mining`
+    /// link is for. But `RouteId::DataCite` and `RouteId::OpenAlex` are
+    /// *identity* sources: the same route can name a repository copy or a
+    /// publisher's page, and step 3 and step 6 are different rungs. Naming a
+    /// location is not the same as saying what kind of place it is, so for those
+    /// three the URL decides.
+    #[test]
+    fn the_step_is_derived_from_the_url_where_the_route_is_only_an_identity_source() {
+        use crate::resolve::FetchStep as Step;
+        use crate::resolve::fetch_step_for as step_of;
+
+        // The case in the brief: a Crossref-named URL on the pmc-oa bucket is
+        // step 2, not "whatever Crossref is".
+        assert_eq!(
+            step_of(
+                RouteId::Crossref,
+                "https://pmc-oa-opendata.s3.amazonaws.com/PMC4702794.1/PMC4702794.1.pdf"
+            ),
+            Step::PmcOa
+        );
+        // The DOI resolver's landing page is §3 step 6 by definition, whichever
+        // registry named it.
+        for route in [RouteId::OpenAlex, RouteId::Unpaywall, RouteId::DataCite] {
+            assert_eq!(
+                step_of(route, "https://doi.org/10.18434/mds2-2400"),
+                Step::PublisherLandingPage,
+                "{route} naming doi.org named the landing page, which §3 step 6 is"
+            );
+        }
+        // And Europe PMC named by an index is still §3 step 1.
+        assert_eq!(
+            step_of(
+                RouteId::OpenAlex,
+                "https://europepmc.org/articles/PMC4702794"
+            ),
+            Step::EuropePmc
+        );
+        // A publisher's own PDF named by an index stays step 3, because §3 step 3
+        // is "OA repository locations **from OpenAlex and Unpaywall**" and the
+        // resolver cannot tell a repository host from a publisher host without a
+        // list. Asserted so the limitation is a decision on the record rather
+        // than an oversight; see the report.
+        assert_eq!(
+            step_of(
+                RouteId::Unpaywall,
+                "https://www.mdpi.com/1420-3049/24/15/2793/pdf"
+            ),
+            Step::RepositoryLocation
+        );
     }
 
     // =====================================================================
