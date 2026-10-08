@@ -11,6 +11,15 @@ categories.workspace = true
 description = "Source adapters (PubMed, arXiv, OpenAlex, INSPIRE, EPO, PatentsView, Lens) and the paper download chain for scitadel."
 readme = "../../README.md"
 
+[features]
+# DES-002 deliverable E4, revived in #268: live requests that assert the
+# response still *parses*, never that a field value is right. Gated rather
+# than `#[ignore]`d because a feature that gates nothing is what let E4 rot
+# silently for the life of the project — `oa_live::tests::
+# the_contract_gate_covers_a_real_live_test` asserts the gate is wired, so
+# emptying the gated file fails the default suite.
+contract-tests = []
+
 [dependencies]
 scitadel-core = { path = "../scitadel-core", version = "0.8.0" } # x-release-please-version
 scitadel-db = { path = "../scitadel-db", version = "0.8.0" } # x-release-please-version # ADR-007 §1: artefact + blob writes for the flat-layout importer and the download chain's dual-write

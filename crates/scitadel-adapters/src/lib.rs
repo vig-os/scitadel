@@ -14,6 +14,7 @@ pub mod inspire;
 pub mod lens;
 pub mod magic;
 pub mod manifest;
+pub mod oa_live;
 pub mod openalex;
 pub mod osti;
 pub mod patentsview;
