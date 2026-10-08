@@ -659,7 +659,7 @@ pub struct Resolution {
     ///
     /// The one difference from a chain walk, and it is a real one: the chain
     /// stops at the first answer, so its later hops are `NotConsulted`, whereas
-    /// this pass asks all four because it is after version and licence facts
+    /// this pass asks all of them because it is after version and licence facts
     /// too. Every hop here therefore reports what actually happened, and
     /// `NotConsulted` never appears — which is why a plan can show four hops and
     /// a single identity verdict without the two disagreeing.
@@ -1229,14 +1229,19 @@ impl MetadataPass {
     /// order and so the tiebreak is the ADR's own sequence rather than
     /// whichever registry replied first.
     ///
-    /// Every registry is asked even after one answers, which is the one place
+    /// Every source is asked even after one answers, which is the one place
     /// this pass deliberately differs from [`crate::identity_chain`]: the chain
     /// stops at the first answer because a second registry's title is a
     /// different work with the same words, whereas this pass is after *version
-    /// and licence* facts that are genuinely distributed across all four — a
-    /// Crossref `license[]` and an OpenAlex `locations[].version` are the two
-    /// strongest signals available and they live in different registries. What
-    /// the pass reads beyond identity is never fed to the matcher.
+    /// and licence* facts that are genuinely distributed across all six — and
+    /// the strongest of them is not a registration registry's at all.
+    /// [`VersionSource::Repository`], from the `is_manuscript` flag in the
+    /// `pmc-oa-opendata` dataset and Europe PMC's `*AuthMan` flags, is a
+    /// boolean about one stored file rather than a classification word, so it
+    /// outranks every `locations[].version` and `license[]` reading in the
+    /// chain below it. The five registration registries answer the questions
+    /// that remain — identity, and the licences no repository states. What the
+    /// pass reads beyond identity is never fed to the matcher.
     pub async fn resolve(
         &self,
         client: &scitadel_http::PacedClient,
