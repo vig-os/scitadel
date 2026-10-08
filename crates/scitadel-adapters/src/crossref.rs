@@ -338,22 +338,75 @@ pub fn type_signal(message: &serde_json::Value) -> Option<crate::registry::Regis
         .map(|word| crate::registry::RegistryType::of(word, crate::registry::Dialect::Crossref))
 }
 
-/// Every `link[]` entry Crossref carries, with the two facts the ranker reads.
+/// The `intended-application` values that make a `link[]` entry a place to
+/// **read the work from**, as opposed to a service that consumes it.
 ///
-/// `intended-application: text-mining` is the publisher's own statement that
-/// this URL is the sanctioned TDM route, which ADR-007 §3 step 5 turns on.
-/// `content-version` is the publisher's statement of *which* rendering the link
-/// serves — `vor` or `am` — which is the per-location version signal, the same
-/// role OpenAlex's `locations[].version` plays.
+/// An **allow-list**, and the word is the design. ADR-007 §3's resolve bullet
+/// reads
+///
+/// > Crossref (`license[]`, `link[intended-application=text-mining]`, relations)
+///
+/// so `text-mining` is not a judgement this module makes — it is the filter the
+/// ADR already specifies, and this constant is where the ADR's filter lives.
+/// `text-mining` is also the only one of the values in the wild that names a
+/// route a sanctioned client fetches from, which is why §3 step 5 is the step
+/// it maps to.
+///
+/// The other values observed, and why none of them is a reading route
+/// (all measured 2026-10-07; see
+/// `only_text_mining_is_a_reading_route_and_every_observed_value_is_pinned` for
+/// the queries):
+///
+/// - `similarity-checking` — Crossref's own plagiarism-detection service. A
+///   `posted-content` preprint routinely carries one, and the deposit stamps it
+///   `content-version: vor`, so reading the version off it promotes a bot wall
+///   above the preprint every registry agrees is the work. It 403s an anonymous
+///   client, so it is worse than useless: it is a candidate that wins.
+/// - `syndication` — a content-redistribution service for third parties.
+///   **Not in Crossref's format documentation**, which lists only `text-mining`,
+///   `similarity-checking` and `unspecified`. Observed at PNAS, OUP and APS.
+/// - `unspecified` — Crossref's record that the publisher **declined to say**.
+///   Absence of a purpose is not a statement that the link is somewhere to read.
+///
+/// A value nobody has seen yet is therefore not a candidate, and adding one is
+/// an amendment to ADR-007 §3 rather than a one-line edit here.
+pub const READING_ROUTE_APPLICATIONS: [&str; 1] = ["text-mining"];
+
+/// One place the full text might be, from Crossref's `link[]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrossrefLink {
     pub url: String,
     pub content_type: Option<String>,
     /// `intended-application`, e.g. `text-mining` or `similarity-checking`.
+    ///
+    /// Parsed for every entry and **not** filtered here: the resolver decides
+    /// what to do with a link it will not use, and dropping it at the parser
+    /// would mean a plan line could not say "Crossref offered this and it was
+    /// not a reading route".
     pub intended_application: Option<String>,
     /// `content-version`, e.g. `vor` or `am`.
     pub content_version: Option<String>,
     pub version: Option<String>,
+}
+
+impl CrossrefLink {
+    /// Whether this entry is a route to read the work from, per
+    /// [`READING_ROUTE_APPLICATIONS`].
+    ///
+    /// Case-insensitively and whitespace-tolerantly, because Crossref's
+    /// depositors spell the field loosely and the field's *meaning* does not
+    /// depend on their spelling of it.
+    #[must_use]
+    pub fn is_reading_route(&self) -> bool {
+        self.intended_application
+            .as_deref()
+            .is_some_and(|declared| {
+                let declared = declared.trim();
+                READING_ROUTE_APPLICATIONS
+                    .iter()
+                    .any(|route| route.eq_ignore_ascii_case(declared))
+            })
+    }
 }
 
 /// Read `message.link[]`, in Crossref's own array-of-objects shape.
@@ -493,6 +546,195 @@ mod tests {
             Arc::new(GrantingPacer),
             scitadel_http::BucketPolicyTable::new(),
         )
+    }
+
+    // =====================================================================
+    // `link[intended-application=…]`: which entries are a reading route.
+    // =====================================================================
+
+    /// **The thing #260 exists to change**, in the exact shape the live probe
+    /// table found it: Crossref declares a bioRxiv posting a *preprint*
+    /// (`type: posted-content`) and attaches a plagiarism-detection endpoint
+    /// stamped `content-version: vor`.
+    ///
+    /// Both facts are read, and the second one is not a reading route. Measured
+    /// 2026-10-07 against `GET https://api.crossref.org/works/10.1101%2F2025.06.14.659707`:
+    ///
+    /// ```text
+    /// type: posted-content
+    /// link[0]: content-type: unspecified, content-version: vor,
+    ///          intended-application: similarity-checking
+    ///          https://syndication.highwire.org/content/doi/10.1101/2025.06.14.659707
+    /// ```
+    ///
+    /// `syndication.highwire.org/content/doi/…` is Crossref's own service for
+    /// comparing submissions against deposited literature. It is not somewhere a
+    /// person or a library reads a paper, and it answers a ranged GET with 403.
+    #[test]
+    fn a_similarity_checking_endpoint_is_not_a_reading_route() {
+        let body = serde_json::json!({
+            "message": {
+                "type": "posted-content",
+                "link": [{
+                    "URL": "https://syndication.highwire.org/content/doi/10.1101/2025.06.14.659707",
+                    "content-type": "unspecified",
+                    "content-version": "vor",
+                    "intended-application": "similarity-checking",
+                }],
+            }
+        });
+
+        // `links` takes the `message` object, which is how `resolve` passes it.
+        let message = &body["message"];
+        let parsed = links(message);
+        assert_eq!(
+            parsed.len(),
+            1,
+            "the link is still parsed, so it can be reported"
+        );
+        assert_eq!(
+            parsed[0].content_version.as_deref(),
+            Some("vor"),
+            "the misleading `vor` is the whole problem and must still be visible"
+        );
+        assert!(
+            !parsed[0].is_reading_route(),
+            "a plagiarism-detection endpoint stamped `vor` must not become a \
+             candidate, or it outranks the preprint every registry agrees on"
+        );
+    }
+
+    /// The allow-list, pinned against **every value observed in the wild**, and
+    /// the reason it is an allow-list rather than a deny-list.
+    ///
+    /// Crossref's own format documentation (`Crossref/rest-api-doc`,
+    /// `api_format.md`) declares the field as "Either text-mining,
+    /// similarity-checking or unspecified". Publishers deposit at least one value
+    /// that documentation does not list: `syndication`.
+    ///
+    /// Queries run 2026-10-07, all `GET https://api.crossref.org/works/<doi>` or
+    /// a `?filter=` query against the same host:
+    ///
+    /// - the 16 probe DOIs in `crate::oa_live::OA_260_PROBES` — 13
+    ///   `similarity-checking`, 3 `syndication`, no `text-mining`;
+    /// - `?filter=prefix:10.1371,from-pub-date:2023-01-01&rows=200&select=DOI,link`
+    ///   — 200 links, all `similarity-checking`;
+    /// - `?filter=prefix:10.1016,from-pub-date:2024-06-01&rows=200&select=DOI,link`
+    ///   — 404 links, all `text-mining`;
+    /// - `?filter=prefix:10.1101,from-pub-date:2024-06-01&rows=200&select=DOI,link`
+    ///   — 200 links, all `similarity-checking`;
+    /// - `?filter=has-full-text:true,full-text.application:unspecified&rows=20&select=DOI,link`
+    ///   — `unspecified` 20, `similarity-checking` 21, `syndication` 7, `text-mining` 2.
+    ///
+    /// Four values, one of which the documentation does not list. An allow-list
+    /// keeps the fifth from becoming a candidate by default; a deny-list would
+    /// have to have been updated before the measurement noticed.
+    #[test]
+    fn only_text_mining_is_a_reading_route_and_every_observed_value_is_pinned() {
+        for (declared, is_route) in [
+            // §3 step 5, and the only value that names a route a client fetches.
+            ("text-mining", true),
+            // Crossref's plagiarism-detection service.
+            ("similarity-checking", false),
+            // Crossref's content-redistribution service, absent from the format
+            // documentation and observed at PNAS, OUP and APS.
+            ("syndication", false),
+            // Crossref's record that the publisher **did not say**. Not a
+            // statement that the link is somewhere to read from.
+            ("unspecified", false),
+            // A value nobody has seen yet. Absent from the list, and that is the
+            // point: it is not a candidate until someone argues it is a route.
+            ("text-and-data-mining", false),
+            ("something-new", false),
+        ] {
+            let body = serde_json::json!({
+                "message": {"link": [{
+                    "URL": "https://example.invalid/x.pdf",
+                    "content-version": "vor",
+                    "intended-application": declared,
+                }]}
+            });
+            let parsed = links(&body["message"]);
+            assert_eq!(parsed.len(), 1);
+            assert_eq!(
+                parsed[0].is_reading_route(),
+                is_route,
+                "intended-application: {declared}"
+            );
+        }
+
+        // Case and surrounding whitespace are Crossref's to spell loosely, and
+        // the comparison must not depend on it.
+        for declared in ["Text-Mining", " text-mining ", "TEXT-MINING"] {
+            let body = serde_json::json!({
+                "message": {"link": [{
+                    "URL": "https://example.invalid/x.pdf",
+                    "intended-application": declared,
+                }]}
+            });
+            assert!(
+                links(&body["message"])[0].is_reading_route(),
+                "{declared:?} is `text-mining` spelled differently"
+            );
+        }
+
+        // A `link[]` entry with no `intended-application` at all is not a
+        // declared reading route either.
+        let body = serde_json::json!({
+            "message": {"link": [{"URL": "https://example.invalid/x.pdf"}]}
+        });
+        assert_eq!(links(&body["message"])[0].intended_application, None);
+        assert!(!links(&body["message"])[0].is_reading_route());
+
+        assert_eq!(
+            READING_ROUTE_APPLICATIONS,
+            ["text-mining"],
+            "ADR-007 §3's resolve bullet reads `link[intended-application=text-mining]`. \
+             If this list grows, the ADR needs amending and this constant's doc \
+             needs rewriting — do not widen it quietly."
+        );
+    }
+
+    /// The sanctioned TDM route is **kept**, which is the half of the change
+    /// that is easy to lose: dropping every non-`text-mining` link would also
+    /// drop Elsevier's Article Retrieval API, which is ADR-007 §3 step 5 and the
+    /// only full-text route a TDM-licensed Elsevier article has.
+    ///
+    /// Measured 2026-10-07 against
+    /// `GET https://api.crossref.org/works/10.1016%2Fj.cell.2021.04.048`.
+    #[test]
+    fn a_text_mining_link_is_still_a_candidate() {
+        let body = serde_json::json!({
+            "message": {
+                "type": "journal-article",
+                "link": [
+                    {
+                        "URL": "https://api.elsevier.com/content/article/PII:S0092867421005833?httpAccept=text/xml",
+                        "content-type": "text/xml",
+                        "content-version": "vor",
+                        "intended-application": "text-mining",
+                    },
+                    {
+                        "URL": "https://www.sciencedirect.com/science/article/pii/S0092867421005833/pdfft",
+                        "content-type": "unspecified",
+                        "content-version": "vor",
+                        "intended-application": "similarity-checking",
+                    },
+                ],
+            }
+        });
+
+        let routes: Vec<String> = links(&body["message"])
+            .into_iter()
+            .filter(CrossrefLink::is_reading_route)
+            .map(|link| link.url)
+            .collect();
+        assert_eq!(
+            routes,
+            ["https://api.elsevier.com/content/article/PII:S0092867421005833?httpAccept=text/xml"],
+            "the TDM endpoint survives and the ScienceDirect PDF does not — ADR-007 \
+             §3 step 5 is the Article Retrieval API and ScienceDirect is never scraped"
+        );
     }
 
     // =====================================================================
