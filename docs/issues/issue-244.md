@@ -2,7 +2,7 @@
 type: issue
 state: open
 created: 2026-09-29T12:26:32Z
-updated: 2026-10-03T22:38:31Z
+updated: 2026-10-07T20:18:41Z
 author: renovate[bot]
 author_url: https://github.com/renovate[bot]
 url: https://github.com/vig-os/scitadel/issues/244
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-10-04T07:34:06.603Z
+synced: 2026-10-08T08:09:36.906Z
 ---
 
 # [Issue 244]: [Dependency Dashboard](https://github.com/vig-os/scitadel/issues/244)
@@ -43,7 +43,7 @@ The following updates are awaiting their schedule. To get an update now, click o
  - [ ] <!-- unschedule-branch=renovate/quick-xml-0.x -->chore(deps): update rust crate quick-xml to 0.42
  - [ ] <!-- unschedule-branch=renovate/r2d2_sqlite-0.x -->chore(deps): update rust crate r2d2_sqlite to 0.35
  - [ ] <!-- unschedule-branch=renovate/reqwest-0.x -->chore(deps): update rust crate reqwest to 0.13
- - [ ] <!-- unschedule-branch=renovate/rmcp-3.x-lockfile -->chore(deps): update rust crate rmcp to v3.5.0
+ - [ ] <!-- unschedule-branch=renovate/rmcp-3.x-lockfile -->chore(deps): update rust crate rmcp to v3.5.1
  - [ ] <!-- unschedule-branch=renovate/rusqlite-0.x -->chore(deps): update rust crate rusqlite to 0.40
  - [ ] <!-- unschedule-branch=renovate/scraper-0.x -->chore(deps): update rust crate scraper to 0.27
  - [ ] <!-- unschedule-branch=renovate/sha1-0.x -->chore(deps): update rust crate sha1 to 0.11
@@ -51,7 +51,7 @@ The following updates are awaiting their schedule. To get an update now, click o
  - [ ] <!-- unschedule-branch=renovate/tempfile-3.x-lockfile -->chore(deps): update rust crate tempfile to v3.27.0
  - [ ] <!-- unschedule-branch=renovate/tokio-1.x-lockfile -->chore(deps): update rust crate tokio to v1.53.2
  - [ ] <!-- unschedule-branch=renovate/uuid-1.x-lockfile -->chore(deps): update rust crate uuid to v1.27.0
- - [ ] <!-- unschedule-branch=renovate/zeroize-1.x-lockfile -->chore(deps): update rust crate zeroize to v1.9.0
+ - [ ] <!-- unschedule-branch=renovate/zeroize-1.x-lockfile -->chore(deps): update rust crate zeroize to v1.9.1
  - [ ] <!-- unschedule-branch=renovate/biblatex-0.x -->fix(deps): update rust crate biblatex to 0.12
  - [ ] <!-- unschedule-branch=renovate/toml-0.x -->fix(deps): update rust crate toml to 0.9
  - [ ] <!-- unschedule-branch=renovate/keyring-4.x -->chore(deps): update rust crate keyring to v4
