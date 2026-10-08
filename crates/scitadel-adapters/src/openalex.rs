@@ -703,6 +703,24 @@ pub struct OaLocation {
     /// `landing_page_url`, kept so a location with no PDF still yields a
     /// candidate (an HTML landing page is a candidate the ladder can take).
     pub landing_page_url: Option<String>,
+    /// `locations[].id`, **OpenAlex's own typing of what the location is**.
+    ///
+    /// Not a decoration and not an OpenAlex primary key: it is a *prefixed
+    /// identifier*, and the prefix names the scheme. Measured 2026-10-09 on
+    /// `10.1101/2025.06.14.659707`, one work with three locations:
+    ///
+    /// | `id` | `landing_page_url` |
+    /// |---|---|
+    /// | `doi:10.1101/2025.06.14.659707` | `https://doi.org/10.1101/…` |
+    /// | `pmid:40667369` | `https://pubmed.ncbi.nlm.nih.gov/40667369` |
+    /// | `pmh:oai:pubmedcentral.nih.gov:12262699` | `https://www.ncbi.nlm.nih.gov/pmc/articles/12262699` |
+    ///
+    /// `pmid:` is the field that says *this is a PubMed record about the work*,
+    /// where `pmh:` says the PMC copy and `doi:` says the DOI resolver. It is
+    /// the only thing in the location that distinguishes them, and it is
+    /// OpenAlex's own vocabulary rather than a host this module recognises — the
+    /// distinction #298 turns on.
+    pub id: Option<String>,
     /// `is_oa`, when the location declares it.
     pub is_oa: Option<bool>,
     /// Is this the `best_oa_location` rather than an entry from `locations[]`?
@@ -768,6 +786,12 @@ pub fn oa_locations(work: &serde_json::Value) -> Vec<OaLocation> {
                 .map(str::to_string),
             landing_page_url: landing.map(str::to_string),
             is_oa: value.get("is_oa").and_then(serde_json::Value::as_bool),
+            id: value
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string),
             pdf_url: pdf.map(str::to_string),
         })
     };
@@ -786,6 +810,11 @@ pub fn oa_locations(work: &serde_json::Value) -> Vec<OaLocation> {
             seen.licence = seen.licence.take().or(best.licence);
             seen.landing_page_url = seen.landing_page_url.take().or(best.landing_page_url);
             seen.is_oa = seen.is_oa.or(best.is_oa);
+            // The typed identifier is the same fact twice when the URL is, so
+            // either spelling is the right one — and the *prefix* is what
+            // `crate::resolve` reads the role from, so losing it here would lose
+            // the role.
+            seen.id = seen.id.take().or(best.id);
             if seen.pdf_url.is_none() {
                 seen.pdf_url = best.pdf_url.take();
                 seen.url = seen.url.clone();

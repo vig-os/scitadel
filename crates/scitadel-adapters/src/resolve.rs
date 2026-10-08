@@ -613,26 +613,44 @@ impl FetchStep {
     }
 }
 
-/// Where a candidate sits on [`FetchStep`], from its route and its URL.
+/// Where a candidate sits on [`FetchStep`], from its route, its URL and its
+/// [`CandidateKind`].
 ///
-/// **Route-primary, URL as the override, and only for the three routes that are
-/// identity sources.** `RouteId::Crossref`, `RouteId::DataCite` and
-/// `RouteId::OpenAlex` answer "what does this DOI refer to"; a candidate they
-/// name can be a repository location (step 3), the PMC-OA dataset (step 2) or a
-/// publisher's page (step 6), and the route says nothing about which. So for
-/// those three the URL decides — but only for hosts the ADR itself names, because
-/// a host list of "repositories we recognise" would be a reliability heuristic
-/// wearing a typing hat, and #260 is not a licence to invent one.
+/// **Route-primary, URL as the override, kind as the fallback the route cannot
+/// supply.** [`RouteId::Crossref`], [`RouteId::DataCite`],
+/// [`RouteId::OpenAlex`] and [`RouteId::Unpaywall`] answer "what does this DOI
+/// refer to"; a candidate they name can be a repository location (step 3), the
+/// PMC-OA dataset (step 2) or a publisher's page (step 6), and the route says
+/// nothing about which. So for those four the URL decides — but only for hosts
+/// the ADR itself names, because a host list of "repositories we recognise"
+/// would be a reliability heuristic wearing a typing hat, and #260 is not a
+/// licence to invent one.
+///
+/// The `kind` is what answers the question the ADR leaves open, and it answers it
+/// from the source's own field rather than from the URL: a source that named a
+/// **landing page** has said the thing §3 step 6 is about, whatever route carried
+/// it. That is the only place the kind moves a step, and it moves it for
+/// [`RouteId::DataCite`] alone, because step 3's arm below already carries a
+/// comment recording that `attributes.url` has no home in §3 — #298 gives it one.
 ///
 /// [`the_step_is_derived_from_the_url_where_the_route_is_only_an_identity_source`]
 /// pins every branch, including the one that is a **known limitation**: an
 /// index-named URL on a publisher's own host stays step 3, because nothing in the
 /// URL says it is a publisher.
 #[must_use]
-pub fn fetch_step_for(route: RouteId, url: &str) -> FetchStep {
+pub fn fetch_step_for(route: RouteId, url: &str, kind: CandidateKind) -> FetchStep {
     use RouteId as R;
 
-    // The three identity sources first, and only for hosts ADR-007 §3 names.
+    // The two kinds that are not candidates at all reach here only from a caller
+    // that built a `Candidate` by hand, because the resolver drops them before
+    // ranking. Answering with a fabricated rung would put a citation page back on
+    // the ladder; answering with §3's own "this is not a fetch route" is what
+    // `RouteId::never_fetches` already means.
+    if kind.is_excluded() {
+        return FetchStep::NotAFetchRoute;
+    }
+
+    // The four identity sources first, and only for hosts ADR-007 §3 names.
     if matches!(
         route,
         R::Crossref | R::DataCite | R::OpenAlex | R::Unpaywall
@@ -675,25 +693,38 @@ pub fn fetch_step_for(route: RouteId, url: &str) -> FetchStep {
         // below the publisher landing page would invert #260's preprint clause.
         // The placement is a reading of §3 and it is on the record as one.
         //
-        // `RouteId::DataCite` is here too, and that is a **gap in the ADR**: §3
-        // names DataCite for step 4's `IsSupplementTo` and for nothing else, while
-        // this resolver also builds a `RouteId::DataCite` candidate from
-        // `attributes.url` — the work's **own** landing page, which is not on
-        // §3's ladder at all. Measured on `10.18434/*`, `attributes.url` is
-        // `data.nist.gov/od/id/mds2-…`, a repository landing page for a
-        // national-lab deposit, so step 3 is the honest placement. The gap is
-        // reported rather than papered over with a default.
-        R::OpenAlex | R::Unpaywall | R::Arxiv | R::Biorxiv | R::Osti | R::DataCite => {
+        // **These five keep step 3 whatever the kind**, and that is the ADR's
+        // wording rather than a judgement: step 3 names OpenAlex and Unpaywall by
+        // name, so a landing page they named is an OA repository location and not
+        // a publisher's page. Separating the arm is what stops the kind fallback
+        // below from reaching them — the PMC article copy is a reading location
+        // that would otherwise lose its step-3 tiebreak to the DOI resolver.
+        R::OpenAlex | R::Unpaywall | R::Arxiv | R::Biorxiv | R::Osti => {
             FetchStep::RepositoryLocation
         }
-        // Step 6. `RouteId::ManualUrl` is here too: a URL a person or a reference
-        // manager supplied is the publisher's own page in the ordinary case, and
-        // the resolver already emits `RouteId::Publisher` first for the same
-        // document — so the two tie and the pass's order keeps them apart. The
-        // existing code calls ManualUrl "the last resort"; §3's own last resort is
-        // step 7, and claiming that would be claiming a browser session for a
-        // plain HTTP GET.
-        R::Publisher | R::ManualUrl => FetchStep::PublisherLandingPage,
+        // `RouteId::DataCite`'s step-3 arm, **guarded on the kind**, and it is
+        // the only conditional in this match. §3 names DataCite for step 4's
+        // `IsSupplementTo` and for nothing else, so the work's own
+        // `attributes.url` has no rung in the ADR at all. Measured on
+        // `10.18434/*`, `attributes.url` is `data.nist.gov/od/id/mds2-…` — so
+        // step 3 is the honest placement for anything the record does not
+        // identify as a page, and the guard is what leaves the rest to step 6
+        // below. The gap #292 reported is closed by the record's own field rather
+        // than by a default.
+        R::DataCite if kind != CandidateKind::LandingPage => FetchStep::RepositoryLocation,
+        // Step 6. `RouteId::Publisher` and `RouteId::ManualUrl` are here too: a
+        // URL a person or a reference manager supplied is the publisher's own
+        // page in the ordinary case, and the resolver already emits
+        // `RouteId::Publisher` first for the same document — so the two tie and
+        // the pass's order keeps them apart. The existing code calls ManualUrl
+        // "the last resort"; §3's own last resort is step 7, and claiming that
+        // would be claiming a browser session for a plain HTTP GET.
+        //
+        // `RouteId::DataCite` reaches this arm **through the kind** and is the
+        // only route that does: a source that named a landing page has said the
+        // thing §3 step 6 numbers, whichever route carried it. The arm has to
+        // come after the guarded one above, or it would shadow it.
+        R::Publisher | R::ManualUrl | R::DataCite => FetchStep::PublisherLandingPage,
         // Step 7, verbatim.
         R::BrowserSession => FetchStep::BrowserSession,
         // Not on the ladder at all: these three record where a file came from
@@ -817,6 +848,182 @@ impl LicenceStrength {
     }
 }
 
+/// What a candidate's URL **serves**, from the naming source's own field for it.
+///
+/// The field exists because of #298, and the reason is the same one ADR-007 §3's
+/// `similarity-checking` filter was written for: a URL can be a *record about a
+/// work* rather than a *copy of the work*, and no amount of version or licence
+/// metadata makes the two interchangeable. OpenAlex measured that directly —
+/// `10.1101/2025.06.14.659707`'s PubMed citation page arrives as
+/// `locations[].version = publishedVersion`, so the ladder files a 5590-byte
+/// abstract page as the version of record and the bioRxiv PDF is never fetched.
+///
+/// **Every value is derived from a field the source already populates**, never
+/// from a host this module recognises. A host list would be a reliability
+/// heuristic wearing a typing hat, which is the thing
+/// [`fetch_step_for`]'s known-limitation comment refuses to be:
+///
+/// | source | field | values |
+/// |---|---|---|
+/// | OpenAlex | `locations[].pdf_url` / `landing_page_url` | a document / a page |
+/// | OpenAlex | `locations[].id` prefix | `pmid:` a PubMed record |
+/// | Unpaywall | `url_for_pdf` / `url_for_landing_page` | a document / a page |
+/// | Crossref | `link[].content-type` | `application/pdf`, `text/html` |
+/// | Europe PMC | `fullTextUrl.documentStyle` | `pdf`, `html`, `doi` |
+///
+/// Two values are **not candidates at all** ([`CandidateKind::is_excluded`]):
+/// [`Self::CitationRecord`] and [`Self::Manifest`]. They are kept in the
+/// vocabulary rather than filtered at the source so that the reason a location
+/// was dropped is a typed fact a plan or a report can name, exactly as
+/// `RouteId::never_fetches` names the routes that record provenance instead of
+/// an address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateKind {
+    /// The source named a PDF. OpenAlex `pdf_url`, Unpaywall `url_for_pdf`,
+    /// Crossref `content-type: application/pdf`, Europe PMC
+    /// `documentStyle: pdf`, the PMC-OA dataset's own `pdf_url`.
+    ArticlePdf,
+    /// The source named article **HTML** — the article body in a page, not a
+    /// page about the article. Europe PMC `documentStyle: html`, Crossref
+    /// `content-type: text/html`.
+    ArticleHtml,
+    /// The source named a **place**, not a rendering: a page a human is sent to
+    /// that may serve any version the publisher chooses. ADR-007 §3 step 6 is
+    /// this rung ("Landing-page HTML, for OA works only, after TDM"), and a
+    /// landing page is a legitimate candidate — it is just a *late* one.
+    LandingPage,
+    /// A **bibliographic record about the work**, served by an index rather than
+    /// by a publisher or a repository. A PubMed citation page is the measured
+    /// case: `pubmed.ncbi.nlm.nih.gov/<pmid>` answers 200 with an abstract and
+    /// no PDF, and OpenAlex types the location `pmid:…`.
+    CitationRecord,
+    /// A **machine-readable metadata document** — the DOI resolving to a DataCite
+    /// JSON manifest rather than to a page. Measured on `10.18434/*`, where
+    /// `doi.org/10.18434/mds2-2400` answers 200 with 29 KB of JSON about a
+    /// dataset.
+    Manifest,
+    /// The source named a URL and said nothing about what it serves. Not a
+    /// default that behaves like [`Self::LandingPage`]: it is the absence of a
+    /// role, and it is treated as "no information either way" rather than "a
+    /// page", so it keeps whatever the source said about versions.
+    Unknown,
+}
+
+impl CandidateKind {
+    /// Every value, so a test can walk the vocabulary without hand-maintaining
+    /// a list that a new variant would leave behind.
+    pub const ALL: [Self; 6] = [
+        Self::ArticlePdf,
+        Self::ArticleHtml,
+        Self::LandingPage,
+        Self::CitationRecord,
+        Self::Manifest,
+        Self::Unknown,
+    ];
+
+    /// Whether this kind is **not a candidate at all**, and why that is not the
+    /// same as being ranked last.
+    ///
+    /// A citation record and a metadata manifest are not late rungs on the
+    /// ladder; they are the wrong kind of document, and putting them on the
+    /// ladder at all is what let a 200-with-an-abstract count as an acquisition.
+    /// Dropping them at the source — rather than ranking them and filtering at
+    /// the fetch — is the shape PR #299 gave `similarity-checking`.
+    #[must_use]
+    pub fn is_excluded(self) -> bool {
+        matches!(self, Self::CitationRecord | Self::Manifest)
+    }
+
+    /// Whether the naming source described this candidate as a **rendering of
+    /// the work** — bytes a reader would read — rather than as a place it might
+    /// be found.
+    ///
+    /// Read by [`location_version_word_applies`], which is where the decision
+    /// actually lives. The distinction carries one decision and it is #298's: an
+    /// index's *location-level* version word (`locations[].version`,
+    /// `best_oa_location.version`, `link[].content-version`) is a claim about a
+    /// URL the index catalogued, and where that URL cannot serve a document the
+    /// claim is about whatever it redirects to — which is the *work*, and the
+    /// work-level chain is the authority for that.
+    ///
+    /// [`Self::Unknown`] answers **yes**, deliberately: no role means no
+    /// evidence that the word does not apply, and the absence of a `content-type`
+    /// is not a statement about the document. That keeps a Crossref `link[]`
+    /// with no `content-type` exactly where it was before this field existed.
+    #[must_use]
+    pub fn is_a_rendering(self) -> bool {
+        !matches!(
+            self,
+            Self::LandingPage | Self::CitationRecord | Self::Manifest
+        )
+    }
+
+    /// The phrase a `tracing` record or a plan line uses.
+    #[must_use]
+    pub fn why(self) -> &'static str {
+        match self {
+            Self::ArticlePdf => "a PDF of the work",
+            Self::ArticleHtml => "the work's HTML full text",
+            Self::LandingPage => "a landing page, which ADR-007 §3 step 6 places",
+            Self::CitationRecord => "a bibliographic record about the work, not the work",
+            Self::Manifest => "a machine-readable metadata manifest, not the work",
+            Self::Unknown => "a URL whose role the naming source did not state",
+        }
+    }
+
+    /// How the **source** names this kind, so a plan line can say which field
+    /// the verdict came from.
+    #[must_use]
+    pub fn named_by(self) -> &'static str {
+        match self {
+            Self::ArticlePdf => "the source named a PDF",
+            Self::ArticleHtml => "the source named article HTML",
+            Self::LandingPage => "the source named a landing page",
+            Self::CitationRecord => "the source named a bibliographic record",
+            Self::Manifest => "the source named a metadata manifest",
+            Self::Unknown => "no role stated",
+        }
+    }
+}
+
+/// Whether a location's own version word is a claim about **the bytes at
+/// `url`**, or a claim about a URL the naming index merely catalogued.
+///
+/// #298's proposal 2, narrowed to what the pass can actually prove.
+///
+/// The broad reading — *no* `landing_page_url` takes a version word — is
+/// unsound on the measurement that row was meant to protect. OpenAlex's
+/// `best_oa_location` for `10.1093/neuonc/noz175.233` is
+/// `https://www.ncbi.nlm.nih.gov/pmc/articles/6847611` with
+/// `version: publishedVersion`, and PMC serves 94 KB of article HTML there. The
+/// word *is* a claim about the bytes; taking it away sends a working copy of the
+/// version of record to `Unstated` and loses a working reading location.
+///
+/// The narrow reading keeps the part that is provable. A version word is a claim
+/// about what `url` serves, and there is exactly one URL shape this pass can
+/// name that **serves no document by construction**: the DOI resolver. `doi.org`
+/// answers with a redirect and nothing else, ADR-007 §3 step 6 already names it
+/// as the landing page, and [`fetch_step_for`] already recognises those hosts for
+/// exactly that reason. A version word on a URL that cannot serve a document is
+/// a claim about whatever the redirect lands on — which is the *work*, and the
+/// work-level chain is the authority for that.
+///
+/// It is also what [`RouteId::Publisher`]'s own candidate for the same URL
+/// already reads, so the rule stops one URL carrying two different versions
+/// through two routes. Measured on `10.1101/2024.10.10.615955`: OpenAlex's
+/// `best_oa_location` files `doi.org/10.1101/…` as `acceptedVersion` while the
+/// same record's `type` is `preprint`, and both candidates named the same URL.
+#[must_use]
+fn location_version_word_applies(kind: CandidateKind, url: &str) -> bool {
+    if kind.is_a_rendering() {
+        return true;
+    }
+    // Not the resolver, so the URL may serve any rendering and the source's word
+    // about it stands.
+    !url_has_host(url, &["doi.org", "dx.doi.org"])
+}
+
 /// One place the full text might be, with everything the ranker needs to place
 /// it — and nothing that had to be fetched to find out.
 ///
@@ -835,6 +1042,9 @@ pub struct Candidate {
     /// Which registry named this location, or the route transform that derived
     /// it. Displayed so a plan line says *where the claim came from*.
     pub named_by: String,
+    /// What [`Self::url`] serves, in the naming source's own field. See
+    /// [`CandidateKind`].
+    pub kind: CandidateKind,
     /// The version, **or** the absence of one.
     pub version: Option<Version>,
     /// Why [`Self::version`] is what it is.
@@ -847,10 +1057,11 @@ impl Candidate {
     #[must_use]
     pub fn why(&self) -> String {
         format!(
-            "{} via {} (named by {}) — version {} [{}]; {}",
+            "{} via {} (named by {}) — {}; version {} [{}]; {}",
             self.url,
             self.route.label(),
             self.named_by,
+            self.kind.why(),
             self.version
                 .map_or_else(|| "unrankable".to_string(), |version| version.to_string()),
             self.version_source.why(),
@@ -1042,7 +1253,7 @@ fn rank_by(candidate: &Candidate) -> Rank {
             .version
             .expect("rank_candidates only sorts candidates that carry a version"),
         licence: candidate.licence,
-        fetch_step: fetch_step_for(candidate.route, &candidate.url),
+        fetch_step: fetch_step_for(candidate.route, &candidate.url, candidate.kind),
     }
 }
 
@@ -1579,6 +1790,28 @@ impl MetadataPass {
                     // lists all of them, open or not, and a repository copy it
                     // indexed once is not thereby free to read.
                     let best = location.is_best;
+                    let kind = openalex_location_kind(location);
+                    // A citation record is not a candidate, and the reason is
+                    // the kind rather than the URL: OpenAlex typed the location
+                    // `pmid:…` itself, and a PubMed abstract page is where
+                    // metadata about a work is served. Filed and reported, never
+                    // fetched — the shape #299 gave a `similarity-checking`
+                    // `link[]`.
+                    if kind.is_excluded() {
+                        tracing::debug!(
+                            url,
+                            named_by = if best {
+                                format!("{} best_oa_location", Registry::OpenAlex)
+                            } else {
+                                format!("{} locations[{}]", Registry::OpenAlex, at + 1)
+                            },
+                            kind = %kind.why(),
+                            "openalex named a location that describes the work \
+                             rather than serving it; it is not offered as a \
+                             candidate"
+                        );
+                        continue;
+                    }
                     if !is_fetchable_url(url) {
                         tracing::info!(
                             url,
@@ -1597,6 +1830,7 @@ impl MetadataPass {
                             } else {
                                 format!("{} locations[{}]", Registry::OpenAlex, at + 1)
                             },
+                            kind,
                             version_word: location.version_word.clone(),
                             version_flag: None,
                             location_licence: location.licence.clone(),
@@ -1674,6 +1908,22 @@ impl MetadataPass {
                         continue;
                     };
                     let best = location.is_best;
+                    let kind = openalex_location_kind(location);
+                    if kind.is_excluded() {
+                        tracing::debug!(
+                            url,
+                            named_by = if best {
+                                format!("{} {short} best_oa_location", Registry::OpenAlex)
+                            } else {
+                                format!("{} {short} locations[{}]", Registry::OpenAlex, at + 1)
+                            },
+                            kind = %kind.why(),
+                            "openalex named a location that describes the work \
+                             rather than serving it; it is not offered as a \
+                             candidate"
+                        );
+                        continue;
+                    }
                     candidates.push(Self::location_candidate(
                         today,
                         CandidateSeed {
@@ -1684,6 +1934,7 @@ impl MetadataPass {
                             } else {
                                 format!("{} {short} locations[{}]", Registry::OpenAlex, at + 1)
                             },
+                            kind,
                             version_word: location.version_word.clone(),
                             version_flag: None,
                             location_licence: location.licence.clone(),
@@ -1765,6 +2016,7 @@ impl MetadataPass {
                             route: RouteId::Crossref,
                             url: link.url.clone(),
                             named_by: format!("{} link[{}]", Registry::Crossref, at + 1),
+                            kind: crossref_link_kind(link.content_type.as_deref()),
                             version_word: link.content_version.clone(),
                             version_flag: None,
                             location_licence: None,
@@ -1827,6 +2079,12 @@ impl MetadataPass {
                             route: RouteId::DataCite,
                             url: url.to_string(),
                             named_by: format!("{} attributes.url", Registry::DataCite),
+                            // §3 names DataCite for step 4's `IsSupplementTo` and
+                            // nowhere else, so `attributes.url` — the work's own
+                            // page — has no rung in the ADR. A landing page is
+                            // what §3 step 6 numbers, and that is the only
+                            // placement the record's own shape supports.
+                            kind: CandidateKind::LandingPage,
                             version_word: None,
                             version_flag: None,
                             location_licence: None,
@@ -1910,6 +2168,12 @@ impl MetadataPass {
                             route: RouteId::Unpaywall,
                             url: url.to_string(),
                             named_by: format!("{} location {at}", Registry::Unpaywall),
+                            kind: unpaywall_location_kind(
+                                location
+                                    .get("url_for_pdf")
+                                    .and_then(serde_json::Value::as_str)
+                                    .is_some_and(|u| !u.trim().is_empty()),
+                            ),
                             version_word: location
                                 .get("version")
                                 .and_then(serde_json::Value::as_str)
@@ -2004,6 +2268,7 @@ impl MetadataPass {
                                     record.id,
                                     at + 1
                                 ),
+                                kind: europepmc_kind(location),
                                 version_word: None,
                                 version_flag: Some(version_from_repository(
                                     Registry::EuropePmc,
@@ -2110,6 +2375,10 @@ impl MetadataPass {
                                 "not a manuscript"
                             }
                         ),
+                        // The bucket's own `pdf_url`, already asserted non-null
+                        // above, so the document is the dataset's statement
+                        // rather than this module's inference.
+                        kind: CandidateKind::ArticlePdf,
                         version_word: None,
                         version_flag: Some(version_from_repository(
                             Registry::PmcOa,
@@ -2318,6 +2587,10 @@ impl MetadataPass {
                         .trim_start_matches("https://arxiv.org/pdf/")
                 ),
                 named_by: "the record's own arxiv_id".to_string(),
+                // The transform's own path shape: arXiv's `/pdf/<id>` is the
+                // document, which is what makes the version below a claim about
+                // these bytes rather than about a page.
+                kind: CandidateKind::ArticlePdf,
                 version: Some(Version::Preprint),
                 version_source: VersionSource::Route {
                     route: RouteId::Arxiv,
@@ -2333,6 +2606,10 @@ impl MetadataPass {
                     route: candidate.route,
                     url: candidate.url,
                     named_by: format!("the {} DOI transform", candidate.route),
+                    // `preprint.rs` emits `/content/<doi>v<n>.full.pdf` and
+                    // `arxiv.org/pdf/<id>` — documents by construction, which is
+                    // why a route transform may state a version outright.
+                    kind: CandidateKind::ArticlePdf,
                     version: Some(Version::Preprint),
                     version_source: VersionSource::Route {
                         route: candidate.route,
@@ -2350,6 +2627,11 @@ impl MetadataPass {
                 route: RouteId::Osti,
                 url,
                 named_by: format!("the osti_id {id} purl"),
+                // A PURL is a redirect to whatever OSTI decides to serve, so it
+                // names a **place**. The version below is this route's own
+                // assertion — OSTI serves nothing else, so the route is a version
+                // authority by construction — not a reading of the URL.
+                kind: CandidateKind::LandingPage,
                 // A national-lab report's own publication is its version of
                 // record. Stated here rather than left `None` because OSTI
                 // serves nothing else, and a route that can only ever serve one
@@ -2393,6 +2675,10 @@ impl MetadataPass {
                     self.sources.doi_resolver.trim_end_matches('/')
                 ),
                 named_by: "the DOI resolver's landing page".to_string(),
+                // A resolver serves a redirect, which is §3 step 6's document and
+                // nothing else — so the kind agrees with the step and the version
+                // comes from the work-level chain below, never from the page.
+                kind: CandidateKind::LandingPage,
                 // The same four-step chain, so a `10.1101` DOI's landing page
                 // is a preprint (which it is — `doi.org/10.1101/…` lands on the
                 // posting) and an unregistered publisher DOI's landing page is
@@ -2433,6 +2719,10 @@ impl MetadataPass {
                 route: RouteId::ManualUrl,
                 url: url.to_string(),
                 named_by: "the record's own url".to_string(),
+                // No field on the record says what this URL serves, and this
+                // module will not fetch one to find out. `Unknown` keeps the
+                // work-level chain, which is what the version below reads.
+                kind: CandidateKind::Unknown,
                 version: work_level
                     .as_ref()
                     .map(|(version, _)| *version)
@@ -2462,12 +2752,20 @@ impl MetadataPass {
     ///
     /// The chain, strongest first, and the reason for each step:
     ///
-    /// 1. the **location's own** `version` word, if the registry gave one;
-    /// 2. the **record's** `type`, from whichever registry typed it first;
-    /// 3. the **DOI prefix**, the #260 fallback, recorded as such;
-    /// 4. nothing, which makes the candidate [`UnrankedCandidate`].
+    /// 1. the **repository's own** flag about the stored file, if there is one;
+    /// 2. the **location's own** `version` word, if the registry gave one **and**
+    ///    it is a claim about these bytes — see
+    ///    [`location_version_word_applies`];
+    /// 3. the **record's** `type`, from whichever registry typed it first;
+    /// 4. the **DOI prefix**, the #260 fallback, recorded as such;
+    /// 5. nothing, which makes the candidate [`UnrankedCandidate`].
     ///
-    /// Step 4 is a `None` and never a default — and it is only reachable for a
+    /// Step 2's extra condition is the one decision in this pass that declines a
+    /// version a source offered. It is #298's proposal 2, and it is deliberately
+    /// narrow — see [`location_version_word_applies`] for what it costs and why
+    /// the broad reading is unsound.
+    ///
+    /// Step 5 is a `None` and never a default — and it is only reachable for a
     /// candidate whose `licence_floor` is
     /// [`LicenceFloor::IndexAssertionOnly`], because that is the only source in
     /// this pass that can decline to vouch for its own location. Every other
@@ -2487,9 +2785,23 @@ impl MetadataPass {
         // here, while `seed` is whole.
         let route = seed.route;
         let registry_hint = seed.registry_hint();
+        let location_word_applies = location_version_word_applies(seed.kind, &seed.url);
         let (version, version_source) = seed
             .version_flag
             .or_else(|| {
+                if !location_word_applies {
+                    tracing::debug!(
+                        url = %seed.url,
+                        named_by = %named,
+                        kind = %seed.kind.why(),
+                        "the naming source described this URL as a place that \
+                         serves no document — the DOI resolver answers with a \
+                         redirect — so its version word is a claim about the \
+                         work rather than about these bytes; the work-level \
+                         chain decides instead"
+                    );
+                    return None;
+                }
                 seed.version_word.as_deref().and_then(|word| {
                     if route == RouteId::Crossref {
                         version_from_content_version(word)
@@ -2572,6 +2884,7 @@ impl MetadataPass {
             route: seed.route,
             url: seed.url,
             named_by: seed.named_by,
+            kind: seed.kind,
             version,
             version_source,
             licence,
@@ -2816,11 +3129,105 @@ impl RegistryHop {
     }
 }
 
+/// What an OpenAlex location is, in OpenAlex's own vocabulary.
+///
+/// Two fields, read in this order and neither of them a host:
+///
+/// 1. **`locations[].id`'s prefix.** OpenAlex types each location with a prefixed
+///    identifier — `doi:…`, `pmid:…`, `pmh:oai:pubmedcentral.nih.gov:…` — and the
+///    prefix says what the location *is*. A `pmid:` location is a PubMed record,
+///    so it is [`CandidateKind::CitationRecord`] and not a candidate at all. This
+///    is the field #298 turns on, and it is OpenAlex naming the role, not this
+///    module recognising a host.
+/// 2. **`pdf_url` versus `landing_page_url`.** OpenAlex populates them as
+///    separate fields, so the presence of a PDF *is* the source's statement that
+///    the location carries a document.
+///
+/// A location with neither PDF nor landing page yields nothing here and is
+/// dropped by [`crate::openalex::oa_locations`] instead.
+#[must_use]
+pub fn openalex_location_kind(location: &crate::openalex::OaLocation) -> CandidateKind {
+    if location
+        .id
+        .as_deref()
+        .is_some_and(|id| id.starts_with("pmid:"))
+    {
+        return CandidateKind::CitationRecord;
+    }
+    if location.pdf_url.is_some() {
+        CandidateKind::ArticlePdf
+    } else {
+        CandidateKind::LandingPage
+    }
+}
+
+/// What a Crossref `link[]` entry is, from Crossref's own `content-type`.
+///
+/// ADR-007 §3's resolve bullet already filters these on
+/// `intended-application`; `content-type` is the field that says which
+/// *rendering* the surviving link serves. Only the two values Crossref's format
+/// documentation and the measured deposits actually name are mapped:
+///
+/// | `content-type` | kind |
+/// |---|---|
+/// | `application/pdf` | [`CandidateKind::ArticlePdf`] |
+/// | `text/html` | [`CandidateKind::ArticleHtml`] |
+/// | anything else, or absent | [`CandidateKind::Unknown`] |
+///
+/// `Unknown` rather than a guess. A `link[]` is already a text-mining endpoint
+/// by the time it gets here, and an unmapped `content-type` — `application/xml`,
+/// `application/vnd.openxmlformats-…`, `unspecified` — is a rendering this module
+/// has not measured, which is not the same statement as "it is a landing page".
+#[must_use]
+pub fn crossref_link_kind(content_type: Option<&str>) -> CandidateKind {
+    let content_type = content_type.map(str::trim).filter(|ct| !ct.is_empty());
+    match content_type {
+        Some(ct) if ct.eq_ignore_ascii_case("application/pdf") => CandidateKind::ArticlePdf,
+        Some(ct) if ct.eq_ignore_ascii_case("text/html") => CandidateKind::ArticleHtml,
+        _ => CandidateKind::Unknown,
+    }
+}
+
+/// What a Europe PMC `fullTextUrl` entry is, from Europe PMC's own
+/// `documentStyle`.
+///
+/// Europe PMC names three: `pdf`, `html`, and `doi` — and `doi` is the DOI
+/// resolver's landing page, which the pass already derives itself under
+/// [`RouteId::Publisher`]. The two document styles are renderings; the `doi`
+/// style is a place.
+#[must_use]
+pub fn europepmc_kind(location: &crate::europepmc::EuropePmcFullText) -> CandidateKind {
+    match location.document_style.as_deref().map(str::trim) {
+        Some("pdf") => CandidateKind::ArticlePdf,
+        Some("html") => CandidateKind::ArticleHtml,
+        _ => CandidateKind::LandingPage,
+    }
+}
+
+/// What a Unpaywall location is, from Unpaywall's own two URL fields.
+///
+/// `url_for_pdf` is the document; `url_for_landing_page` is the page. The pass
+/// currently reads only `url_for_pdf`, so today every Unpaywall candidate is an
+/// [`CandidateKind::ArticlePdf`] — and the mapping for the other field is here
+/// because reading it is wave-3 work, not because it is undecided.
+#[must_use]
+pub fn unpaywall_location_kind(has_pdf: bool) -> CandidateKind {
+    if has_pdf {
+        CandidateKind::ArticlePdf
+    } else {
+        CandidateKind::LandingPage
+    }
+}
+
 /// One location's raw facts, before the chain turns them into a version.
 struct CandidateSeed {
     route: RouteId,
     url: String,
     named_by: String,
+    /// What the naming source said this URL serves. Read before the version
+    /// chain, because it decides whether the location's own version word is a
+    /// claim about this candidate at all.
+    kind: CandidateKind,
     /// The location's own `version` word, when the naming registry gave one.
     version_word: Option<String>,
     /// A version a repository stated **as a flag about this copy**, already
@@ -2903,6 +3310,7 @@ mod tests {
                 version.map_or("none", |v| v.label())
             ),
             named_by: "the metadata pass".to_string(),
+            kind: CandidateKind::ArticlePdf,
             version,
             version_source: match version {
                 Some(Version::Unstated) => VersionSource::Unstated {
@@ -3135,13 +3543,166 @@ mod tests {
     fn the_step_4_rung_is_numbered_and_empty() {
         for route in RouteId::ALL {
             assert_ne!(
-                fetch_step_for(route, "https://example.invalid/supp.pdf"),
+                fetch_step_for(
+                    route,
+                    "https://example.invalid/supp.pdf",
+                    CandidateKind::ArticlePdf
+                ),
                 FetchStep::SupplementDiscovery,
                 "{route} now maps to §3 step 4; say in this test which route it is \
                  and why a supplement ranks there"
             );
         }
         assert_eq!(FetchStep::SupplementDiscovery.adr_step(), 4);
+    }
+
+    /// **`CandidateKind::Manifest` is named and currently has no producer**, and
+    /// both halves are deliberate.
+    ///
+    /// The failure it names is measured: `doi.org/10.18434/mds2-2400` answers 200
+    /// with 29 KB of `application/json` — a DataCite record about a dataset, not
+    /// an article — and the harness counted it as "obtained". But **nothing in
+    /// the metadata pass can know that pre-fetch**, because the resolver is
+    /// forbidden to fetch while gathering. DataCite's `attributes.url` is the
+    /// work's own landing page; its `contentUrl` is null; its
+    /// `types.resourceTypeGeneral` is a claim about the work, not about the
+    /// document the URL serves.
+    ///
+    /// So the variant is in the vocabulary because the report needs a name for
+    /// what that row *is*, and the test pins that no source yet claims it. The
+    /// day one does — a `content-type`, a `documentStyle`, a recognisable manifest
+    /// path — this fails and asks for the field it read.
+    #[test]
+    fn the_manifest_kind_is_named_and_empty() {
+        assert!(
+            CandidateKind::Manifest.is_excluded(),
+            "a metadata manifest is a record about the work, not the work"
+        );
+        // Every mapping the pass has, and none of them produces a manifest.
+        let doi_landing = crate::openalex::OaLocation {
+            url: "https://data.nist.gov/od/id/mds2-2400".to_string(),
+            pdf_url: None,
+            version_word: None,
+            licence: None,
+            landing_page_url: Some("https://data.nist.gov/od/id/mds2-2400".to_string()),
+            id: Some("doi:10.18434/mds2-2400".to_string()),
+            is_oa: Some(true),
+            is_best: true,
+        };
+        assert_ne!(
+            openalex_location_kind(&doi_landing),
+            CandidateKind::Manifest
+        );
+        assert_ne!(unpaywall_location_kind(false), CandidateKind::Manifest);
+        assert_ne!(crossref_link_kind(None), CandidateKind::Manifest);
+        // The three sources that could name a manifest and do not: Crossref has
+        // no `application/json` `content-type` in the measured deposits, Europe
+        // PMC's `documentStyle` is pdf/html/doi, and DataCite's `attributes.url`
+        // is its landing page.
+        let mut full_text = crate::europepmc::EuropePmcFullText {
+            url: "https://europepmc.org/article/MED/2400".to_string(),
+            site: Some("Europe_PMC".to_string()),
+            document_style: Some("html".to_string()),
+            availability_code: Some("OA".to_string()),
+        };
+        for style in ["pdf", "html", "doi"] {
+            full_text.document_style = Some(style.to_string());
+            assert_ne!(europepmc_kind(&full_text), CandidateKind::Manifest);
+        }
+    }
+
+    /// **A DOI-resolver landing page does not take the version a location word
+    /// gave it.**
+    ///
+    /// The one decision in this pass that declines a version a source offered,
+    /// and it is #298's proposal 2 narrowed to what the pass can prove. Measured
+    /// both ways, and both measurements are on the record:
+    ///
+    /// - the **broad** rule (no `landing_page_url` takes a version word) costs
+    ///   `10.1093/neuonc/noz175.233` its working copy. OpenAlex's
+    ///   `best_oa_location` there is the PMC article page filed
+    ///   `publishedVersion`, and PMC serves 94 KB of article HTML from it — the
+    ///   word *is* about the bytes, so the rule moves a working VoR to
+    ///   `Unstated`;
+    /// - the **narrow** rule (only the DOI resolver's URL, which serves a
+    ///   redirect and never a document) takes nothing away from it and still
+    ///   stops `10.1101/2024.10.10.615955`'s `doi.org` page being filed
+    ///   `acceptedVersion` while the record's own `type` says `preprint`.
+    #[test]
+    fn a_doi_resolver_landing_page_takes_the_work_version_not_its_location_word() {
+        // A document always keeps its own word.
+        for kind in [CandidateKind::ArticlePdf, CandidateKind::ArticleHtml] {
+            assert!(
+                location_version_word_applies(kind, "https://example.invalid/x.pdf"),
+                "{kind:?} is a rendering, so `locations[].version` applies"
+            );
+        }
+        // A repository landing page keeps its own word too, because it may serve
+        // any rendering and the source's statement about it stands.
+        assert!(
+            location_version_word_applies(
+                CandidateKind::LandingPage,
+                "https://www.ncbi.nlm.nih.gov/pmc/articles/6847611"
+            ),
+            "PMC serves the article HTML from its landing page, so the word is a \\
+             claim about the bytes — this is the row the broad rule would cost"
+        );
+        assert!(
+            location_version_word_applies(
+                CandidateKind::LandingPage,
+                "https://www.biorxiv.org/content/10.1101/2024.10.10.615955v2"
+            ),
+            "a preprint server's own posting page likewise"
+        );
+        // The DOI resolver does not, in either spelling.
+        for url in [
+            "https://doi.org/10.1101/2024.10.10.615955",
+            "https://dx.doi.org/10.1101/2024.10.10.615955",
+        ] {
+            assert!(
+                !location_version_word_applies(CandidateKind::LandingPage, url),
+                "{url} answers with a redirect and never with a document, so a \\
+                 version word on it is a claim about the work"
+            );
+        }
+        // A DOI-resolver URL the source called a **document** keeps the word:
+        // the kind, not the host, is the primary decision.
+        assert!(
+            location_version_word_applies(
+                CandidateKind::ArticlePdf,
+                "https://doi.org/10.1101/2024.10.10.615955"
+            ),
+            "no source names a PDF at doi.org today, and if one ever did the \\
+             document would outrank the place"
+        );
+        // The two excluded kinds never reach the predicate at all — the
+        // OpenAlex loop drops them before a candidate is built, which is what
+        // `a_citation_record_and_a_manifest_are_not_placed_on_the_adr_ladder`
+        // pins. Asserted here only so the vocabulary's own two predicates cannot
+        // drift apart.
+        for kind in [CandidateKind::CitationRecord, CandidateKind::Manifest] {
+            assert!(
+                kind.is_excluded(),
+                "{kind:?} is excluded by `is_excluded`, so this predicate's \
+                 answer about it is never read"
+            );
+        }
+        // And the vocabulary's own predicate: `Unknown` is the only value whose
+        // answer is "no role, so the word stands", which is what keeps a
+        // Crossref `link[]` with no `content-type` where it was before this
+        // field existed.
+        assert!(
+            CandidateKind::Unknown.is_a_rendering(),
+            "no role means no evidence the word does not apply"
+        );
+        let excluded: Vec<CandidateKind> = CandidateKind::ALL
+            .into_iter()
+            .filter(|kind| kind.is_excluded())
+            .collect();
+        assert_eq!(
+            excluded,
+            vec![CandidateKind::CitationRecord, CandidateKind::Manifest]
+        );
     }
 
     /// The reason the ladder is not a weighted score: interleaving licence and
@@ -3274,12 +3835,12 @@ mod tests {
                 "the fixture must exercise two different fetch steps"
             );
             assert_eq!(
-                fetch_step_for(stronger.route, &stronger.url),
+                fetch_step_for(stronger.route, &stronger.url, stronger.kind),
                 FetchStep::PmcOa,
                 "the fixture's premise: the repository copy is §3 step 2"
             );
             assert!(
-                fetch_step_for(weaker.route, &weaker.url) > FetchStep::PmcOa,
+                fetch_step_for(weaker.route, &weaker.url, weaker.kind) > FetchStep::PmcOa,
                 "the fixture's premise: the weaker candidate is on a later rung"
             );
 
@@ -3307,7 +3868,11 @@ mod tests {
     #[test]
     fn every_route_id_is_placed_on_the_adr_fetch_order() {
         for route in RouteId::ALL {
-            let step = crate::resolve::fetch_step_for(route, "https://example.invalid/x.pdf");
+            let step = crate::resolve::fetch_step_for(
+                route,
+                "https://example.invalid/x.pdf",
+                CandidateKind::ArticlePdf,
+            );
             assert!(
                 crate::resolve::FetchStep::ALL.contains(&step),
                 "{route} mapped to a step outside the ladder"
@@ -3353,7 +3918,11 @@ mod tests {
     fn a_route_that_never_fetches_is_never_the_chosen_candidate() {
         for route in [RouteId::Legacy, RouteId::ImportFlat, RouteId::Manual] {
             assert_eq!(
-                crate::resolve::fetch_step_for(route, "https://example.invalid/x.pdf"),
+                crate::resolve::fetch_step_for(
+                    route,
+                    "https://example.invalid/x.pdf",
+                    CandidateKind::ArticlePdf
+                ),
                 crate::resolve::FetchStep::NotAFetchRoute,
                 "{route} records where a file came from rather than where to fetch \
                  it, so it has no place on §3's fetch ladder"
@@ -3366,7 +3935,8 @@ mod tests {
         assert_eq!(
             crate::resolve::fetch_step_for(
                 RouteId::BrowserSession,
-                "https://example.invalid/x.pdf"
+                "https://example.invalid/x.pdf",
+                CandidateKind::ArticlePdf
             ),
             crate::resolve::FetchStep::BrowserSession,
             "ADR-007 §3 step 7 is the last resort and is still a fetch route"
@@ -3393,7 +3963,8 @@ mod tests {
         assert_eq!(
             step_of(
                 RouteId::Crossref,
-                "https://pmc-oa-opendata.s3.amazonaws.com/PMC4702794.1/PMC4702794.1.pdf"
+                "https://pmc-oa-opendata.s3.amazonaws.com/PMC4702794.1/PMC4702794.1.pdf",
+                CandidateKind::ArticlePdf
             ),
             Step::PmcOa
         );
@@ -3401,7 +3972,11 @@ mod tests {
         // registry named it.
         for route in [RouteId::OpenAlex, RouteId::Unpaywall, RouteId::DataCite] {
             assert_eq!(
-                step_of(route, "https://doi.org/10.18434/mds2-2400"),
+                step_of(
+                    route,
+                    "https://doi.org/10.18434/mds2-2400",
+                    CandidateKind::LandingPage
+                ),
                 Step::PublisherLandingPage,
                 "{route} naming doi.org named the landing page, which §3 step 6 is"
             );
@@ -3410,22 +3985,245 @@ mod tests {
         assert_eq!(
             step_of(
                 RouteId::OpenAlex,
-                "https://europepmc.org/articles/PMC4702794"
+                "https://europepmc.org/articles/PMC4702794",
+                CandidateKind::ArticlePdf
             ),
             Step::EuropePmc
         );
         // A publisher's own PDF named by an index stays step 3, because §3 step 3
-        // is "OA repository locations **from OpenAlex and Unpaywall**" and the
+        // is "OA repository locations **from OpenLex and Unpaywall**" and the
         // resolver cannot tell a repository host from a publisher host without a
         // list. Asserted so the limitation is a decision on the record rather
         // than an oversight; see the report.
         assert_eq!(
             step_of(
                 RouteId::Unpaywall,
-                "https://www.mdpi.com/1420-3049/24/15/2793/pdf"
+                "https://www.mdpi.com/1420-3049/24/15/2793/pdf",
+                CandidateKind::ArticlePdf
             ),
             Step::RepositoryLocation
         );
+    }
+
+    /// **The kind, not a host list, says what a landing page is.**
+    ///
+    /// The PMC **article** copy and the PubMed **citation page** differ in
+    /// nothing a host list can separate at a glance — both are NCBI, both are
+    /// named by OpenAlex from `locations[]`, both carry a version word — and the
+    /// one is a reading location while the other is a record about the work.
+    /// What separates them is OpenAlex's own typing: `pmh:oai:pubmedcentral…`
+    /// against `pmid:…`.
+    ///
+    /// This is the test that pins #298's whole vocabulary, and it walks every
+    /// value in the enum so a variant added later cannot go unmapped.
+    #[test]
+    fn every_candidate_kind_is_derived_from_the_field_its_own_source_populates() {
+        use crate::openalex::OaLocation;
+
+        // ---- OpenAlex: `pdf_url` / `landing_page_url`, then the typed `id`. ----
+        // A PDF location, `id: doi:…`.
+        let doi_pdf = OaLocation {
+            url: "https://example.invalid/a.pdf".to_string(),
+            pdf_url: Some("https://example.invalid/a.pdf".to_string()),
+            version_word: Some("publishedVersion".to_string()),
+            licence: None,
+            landing_page_url: None,
+            id: Some("doi:10.1101/2025.06.14.659707".to_string()),
+            is_oa: Some(true),
+            is_best: true,
+        };
+        assert_eq!(openalex_location_kind(&doi_pdf), CandidateKind::ArticlePdf);
+
+        // A landing page, `id: doi:…` — the DOI resolver's page, which is a place.
+        let doi_landing = OaLocation {
+            pdf_url: None,
+            landing_page_url: Some("https://doi.org/10.1101/2025.06.14.659707".to_string()),
+            ..doi_pdf.clone()
+        };
+        assert_eq!(
+            openalex_location_kind(&doi_landing),
+            CandidateKind::LandingPage
+        );
+
+        // A landing page whose typed identifier is a **PMID**: PubMed's citation
+        // record. Same fields as the row above, one field different, and that is
+        // the entire distinction.
+        let pubmed = OaLocation {
+            id: Some("pmid:40667369".to_string()),
+            ..doi_landing.clone()
+        };
+        assert_eq!(
+            openalex_location_kind(&pubmed),
+            CandidateKind::CitationRecord,
+            "the `pmid:` prefix is OpenAlex naming the location as a PubMed \
+             record about the work"
+        );
+
+        // The PMC **article** copy: a landing page with a `pmh:` identifier, and
+        // it is *not* a citation record — #297 measured 233 KB of article HTML
+        // from this URL, which is the row the fix must not cost.
+        let pmc = OaLocation {
+            id: Some("pmh:oai:pubmedcentral.nih.gov:12262699".to_string()),
+            ..doi_landing.clone()
+        };
+        assert_eq!(openalex_location_kind(&pmc), CandidateKind::LandingPage);
+
+        // A PMC location that *does* carry a PDF stays a document.
+        let pmc_pdf = OaLocation {
+            id: Some("pmh:oai:pubmedcentral.nih.gov:11601547".to_string()),
+            pdf_url: Some(
+                "https://pmc.ncbi.nlm.nih.gov/articles/PMC11601547/pdf/x.pdf".to_string(),
+            ),
+            ..doi_pdf.clone()
+        };
+        assert_eq!(openalex_location_kind(&pmc_pdf), CandidateKind::ArticlePdf);
+
+        // ---- Unpaywall: `url_for_pdf` / `url_for_landing_page`. ----
+        assert_eq!(
+            unpaywall_location_kind(true),
+            CandidateKind::ArticlePdf,
+            "`url_for_pdf` is the document"
+        );
+        assert_eq!(
+            unpaywall_location_kind(false),
+            CandidateKind::LandingPage,
+            "`url_for_landing_page` is the page"
+        );
+
+        // ---- Crossref: `link[].content-type`. ----
+        assert_eq!(
+            crossref_link_kind(Some("application/pdf")),
+            CandidateKind::ArticlePdf
+        );
+        assert_eq!(
+            crossref_link_kind(Some("text/html")),
+            CandidateKind::ArticleHtml
+        );
+        // Absent or unmapped is `Unknown`, not a guess at a page: the absence of
+        // a `content-type` is not a statement about the document.
+        assert_eq!(crossref_link_kind(None), CandidateKind::Unknown);
+        assert_eq!(
+            crossref_link_kind(Some("application/xml")),
+            CandidateKind::Unknown
+        );
+
+        // ---- Europe PMC: `fullTextUrl.documentStyle`. ----
+        let mut full_text = crate::europepmc::EuropePmcFullText {
+            url: "https://europepmc.org/article/PPR/PPR1039145".to_string(),
+            site: Some("Europe_PMC".to_string()),
+            document_style: Some("html".to_string()),
+            availability_code: Some("OA".to_string()),
+        };
+        assert_eq!(europepmc_kind(&full_text), CandidateKind::ArticleHtml);
+        full_text.document_style = Some("pdf".to_string());
+        assert_eq!(europepmc_kind(&full_text), CandidateKind::ArticlePdf);
+        // `documentStyle: doi` is the DOI resolver's page, and Europe PMC files
+        // it apart from the two document styles for exactly that reason.
+        full_text.document_style = Some("doi".to_string());
+        full_text.site = Some("DOI".to_string());
+        assert_eq!(europepmc_kind(&full_text), CandidateKind::LandingPage);
+        full_text.document_style = None;
+        assert_eq!(europepmc_kind(&full_text), CandidateKind::LandingPage);
+    }
+
+    /// **The two excluded kinds are never placed on the ladder**, and a caller
+    /// that builds one by hand gets §3's own answer rather than a fabricated
+    /// rung.
+    ///
+    /// The resolver drops them before `rank_candidates`, so this arm is reachable
+    /// only through `fetch_step_for` directly — which is why it is pinned here:
+    /// a citation page that reaches the ranking through some other path would be
+    /// silent otherwise.
+    #[test]
+    fn a_citation_record_and_a_manifest_are_not_placed_on_the_adr_ladder() {
+        assert!(
+            CandidateKind::CitationRecord.is_excluded(),
+            "a citation record is not a candidate at all"
+        );
+        assert!(
+            CandidateKind::Manifest.is_excluded(),
+            "a metadata manifest is not a candidate at all"
+        );
+        // And the two that *are* late rungs are not excluded — #298's
+        // "do not over-exclude".
+        for kind in [CandidateKind::ArticlePdf, CandidateKind::Unknown] {
+            assert!(
+                !kind.is_excluded(),
+                "{kind:?} is a candidate; only a record and a manifest are not"
+            );
+        }
+        assert!(
+            !CandidateKind::LandingPage.is_excluded(),
+            "a landing page is §3 step 6's document and must stay a candidate"
+        );
+        // `FetchStep::NotAFetchRoute`'s `adr_step()` is 0 precisely so an
+        // excluded kind cannot read as a rung the ADR numbered.
+        assert_eq!(
+            fetch_step_for(
+                RouteId::OpenAlex,
+                "https://pubmed.ncbi.nlm.nih.gov/40667369",
+                CandidateKind::CitationRecord
+            ),
+            crate::resolve::FetchStep::NotAFetchRoute
+        );
+        assert_eq!(
+            fetch_step_for(
+                RouteId::DataCite,
+                "https://data.nist.gov/od/id/mds2-2400",
+                CandidateKind::Manifest
+            ),
+            crate::resolve::FetchStep::NotAFetchRoute
+        );
+    }
+
+    /// **A landing page is step 6 wherever the route cannot say.**
+    ///
+    /// The kind is what answers the question §3 leaves open for a route that is
+    /// only an identity source. DataCite's `attributes.url` is the measured
+    /// case: §3 names DataCite for step 4's `IsSupplementTo` and for nothing
+    /// else, so the work's own page has no rung — and a source that named it a
+    /// landing page has said the thing step 6 is about.
+    ///
+    /// **Only DataCite moves.** OpenAlex and Unpaywall landing pages stay at
+    /// step 3, because §3 step 3 reads "OA repository locations **from OpenAlex
+    /// and Unpaywall**" — the route names the step for those two, and the PMC
+    /// article copy is a reading location that would otherwise lose a tie to
+    /// the DOI resolver's page on ordering alone.
+    #[test]
+    fn a_landing_page_from_a_route_that_cannot_say_is_step_six() {
+        use crate::resolve::FetchStep as Step;
+        use crate::resolve::fetch_step_for as step_of;
+
+        assert_eq!(
+            step_of(
+                RouteId::DataCite,
+                "https://data.nist.gov/od/id/mds2-2400",
+                CandidateKind::LandingPage
+            ),
+            Step::PublisherLandingPage,
+            "the record's own landing page is what §3 step 6 numbers"
+        );
+        // A PDF from the same route is still a repository location: the kind,
+        // not the route, is what moves.
+        assert_eq!(
+            step_of(
+                RouteId::DataCite,
+                "https://example.invalid/report.pdf",
+                CandidateKind::ArticlePdf
+            ),
+            Step::RepositoryLocation
+        );
+        // And OpenAlex/Unpaywall keep step 3 either way — the ADR names them there.
+        for route in [RouteId::OpenAlex, RouteId::Unpaywall] {
+            assert_eq!(
+                step_of(
+                    route,
+                    "https://www.ncbi.nlm.nih.gov/pmc/articles/6847611",
+                    CandidateKind::LandingPage
+                ),
+                Step::RepositoryLocation
+            );
+        }
     }
 
     // =====================================================================
@@ -4482,6 +5280,149 @@ mod tests {
         assert!(
             manuscript_position > 0,
             "and the index's manuscript is below it: {ranked:?}"
+        );
+    }
+
+    /// **#298's acceptance criterion, as a test.**
+    ///
+    /// The measured shape, recorded live on `10.1101/2025.06.14.659707`
+    /// (2026-10-09): OpenAlex files the work's PubMed citation page at
+    /// `locations[1]`, with `landing_page_url = https://pubmed.ncbi.nlm.nih.gov/40667369`
+    /// and `version = publishedVersion`, and the bioRxiv posting at
+    /// `locations[0]` with `acceptedVersion`. The ranker then puts a 5590-byte
+    /// abstract page at rank 1 and the preprint PDF is never fetched — which is
+    /// #260's clause-1 failure that is not the ranker's fault.
+    ///
+    /// OpenAlex types the location itself: `locations[].id` is `pmid:40667369`
+    /// where the bioRxiv copy is `doi:…` and the PMC copy is
+    /// `pmh:oai:pubmedcentral.nih.gov:…`. A location whose identifier is a PMID is
+    /// a *record about the work*, and that is what the source's own role naming
+    /// says — no host list is consulted to reach the verdict.
+    ///
+    /// **Provenance.** The DOI is `10.1101/2025.06.14.659707`, one of the three
+    /// #260 probe DOIs in [`crate::oa_live::OA_260_PROBES`]; the OpenAlex body is
+    /// the live record verbatim, read 2026-10-09 from
+    /// `GET https://api.openalex.org/works/doi:10.1101/2025.06.14.659707`. The
+    /// PMCID `PMC12262699` is the live location's own identifier. No DOI here was
+    /// chosen for the convenience of the assertion.
+    ///
+    /// Asserted on the plan rather than on a fetch: "resolve, then rank" means the
+    /// ranking must be decided by metadata alone, so a citation page that happens
+    /// to be unreachable would be no evidence at all.
+    #[tokio::test]
+    async fn an_openalex_pubmed_citation_page_is_never_a_candidate() {
+        let sources = MetadataSources::new().await;
+        for server in &sources.servers {
+            if server.address().port() == sources.server("openalex").address().port() {
+                continue;
+            }
+            Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(ResponseTemplate::new(404).set_body_string("no\n"))
+                .mount(server)
+                .await;
+        }
+        // The live record, transcribed: every field the pass reads is the one the
+        // live service answered with, and nothing else was added.
+        Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path_regex(
+                r"^/doi:10[.]1101%2F2025[.]06",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(
+                        r#"{"id":"W1","type":"preprint","open_access":{"is_oa":true},
+                            "best_oa_location":{"is_oa":true,
+                              "id":"doi:10.1101/2025.06.14.659707",
+                              "landing_page_url":"https://doi.org/10.1101/2025.06.14.659707",
+                              "version":"acceptedVersion"},
+                            "locations":[
+                              {"is_oa":true,"id":"doi:10.1101/2025.06.14.659707",
+                               "landing_page_url":"https://doi.org/10.1101/2025.06.14.659707",
+                               "version":"acceptedVersion"},
+                              {"is_oa":false,"id":"pmid:40667369",
+                               "landing_page_url":"https://pubmed.ncbi.nlm.nih.gov/40667369",
+                               "version":"publishedVersion"},
+                              {"is_oa":true,"id":"pmh:oai:pubmedcentral.nih.gov:12262699",
+                               "landing_page_url":"https://www.ncbi.nlm.nih.gov/pmc/articles/12262699",
+                               "version":"submittedVersion"}]}"#,
+                    ),
+            )
+            .mount(sources.server("openalex"))
+            .await;
+        let pacer = Arc::new(RecordingPacer::default());
+        let resolution = pass_for(&sources)
+            .resolve(
+                &recording_client(&pacer, sources.table.clone()),
+                &WorkScope::new(),
+                WorkRefs {
+                    doi: Some("10.1101/2025.06.14.659707"),
+                    ..WorkRefs::default()
+                },
+            )
+            .await;
+
+        // (a) The citation page is not a candidate at all — reported, never
+        // fetched, exactly as a `similarity-checking` `link[]` is not.
+        let pubmed = resolution
+            .candidates()
+            .any(|candidate| candidate.url.contains("pubmed.ncbi.nlm.nih.gov"));
+        assert!(
+            !pubmed,
+            "OpenAlex named a PubMed citation record as a location; it is a page \
+             about the work, not the work: {}",
+            resolution.plan_lines().join("\n")
+        );
+
+        // (b) Every candidate is a **preprint**, so none of them carries the
+        // `publishedVersion` word that was filed against the citation page. The
+        // work is `type: preprint`; the `acceptedVersion` word belonged to a
+        // landing page and the `publishedVersion` word to a PubMed record, and
+        // neither is a claim about bytes a reader would read. What is left
+        // competes on ADR-007 §3's fetch order instead of being buried under a
+        // citation page's version-of-record assertion.
+        let versions: Vec<Option<Version>> = resolution
+            .candidates()
+            .map(|candidate| candidate.version)
+            .collect();
+        assert_eq!(
+            versions,
+            vec![Some(Version::Preprint); versions.len()],
+            "the record's only VoR word was attached to a page about the work, \
+             so nothing claims a version of record: {}",
+            resolution.plan_lines().join("\n")
+        );
+
+        // (c) And the preprint transform the DOI already implies is still here,
+        // still a preprint, and outranked by nothing but a reading location the
+        // ADR itself places earlier — §3's own chain order, which is the tiebreak
+        // the pass documents.
+        let bio = resolution
+            .candidates()
+            .find(|candidate| candidate.route == RouteId::Biorxiv)
+            .expect("the 10.1101 transform is still derived");
+        assert!(
+            bio.url.contains("10.1101/2025.06.14.659707"),
+            "the transform names {}",
+            bio.url
+        );
+        assert_eq!(bio.version, Some(Version::Preprint));
+        assert_eq!(bio.kind, CandidateKind::ArticlePdf);
+        assert!(
+            !resolution.ranked.is_empty(),
+            "something is ranked, and the ranked list is what a plan prints"
+        );
+
+        // (d) The PMC **article** copy is untouched: OpenAlex names it a landing
+        // page with `submittedVersion`, and it is still a ranked candidate. This
+        // is the row the fix must not cost.
+        assert!(
+            resolution
+                .candidates()
+                .any(|candidate| candidate.url
+                    == "https://www.ncbi.nlm.nih.gov/pmc/articles/12262699"),
+            "the PMC article copy is a reading location and must survive: {}",
+            resolution.plan_lines().join("\n")
         );
     }
 
