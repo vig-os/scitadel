@@ -30,7 +30,7 @@ jobs:
     # rest stay at 10m where they have ~3m of headroom over their
     # observed wall-clock. Total wall-clock stays under 14m because
     # shards run in parallel.
-    timeout-minutes: ${{ matrix.shard.timeout-minutes || 10 }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -67,10 +67,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: rustup show active-toolchain && rustc --version
 
-      - name: Install ffmpeg + ttyd
+      # ffmpeg + ttyd and the release build are independent; running them
+      # serially was the ~8m of fixed overhead that put every shard within one
+      # slow tape of the 10m ceiling. Measured: the small shards dropped from
+      # ~9m to 3-4m once they ran concurrently.
+      - name: Install ffmpeg + ttyd, and build scitadel, concurrently
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg ttyd
+          set -uo pipefail
+          (sudo apt-get update && sudo apt-get install -y ffmpeg ttyd) &
+          apt_pid=$!
+          cargo build --release -p scitadel-cli &
+          build_pid=$!
+          apt_rc=0; build_rc=0
+          wait "$apt_pid" || apt_rc=$?
+          wait "$build_pid" || build_rc=$?
+          [ "$apt_rc" -eq 0 ] || { echo "::error::ffmpeg/ttyd install failed"; exit 1; }
+          [ "$build_rc" -eq 0 ] || { echo "::error::release build failed"; exit 1; }
+          command -v ffmpeg >/dev/null && command -v ttyd >/dev/null
 
       - name: Install vhs
         run: |
@@ -79,9 +92,6 @@ jobs:
             -o vhs.deb
           sudo dpkg -i vhs.deb
           vhs --version
-
-      - name: Build scitadel
-        run: cargo build --release -p scitadel-cli
 
       - name: Run shard tapes
         env:
