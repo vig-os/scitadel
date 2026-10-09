@@ -30,47 +30,17 @@ jobs:
     # rest stay at 10m where they have ~3m of headroom over their
     # observed wall-clock. Total wall-clock stays under 14m because
     # shards run in parallel.
-    # 20m, not 10m, and no per-shard patching. #274 was filed as "the
-    # ffmpeg/ttyd install step is cancelled on a 10-minute timer"; what actually
-    # happens is that every step succeeds and the job is then killed at its own
-    # ceiling. Bounding one shard at a time (#302 for tui-papers, then cli,
-    # then connectivity at two tapes) is whack-a-mole: the fixed setup — apt
-    # install + a release build, run serially — is ~8-10m on its own, so *every*
-    # shard was within one slow tape of the ceiling regardless of tape count.
-    # A budget that fits the overhead removes the need to patch each new shard.
-    # A literal, not `${{ matrix.shard.timeout-minutes || 20 }}`: with every
-    # per-shard override removed, that expression names a property the shard
-    # object no longer has. actionlint rejected it, which is the check doing
-    # its job -- a dead override slot is exactly what let #274 hide as a
-    # timeout.
-    #
-    # 20m is the safety net, not the plan. The measured fix is **shard size**:
-    # every shard with <=3 tapes finishes in 3-4m, while the 7-tape `cli` shard
-    # spent ~20m in the setup+build step alone and rendered two tapes before
-    # the ceiling, and `tui-reader`'s five consumed the whole budget. Per-tape
-    # render is only ~2-3m; the fixed cost varies with the runner, so the
-    # budget cannot be predicted from tape count. Keep shards at <=3 tapes and
-    # this number is never reached.
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         shard:
-          - name: cli-bib
-            tapes: "cli-bib-import.tape cli-bib-rekey.tape cli-coverage-action-list.tape"
-          - name: cli-workflow
-            tapes: "cli-question-workflow.tape cli-search.tape"
-          - name: cli-auth
-            tapes: "cli-auth.tape cli-openalex-title-and-doi.tape"
-            # Seven tapes — the largest shard in the matrix — against the same
-            # 10-minute default. It has been sitting just under the ceiling
-            # (9m in #302's measurement) and now tips over at 10m15s.
+          - name: cli
+            tapes: "cli-bib-import.tape cli-bib-rekey.tape cli-coverage-action-list.tape cli-question-workflow.tape cli-search.tape cli-auth.tape cli-openalex-title-and-doi.tape"
           - name: tui-launch
             tapes: "tui-launch.tape init-wizard.tape"
-          - name: tui-papers-list
-            tapes: "papers-download-state.tape queue-tab.tape"
-          - name: tui-papers-state
-            tapes: "reading-queue-star.tape question-dashboard.tape tui-inbox.tape"
+          - name: tui-papers
+            tapes: "papers-download-state.tape queue-tab.tape reading-queue-star.tape question-dashboard.tape tui-inbox.tape"
             # Five tapes, the same count as tui-reader, and the second-largest
             # shard after it. `timeout-minutes` defaults to 10m per the job
             # expression below, which leaves ~3m of fixed build+install overhead
@@ -79,10 +49,10 @@ jobs:
             # It is not the ffmpeg/ttyd install step #274 describes being
             # cancelled: every step completes, and the job is then killed at its
             # own ceiling with the last tape's render half-finished.
-          - name: reader-writes
-            tapes: "tui-annotation-write.tape tui-annotations-reader.tape"
-          - name: reader-reads
-            tapes: "annotations-in-detail.tape tui-export-keybind.tape tui-paper-note.tape"
+            timeout-minutes: 14
+          - name: tui-reader
+            tapes: "tui-annotation-write.tape tui-annotations-reader.tape annotations-in-detail.tape tui-export-keybind.tape tui-paper-note.tape"
+            timeout-minutes: 14
           - name: theme
             tapes: "theme-dark.tape theme-light.tape theme-toggle.tape"
           - name: connectivity
@@ -97,10 +67,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: rustup show active-toolchain && rustc --version
 
-      # ffmpeg + ttyd and the release build are independent, and running them
-      # serially was the ~8-10min of fixed overhead that put every shard within
-      # one slow tape of the 10m ceiling. They run concurrently here, so the
-      # wall clock is roughly the slower of the two instead of their sum.
+      # ffmpeg + ttyd and the release build are independent; running them
+      # serially was the ~8m of fixed overhead that put every shard within one
+      # slow tape of the 10m ceiling. Measured: the small shards dropped from
+      # ~9m to 3-4m once they ran concurrently.
       - name: Install ffmpeg + ttyd, and build scitadel, concurrently
         run: |
           set -uo pipefail
@@ -111,7 +81,6 @@ jobs:
           apt_rc=0; build_rc=0
           wait "$apt_pid" || apt_rc=$?
           wait "$build_pid" || build_rc=$?
-          echo "apt rc=$apt_rc build rc=$build_rc"
           [ "$apt_rc" -eq 0 ] || { echo "::error::ffmpeg/ttyd install failed"; exit 1; }
           [ "$build_rc" -eq 0 ] || { echo "::error::release build failed"; exit 1; }
           command -v ffmpeg >/dev/null && command -v ttyd >/dev/null
