@@ -99,6 +99,18 @@
 //! version signal is not a candidate with a bad version, and sorting it into
 //! last place by default would make "we guessed" indistinguishable from "the
 //! registries all said preprint".
+//!
+//! # The licence travels, not just its strength (#291)
+//!
+//! [`Candidate::licence`] is a strength and answers the ranking;
+//! [`Candidate::licence_offer`] is the grant that produced it and answers
+//! *which* licence. Both are needed and only the first used to exist: with the
+//! strength alone, `artefacts` recorded `access_basis` — a classification of the
+//! route — and migration 013's four `license_*` columns had no writer at all,
+//! so the manifest mirror reported `null` for every licence forever. The offer
+//! is a registry's statement about the work and is filtered to the candidate's
+//! own version before it is attached, which is what keeps a `vor`-only grant
+//! off a preprint artefact.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -1050,6 +1062,24 @@ pub struct Candidate {
     /// Why [`Self::version`] is what it is.
     pub version_source: VersionSource,
     pub licence: LicenceStrength,
+    /// The offer that produced [`Self::licence`], or `None` when the strength
+    /// came from anywhere but a grant.
+    ///
+    /// **Whose statement this is, and which is the part that is easy to get
+    /// wrong.** A licence offer is a *registry's statement about the work*, so
+    /// the candidate it rides on inherits it — but only for the version this
+    /// candidate was ranked at. The filtering already happened by the time this
+    /// field exists ([`LicenceOffer::counts_for`]), so what survives is a grant
+    /// that covers the document this candidate serves. A `vor`-only CC-BY
+    /// therefore never reaches a preprint candidate, however many registries
+    /// published it.
+    ///
+    /// `None` for the strengths that are not grants: `FreeToRead` is a route's
+    /// own assertion and `SubscriptionRead` is the caller's entitlement, and
+    /// neither names a URL. Recording one anyway would put a licence on bytes
+    /// nobody licensed, which is #261's overclaim with a URL attached — and an
+    /// unwritten `license_url` is the honest answer for those fetches.
+    pub licence_offer: Option<LicenceOffer>,
 }
 
 impl Candidate {
@@ -2596,6 +2626,10 @@ impl MetadataPass {
                     route: RouteId::Arxiv,
                 },
                 licence: LicenceStrength::FreeToRead,
+                // A preprint server states no reuse licence: `FreeToRead` is
+                // this route's own assertion, and there is no URL to record
+                // beside it.
+                licence_offer: None,
             });
         }
 
@@ -2615,6 +2649,7 @@ impl MetadataPass {
                         route: candidate.route,
                     },
                     licence: LicenceStrength::FreeToRead,
+                    licence_offer: None,
                 });
             }
         }
@@ -2643,6 +2678,10 @@ impl MetadataPass {
                     route: RouteId::Osti,
                 },
                 licence: LicenceStrength::FreeToRead,
+                // `access_basis` calls OSTI's work US-government public domain,
+                // and that is a statement about who holds rights, not a grant
+                // with a URL. Nothing here names one.
+                licence_offer: None,
             });
         }
 
@@ -2702,6 +2741,9 @@ impl MetadataPass {
                         because: String::from("no registry typed the work"),
                     }),
                 licence: LicenceStrength::SubscriptionRead,
+                // The DOI resolver and the record's own URL name no licence.
+                // `SubscriptionRead` is the caller's entitlement, not a grant.
+                licence_offer: None,
             });
         }
 
@@ -2742,6 +2784,9 @@ impl MetadataPass {
                         because: String::from("no registry typed the work"),
                     }),
                 licence: LicenceStrength::SubscriptionRead,
+                // The DOI resolver and the record's own URL name no licence.
+                // `SubscriptionRead` is the caller's entitlement, not a grant.
+                licence_offer: None,
             });
         }
 
@@ -2879,6 +2924,16 @@ impl MetadataPass {
         } else {
             licence_strength(&[], version, seed.route, seed.licence_floor)
         };
+        // The offer the winning strength came from, which is the **first** in
+        // `counting` — the location's own statement before the work's, because
+        // the location is the more specific claim about the bytes we would
+        // fetch. `Some` only for `OpenLicence`: the other three strengths name
+        // no URL, so there is nothing to store and nothing to inherit.
+        let licence_offer = if matches!(licence, LicenceStrength::OpenLicence) {
+            counting.into_iter().next()
+        } else {
+            None
+        };
 
         Candidate {
             route: seed.route,
@@ -2888,6 +2943,7 @@ impl MetadataPass {
             version,
             version_source,
             licence,
+            licence_offer,
         }
     }
 
@@ -3331,6 +3387,8 @@ mod tests {
                 None => VersionSource::None,
             },
             licence,
+            // A hand-built fixture states no licence, so it carries no offer.
+            licence_offer: None,
         }
     }
 
@@ -3754,6 +3812,129 @@ mod tests {
                 "{weaker:?} must not outrank {stronger:?} at the same version"
             );
         }
+    }
+
+    /// #291: **which** licence, not just how strong it is — and whose statement
+    /// it is.
+    ///
+    /// The offer rides the candidate that won on it, and it rides *only* the
+    /// candidates whose version it covers. Crossref's `license[]` is a statement
+    /// about the work, the artefact row is one document of the work, and the
+    /// candidate's version is what ties the two together: a `vor`-only CC-BY
+    /// grant reaches the VoR candidate and stops there. The preprint candidate
+    /// beside it — same registry, same record, same grant — carries no offer at
+    /// all, so the artefact recorded for it keeps `license_url` NULL rather
+    /// than claiming a licence that covers a document it does not cover.
+    ///
+    /// That asymmetry is the correctness risk this whole change turns on, and it
+    /// is asserted rather than argued: the alternative is an artefact row saying
+    /// "CC-BY" beside a bioRxiv PDF the publisher never licensed, which is
+    /// #261's overclaim reached through an upsert instead of a caller.
+    #[tokio::test]
+    async fn the_licence_offer_rides_the_version_it_covers_and_no_other() {
+        const CC: &str = "https://creativecommons.org/licenses/by/4.0/";
+        let first = MetadataSources::new().await;
+        // One Crossref record: a preprint by `type`, one VoR reading link and
+        // one that names no content-version (so it inherits the work's
+        // `posted-content` type and lands on `preprint`), and a `vor`-only CC
+        // grant in force today.
+        let vor_url = format!("{}/vor.pdf", first.server("crossref").uri());
+        let preprint_url = format!("{}/pre.pdf", first.server("crossref").uri());
+        Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path_regex("^/works/"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(first.server("openalex"))
+            .await;
+        first
+            .serve_crossref(&format!(
+                r#"{{"status":"ok","message":{{
+                     "type":"posted-content",
+                     "title":["A work"],
+                     "license":[{{"URL":"{CC}","content-version":"vor","start":"2020-01-01"}}],
+                     "link":[
+                       {{"URL":"{vor_url}","content-type":"application/pdf",
+                         "intended-application":"text-mining","content-version":"vor"}},
+                       {{"URL":"{preprint_url}","content-type":"application/pdf",
+                         "intended-application":"text-mining"}}
+                     ]}}}}"#,
+            ))
+            .await;
+        for bucket in ["datacite", "unpaywall", "europepmc", "pmc_oa"] {
+            Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(first.server(bucket))
+                .await;
+        }
+
+        let pacer = Arc::new(RecordingPacer::default());
+        let client = recording_client(&pacer, first.table.clone());
+        let resolution = pass_for(&first)
+            .resolve(
+                &client,
+                &WorkScope::new(),
+                WorkRefs {
+                    doi: Some("10.1038/s41586-020-2649-2"),
+                    ..WorkRefs::default()
+                },
+            )
+            .await;
+
+        // The version of record carries the grant, and the grant is Crossref's.
+        let vor = resolution
+            .ranked
+            .iter()
+            .find(|entry| entry.rank.version == Version::VersionOfRecord)
+            .unwrap_or_else(|| panic!("a VoR candidate: {:?}", resolution.plan_lines()));
+        assert_eq!(
+            vor.candidate.licence,
+            LicenceStrength::OpenLicence,
+            "the grant counts for this version: {:?}",
+            resolution.plan_lines()
+        );
+        let offer = vor
+            .candidate
+            .licence_offer
+            .as_ref()
+            .unwrap_or_else(|| panic!("the offer that won it: {:?}", resolution.plan_lines()));
+        assert_eq!(offer.url, CC);
+        assert_eq!(offer.content_version.as_deref(), Some("vor"));
+        assert_eq!(offer.start.as_deref(), Some("2020-01-01"));
+        assert_eq!(offer.registry, Registry::Crossref);
+
+        // The preprint candidate, from the same record and the same grant,
+        // carries nothing: the grant does not cover it.
+        let preprint = resolution
+            .ranked
+            .iter()
+            .find(|entry| entry.rank.version == Version::Preprint)
+            .unwrap_or_else(|| panic!("a preprint candidate: {:?}", resolution.plan_lines()));
+        assert_eq!(
+            preprint.candidate.licence_offer,
+            None,
+            "a vor-only grant must not ride a preprint, however plainly the \
+             registry published it: {:?}",
+            resolution.plan_lines()
+        );
+
+        // And the chosen candidate is the VoR one, so what a fetch would store is
+        // the grant above — threaded from the candidate, never from the work.
+        assert_eq!(
+            resolution.chosen().expect("a choice").candidate.url,
+            vor_url,
+            "version dominates, so the licensed VoR link is what gets fetched: {:?}",
+            resolution.plan_lines()
+        );
+        assert_eq!(
+            resolution
+                .chosen()
+                .expect("a choice")
+                .candidate
+                .licence_offer
+                .as_ref()
+                .map(|offer| offer.url.as_str()),
+            Some(CC),
+            "the chosen candidate carries the offer that ranked it first"
+        );
     }
 
     // =====================================================================
@@ -4821,6 +5002,16 @@ mod tests {
                 .position(|name| *name == bucket)
                 .unwrap_or_else(|| panic!("{bucket} is not a metadata bucket"));
             &self.servers[at]
+        }
+
+        /// Mount a Crossref `/works/<doi>` answer at whatever path the pass
+        /// asks, since the fixture routes by prefix rather than by DOI.
+        async fn serve_crossref(&self, body: &str) {
+            Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path_regex("^/"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+                .mount(self.server("crossref"))
+                .await;
         }
 
         /// The authority each server actually listens on — `host:port`, which is

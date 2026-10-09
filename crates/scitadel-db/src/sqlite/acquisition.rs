@@ -327,6 +327,12 @@ fn plan_legacy_artefact(
         // published them: the file predates any route we could name.
         publisher: None,
         publisher_note: None,
+        // A legacy file was on disk before any registry said anything about a
+        // licence, so all four stay NULL — and `access_basis` is `manual`.
+        license_url: None,
+        license_content_version: None,
+        license_start: None,
+        license_source: None,
         imported_from: Some(absolute.to_string_lossy().into_owned()),
         retrieved_at: retrieved_at(row, now),
         blob,

@@ -27,10 +27,10 @@ pub use annotations::{SqliteAnnotationRepository, resolve_anchor};
 /// flat-layout importer (`scitadel_adapters::import_flat`).
 pub use artefacts::{
     ACCESS_BASIS_MANUAL, ArtefactRow, ArtefactWrite, BlobWrite, DownloadWrite, FULLTEXT_LOCATOR,
-    FulltextKind, ROUTE_IMPORT_FLAT, StateRow, StateWrite, VERSION_UNKNOWN, WriteMode, artefact_id,
-    delete_acquisition_states_at, distinct_blob_count, fulltext_kind, has_fulltext_artefact,
-    read_acquisition_state, read_artefacts_for_paper, record_download, write_acquisition_states,
-    write_acquisition_states_in, write_artefacts, write_artefacts_in,
+    FulltextKind, LicenceWrite, ROUTE_IMPORT_FLAT, StateRow, StateWrite, VERSION_UNKNOWN,
+    WriteMode, artefact_id, delete_acquisition_states_at, distinct_blob_count, fulltext_kind,
+    has_fulltext_artefact, read_acquisition_state, read_artefacts_for_paper, record_download,
+    write_acquisition_states, write_acquisition_states_in, write_artefacts, write_artefacts_in,
 };
 pub use assessments::SqliteAssessmentRepository;
 /// ADR-007 §1 "Storage": the content-addressed blob store.

@@ -932,6 +932,13 @@ fn plan(
         // published the work: no route looked, so no publisher is named.
         publisher: None,
         publisher_note: None,
+        // And for the same reason no licence: the importer reads a
+        // directory, not a registry, so there is nobody's statement about
+        // reuse to record and the columns stay NULL.
+        license_url: None,
+        license_content_version: None,
+        license_start: None,
+        license_source: None,
         imported_from: Some(candidate.path.to_string_lossy().into_owned()),
         retrieved_at: modified_at(&candidate.path).unwrap_or(now).to_rfc3339(),
         missing_on_disk: false,
