@@ -90,4 +90,3 @@ Screenshot "tests/vhs/snapshots/papers-download-state/01-papers-table.png"
 
 Type "q"
 Sleep 300ms
-Screenshot "tests/vhs/snapshots/papers-download-state/02-quit.png"
