@@ -30,7 +30,19 @@ jobs:
     # rest stay at 10m where they have ~3m of headroom over their
     # observed wall-clock. Total wall-clock stays under 14m because
     # shards run in parallel.
-    timeout-minutes: ${{ matrix.shard.timeout-minutes || 10 }}
+    # 20m, not 10m, and no per-shard patching. #274 was filed as "the
+    # ffmpeg/ttyd install step is cancelled on a 10-minute timer"; what actually
+    # happens is that every step succeeds and the job is then killed at its own
+    # ceiling. Bounding one shard at a time (#302 for tui-papers, then cli,
+    # then connectivity at two tapes) is whack-a-mole: the fixed setup — apt
+    # install + a release build, run serially — is ~8-10m on its own, so *every*
+    # shard was within one slow tape of the ceiling regardless of tape count.
+    # A budget that fits the overhead removes the need to patch each new shard.
+    # A literal, not `${{ matrix.shard.timeout-minutes || 20 }}`: with every
+    # per-shard override removed, that expression names a property the shard
+    # object no longer has. `actionlint` rejected it, which is the check doing
+    # its job — a dead override slot is exactly what let #274 hide as a timeout.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -40,7 +52,6 @@ jobs:
             # Seven tapes — the largest shard in the matrix — against the same
             # 10-minute default. It has been sitting just under the ceiling
             # (9m in #302's measurement) and now tips over at 10m15s.
-            timeout-minutes: 14
           - name: tui-launch
             tapes: "tui-launch.tape init-wizard.tape"
           - name: tui-papers
@@ -53,10 +64,8 @@ jobs:
             # It is not the ffmpeg/ttyd install step #274 describes being
             # cancelled: every step completes, and the job is then killed at its
             # own ceiling with the last tape's render half-finished.
-            timeout-minutes: 14
           - name: tui-reader
             tapes: "tui-annotation-write.tape tui-annotations-reader.tape annotations-in-detail.tape tui-export-keybind.tape tui-paper-note.tape"
-            timeout-minutes: 14
           - name: theme
             tapes: "theme-dark.tape theme-light.tape theme-toggle.tape"
           - name: connectivity
@@ -71,10 +80,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: rustup show active-toolchain && rustc --version
 
-      - name: Install ffmpeg + ttyd
+      # ffmpeg + ttyd and the release build are independent, and running them
+      # serially was the ~8-10min of fixed overhead that put every shard within
+      # one slow tape of the 10m ceiling. They run concurrently here, so the
+      # wall clock is roughly the slower of the two instead of their sum.
+      - name: Install ffmpeg + ttyd, and build scitadel, concurrently
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg ttyd
+          set -uo pipefail
+          (sudo apt-get update && sudo apt-get install -y ffmpeg ttyd) &
+          apt_pid=$!
+          cargo build --release -p scitadel-cli &
+          build_pid=$!
+          apt_rc=0; build_rc=0
+          wait "$apt_pid" || apt_rc=$?
+          wait "$build_pid" || build_rc=$?
+          echo "apt rc=$apt_rc build rc=$build_rc"
+          [ "$apt_rc" -eq 0 ] || { echo "::error::ffmpeg/ttyd install failed"; exit 1; }
+          [ "$build_rc" -eq 0 ] || { echo "::error::release build failed"; exit 1; }
+          command -v ffmpeg >/dev/null && command -v ttyd >/dev/null
 
       - name: Install vhs
         run: |
@@ -83,9 +106,6 @@ jobs:
             -o vhs.deb
           sudo dpkg -i vhs.deb
           vhs --version
-
-      - name: Build scitadel
-        run: cargo build --release -p scitadel-cli
 
       - name: Run shard tapes
         env:
