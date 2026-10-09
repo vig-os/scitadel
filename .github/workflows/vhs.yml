@@ -41,6 +41,15 @@ jobs:
             tapes: "tui-launch.tape init-wizard.tape"
           - name: tui-papers
             tapes: "papers-download-state.tape queue-tab.tape reading-queue-star.tape question-dashboard.tape tui-inbox.tape"
+            # Five tapes, the same count as tui-reader, and the second-largest
+            # shard after it. `timeout-minutes` defaults to 10m per the job
+            # expression below, which leaves ~3m of fixed build+install overhead
+            # plus 5 TUI renders at 60-90s each — that is 8-10.5m and the shard
+            # was timing out at exactly 10m0s on dev as well as PR branches.
+            # It is not the ffmpeg/ttyd install step #274 describes being
+            # cancelled: every step completes, and the job is then killed at its
+            # own ceiling with the last tape's render half-finished.
+            timeout-minutes: 14
           - name: tui-reader
             tapes: "tui-annotation-write.tape tui-annotations-reader.tape annotations-in-detail.tape tui-export-keybind.tape tui-paper-note.tape"
             timeout-minutes: 14
