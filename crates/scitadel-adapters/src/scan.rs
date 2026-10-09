@@ -778,6 +778,12 @@ fn plan_one(
         source_url: None,
         publisher: None,
         publisher_note: None,
+        // A drop-in names no licence either, for `import_flat`'s reason: the
+        // bytes arrived on disk, not from a registry that stated terms.
+        license_url: None,
+        license_content_version: None,
+        license_start: None,
+        license_source: None,
         imported_from: Some(candidate.path.to_string_lossy().into_owned()),
         retrieved_at: import_flat::modified_at(&candidate.path)
             .unwrap_or(now)
@@ -1162,6 +1168,13 @@ fn flag_vanished(db: &Database, paper_id: &str) -> Result<Vec<String>, ScanError
             source_url: row.source_url.clone(),
             publisher: row.publisher.clone(),
             publisher_note: row.publisher_note.clone(),
+            // A flag does not restate a licence: the row is being marked
+            // `missing_on_disk`, not re-attributed, and copying the columns
+            // here would make a read-modify-write the *writer* of a licence.
+            license_url: None,
+            license_content_version: None,
+            license_start: None,
+            license_source: None,
             imported_from: Some(imported_from.to_string()),
             retrieved_at: row.retrieved_at.clone(),
             missing_on_disk: true,

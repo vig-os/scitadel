@@ -416,7 +416,12 @@ pub enum LicenceRefusal {
 /// fact under two names, and neither is a licence until three separate things
 /// hold: the URL is an allow-listed CC grant, the grant is in force today, and
 /// it covers the version of the work we would actually fetch.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize` because the whole offer travels with the ranked candidate that
+/// won on it: a plan line that says `OpenLicence` without the URL that
+/// established it cannot be checked, and the manifest mirror's four licence
+/// columns are this struct verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct LicenceOffer {
     /// The URL the registry gave, verbatim.
     pub url: String,

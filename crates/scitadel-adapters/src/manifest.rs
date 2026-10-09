@@ -67,6 +67,18 @@
 //! mean "no write": the *rows* are unchanged, which is the claim `scan` makes and
 //! the one a reader can check, while a mirror whose timestamp moves is honest
 //! about when it was produced rather than pretending to be a checksum.
+//!
+//! ## A field nothing recorded is omitted, not emitted as `null` (#291)
+//!
+//! The four `license_*` fields are the case that forced the rule: for most of
+//! this project's life nothing could write them, so every artefact's mirror
+//! carried `"license_url": null` — which reads as "we looked and there is no
+//! licence", the exact assertion-of-absence #291 exists to stop. A field with
+//! no value is now left out of the JSON, and only [`ManifestArtefact`]'s four
+//! licence fields are affected, because they are the ones whose absence is a
+//! claim about the world. A reader that needs to know whether a licence was
+//! recorded asks whether the key is present, which is the same question the
+//! column answers.
 
 use std::path::{Path, PathBuf};
 
@@ -165,9 +177,26 @@ pub struct ManifestArtefact {
     pub access_status: String,
     pub access_basis: String,
     pub publisher: Option<String>,
+    /// The licence, as migration 013's four columns carry it. **Omitted from
+    /// the JSON when nothing was recorded**, and that is the whole of #291's
+    /// second proposal: a mirror that emits `"license_url": null` reads as "we
+    /// looked and there is no licence", which is a claim about the world that
+    /// no writer has made. An absent key reads as "not recorded", which is
+    /// what the column actually means.
+    ///
+    /// Omission rather than a note because the field's *type* has to stay
+    /// stable: a consumer deciding whether derived data may redistribute reads
+    /// `license_url` as a string, and an object that says `{"recorded": false}`
+    /// would make every reader handle two shapes for one question. `Option` is
+    /// already the field's own word for "absent", so the mirror says it that
+    /// way.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub license_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub license_content_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub license_start: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub license_source: Option<String>,
     pub label: Option<String>,
     pub caption: Option<String>,
@@ -446,9 +475,7 @@ mod tests {
     use super::*;
     use scitadel_core::models::PaperId;
     use scitadel_core::ports::PaperRepository as _;
-    use scitadel_db::sqlite::{
-        ACCESS_BASIS_MANUAL, ArtefactWrite, BlobWrite, WriteMode, blob_rel_path,
-    };
+    use scitadel_db::sqlite::{ArtefactWrite, BlobWrite, WriteMode, blob_rel_path};
 
     struct Fx {
         dir: tempfile::TempDir,
@@ -488,38 +515,68 @@ mod tests {
         /// Hold a full text for the work, bytes and all.
         fn hold_fulltext(&self) {
             let sha = format!("{:0>64}", "a1b2c3d4");
+            let row = ArtefactWrite {
+                sha256: Some(sha.clone()),
+                ..Self::fulltext_row(&sha)
+            };
             self.db
-                .write_artefacts(
-                    &[ArtefactWrite {
-                        id: String::new(),
-                        paper_id: "p-1".into(),
-                        kind: "fulltext_pdf".into(),
-                        version: "vor".into(),
-                        locator: String::new(),
-                        sha256: Some(sha.clone()),
-                        format: Some("pdf".into()),
-                        access_status: "full_text".into(),
-                        route: "manual".into(),
-                        access_basis: ACCESS_BASIS_MANUAL.into(),
-                        label: None,
-                        caption: None,
-                        source_url: None,
-                        publisher: None,
-                        publisher_note: None,
-                        imported_from: None,
-                        retrieved_at: "2026-01-01T00:00:00+00:00".into(),
-                        missing_on_disk: false,
-                        blob: Some(BlobWrite {
-                            rel_path: blob_rel_path(&sha, "pdf"),
-                            sha256: sha.clone(),
-                            bytes: 4,
-                            mime: "application/pdf".into(),
-                            created_at: "2026-01-01T00:00:00+00:00".into(),
-                        }),
-                    }],
-                    WriteMode::Reconcile,
-                )
+                .write_artefacts(&[row], WriteMode::Reconcile)
                 .unwrap();
+        }
+
+        /// Hold a full text **with a licence**, the way a fetch through a
+        /// source that stated one records it.
+        fn hold_licensed_fulltext(&self, url: &str) {
+            let sha = format!("{:0>64}", "c0ffee01");
+            let row = ArtefactWrite {
+                license_url: Some(url.to_string()),
+                license_content_version: Some("vor".to_string()),
+                license_start: Some("2024-01-01".to_string()),
+                license_source: Some("crossref".to_string()),
+                ..Self::fulltext_row(&sha)
+            };
+            self.db
+                .write_artefacts(&[row], WriteMode::Reconcile)
+                .unwrap();
+        }
+
+        /// One `fulltext_pdf` row for the fixture work, licence columns empty.
+        ///
+        /// The single place the row is spelled, so the two fixtures above differ
+        /// by the licence and by nothing else — which is what makes the licence
+        /// test a test about the licence rather than about the fixture.
+        fn fulltext_row(sha: &str) -> ArtefactWrite {
+            ArtefactWrite {
+                id: String::new(),
+                paper_id: "p-1".into(),
+                kind: "fulltext_pdf".into(),
+                version: "vor".into(),
+                locator: String::new(),
+                sha256: None,
+                format: Some("pdf".into()),
+                access_status: "full_text".into(),
+                route: "unpaywall".into(),
+                access_basis: "oa_license".into(),
+                label: None,
+                caption: None,
+                source_url: None,
+                publisher: None,
+                publisher_note: None,
+                license_url: None,
+                license_content_version: None,
+                license_start: None,
+                license_source: None,
+                imported_from: None,
+                retrieved_at: "2026-01-01T00:00:00+00:00".into(),
+                missing_on_disk: false,
+                blob: Some(BlobWrite {
+                    rel_path: blob_rel_path(sha, "pdf"),
+                    sha256: sha.to_string(),
+                    bytes: 4,
+                    mime: "application/pdf".into(),
+                    created_at: "2026-01-01T00:00:00+00:00".into(),
+                }),
+            }
         }
 
         /// Record a want the work does not hold.
@@ -794,6 +851,82 @@ mod tests {
             fx.db.leases().unwrap().len(),
             0,
             "ADR-007 §1 \"Leases\": a plan never claims a work"
+        );
+    }
+
+    /// #291's second proposal, and the reason the mirror is now honest about
+    /// *which* licence: the four columns have a writer, so a recorded one is
+    /// reported verbatim — and an unrecorded one is **not** reported as `null`.
+    ///
+    /// `null` in a published provenance document is a claim: it reads as "we
+    /// looked and there is no licence". For most of this project's life that was
+    /// exactly backwards, because nothing could write the columns at all. An
+    /// absent key is the encoding that matches the fact, and a datasheet
+    /// consumer must be able to tell the two apart before it decides what may
+    /// be redistributed.
+    #[test]
+    fn a_recorded_licence_is_reported_and_an_absent_one_is_not_a_null() {
+        // --- recorded: the four keys, verbatim ---
+        let fx = Fx::new();
+        fx.hold_licensed_fulltext("https://creativecommons.org/licenses/by/4.0/");
+        let owner = fx.claim();
+        write(&fx.db, &fx.paper, &owner).expect("written");
+        let body = std::fs::read_to_string(fx.manifest()).unwrap();
+        let mirror: Manifest = serde_json::from_str(&body).unwrap();
+        let artefact = &mirror.artefacts[0];
+        assert_eq!(
+            artefact.license_url.as_deref(),
+            Some("https://creativecommons.org/licenses/by/4.0/"),
+            "the URL the registry gave, verbatim — a mirror that has to reconstruct \
+             it cannot be checked against the registry that stated it"
+        );
+        assert_eq!(
+            (
+                artefact.license_content_version.as_deref(),
+                artefact.license_start.as_deref(),
+                artefact.license_source.as_deref(),
+            ),
+            (Some("vor"), Some("2024-01-01"), Some("crossref")),
+            "and the three fields beside it, as they were stated"
+        );
+        // And the raw JSON carries the keys, so the file is what a reader sees.
+        for needle in [
+            "\"license_url\": \"https://creativecommons.org/licenses/by/4.0/\"",
+            "\"license_content_version\": \"vor\"",
+            "\"license_start\": \"2024-01-01\"",
+            "\"license_source\": \"crossref\"",
+        ] {
+            assert!(body.contains(needle), "{needle} is in the mirror: {body}");
+        }
+
+        // --- not recorded: no keys at all, and no `null` standing in for one ---
+        let fx = Fx::new();
+        fx.hold_fulltext();
+        let owner = fx.claim();
+        write(&fx.db, &fx.paper, &owner).expect("written");
+        let body = std::fs::read_to_string(fx.manifest()).unwrap();
+        let mirror: Manifest = serde_json::from_str(&body).unwrap();
+        let artefact = &mirror.artefacts[0];
+        assert_eq!(
+            artefact.license_url, None,
+            "the reader still reports None: nothing was recorded"
+        );
+        for needle in [
+            "\"license_url\"",
+            "\"license_content_version\"",
+            "\"license_start\"",
+            "\"license_source\"",
+        ] {
+            assert!(
+                !body.contains(needle),
+                "{needle} must not appear at all — neither as a URL nor as a `null` \
+                 that reads as \"there is no licence\": {body}"
+            );
+        }
+        assert!(
+            body.contains("\"access_basis\": \"oa_license\""),
+            "and access_basis is still there, because that one *is* established: \
+             it is the answer to why the fetch was lawful: {body}"
         );
     }
 

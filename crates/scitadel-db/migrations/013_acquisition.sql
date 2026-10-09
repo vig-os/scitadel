@@ -64,6 +64,12 @@ CREATE TABLE IF NOT EXISTS artefacts (
     format           TEXT,                       -- pdf|html|jats|json|csv|xlsx|zip|png|…
     access_status    TEXT NOT NULL CHECK (access_status IN ('full_text','abstract','paywall','unknown')),
     derived_from     TEXT REFERENCES artefacts(id) ON DELETE CASCADE,
+                       -- which full text a derived artefact was extracted from
+                       -- (#234's manifest shape; ADR-007 §3's S3 acceptance
+                       -- criterion is the slice that writes the rows). Unwritten
+                       -- until #254 lands the JATS `table-wrap` extractor, and
+                       -- not before: a self-referential FK nobody fills is
+                       -- honest, a writer that always wrote NULL is not.
     route            TEXT NOT NULL,              -- RouteId | 'legacy' | 'import_flat' | 'manual' | 'manual_url'
     source_url       TEXT,
     label            TEXT,

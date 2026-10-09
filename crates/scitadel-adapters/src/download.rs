@@ -112,7 +112,8 @@ use scitadel_core::ports::{Bucket, PaceTier, Pacer};
 use scitadel_core::publisher::{PublisherVerdict, RouteVerdict, classify_publisher};
 use scitadel_db::sqlite::{
     ANY_VERSION, AttemptWrite, BlobWrite, Database, DownloadWrite, FULLTEXT_LOCATOR, IdentityPhase,
-    IdentitySource, SqlitePacer, StateRow, StateWrite, blob_rel_path, fulltext_kind, store_bytes,
+    IdentitySource, LicenceWrite, SqlitePacer, StateRow, StateWrite, blob_rel_path, fulltext_kind,
+    store_bytes,
 };
 use scitadel_http::{
     BucketPolicyTable, FetchError, PacedClient, PacedResponse, SafeHeaders, WorkScope,
@@ -780,6 +781,7 @@ impl PaperDownloader {
         (result, resolution)
     }
 
+    /// The metadata pass, built from this downloader's own endpoints.    ///
     /// The metadata pass, built from this downloader's own endpoints.
     ///
     /// Built per call for the reason `identity_chain()` is: three base URLs and
@@ -900,6 +902,14 @@ impl PaperDownloader {
             // maps to `None` so the route's fallback is consulted — see
             // `resolve::Version::as_artefact_version`.
             version: chosen.rank.version.as_artefact_version(),
+            // And the licence, from the same candidate rather than from the
+            // work: a registry's `license[]` is a statement about the work, the
+            // artefact is one document of it, and the candidate is what ties the
+            // two together — its version is what the offer was filtered
+            // against. #291's fix: without this the four `license_*` columns had
+            // no writer and the manifest mirror reported `null` for every
+            // licence forever.
+            licence: chosen.candidate.licence_offer.as_ref().map(licence_write),
         })
     }
 
@@ -1397,6 +1407,7 @@ impl PaperDownloader {
             path,
             identity,
             version,
+            licence,
         } = fetched;
 
         // #253, and the reason the bytes are still only in memory here: nothing
@@ -1488,6 +1499,7 @@ impl PaperDownloader {
             source_url: result.source_url.clone(),
             publisher,
             publisher_note: publisher_note.clone(),
+            licence,
             retrieved_at: now.clone(),
             blob: Some(BlobWrite {
                 sha256: sha256.clone(),
@@ -1648,6 +1660,9 @@ impl PaperDownloader {
             // artefact and the version has nowhere to go. See `fetch_candidate`
             // for the one site that establishes one.
             version: None,
+            // No metadata pass ran on this leg either, so no registry stated a
+            // licence and there is nothing to attribute.
+            licence: None,
         })
     }
 
@@ -1725,6 +1740,8 @@ impl PaperDownloader {
             identity: None,
             // The DOI-only path; see `preprint_candidate` above.
             version: None,
+            // And it asks no registry, so no licence is stated for it.
+            licence: None,
         })
     }
 
@@ -1758,6 +1775,8 @@ impl PaperDownloader {
             identity: None,
             // The DOI-only path; see `preprint_candidate` above.
             version: None,
+            // A resolver answers with a redirect and states no terms of its own.
+            licence: None,
         })
     }
 
@@ -1856,6 +1875,16 @@ struct Fetched {
     /// and only one of them is an attribution. See
     /// [`crate::resolve::Version::as_artefact_version`].
     version: Option<ArtefactVersion>,
+    /// The licence the **chosen candidate** carried, as the registry stated it.
+    ///
+    /// `None` on every leg that establishes nothing: the arXiv and preprint
+    /// transforms ask no registry, the DOI-only path resolves no row at all, and
+    /// a candidate whose source named no licence has no offer to carry. What is
+    /// *not* `None`-able is the attribution — the offer belongs to the candidate
+    /// that was fetched, so a grant another source published for the work never
+    /// reaches these bytes. `access_basis` remains the answer for why those
+    /// fetches were lawful.
+    licence: Option<LicenceWrite>,
 }
 
 /// The two sides of one comparison, as the recorded row carries them.
@@ -1945,6 +1974,22 @@ impl Leg {
             Self::Publisher => "doi.org publisher page",
             Self::ManualUrl => "record url",
         }
+    }
+}
+
+/// A registry's [`LicenceOffer`], as the storage shape records it.
+///
+/// The one place the two vocabularies meet, and it is a **copy**: the URL
+/// verbatim, the two optional fields exactly as they were stated or not
+/// stated, and the registry's own label as `license_source`. Nothing is
+/// derived and nothing is defaulted — a licence this function had to
+/// reconstruct would be a licence nobody published.
+fn licence_write(offer: &crate::registry::LicenceOffer) -> LicenceWrite {
+    LicenceWrite {
+        url: offer.url.clone(),
+        content_version: offer.content_version.clone(),
+        start: offer.start.clone(),
+        source: offer.registry.label().to_string(),
     }
 }
 
@@ -3084,7 +3129,8 @@ mod tests {
             let mut stmt = conn
                 .prepare(
                     "SELECT paper_id, kind, version, sha256, format, access_status, route,
-                            access_basis, source_url, publisher, publisher_note, retrieved_at
+                            access_basis, source_url, publisher, publisher_note, retrieved_at,
+                            license_url, license_content_version, license_start, license_source
                      FROM artefacts ORDER BY paper_id",
                 )
                 .expect("prepare");
@@ -3102,6 +3148,10 @@ mod tests {
                     publisher: r.get(9)?,
                     publisher_note: r.get(10)?,
                     retrieved_at: r.get(11)?,
+                    license_url: r.get(12)?,
+                    license_content_version: r.get(13)?,
+                    license_start: r.get(14)?,
+                    license_source: r.get(15)?,
                 })
             })
             .expect("query")
@@ -3173,6 +3223,10 @@ mod tests {
             source_url: None,
             publisher: None,
             publisher_note: None,
+            license_url: None,
+            license_content_version: None,
+            license_start: None,
+            license_source: None,
             imported_from: None,
             retrieved_at: NOW.into(),
             missing_on_disk: false,
@@ -3268,6 +3322,10 @@ mod tests {
         publisher: Option<String>,
         publisher_note: Option<String>,
         retrieved_at: String,
+        license_url: Option<String>,
+        license_content_version: Option<String>,
+        license_start: Option<String>,
+        license_source: Option<String>,
     }
 
     /// One `acquisition_state` row as the ladder wrote it (#260).
@@ -3330,6 +3388,126 @@ mod tests {
     /// that made #260 report three free preprints as unreachable.
     fn openalex_json_without_a_location() -> String {
         r#"{"id":"W1","best_oa_location":null,"open_access":{"is_oa":false}}"#.to_string()
+    }
+
+    /// An OpenAlex `/works/doi:<doi>` body whose `best_oa_location` states a
+    /// licence, in OpenAlex's own shape.
+    ///
+    /// `license` on the **location** rather than a work-level field, because
+    /// that is where OpenAlex puts it and because the offer it produces is the
+    /// shape that can actually reach a recorded row: the location is named by a
+    /// route with an `access_basis`, so the candidate built from it is both
+    /// fetched and recordable.
+    fn openalex_best_location_with_licence(pdf_url: &str, licence: &str, title: &str) -> String {
+        format!(
+            r#"{{"id":"W1","title":{title},"publication_year":2020,
+                "best_oa_location":{{"pdf_url":{url},"version":"publishedVersion",
+                                     "is_oa":true,"license":{licence}}}}}"#,
+            title = json(title),
+            url = json(pdf_url),
+            licence = json(licence),
+        )
+    }
+
+    /// #291, end to end: the licence the metadata pass attributed to the chosen
+    /// candidate reaches the `artefacts` row, and a work whose source named no
+    /// licence keeps the columns NULL.
+    ///
+    /// The setup is the shape that actually produces a recorded licence:
+    /// OpenAlex's `best_oa_location` states the grant, that location is the
+    /// ranked candidate, and `RouteId::OpenAlex::access_basis()` is `oa_license`
+    /// so `record_download` accepts the fetch at all. (A Crossref `link[]` can
+    /// carry the grant too, but its route establishes no basis, so it is refused
+    /// at the write — the licence is only ever recorded beside a fetch that
+    /// happened.)
+    ///
+    /// The second half is the one that must not regress: an arXiv fetch of a
+    /// work nobody published terms for leaves all four columns NULL and keeps
+    /// `access_basis` as the only licence-adjacent answer, because a preprint
+    /// server states permission to read and says nothing about reuse.
+    #[tokio::test]
+    async fn the_licence_the_chosen_candidate_carried_reaches_the_artefact_row() {
+        const CC: &str = "https://creativecommons.org/licenses/by/4.0/";
+        let fx = Fixture::new().await;
+        let doi = "10.99999/some.suffix.12345";
+        let paper = save(&fx, "p-licensed", Some(doi), None, None, None);
+        let pdf = format!("{}/oa/paper.pdf", fx.server.uri());
+        fx.serve_pdf("/oa/paper.pdf").await;
+        // The pass asks `/works/doi:<doi>` through `Url`'s own encoder, so the
+        // mock is mounted at the path that produces — an unencoded one is a
+        // different path, wiremock answers 404, and this test read that as "no
+        // candidate location at all".
+        let encoded = crate::openalex::doi_works_url(&format!("{}/works", fx.server.uri()), doi)
+            .expect("a URL")
+            .path()
+            .to_string();
+        fx.serve(
+            &encoded,
+            openalex_best_location_with_licence(&pdf, CC, &paper.title),
+        )
+        .await;
+        // Everything else misses, so the OpenAlex location is the ranked choice.
+        for miss in [
+            format!("/v2/{doi}"),
+            format!("/cr/{doi}"),
+            format!("/dc/{doi}"),
+            format!("/epmc/{doi}"),
+        ] {
+            fx.miss(&miss).await;
+        }
+
+        fx.downloader()
+            .download_paper(&paper, &fx.papers_dir())
+            .await
+            .expect("the ranked candidate is fetched");
+
+        let row = fx.artefact("p-licensed").expect("an artefact row");
+        assert_eq!(row.route, "openalex", "the location's own route");
+        assert_eq!(row.version, "vor", "and its own version word");
+        assert_eq!(
+            (
+                row.license_url.as_deref(),
+                row.license_content_version.as_deref(),
+                row.license_start.as_deref(),
+                row.license_source.as_deref(),
+            ),
+            (Some(CC), None, None, Some("openalex")),
+            "copied verbatim: OpenAlex stated a URL and nothing else, so the \
+             other three are NULL rather than invented"
+        );
+
+        // ---- and a source that named no licence records none ----
+        let fx = Fixture::new().await;
+        fx.serve_pdf("/pdf/2005.07866.pdf").await;
+        let paper = save(
+            &fx,
+            "p-arxiv",
+            Some("10.48550/arxiv.2005.07866"),
+            Some("2005.07866"),
+            None,
+            None,
+        );
+        fx.downloader()
+            .download_paper(&paper, &fx.papers_dir())
+            .await
+            .expect("the arXiv leg serves the PDF");
+        let row = fx.artefact("p-arxiv").expect("an artefact row");
+        assert_eq!(row.route, "arxiv");
+        assert_eq!(
+            (
+                row.license_url.as_deref(),
+                row.license_content_version.as_deref(),
+                row.license_start.as_deref(),
+                row.license_source.as_deref(),
+            ),
+            (None, None, None, None),
+            "no registry offered a grant for this preprint, so nothing is written"
+        );
+        assert_eq!(
+            row.access_basis, "oa_license",
+            "and access_basis still answers why the fetch was lawful, which is \
+             the whole claim a row with no licence needs to make"
+        );
     }
 
     #[test]
@@ -3709,6 +3887,10 @@ mod tests {
                     source_url: None,
                     publisher: None,
                     publisher_note: None,
+                    license_url: None,
+                    license_content_version: None,
+                    license_start: None,
+                    license_source: None,
                     imported_from: None,
                     retrieved_at: "2026-01-01T00:00:00+00:00".into(),
                     missing_on_disk: false,

@@ -150,6 +150,40 @@ pub struct BlobWrite {
     pub created_at: String,
 }
 
+/// The licence a registry stated for the work the fetched document is a copy
+/// of — migration 013's four `license_*` columns as one value.
+///
+/// **Whose licence this is, and what it is a statement about.** A licence
+/// offer is a registry's statement about the *work*: Crossref's `license[]`
+/// says "this DOI's version of record is CC-BY", not "these bytes are CC-BY".
+/// The artefact row it lands on is *one document* of that work, at the version
+/// the resolver ranked the candidate at, which is why the offer is threaded
+/// from the **chosen candidate** and not from the work: a `vor`-only grant is
+/// already filtered out for a preprint candidate before this struct exists
+/// (the resolve pass's `counts_for`), so what survives is a grant that covers
+/// the version actually stored.
+///
+/// `url` is not an `Option` because an offer with no URL is not an offer:
+/// every constructor in the resolve pass requires one, and a licence we cannot
+/// name is not a licence we may record. The other three fields stay `Option`
+/// because a registry that states no `content-version`, no `start` or no
+/// recognisable source has said nothing about them, and "not stated" is what
+/// `NULL` means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LicenceWrite {
+    /// The grant's URL, verbatim as the registry spelled it.
+    pub url: String,
+    /// `content-version`, when the registry declared one.
+    pub content_version: Option<String>,
+    /// `start`, when the registry declared one.
+    pub start: Option<String>,
+    /// Which registry stated it, in that registry's own label — recorded
+    /// rather than derived, because "Crossref said so" and "Unpaywall said so"
+    /// are different provenance and a mirror that collapsed them could not be
+    /// checked against the registry that made the claim.
+    pub source: String,
+}
+
 /// One `artefacts` row. Its `blob`, when present, is written first —
 /// `artefacts.sha256` references it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +213,15 @@ pub struct ArtefactWrite {
     /// `RouteVerdict::PublisherUnknown` note, never a claim about TDM
     /// route availability.
     pub publisher_note: Option<String>,
+    /// The licence the metadata pass attributed to the bytes, as
+    /// [`LicenceWrite`]'s four fields. All four `None` when the chosen
+    /// candidate's source named no licence — which is *not* "there is no
+    /// licence", it is "none was recorded", and `access_basis` remains the
+    /// only licence-adjacent claim the row makes.
+    pub license_url: Option<String>,
+    pub license_content_version: Option<String>,
+    pub license_start: Option<String>,
+    pub license_source: Option<String>,
     pub imported_from: Option<String>,
     pub retrieved_at: String,
     /// The path is recorded but we hold no usable bytes for it.
@@ -315,6 +358,10 @@ pub fn write_artefacts_in(
                 row.source_url,
                 row.publisher,
                 row.publisher_note,
+                row.license_url,
+                row.license_content_version,
+                row.license_start,
+                row.license_source,
                 row.imported_from,
                 row.retrieved_at,
                 i64::from(row.missing_on_disk),
@@ -336,7 +383,14 @@ pub fn write_artefacts_in(
 /// `Refetch` moves `route` and `access_basis` too, because these bytes
 /// arrived through a named route that established a basis, and a row
 /// left claiming the previous route's answer would misreport where the
-/// bytes came from and what may be done with them.
+/// bytes came from and what may be done with them. The four `license_*`
+/// columns move for the same reason and by the same rule: they are the
+/// resolve pass's answer for *this* fetch, so a re-download that reached
+/// the work through a source that named no licence must clear the grant
+/// the previous source named rather than carry it beside bytes it was
+/// never said about. `Reconcile` deliberately leaves them alone, like
+/// `label` and `caption`: a re-scanned file tree states nothing about a
+/// licence, so it has nothing to move.
 ///
 /// It also clears `imported_from`, which is the one field a fetch must
 /// take away rather than set: a re-download that collides with a
@@ -347,11 +401,11 @@ pub fn write_artefacts_in(
 /// `si`/`table`/`figure` slots, which no fetch writes today, and nulling
 /// them would destroy a caption the fetch knows nothing about.
 fn artefacts_insert(mode: WriteMode) -> String {
-    let values =
-        "(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)";
+    let values = "(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)";
     let columns = "(id, paper_id, kind, version, locator, sha256, format, access_status,
                    route, access_basis, label, caption, source_url, publisher,
-                   publisher_note, imported_from, retrieved_at, missing_on_disk)";
+                   publisher_note, license_url, license_content_version, license_start,
+                   license_source, imported_from, retrieved_at, missing_on_disk)";
     match mode {
         WriteMode::IgnoreExisting => {
             format!("INSERT OR IGNORE INTO artefacts {columns} VALUES {values}")
@@ -387,6 +441,10 @@ fn artefacts_insert(mode: WriteMode) -> String {
                source_url = excluded.source_url,
                publisher = excluded.publisher,
                publisher_note = excluded.publisher_note,
+               license_url = excluded.license_url,
+               license_content_version = excluded.license_content_version,
+               license_start = excluded.license_start,
+               license_source = excluded.license_source,
                imported_from = excluded.imported_from,
                retrieved_at = excluded.retrieved_at
              WHERE artefacts.sha256 IS NOT excluded.sha256
@@ -397,6 +455,10 @@ fn artefacts_insert(mode: WriteMode) -> String {
                 OR artefacts.source_url IS NOT excluded.source_url
                 OR artefacts.publisher IS NOT excluded.publisher
                 OR artefacts.publisher_note IS NOT excluded.publisher_note
+                OR artefacts.license_url IS NOT excluded.license_url
+                OR artefacts.license_content_version IS NOT excluded.license_content_version
+                OR artefacts.license_start IS NOT excluded.license_start
+                OR artefacts.license_source IS NOT excluded.license_source
                 OR artefacts.imported_from IS NOT excluded.imported_from
                 OR artefacts.retrieved_at IS NOT excluded.retrieved_at"
         ),
@@ -443,6 +505,16 @@ pub struct DownloadWrite {
     pub publisher: Option<String>,
     /// Why `publisher` is empty — see [`ArtefactWrite::publisher_note`].
     pub publisher_note: Option<String>,
+    /// The licence the metadata pass attributed to **this** fetch, or `None`
+    /// when the source that served the bytes named no licence. See
+    /// [`LicenceWrite`] for whose statement this is and why it travels with the
+    /// chosen candidate.
+    ///
+    /// There is no route-level fallback, deliberately: `RouteId::access_basis`
+    /// already records *why access is lawful* and no route states a reuse
+    /// grant. Deriving a licence from the route would be #261's overclaim with
+    /// a URL attached.
+    pub licence: Option<LicenceWrite>,
     /// RFC 3339 UTC: when these bytes were fetched.
     pub retrieved_at: String,
     /// The content-addressed copy. `None` means the caller could not put
@@ -557,6 +629,15 @@ pub fn record_download(conn: &mut Connection, write: &DownloadWrite) -> Result<(
     // route's licence answer — is therefore still enforced by there being
     // nowhere to put one, and only the axis the resolver is *entitled* to answer
     // gained a field.
+    //
+    // ## Why the licence columns are not derived from the route either
+    //
+    // A licence offer is a registry's statement about the *work* the chosen
+    // candidate serves, filtered to the version that candidate was ranked at
+    // before it reaches this function. So the one thing this function does with
+    // it is copy it: four columns, no derivation, no default. `None` stays
+    // `None` — "no licence was recorded" and "there is no licence" are different
+    // facts and only one of them is in the row.
     let version = write
         .version
         .or_else(|| write.route.artefact_version())
@@ -598,6 +679,18 @@ pub fn record_download(conn: &mut Connection, write: &DownloadWrite) -> Result<(
         source_url: write.source_url.clone(),
         publisher: write.publisher.clone(),
         publisher_note: write.publisher_note.clone(),
+        // Copied, not derived: see the docs above on why a licence has no
+        // route-level fallback and why "absent" and "no licence" differ.
+        license_url: write.licence.as_ref().map(|licence| licence.url.clone()),
+        license_content_version: write
+            .licence
+            .as_ref()
+            .and_then(|licence| licence.content_version.clone()),
+        license_start: write
+            .licence
+            .as_ref()
+            .and_then(|licence| licence.start.clone()),
+        license_source: write.licence.as_ref().map(|licence| licence.source.clone()),
         imported_from: None,
         retrieved_at: write.retrieved_at.clone(),
         missing_on_disk: false,
@@ -1090,6 +1183,9 @@ mod tests {
                     source_url: None,
                     publisher: None,
                     publisher_note: None,
+                    // `None`: this table is the version precedence, and the
+                    // licence has its own test below.
+                    licence: None,
                     retrieved_at: NOW.into(),
                     blob: Some(BlobWrite {
                         sha256: format!("{id}-sha"),
@@ -1168,6 +1264,10 @@ mod tests {
             source_url: None,
             publisher: None,
             publisher_note: None,
+            license_url: None,
+            license_content_version: None,
+            license_start: None,
+            license_source: None,
             imported_from: Some("/tmp/x.pdf".into()),
             retrieved_at: "2026-01-01T00:00:00+00:00".into(),
             missing_on_disk: false,
@@ -1575,6 +1675,12 @@ mod tests {
             source_url: Some("https://example.org/paper.pdf".into()),
             publisher: Some("nature".into()),
             publisher_note: None,
+            // `None`: the fixture predates the resolve pass's licence
+            // attribution, and "this source named no licence" is the correct
+            // answer for a download that established none.
+            // `the_licence_the_resolver_attributed_is_written_beside_the_bytes`
+            // is the test that sets it.
+            licence: None,
             retrieved_at: retrieved_at.into(),
             blob: Some(BlobWrite {
                 sha256: sha.into(),
@@ -1657,6 +1763,163 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(blobs, 1);
+    }
+
+    /// #291: the artefact used to record *why* access is lawful and not *which
+    /// licence* — the four `license_*` columns migration 013 added had no writer
+    /// at all, so the manifest mirror reported `null` for every licence forever.
+    ///
+    /// The rule this pins: the four columns are a **verbatim copy** of the offer
+    /// the resolver attributed to the chosen candidate, and an absent field
+    /// stays absent. `None` on all four is "no licence was recorded", which is
+    /// not "there is no licence" — and `access_basis` alone still answers why
+    /// the bytes could be fetched, which is the whole of the row's claim for a
+    /// work nobody published terms for.
+    #[test]
+    fn the_licence_the_resolver_attributed_is_written_beside_the_bytes() {
+        let (_dir, db) = open();
+        let mut conn = db.conn().unwrap();
+
+        // Unpaywall served the bytes, and the grant the copy carries was
+        // **Crossref's statement about the work**, filtered to the version
+        // this candidate was ranked at — which is why the version is set here
+        // and why a `vor` grant beside a `preprint` row is a shape this writer
+        // refuses to produce rather than one it silently allows.
+        let mut licensed = download(RouteId::Unpaywall, "aaa", "2026-01-01T00:00:00+00:00");
+        licensed.version = Some(ArtefactVersion::VersionOfRecord);
+        licensed.licence = Some(LicenceWrite {
+            url: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+            content_version: Some("vor".to_string()),
+            start: Some("2024-01-01".to_string()),
+            source: "crossref".to_string(),
+        });
+        record_download(&mut conn, &licensed).expect("the licensed download");
+
+        // An unlicensed fetch of a *different* work, through a route that
+        // establishes a basis but states no grant — arXiv's own shape.
+        let mut unlicensed = download(RouteId::Arxiv, "bbb", "2026-01-01T00:00:00+00:00");
+        unlicensed.paper_id = "p-2".into();
+        conn.execute(
+            "INSERT INTO papers (id, title, authors, created_at, updated_at)
+             VALUES ('p-2', 'Another work', '[]', '2026-01-01T00:00:00+00:00',
+                     '2026-01-01T00:00:00+00:00')",
+            [],
+        )
+        .unwrap();
+        record_download(&mut conn, &unlicensed).expect("the unlicensed download");
+
+        let licence_of = |paper_id: &str| -> (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) {
+            let conn = db.conn().unwrap();
+            conn.query_row(
+                "SELECT license_url, license_content_version, license_start, license_source
+                   FROM artefacts WHERE paper_id = ?1",
+                [paper_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap_or_else(|e| panic!("{paper_id}: read back: {e}"))
+        };
+
+        assert_eq!(
+            licence_of("p-1"),
+            (
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+                Some("vor".to_string()),
+                Some("2024-01-01".to_string()),
+                Some("crossref".to_string()),
+            ),
+            "copied verbatim: a mirror that has to reconstruct these cannot \
+             report a licence nobody wrote down"
+        );
+        assert_eq!(
+            licence_of("p-2"),
+            (None, None, None, None),
+            "no offer named, no columns written — NULL, not a guess and not an \
+             empty string a reader would render as a blank cell"
+        );
+
+        let (version, basis): (String, String) = conn
+            .query_row(
+                "SELECT version, access_basis FROM artefacts WHERE paper_id = 'p-2'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            version, "preprint",
+            "and the preprint row carries no `vor` grant beside it: the offer is \
+             filtered to the candidate's version before it is ever stored"
+        );
+        assert_eq!(
+            basis, "oa_license",
+            "while access_basis is unchanged: the route's own answer is what \
+             records why an unlicensed fetch was lawful"
+        );
+    }
+
+    /// A re-download moves the licence with the bytes, exactly as it moves
+    /// `route` and `access_basis`.
+    ///
+    /// The failure this prevents is the subtle one: a first fetch through a
+    /// source that named CC-BY, a re-download through a source that named
+    /// nothing, and a row left claiming the first source's grant beside the
+    /// second source's bytes. That is a licence attributed to bytes nobody
+    /// licensed, which is the overclaim #261 exists to stop — reached through
+    /// an upsert rather than through a caller.
+    #[test]
+    fn a_re_download_moves_the_licence_with_the_bytes() {
+        let (_dir, db) = open();
+        let mut conn = db.conn().unwrap();
+        let mut first = download(RouteId::Unpaywall, "aaa", "2026-01-01T00:00:00+00:00");
+        first.licence = Some(LicenceWrite {
+            url: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+            content_version: None,
+            start: None,
+            source: "unpaywall".to_string(),
+        });
+        record_download(&mut conn, &first).unwrap();
+        let before: Vec<crate::sqlite::artefacts::ArtefactRow> =
+            read_artefacts_for_paper(&conn, "p-1").unwrap();
+        assert_eq!(
+            before[0].license_url.as_deref(),
+            Some("https://creativecommons.org/licenses/by/4.0/"),
+            "the first fetch recorded the grant the naming source stated"
+        );
+
+        // Same UNIQUE key (both `unknown`), so this is an update and not a
+        // second row — and this source named no licence.
+        record_download(
+            &mut conn,
+            &download(RouteId::Publisher, "bbb", "2027-06-06T06:06:06+00:00"),
+        )
+        .unwrap();
+
+        let rows: Vec<crate::sqlite::artefacts::ArtefactRow> =
+            read_artefacts_for_paper(&conn, "p-1").unwrap();
+        assert_eq!(rows.len(), 1, "same (paper, kind, version, locator)");
+        assert_eq!(
+            rows[0].route, "publisher",
+            "the row followed the route that served the second fetch"
+        );
+        assert_eq!(
+            (
+                rows[0].license_url.as_deref(),
+                rows[0].license_content_version.as_deref(),
+                rows[0].license_start.as_deref(),
+                rows[0].license_source.as_deref(),
+            ),
+            (None, None, None, None),
+            "the re-download's silence takes the grant away rather than leaving \
+             the previous source's URL beside bytes it was never said about"
+        );
+        assert_eq!(
+            rows[0].access_basis, "subscription_read",
+            "and the basis moved too — the two answers travel together"
+        );
     }
 
     /// A re-download *did* happen, so the row follows the new route rather
