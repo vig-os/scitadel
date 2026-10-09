@@ -37,6 +37,10 @@ jobs:
         shard:
           - name: cli
             tapes: "cli-bib-import.tape cli-bib-rekey.tape cli-coverage-action-list.tape cli-question-workflow.tape cli-search.tape cli-auth.tape cli-openalex-title-and-doi.tape"
+            # Seven tapes — the largest shard in the matrix — against the same
+            # 10-minute default. It has been sitting just under the ceiling
+            # (9m in #302's measurement) and now tips over at 10m15s.
+            timeout-minutes: 14
           - name: tui-launch
             tapes: "tui-launch.tape init-wizard.tape"
           - name: tui-papers
