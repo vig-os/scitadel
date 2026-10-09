@@ -6,8 +6,10 @@
 //! > prompt injection.
 //!
 //! ADR-007 states the requirement in §5; #287 is the issue that found it did not
-//! exist. The part implemented here is the part that has to exist before any
-//! consumer can be written safely:
+//! exist. #290 landed this type, and #287 landed the fields on it: `Paper.title`
+//! and every `Paper.authors` entry are an [`UntrustedText`], so the reader, the
+//! state column and `read_paper` cannot render one without going through
+//! [`UntrustedText::rendered`] or `Display`. The type does three things:
 //!
 //! 1. **A type, not a convention.** [`UntrustedText`] carries a [`Provenance`]
 //!    next to the string, so "is this ours or the document's?" is answered by
@@ -18,6 +20,10 @@
 //!    characters, collapses whitespace and caps the length. A caller cannot
 //!    reach a terminal or a tool return with an unescaped publisher string by
 //!    accident, because the default formatting *is* the escaped form.
+//! 3. **Provenance recoverable at the call site.** [`UntrustedText::provenance`]
+//!    and [`Provenance::label`], which is what lets a return say "from the
+//!    document (untrusted)" rather than leaving a consumer to guess (#287's
+//!    third acceptance box).
 //!
 //! The raw string is still reachable, as [`UntrustedText::as_str`], and it has to
 //! be: the identity matcher compares titles, the manifest mirror records what the
@@ -35,7 +41,22 @@
 //!   escaped, and a caller that wants the second one has [`UntrustedText::rendered`].
 //! - **No prompt-injection envelope.** ADR-007 §5 asks for the *returned* full
 //!   text to be wrapped and its scripts and styles stripped. That is a property
-//!   of one consumer's output, not of this type, and it stays with #287.
+//!   of one consumer's output, not of this type, and it stays with #287. The
+//!   #287 amendment to ADR-007 records that `read_paper`'s full text still
+//!   arrives unwrapped, and why: the same 200-character cap that makes this type
+//!   safe for a title would truncate a reader's body to nothing.
+//!
+//! # What a serialised `UntrustedText` is
+//!
+//! A bare string — hand-written rather than derived, because `#[serde(transparent)]`
+//! only accepts a one-field struct and the derived two-field form would put
+//! `{"text":…,"provenance":…}` into `get_paper`'s output and every export. The
+//! provenance does not travel: a value that arrives through JSON arrived through
+//! a scitadel writer, so deserialising tags [`Provenance::Ours`] rather than
+//! guessing. A display path therefore builds its JSON explicitly —
+//! [`Paper::to_display_json`] — rather than relying on the derived form.
+//!
+//! [`Paper::to_display_json`]: crate::models::Paper::to_display_json
 //!
 //! # Why the cap is here and not at each call site
 //!
@@ -46,6 +67,8 @@
 
 use std::borrow::Cow;
 use std::fmt;
+
+use serde::{Deserialize, Serialize};
 
 /// The most characters any untrusted string renders as.
 ///
@@ -156,6 +179,47 @@ pub struct UntrustedText {
     provenance: Provenance,
 }
 
+/// A serialised `UntrustedText` is its string and nothing else.
+///
+/// Hand-written rather than derived because `#[serde(transparent)]` only
+/// accepts a one-field struct, and the derived form of a two-field one would put
+/// `{"text":…,"provenance":…}` into `get_paper`'s output and into every export —
+/// a shape change no consumer asked for. The provenance is not part of what
+/// travels: see the module docs.
+impl Serialize for UntrustedText {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.text)
+    }
+}
+
+impl<'de> Deserialize<'de> for UntrustedText {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Ok(Self::ours(text))
+    }
+}
+
+/// Comparing against a plain string is a read, not a render: the string is never
+/// put on a terminal by it. These exist so an assertion about a stored title
+/// reads as the string it is about.
+impl PartialEq<str> for UntrustedText {
+    fn eq(&self, other: &str) -> bool {
+        self.text == other
+    }
+}
+
+impl PartialEq<&str> for UntrustedText {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
+}
+
+impl PartialEq<String> for UntrustedText {
+    fn eq(&self, other: &String) -> bool {
+        &self.text == other
+    }
+}
+
 impl UntrustedText {
     /// Tag `text` with its provenance.
     pub fn new(text: impl Into<String>, provenance: Provenance) -> Self {
@@ -199,6 +263,17 @@ impl UntrustedText {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.text
+    }
+
+    /// The first `max_chars` characters of the rendered form.
+    ///
+    /// A caller that wants a short line out of a long string — a confirmation
+    /// message, a table column — reaches for a byte slice of the stored string,
+    /// which both skips neutralisation and panics on a multi-byte boundary. This
+    /// is that operation done once, on the safe side of the boundary.
+    #[must_use]
+    pub fn preview(&self, max_chars: usize) -> String {
+        self.rendered().chars().take(max_chars).collect()
     }
 
     /// Whether the string changed at all under neutralisation: a hint for a
@@ -676,5 +751,56 @@ mod tests {
             "and a serialiser writes the stored bytes, because the mirror's \
              fidelity is a separate requirement from display safety"
         );
+    }
+
+    /// A serialised `UntrustedText` is its string — the shape every consumer
+    /// already parses — and provenance does not travel with it. A consumer that
+    /// needs the rendered form asks for `Paper::to_display_json`; a value that
+    /// arrives through JSON arrived through a scitadel writer, so it is tagged
+    /// `Ours` rather than guessed at.
+    #[test]
+    fn serialisation_is_a_bare_string_and_provenance_resets_to_ours() {
+        let hostile = UntrustedText::publisher_supplied("Title\u{1b}[2J");
+        let json = serde_json::to_string(&hostile).expect("serialise");
+        assert_eq!(json, "\"Title\\u001b[2J\"");
+
+        let back: UntrustedText = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(back.as_str(), hostile.as_str());
+        assert!(back.is_trusted(), "a value from JSON is scitadel's own");
+        // Neutralisation is a rendering concern, so the round trip through JSON
+        // does not lose the bytes and does not make them safe either.
+        assert_eq!(back.rendered(), "Title");
+    }
+
+    /// `preview` is the byte-slice truncation a caller reaches for otherwise,
+    /// which both skips neutralisation and panics on a multi-byte boundary.
+    #[test]
+    fn preview_truncates_the_rendered_form_at_a_character_boundary() {
+        // An escape is a separator rather than a deletion, so the preview keeps
+        // the word boundary the escape left behind.
+        let hostile = UntrustedText::publisher_supplied("R\u{1b}[2Jéal Title");
+        assert_eq!(hostile.preview(5), "R éal");
+        assert_eq!(hostile.preview(100), "R éal Title");
+        assert_eq!(hostile.preview(0), "");
+
+        // Multi-byte, and cut mid-way through: no panic, valid UTF-8.
+        let wide = UntrustedText::publisher_supplied("\u{1f9ea}".repeat(10));
+        let preview = wide.preview(4);
+        assert_eq!(preview.chars().count(), 4);
+        assert!(std::str::from_utf8(preview.as_bytes()).is_ok());
+    }
+
+    /// Comparing against a plain string is a read, not a render.
+    #[test]
+    fn comparison_against_a_plain_string_compares_the_stored_bytes() {
+        let title = UntrustedText::ours("A Title");
+        assert_eq!(title, "A Title");
+        assert_eq!(title, String::from("A Title"));
+        assert_ne!(title, "Another");
+        assert_ne!(title, String::from("Another"));
+        // The comparison is on the stored bytes, so it is not a way to render.
+        let hostile = UntrustedText::publisher_supplied("A\u{1b}[2JTitle");
+        assert_ne!(hostile, "A Title");
+        assert_eq!(hostile.rendered(), "A Title");
     }
 }

@@ -151,6 +151,7 @@ fn is_valid_citekey(s: &str) -> bool {
 mod tests {
     use super::*;
     use scitadel_core::models::Paper;
+    use scitadel_core::untrusted::UntrustedText;
     use scitadel_db::sqlite::Database;
 
     fn fresh() -> (SqlitePaperRepository, SqlitePaperAliasRepository) {
@@ -164,7 +165,7 @@ mod tests {
 
     fn seed(papers: &SqlitePaperRepository, title: &str, author: &str, year: i32) -> Paper {
         let mut p = Paper::new(title);
-        p.authors = vec![author.to_string()];
+        p.authors = vec![UntrustedText::ours(author)];
         p.year = Some(year);
         papers.save(&p).unwrap();
         // Seed a key the way migrate's backfill would.
@@ -261,7 +262,7 @@ mod tests {
 
         // Mutate paper metadata (simulating a title correction).
         let mut updated = p.clone();
-        updated.title = "Brand New Title".into();
+        updated.title = UntrustedText::ours("Brand New Title");
         papers.save(&updated).unwrap();
 
         let out = rekey_paper(&papers, &aliases, p.id.as_str(), None, "lars").unwrap();

@@ -303,7 +303,7 @@ pub fn get_papers_tool(search_id: &str) -> Result<String, String> {
             .authors
             .iter()
             .take(3)
-            .cloned()
+            .map(|author| author.rendered().into_owned())
             .collect::<Vec<_>>()
             .join("; ");
         let authors_suffix = if p.authors.len() > 3 {
@@ -333,7 +333,9 @@ pub fn get_papers_tool(search_id: &str) -> Result<String, String> {
 pub fn get_paper_tool(paper_id: &str) -> Result<String, String> {
     let db = open_db()?;
     let paper = resolve_paper_id(&db, paper_id)?;
-    serde_json::to_string_pretty(&paper).map_err(|e| e.to_string())
+    // `to_display_json`, not `Serialize`: `Serialize` writes the title as
+    // stored and this return is an agent's context (#287).
+    serde_json::to_string_pretty(&paper.to_display_json()).map_err(|e| e.to_string())
 }
 
 pub fn export_search_tool(search_id: &str, format: &str) -> Result<String, String> {
@@ -461,7 +463,7 @@ pub fn assess_paper_tool(
     Ok(format!(
         "Assessment saved: {}\nPaper: {}\nQuestion: {}\nScore: {score:.2}\nReasoning: {}",
         assessment.id.as_str(),
-        &paper.title[..paper.title.len().min(60)],
+        paper.title.preview(60),
         &question.text[..question.text.len().min(60)],
         &reasoning[..reasoning.len().min(200)]
     ))
@@ -495,10 +497,7 @@ pub fn get_assessments_tool(
                 .get(a.paper_id.as_str())
                 .ok()
                 .flatten()
-                .map_or_else(
-                    || "Unknown".into(),
-                    |p| p.title[..p.title.len().min(50)].to_string(),
-                );
+                .map_or_else(|| "Unknown".into(), |p| p.title.preview(50));
             format!(
                 "Score: {:.2}  Paper: {}  Assessor: {}  {}\n  Reasoning: {}",
                 a.score,
@@ -572,7 +571,7 @@ pub fn save_assessment_tool(
     Ok(format!(
         "Assessment saved: {}\nPaper: {}\nQuestion: {}\nScore: {score:.2}\nAssessor: mcp-native\nReasoning: {}",
         assessment.id.as_str(),
-        &paper.title[..paper.title.len().min(60)],
+        paper.title.preview(60),
         &question.text[..question.text.len().min(60)],
         &reasoning[..reasoning.len().min(200)]
     ))
@@ -742,10 +741,18 @@ fn assemble_read_paper_response(
 
     if with_annotations {
         let (annotations, source_version) = build_annotations_json(db, paper.id.as_str())?;
+        // #287: the title is the document's own claim about itself, and this
+        // return lands in an agent's context where it is indistinguishable from
+        // text scitadel produced. `rendered()` — the same neutralisation
+        // `Display` applies — plus the provenance label, so the consumer can
+        // weigh the string rather than guess whose it is. The full text stays
+        // raw: see the ADR-007 amendment, which records that envelope as not
+        // done and why.
         let response = serde_json::json!({
             "paper": {
                 "id": paper.id.as_str(),
-                "title": paper.title,
+                "title": paper.title.rendered(),
+                "title_provenance": paper.title.provenance().label(),
                 "abstract": paper.r#abstract,
                 "full_text": body,
             },
@@ -766,8 +773,9 @@ fn assemble_read_paper_response(
     };
     let extractor_line = extractor.map_or_else(String::new, |e| format!("Extractor: {e}\n"));
     Ok(format!(
-        "Paper: {}\nPath: {path_display}\n{extractor_line}\n{body_with_marker}",
-        paper.title
+        "Paper: {} ({})\nPath: {path_display}\n{extractor_line}\n{body_with_marker}",
+        paper.title,
+        paper.title.provenance().label()
     ))
 }
 
@@ -789,7 +797,7 @@ pub async fn get_references_tool(paper_id: &str) -> Result<String, String> {
         .map(|p| {
             serde_json::json!({
                 "id": p.id.as_str(),
-                "title": p.title,
+                "title": p.title.rendered(),
                 "authors": p.authors,
                 "year": p.year,
                 "doi": p.doi,
@@ -816,7 +824,7 @@ pub async fn get_citations_tool(paper_id: &str, limit: Option<usize>) -> Result<
         .map(|p| {
             serde_json::json!({
                 "id": p.id.as_str(),
-                "title": p.title,
+                "title": p.title.rendered(),
                 "authors": p.authors,
                 "year": p.year,
                 "doi": p.doi,
@@ -1058,7 +1066,7 @@ pub fn prepare_batch_assessments_tool(
             .authors
             .iter()
             .take(3)
-            .cloned()
+            .map(|author| author.rendered().into_owned())
             .collect::<Vec<_>>()
             .join("; ");
         let authors_suffix = if p.authors.len() > 3 {
@@ -1496,7 +1504,7 @@ fn build_annotated_paper(db: &Database, paper_id: &str) -> Result<String, String
     let response = serde_json::json!({
         "paper": {
             "id": paper.id.as_str(),
-            "title": paper.title,
+            "title": paper.title.rendered(),
             "abstract": paper.r#abstract,
             "full_text": paper.full_text,
         },
@@ -1589,7 +1597,7 @@ pub fn summarize_search_tool(
             let (abstract_text, truncated) = truncate_abstract(&p.r#abstract, abstract_char_limit);
             serde_json::json!({
                 "paper_id": p.id.as_str(),
-                "title": p.title,
+                "title": p.title.rendered(),
                 "authors": p.authors,
                 "year": p.year,
                 "journal": p.journal,
@@ -2604,10 +2612,133 @@ mod tests {
         // Legacy text shape: must NOT be JSON, must include the title
         // and extractor lines exactly as before #185.
         assert!(serde_json::from_str::<serde_json::Value>(&out).is_err());
-        assert!(out.starts_with("Paper: Old format\n"));
+        assert!(out.starts_with("Paper: Old format (scitadel's own record)\n"));
         assert!(out.contains("Path: /tmp/p-rp2.pdf"));
         assert!(out.contains("Extractor: pdftotext"));
         assert!(out.contains("hello"));
+    }
+
+    /// The title a PDF `/Title` really carries, extracted by the real
+    /// extractor rather than typed in. The UTF-16BE hex string is the encoding
+    /// Word writes, and it is the only `/Title` encoding that can hold a literal
+    /// backslash — the literal-string decoder drops one.
+    ///
+    /// The same payload is asserted through the TUI render path in
+    /// `scitadel-tui`; the extractor half of the claim is proven in
+    /// `scitadel-adapters/tests/untrusted_envelope.rs`.
+    fn hostile_pdf_title() -> String {
+        const HOSTILE: &str = "Real Title\u{1b}[31m\u{1b}[2J\u{1b}]8;;https://attacker.example/\u{1b}\\click\u{1b}]8;;\u{1b}\\";
+        let hex: String = HOSTILE.chars().fold(String::new(), |mut acc, c| {
+            use std::fmt::Write as _;
+            let _ = write!(acc, "{:04X}", c as u32);
+            acc
+        });
+        let pdf = format!("%PDF-1.7\n/Title <FEFF{hex}> /Author(x)\n%%EOF\n");
+        scitadel_adapters::identity::pdf_title(pdf.as_bytes()).expect("a title the PDF states")
+    }
+
+    /// #287's MCP half: a document's own title, carrying terminal escape
+    /// sequences, must not reach an agent's context intact. Asserted on the
+    /// *output*, not on a method having been called.
+    #[test]
+    fn read_paper_neutralises_a_hostile_document_title() {
+        let db = fresh_db();
+        let raw = hostile_pdf_title();
+
+        // Stored the way every writer stores it, read back the way every reader
+        // reads it: the assertion is about the return, not about a fixture.
+        let (paper_repo, _, _, _, _) = db.repositories();
+        let mut p = Paper::new(&raw);
+        p.id = PaperId::from("p-hostile");
+        p.r#abstract = "abs".into();
+        p.full_text = Some("hello".into());
+        paper_repo.save(&p).expect("save paper");
+        let stored = load_paper(&db, "p-hostile");
+        assert_eq!(
+            stored.title.as_str(),
+            raw,
+            "the round trip keeps the bytes: neutralisation is a rendering concern"
+        );
+
+        let out = assemble_read_paper_response(
+            &db,
+            &stored,
+            "hello".into(),
+            None,
+            "/tmp/p.pdf",
+            100,
+            true,
+        )
+        .expect("response");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+
+        let title = v["paper"]["title"].as_str().expect("a title");
+        assert!(
+            !title.contains('\u{1b}'),
+            "no escape byte may survive: {title:?}"
+        );
+        assert!(
+            !title.chars().any(char::is_control),
+            "no control character may survive: {title:?}"
+        );
+        for (label, needle) in [
+            ("CSI", "31m"),
+            ("erase-display", "[2J"),
+            ("OSC 8", "https://attacker.example/"),
+        ] {
+            assert!(
+                !title.contains(needle),
+                "the {label} payload must not survive: {title:?}"
+            );
+        }
+        assert_eq!(title, "Real Title click", "the words survive: {title:?}");
+
+        // #287's third box: the consumer is told whose string it is. Built from
+        // a publisher-supplied value because the `papers.title` column does not
+        // record which side of the boundary its title came from — the document's
+        // own claim is `paper_identity_checks.resolved_title`, and
+        // `resolved_title_text()` labels that one `PublisherSupplied`.
+        let mut theirs = stored.clone();
+        theirs.title = scitadel_core::untrusted::UntrustedText::publisher_supplied(raw);
+        let out = assemble_read_paper_response(
+            &db,
+            &theirs,
+            "hello".into(),
+            None,
+            "/tmp/p.pdf",
+            100,
+            true,
+        )
+        .expect("response");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(
+            v["paper"]["title"], "Real Title click",
+            "a document-supplied title renders neutralised"
+        );
+        assert_eq!(
+            v["paper"]["title_provenance"], "from the document (untrusted)",
+            "and is labelled as the document's rather than left to be guessed at"
+        );
+
+        // The legacy text shape names it inline, through the same path.
+        let text = assemble_read_paper_response(
+            &db,
+            &theirs,
+            "hello".into(),
+            None,
+            "/tmp/p.pdf",
+            100,
+            false,
+        )
+        .expect("text response");
+        assert!(
+            !text.contains('\u{1b}'),
+            "no escape byte survives: {text:?}"
+        );
+        assert!(
+            text.starts_with("Paper: Real Title click (from the document (untrusted))\n"),
+            "{text:?}"
+        );
     }
 
     #[test]

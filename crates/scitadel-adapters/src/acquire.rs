@@ -1083,6 +1083,7 @@ mod tests {
     //! same rows back, which is the failure this command exists to prevent.
 
     use super::*;
+    use scitadel_core::untrusted::UntrustedText;
 
     use async_trait::async_trait;
     use scitadel_core::config::OpenAlexAuth;
@@ -1562,7 +1563,10 @@ mod tests {
             let mut p = Paper::new(title);
             p.id = scitadel_core::models::PaperId::from(id.to_string());
             p.year = year;
-            p.authors = authors.iter().map(|author| (*author).to_string()).collect();
+            p.authors = authors
+                .iter()
+                .map(|author| UntrustedText::ours(*author))
+                .collect();
             p.doi = doi.map(str::to_string);
             p.openalex_id = openalex_id.map(str::to_string);
             let (paper_repo, _, _, _, _) = self.db.repositories();

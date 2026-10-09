@@ -12,6 +12,7 @@ use std::path::Path;
 use assert_cmd::Command;
 use scitadel_core::models::{Paper, PaperId, ResearchQuestion};
 use scitadel_core::ports::{PaperRepository, QuestionRepository};
+use scitadel_core::untrusted::UntrustedText;
 use scitadel_db::sqlite::{Database, SqliteShortlistRepository};
 use tempfile::TempDir;
 
@@ -179,7 +180,7 @@ fn seed_db(tmp: &Path) -> (std::path::PathBuf, String) {
     for (id, title, author, year) in papers {
         let mut p = Paper::new(title);
         p.id = PaperId::from(id);
-        p.authors = vec![author.to_string()];
+        p.authors = vec![UntrustedText::ours(author)];
         p.year = Some(year);
         paper_repo.save(&p).unwrap();
         let shortlist = SqliteShortlistRepository::new(db.clone());

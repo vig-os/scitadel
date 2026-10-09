@@ -90,7 +90,14 @@ pub fn draw(
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(area);
 
-    draw_text_pane(frame, chunks[0], &paper.title, body, &roots, focus);
+    draw_text_pane(
+        frame,
+        chunks[0],
+        &paper.title.rendered(),
+        body,
+        &roots,
+        focus,
+    );
     draw_notes_pane(
         frame,
         chunks[1],
@@ -395,7 +402,11 @@ pub fn highlight_count(data: &DataStore, paper_id: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scitadel_core::models::{Anchor, AnchorStatus, Annotation, PaperId};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use scitadel_core::models::{Anchor, AnchorStatus, Annotation, Paper, PaperId};
+    use scitadel_core::ports::PaperRepository as _;
+    use scitadel_core::untrusted::UntrustedText;
 
     fn root_at(quote: &str, range: Option<(usize, usize)>) -> Annotation {
         let mut a = Annotation::new_root(
@@ -489,5 +500,72 @@ mod tests {
         let highlights = build_highlights(body, &[&r1]);
         let lines = render_with_highlights(body, &highlights, None);
         assert_eq!(lines.len(), 3);
+    }
+
+    /// Render `paper` in the reader and hand back every character the terminal
+    /// would be asked to print.
+    fn rendered_screen(paper: &Paper) -> String {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = DataStore::open(&dir.path().join("scitadel.db")).expect("open db");
+        let (paper_repo, _, _, _, _) = data.db.repositories();
+        paper_repo.save(paper).expect("save paper");
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, frame.area(), &data, paper.id.as_str(), None, "lars"))
+            .expect("draw");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    /// #287's TUI half: the reader is a terminal application, so a crafted
+    /// `/Title` must not reach the screen intact. Asserted on the rendered
+    /// buffer, not on a method having been called.
+    ///
+    /// The payload is the one `identity::pdf_title` really extracts from a
+    /// UTF-16BE hex `/Title` — the encoding Word writes, and the only `/Title`
+    /// encoding that can hold a literal backslash. The same payload is asserted
+    /// through the MCP return path in `scitadel-mcp`.
+    #[test]
+    fn a_hostile_document_title_is_neutralised_in_the_rendered_buffer() {
+        const HOSTILE: &str = "Real Title\u{1b}[31m\u{1b}[2J\u{1b}]8;;https://attacker.example/\u{1b}\\click\u{1b}]8;;\u{1b}\\";
+        let mut paper = Paper::new(HOSTILE);
+        paper.id = PaperId::from("p-hostile");
+        // An abstract but no full text, so the reader takes its two-pane branch
+        // — the one that puts the title in a block header *and* passes it into
+        // the text pane, which is where an escape would reach the terminal.
+        paper.r#abstract = "An abstract.".into();
+        paper.title = UntrustedText::publisher_supplied(HOSTILE);
+        paper.authors = vec![UntrustedText::publisher_supplied("Attacker\u{1b}[2J, A.")];
+
+        let screen = rendered_screen(&paper);
+
+        assert!(
+            !screen.contains('\u{1b}'),
+            "no escape byte may reach the terminal: {screen:?}"
+        );
+        assert!(
+            !screen.chars().any(char::is_control),
+            "no control character may reach the terminal: {screen:?}"
+        );
+        for (label, needle) in [
+            ("CSI", "31m"),
+            ("erase-display", "2J"),
+            ("OSC 8", "attacker.example"),
+        ] {
+            assert!(
+                !screen.contains(needle),
+                "the {label} payload must not reach the terminal: {screen:?}"
+            );
+        }
+        assert!(
+            screen.contains("Real Title click"),
+            "the words survive, so a reader can still weigh the document: {screen:?}"
+        );
     }
 }

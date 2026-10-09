@@ -4,6 +4,7 @@ use rusqlite::params;
 use scitadel_core::error::CoreError;
 use scitadel_core::models::{Paper, PaperId};
 use scitadel_core::ports::PaperRepository;
+use scitadel_core::untrusted::UntrustedText;
 
 use super::Database;
 use crate::error::DbError;
@@ -126,7 +127,9 @@ impl SqlitePaperRepository {
     fn paper_params(paper: &Paper) -> [Box<dyn rusqlite::types::ToSql>; 17] {
         [
             Box::new(paper.id.as_str().to_string()),
-            Box::new(paper.title.clone()),
+            // `as_str`, not `rendered`: the stored column is the record, and the
+            // 200-character cap belongs to a display surface.
+            Box::new(paper.title.as_str().to_string()),
             Box::new(serde_json::to_string(&paper.authors).unwrap_or_default()),
             Box::new(paper.r#abstract.clone()),
             Box::new(paper.full_text.clone()),
@@ -331,8 +334,10 @@ fn row_to_paper(row: &rusqlite::Row) -> rusqlite::Result<Paper> {
 
     Ok(Paper {
         id: PaperId::from(id),
-        title: row.get("title")?,
-        authors: serde_json::from_str(&authors_json).unwrap_or_default(),
+        // `Ours` because the `papers` row is scitadel's own record of the work —
+        // see the `Provenance::Ours` note on `scitadel_core::models::Paper`.
+        title: UntrustedText::ours(row.get::<_, String>("title")?),
+        authors: serde_json::from_str::<Vec<UntrustedText>>(&authors_json).unwrap_or_default(),
         r#abstract: row.get("abstract")?,
         full_text: row.get("full_text")?,
         summary: row.get("summary")?,

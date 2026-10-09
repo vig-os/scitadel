@@ -1033,9 +1033,12 @@ fn check_dropped_identity(
     path: &Path,
 ) -> Result<ManualIdentity, ScanError> {
     let expected = WorkIdentity {
-        title: Some(paper.title.clone()),
+        title: Some(paper.title.as_str().to_string()),
         year: paper.year,
-        first_author: paper.authors.first().cloned(),
+        first_author: paper
+            .authors
+            .first()
+            .map(|author| author.as_str().to_string()),
     };
     let not_applicable = || ManualIdentity {
         path: path.to_path_buf(),
@@ -1383,7 +1386,7 @@ mod tests {
                 Paper::new("Deep learning for radiopharmaceutical image reconstruction");
             paper.id = PaperId::from("p-1".to_string());
             paper.year = Some(2020);
-            paper.authors = vec!["Young, Christopher J.".to_string()];
+            paper.authors = vec![UntrustedText::ours("Young, Christopher J.")];
             paper.doi = Some("10.99999/some.suffix.12345".to_string());
             let (repo, _, _, _, _) = db.repositories();
             repo.save(&paper).unwrap();

@@ -1543,7 +1543,7 @@ mod tests {
         // A full `save()` of the same work must not clear it.
         let (papers, _, _, _, _) = fx.db.repositories();
         let mut paper = papers.get("p-1").unwrap().unwrap();
-        paper.title = "A corrected title".into();
+        paper.title = UntrustedText::ours("A corrected title");
         papers.save(&paper).unwrap();
         assert_eq!(
             read_osti_id(&fx.db.conn().unwrap(), "p-1")

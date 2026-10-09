@@ -400,6 +400,7 @@ fn import_one(
 mod tests {
     use super::*;
     use scitadel_core::models::Paper;
+    use scitadel_core::untrusted::UntrustedText;
     use scitadel_db::sqlite::Database;
 
     fn fresh() -> (
@@ -468,7 +469,7 @@ mod tests {
         let (papers, aliases, annotations, tags) = fresh();
         // Seed a paper with a known bibtex_key and no external ids.
         let mut p = Paper::new("Cascade Anchor");
-        p.authors = vec!["Anchor, A".into()];
+        p.authors = vec![UntrustedText::ours("Anchor, A")];
         p.year = Some(2099);
         papers.save(&p).unwrap();
         // The save above doesn't persist the key, so do it explicitly
@@ -538,7 +539,7 @@ mod tests {
         let mut existing = Paper::new("Existing Title");
         existing.doi = Some("10.1/x".into());
         existing.year = Some(2020);
-        existing.authors = vec!["Original, Author".into()];
+        existing.authors = vec![UntrustedText::ours("Original, Author")];
         papers.save(&existing).unwrap();
 
         let src = r"
@@ -610,15 +611,15 @@ mod tests {
 
         let (papers, aliases, annotations, tags) = fresh();
         let mut p1 = Paper::new("Quantum Advantage");
-        p1.authors = vec!["Smith, John".into()];
+        p1.authors = vec![UntrustedText::ours("Smith, John")];
         p1.year = Some(2024);
         p1.doi = Some("10.1/quantum".into());
         let mut p2 = Paper::new("Deep Residual Learning");
-        p2.authors = vec!["He, Kaiming".into()];
+        p2.authors = vec![UntrustedText::ours("He, Kaiming")];
         p2.year = Some(2015);
         p2.arxiv_id = Some("1512.03385".into());
         let mut p3 = Paper::new("Title Only");
-        p3.authors = vec!["Anon, A".into()];
+        p3.authors = vec![UntrustedText::ours("Anon, A")];
         p3.year = Some(2000);
 
         for p in [&p1, &p2, &p3] {

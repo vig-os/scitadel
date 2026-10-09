@@ -142,11 +142,12 @@ where
 mod tests {
     use super::*;
     use scitadel_core::models::{Paper, PaperId};
+    use scitadel_core::untrusted::UntrustedText;
 
     fn paper(id: &str, title: &str, year: i32) -> Paper {
         let mut p = Paper::new(title);
         p.id = PaperId::from(id);
-        p.authors = vec!["Doe, J.".into()];
+        p.authors = vec![UntrustedText::ours("Doe, J.")];
         p.year = Some(year);
         p
     }

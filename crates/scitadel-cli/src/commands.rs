@@ -512,7 +512,7 @@ pub fn show(id: &str) -> Result<()> {
 
     // Try as paper ID first
     if let Ok(Some(paper)) = paper_repo.get(id) {
-        let json = serde_json::to_string_pretty(&paper)?;
+        let json = serde_json::to_string_pretty(&paper.to_display_json())?;
         println!("{json}");
         return Ok(());
     }
@@ -520,7 +520,7 @@ pub fn show(id: &str) -> Result<()> {
     // Try prefix match
     let all = paper_repo.list_all(1000, 0)?;
     let paper = resolve_prefix(&all, id, |p| p.id.as_str())?;
-    let json = serde_json::to_string_pretty(paper)?;
+    let json = serde_json::to_string_pretty(&paper.to_display_json())?;
     println!("{json}");
     Ok(())
 }
@@ -727,7 +727,7 @@ pub async fn assess(
                     i + 1,
                     total,
                     assessment.score,
-                    &paper.title[..paper.title.len().min(60)]
+                    paper.title.preview(60)
                 );
                 assessments.push(assessment);
             }
@@ -789,12 +789,20 @@ pub async fn resolve_doi(doi: &str, json: bool, no_save: bool) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("no OpenAlex record for DOI {doi}"))?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&paper)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&paper.to_display_json())?
+        );
     } else {
         let authors = if paper.authors.is_empty() {
             "(none)".to_string()
         } else {
-            paper.authors.join(", ")
+            paper
+                .authors
+                .iter()
+                .map(|author| author.rendered().into_owned())
+                .collect::<Vec<_>>()
+                .join(", ")
         };
         println!("Resolved DOI: {}", paper.doi.as_deref().unwrap_or(doi));
         println!("  Title:    {}", paper.title);

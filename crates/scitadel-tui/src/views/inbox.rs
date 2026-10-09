@@ -71,7 +71,7 @@ pub fn build_items(unread: &[Annotation], papers: &HashMap<String, Paper>) -> Ve
     for (paper_id, anns) in &by_paper {
         let title = papers
             .get(paper_id)
-            .map_or_else(|| paper_id.clone(), |p| p.title.clone());
+            .map_or_else(|| paper_id.clone(), |p| p.title.rendered().into_owned());
         items.push(InboxItem::Header {
             paper_id: paper_id.clone(),
             title,
