@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-10-02T12:20:49Z
-updated: 2026-10-05T13:58:17Z
+updated: 2026-10-08T23:26:45Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/260
-comments: 2
+comments: 3
 labels: bug, effort:medium, priority:high
 assignees: none
 milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-10-06T08:17:52.361Z
+synced: 2026-10-09T08:09:15.248Z
 ---
 
 # [Issue 260]: [fix(acquire): preprint and publisher-direct OA routes are missing — 52 free papers reported unreachable (bioRxiv 3/3 missed)](https://github.com/vig-os/scitadel/issues/260)
@@ -108,4 +108,49 @@ My method was the flaw, not just the conclusion: I inferred registry ownership f
 
 The 52-DOI publisher set in the original report is untouched by any of this and still needs the index routes.
 
+
+---
+
+# [Comment #3]() by [gerchowl]()
+
+_Posted on October 8, 2026 at 11:26 PM_
+
+## Measurement after #299 and #300 (live contract suite, 2026-10-09)
+
+Three changes landed since this issue's last measurement, and two of them are ranker work: #299 (Crossref `similarity-checking` links excluded, and ADR-007 §3's fetch order applied as the tie-break after version+licence), then #300 (candidate kinds, so a PubMed citation page cannot wear a publication's `version` word and win on version dominance).
+
+| | bytes obtained | obtained **as a PDF** |
+|---|---|---|
+| original finding (2026-10-02) | 3 bioRxiv preprints: 3/3 missed | — |
+| after #297's harness | 4 / 16 | 1 / 16 |
+| after #299 (ranker) | 15 / 16 | 6 / 16 |
+| after #300 (candidate kinds) | 13 / 16 | **7 / 16** |
+
+The byte number *fell* and that is the honest direction: two rows previously "obtained" a PubMed abstract page, which is not an article. Both now report the publisher's real 403.
+
+Clause 1 of the three bioRxiv DOIs: a PubMed citation page at rank 1 went **2/3 → 0/3**, and a bioRxiv PDF at rank 1 went **0/3 → 1/3**.
+
+## Clause 1 now needs an ADR decision, and it belongs here
+
+For `10.1101/2025.06.14.659707`, the live OpenAlex record offers three copies:
+
+```
+best_oa_location  doi:…                       acceptedVersion
+locations[1]      pmid:40667369               publishedVersion   <- PubMed page
+locations[2]      pmh:oai:pubmedcentral:12262699  submittedVersion
+```
+
+#300 excludes the PubMed page. What then wins is **Europe PMC's CC-BY author manuscript at ADR-007 §3 step 1** — because §3's own ranking says `OA VoR > AM > preprint`, and §3's fetch order puts Europe PMC first. Both of those are the ADR's stated rules, and both are load-bearing elsewhere.
+
+So **clause 1 asks for a document the ADR deliberately deprioritises.** Two coherent options:
+
+**(a) Amend §3 so the author-manuscript rung is for works without an OA version of record.** Europe PMC's `am` copy would rank above the preprint copy only when no OA VoR exists. For a bioRxiv preprint — where bioRxiv *is* the publication — the transform's PDF is the better artefact.
+
+**(b) Leave §3 alone and amend clause 1 of this issue.** The library is taking an author manuscript from an OA step-1 source, which is defensible and is what the ADR asks for; clause 1's 0/3 was about the PubMed page, which is fixed.
+
+I lean (a), because clause 1's wording — "obtains the PDF with no network index lookup" — is about determinism and the pacer budget, and a DOI transform is the one route that spends neither. But it is a real choice about what artefact the library wants, and I would rather it be made than implied.
+
+## On clause 2's "52-DOI set"
+
+The set this issue calls "above" is **not enumerated in the issue** — it names seven DOIs. #297's harness carries 16, each tagged with its provenance (`Issue260` or a recorded live query), and `LIVE_QUERY_PROVENANCE` records the queries. Until someone can name the 52, ≥90% cannot be measured as written. If the original run's DOI list is recoverable from raid's `tools/fetch/fulltext.py`, adding it to `crates/scitadel-adapters/src/oa_live.rs` would close this properly.
 
