@@ -162,3 +162,78 @@ fn render_paper_table(
     state.select(Some(selected));
     frame.render_stateful_widget(table, area, &mut state);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use scitadel_core::models::PaperId;
+    use scitadel_core::ports::PaperRepository as _;
+    use scitadel_core::untrusted::UntrustedText;
+
+    /// The papers table is the *other* place a document's title reaches a
+    /// screen, and it is the one a person looks at while deciding what to
+    /// read. #287 closed the reader's title path; this closes the list's.
+    ///
+    /// The reader's payload is reused verbatim — a PDF `/Title` carrying
+    /// colour, erase-display and an OSC 8 hyperlink — because a second, weaker
+    /// fixture here would let the list be unsafe while the reader looks safe.
+    const HOSTILE: &str = "Real Title\u{1b}[31m\u{1b}[2J\u{1b}]8;;https://attacker.example/\u{1b}\\click\u{1b}]8;;\u{1b}\\";
+
+    #[test]
+    fn a_hostile_document_title_is_neutralised_in_the_papers_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = DataStore::open(&dir.path().join("scitadel.db")).expect("open db");
+        let (paper_repo, _, _, _, _) = data.db.repositories();
+
+        let mut paper = Paper::new(HOSTILE);
+        paper.id = PaperId::from("p-hostile");
+        paper.authors = vec![UntrustedText::publisher_supplied("Attacker\u{1b}[2J, A.")];
+        paper.title = UntrustedText::publisher_supplied(HOSTILE);
+        paper_repo.save(&paper).expect("save paper");
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 8)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    frame.area(),
+                    &data,
+                    0,
+                    &HashSet::new(),
+                    &HashSet::new(),
+                    &HashSet::new(),
+                );
+            })
+            .expect("draw");
+
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        // Assert the *remnants*, not the ESC byte. ratatui drops the ESC itself
+        // when it writes a string into the buffer — verified by probe — so
+        // "no ESC reached the screen" is a claim about ratatui, not about this
+        // code, and it would pass with `as_str()` at the call site. What
+        // distinguishes `rendered()` from `as_str()` is what is left behind:
+        // `[31m` and `[2J` rendered as visible garbage.
+        for remnant in ["[31m", "[2J", "]8;;", "https://attacker.example"] {
+            assert!(
+                !screen.contains(remnant),
+                "an escape sequence's remnant must not reach the screen: \
+                 {remnant} in {screen:?}"
+            );
+        }
+        assert!(
+            screen.contains("Real Title") && screen.contains("Attacker"),
+            "the words a person needs still render, neutralised rather than \
+             dropped: {screen:?}"
+        );
+    }
+}
