@@ -466,7 +466,8 @@ publisher hosts, gathers:
 - Europe PMC (`isOpenAccess`, `inEPMC`).
 
 Candidates are ranked **OA VoR > AM > preprint**, then by licence
-strength. Crossref `license[]` counts as OA only when it is an
+strength. *(The `AM` rung's domain is narrowed by the 2026-10-09
+amendment below: it does not apply to a work that is itself a preprint.)* Crossref `license[]` counts as OA only when it is an
 allow-listed Creative Commons URL that is in force today (considering
 `content-version`, `start` and `delay-in-days`). ACS's own policy URLs
 (`10.15223/policy-*`) don't count.
@@ -873,3 +874,44 @@ full-text envelope, style stripping and prompt-injection framing are
 **deliberately not built**, for the reasons above, and are the work
 this amendment leaves outstanding rather than a line implying
 something that does not exist.
+
+
+---
+
+## Amendment — 2026-10-09: the `AM` rung does not apply to a preprint work
+
+*#260. The ranking rule above is left standing; this records the one case where
+applying it literally produces the worse document, and the reason.*
+
+**What changed.** The author-manuscript rung applies only to a work whose
+version of record is **not** open access. A work that is itself a preprint has
+no version of record to prefer over, so a repository's author-manuscript copy of
+it is a copy *of a preprint* — the same document the preprint server serves — and
+it now ranks as `preprint` rather than `am`.
+
+**Why.** The rule exists to say: *for a published article, prefer the accepted
+manuscript over a preprint of the same work.* That reasoning needs something to
+prefer. It does not transfer to a bioRxiv posting, where bioRxiv **is** the
+publication and a second copy held by an index is a duplicate, not an upgrade.
+
+Concretely: Europe PMC's `epmcAuthMan` on a PPR record means "we hold the
+author's version of this preprint", which is not the same claim as `epmcAuthMan`
+on a MEDLINE record. The words are identical and the sentence they complete is
+different.
+
+**Where the decision is made.** At the point a repository's flag becomes a
+`Version`, not in the comparator. `Rank` is unchanged, and the 128-cell ordering
+test still pins `version > licence > fetch step`. What changed is the *data* on
+one class of candidates.
+
+**Cost, stated.** A work that is misreported as a preprint by a registry now
+loses its author-manuscript placement. The gate is the work-level signal, so it
+is only as good as the registry's type field — and a registry that calls a
+journal article a preprint would downgrade real AMs. No such record was found;
+the Crossref `posted-content`/`subtype: preprint` and OpenAlex `type: preprint`
+spellings agree on every probe in `oa_live.rs`.
+
+**Not decided here.** Whether a preprint-server copy should outrank an index's
+copy of the same preprint. The two now *tie* on version and licence, so the fetch
+order decides, and Europe PMC is step 1. That is consistent with the fetch order
+and is left to it.

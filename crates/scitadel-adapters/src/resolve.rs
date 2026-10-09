@@ -467,6 +467,65 @@ pub fn version_from_repository(
     (version, source)
 }
 
+/// ADR-007 §3's author-manuscript rung applies only to a work whose version of
+/// record is **not** open. A work that is itself a preprint has no version of
+/// record to prefer over, so a repository's author-manuscript copy of it is a
+/// copy *of a preprint* — the exact document the preprint server serves — and
+/// ranking it above the preprint server's own posting is the rule applied
+/// outside the domain that motivated it.
+///
+/// The rule exists to say *for a published article, prefer the accepted
+/// manuscript over a preprint of the same work*. That reasoning needs something
+/// to prefer. It does not transfer to a bioRxiv posting, where bioRxiv **is**
+/// the publication and Europe PMC's copy is a duplicate, not an upgrade.
+///
+/// The work-level signal is the only thing that can make the distinction: a
+/// repository flag says which copy *that service* holds, and it cannot know
+/// whether a better version exists somewhere else. `epmcAuthMan` on a PPR
+/// record means "we hold the author's version of this preprint", which is not
+/// the same claim as `epmcAuthMan` on a MEDLINE record.
+///
+/// Only `AuthorManuscript` is touched. `VersionOfRecord` from a repository is
+/// left alone — it is a stronger claim, and the question of whether it is right
+/// for a preprint work is a different one. `Unstated` is left alone because
+/// there is nothing to downgrade.
+#[must_use]
+fn preprint_am_is_a_preprint(
+    resolved: Option<(Version, VersionSource)>,
+    work_level: Option<&(Version, VersionSource)>,
+) -> Option<(Version, VersionSource)> {
+    let (version, source) = resolved?;
+    if version != Version::AuthorManuscript {
+        return Some((version, source));
+    }
+    // Only a *preprint* work's AM is downgraded. Anything else — `Unstated`, a
+    // registry type with no rung — leaves the flag standing, because "we do not
+    // know what this work is" is not evidence that it has no version of record.
+    if !matches!(work_level, Some((Version::Preprint, _))) {
+        return Some((version, source));
+    }
+    let registry = match &source {
+        VersionSource::Repository { registry, .. } => *registry,
+        other => {
+            tracing::debug!(
+                ?other,
+                "an author-manuscript claim from a source that is not a                  repository was left standing: the downgrade is about what a                  repository's flag means, and generalising it here would need a                  reason this caller has not established"
+            );
+            return Some((version, source));
+        }
+    };
+    Some((
+        Version::Preprint,
+        VersionSource::Repository {
+            registry,
+            // Names **both** facts that produced it, so a plan line is checkable
+            // against Europe PMC rather than against us: the flag that was read
+            // and the work-level reason it was overridden.
+            signal: "author-manuscript copy of a preprint work".to_string(),
+        },
+    ))
+}
+
 /// The registrant prefix a DOI would be inferred from, or `None`.
 ///
 /// **The fallback, and only ever the fallback.** It exists because a `10.1101`
@@ -2831,52 +2890,54 @@ impl MetadataPass {
         let route = seed.route;
         let registry_hint = seed.registry_hint();
         let location_word_applies = location_version_word_applies(seed.kind, &seed.url);
-        let (version, version_source) = seed
-            .version_flag
-            .or_else(|| {
-                if !location_word_applies {
-                    tracing::debug!(
-                        url = %seed.url,
-                        named_by = %named,
-                        kind = %seed.kind.why(),
-                        "the naming source described this URL as a place that \
-                         serves no document — the DOI resolver answers with a \
-                         redirect — so its version word is a claim about the \
-                         work rather than about these bytes; the work-level \
-                         chain decides instead"
-                    );
-                    return None;
-                }
-                seed.version_word.as_deref().and_then(|word| {
-                    if route == RouteId::Crossref {
-                        version_from_content_version(word)
-                    } else if route == RouteId::Unpaywall {
-                        version_from_location_word(word, Registry::Unpaywall)
-                    } else {
-                        version_from_location_word(word, Registry::OpenAlex)
+        let (version, version_source) = preprint_am_is_a_preprint(
+            seed.version_flag
+                .or_else(|| {
+                    if !location_word_applies {
+                        tracing::debug!(
+                            url = %seed.url,
+                            named_by = %named,
+                            kind = %seed.kind.why(),
+                            "the naming source described this URL as a place that \
+                             serves no document — the DOI resolver answers with a \
+                             redirect — so its version word is a claim about the \
+                             work rather than about these bytes; the work-level \
+                             chain decides instead"
+                        );
+                        return None;
                     }
+                    seed.version_word.as_deref().and_then(|word| {
+                        if route == RouteId::Crossref {
+                            version_from_content_version(word)
+                        } else if route == RouteId::Unpaywall {
+                            version_from_location_word(word, Registry::Unpaywall)
+                        } else {
+                            version_from_location_word(word, Registry::OpenAlex)
+                        }
+                    })
                 })
-            })
-            .or_else(|| work_level.cloned())
-            .or_else(|| doi.and_then(version_from_doi_prefix))
-            .map_or_else(
-                || {
-                    // Nothing said. Whether that is `Unstated` or unrankable is
-                    // the floor's decision, because "here is a rendering whose
-                    // version I do not state" is something a source can say and
-                    // "here is a place I once saw" is not.
-                    match seed.licence_floor {
-                        LicenceFloor::RouteBasis => (
-                            Some(Version::Unstated),
-                            VersionSource::Unstated {
-                                because: format!("{named} named no version"),
-                            },
-                        ),
-                        LicenceFloor::IndexAssertionOnly => (None, VersionSource::None),
-                    }
-                },
-                |(version, source)| (Some(version), source),
-            );
+                .or_else(|| work_level.cloned()),
+            work_level,
+        )
+        .or_else(|| doi.and_then(version_from_doi_prefix))
+        .map_or_else(
+            || {
+                // Nothing said. Whether that is `Unstated` or unrankable is
+                // the floor's decision, because "here is a rendering whose
+                // version I do not state" is something a source can say and
+                // "here is a place I once saw" is not.
+                match seed.licence_floor {
+                    LicenceFloor::RouteBasis => (
+                        Some(Version::Unstated),
+                        VersionSource::Unstated {
+                            because: format!("{named} named no version"),
+                        },
+                    ),
+                    LicenceFloor::IndexAssertionOnly => (None, VersionSource::None),
+                }
+            },
+            |(version, source)| (Some(version), source),
+        );
 
         // The licence: a grant on *this* location first, then any grant the
         // record carries, filtered to grants in force for *this* version. A
@@ -5006,6 +5067,45 @@ mod tests {
 
         /// Mount a Crossref `/works/<doi>` answer at whatever path the pass
         /// asks, since the fixture routes by prefix rather than by DOI.
+        /// Serve a Europe PMC search answer, the shape `europepmc.rs` parses.
+        async fn serve_europepmc(&self, body: &str) {
+            Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path_regex("^/"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+                .mount(self.server("europepmc"))
+                .await;
+        }
+
+        /// Mount a 404 on each named bucket, which is how a metadata source that
+        /// holds nothing is modelled. Listing them rather than assuming keeps a
+        /// new bucket from silently passing by never being asked.
+        async fn first_mock_misses(&self, buckets: &[&str]) {
+            for bucket in buckets {
+                Mock::given(wiremock::matchers::method("GET"))
+                    .respond_with(ResponseTemplate::new(404))
+                    .mount(self.server(bucket))
+                    .await;
+            }
+        }
+
+        /// One `doi` through the whole pass, on a fresh pass with a recording
+        /// pacer. The shared shape, so a test cannot pass by choosing a
+        /// narrower entry point than the one production uses.
+        async fn resolve_doi(&self, doi: &str) -> Resolution {
+            let pacer = Arc::new(RecordingPacer::default());
+            let client = recording_client(&pacer, self.table.clone());
+            pass_for(self)
+                .resolve(
+                    &client,
+                    &WorkScope::new(),
+                    WorkRefs {
+                        doi: Some(doi),
+                        ..WorkRefs::default()
+                    },
+                )
+                .await
+        }
+
         async fn serve_crossref(&self, body: &str) {
             Mock::given(wiremock::matchers::method("GET"))
                 .and(wiremock::matchers::path_regex("^/"))
@@ -5580,7 +5680,7 @@ mod tests {
             versions,
             vec![Some(Version::Preprint); versions.len()],
             "the record's only VoR word was attached to a page about the work, \
-             so nothing claims a version of record: {}",
+             so nothing claims a version of record: {:?}",
             resolution.plan_lines().join("\n")
         );
 
@@ -6407,6 +6507,174 @@ mod tests {
             chosen.candidate.url.contains("/vor.pdf"),
             "and the one attempt was the top-ranked candidate: {}",
             chosen.candidate.url
+        );
+    }
+
+    /// #260's clause 1, and the ADR amendment behind it: an author manuscript of
+    /// a **preprint work** is a copy of a preprint, so it ranks as one.
+    ///
+    /// The Europe PMC body below is the real answer for
+    /// `10.1101/2025.06.14.659707` — `source: PPR`, `epmcAuthMan: Y`, a `cc by`
+    /// licence — and the Crossref body types the work `posted-content`, which is
+    /// how that DOI's live record reads.
+    #[tokio::test]
+    async fn an_author_manuscript_of_a_preprint_work_ranks_as_a_preprint() {
+        let sources = MetadataSources::new().await;
+        sources
+            .first_mock_misses(&["openalex", "datacite", "unpaywall", "pmc_oa"])
+            .await;
+        sources
+            .serve_crossref(
+                r#"{"status":"ok","message":{
+                     "type":"posted-content","subtype":"preprint",
+                     "title":["A bioRxiv preprint"],
+                     "license":[{"URL":"https://creativecommons.org/licenses/by/4.0/"}]
+                   }}"#,
+            )
+            .await;
+        sources
+            .serve_europepmc(
+                r#"{"hitCount":1,"resultList":{"result":[{
+                     "id":"PPR1039145","source":"PPR","pmcid":"PMC12262699",
+                     "isOpenAccess":"Y","inEPMC":"Y","hasPDF":"Y",
+                     "authMan":"N","epmcAuthMan":"Y","nihAuthMan":"N",
+                     "license":"cc by",
+                     "fullTextUrlList":{"fullTextUrl":[{
+                       "availabilityCode":"Available","documentStyle":"pdf",
+                       "site":"europepmc",
+                       "url":"https://europepmc.org/article/PPR/PPR1039145"}]}
+                   }]}}"#,
+            )
+            .await;
+
+        let resolution = sources.resolve_doi("10.1101/2025.06.14.659707").await;
+
+        assert!(
+            resolution
+                .ranked
+                .iter()
+                .any(|placed| placed.candidate.route == RouteId::EuropePmc),
+            "Europe PMC's copy is in the ranking at all, or the assertions \
+             below are about nothing: {:?}",
+            resolution.plan_lines()
+        );
+        assert!(
+            resolution
+                .ranked
+                .iter()
+                .all(|placed| placed.candidate.version != Some(Version::AuthorManuscript)),
+            "a repository's author-manuscript copy of a preprint work must not \
+             rank as `am`: {:?}",
+            resolution.plan_lines()
+        );
+        let preprint = resolution
+            .ranked
+            .iter()
+            .find(|placed| placed.candidate.version == Some(Version::Preprint))
+            .unwrap_or_else(|| {
+                panic!("a preprint-ranked candidate: {:?}", resolution.plan_lines())
+            });
+        assert_eq!(
+            preprint.candidate.version_source,
+            VersionSource::Repository {
+                registry: Registry::EuropePmc,
+                signal: "author-manuscript copy of a preprint work".to_string(),
+            },
+            "the source names both facts — the flag that was read and the \
+             work-level reason it was overridden — so a plan line is checkable \
+             against Europe PMC rather than against us"
+        );
+    }
+
+    /// The amendment narrows the `am` rung; it does not remove it. A repository
+    /// author manuscript of a **published** work still ranks as `am`, and the
+    /// registry's flag is answered differently only because the work-level
+    /// signal changed. If the gate were ever widened to "any work", this fails.
+    #[tokio::test]
+    async fn an_author_manuscript_of_a_published_work_still_ranks_as_am() {
+        let sources = MetadataSources::new().await;
+        sources
+            .first_mock_misses(&["openalex", "datacite", "unpaywall", "pmc_oa"])
+            .await;
+        sources
+            .serve_crossref(
+                r#"{"status":"ok","message":{
+                     "type":"journal-article",
+                     "title":["A published journal article"],
+                     "license":[{"URL":"https://creativecommons.org/licenses/by/4.0/"}]
+                   }}"#,
+            )
+            .await;
+        sources
+            .serve_europepmc(
+                r#"{"hitCount":1,"resultList":{"result":[{
+                     "id":"MED12345","source":"MED","pmcid":"PMC9999999",
+                     "isOpenAccess":"Y","inEPMC":"Y","hasPDF":"Y",
+                     "authMan":"N","epmcAuthMan":"Y","nihAuthMan":"N",
+                     "license":"cc by",
+                     "fullTextUrlList":{"fullTextUrl":[{
+                       "availabilityCode":"Available","documentStyle":"pdf",
+                       "site":"europepmc",
+                       "url":"https://europepmc.org/article/MED/12345"}]}
+                   }]}}"#,
+            )
+            .await;
+
+        let resolution = sources.resolve_doi("10.1038/s41586-020-2649-2").await;
+
+        assert!(
+            resolution
+                .ranked
+                .iter()
+                .any(|placed| placed.candidate.version == Some(Version::AuthorManuscript)),
+            "the `am` rung still applies to a work with a version of record: {:?}",
+            resolution.plan_lines()
+        );
+    }
+
+    /// A repository's author-manuscript claim survives when nothing has typed
+    /// the work. "We do not know what this is" is not evidence that it has no
+    /// version of record, and widening the gate past a *stated* preprint type
+    /// would move every untyped work down a rung on no evidence at all.
+    #[tokio::test]
+    async fn an_author_manuscript_survives_when_nothing_typed_the_work() {
+        let sources = MetadataSources::new().await;
+        sources
+            .first_mock_misses(&["openalex", "datacite", "unpaywall", "pmc_oa"])
+            .await;
+        // Crossref answers with a record carrying **no** `type`.
+        sources
+            .serve_crossref(
+                r#"{"status":"ok","message":{
+                     "title":["A work no registry typed"],
+                     "license":[]
+                   }}"#,
+            )
+            .await;
+        sources
+            .serve_europepmc(
+                r#"{"hitCount":1,"resultList":{"result":[{
+                     "id":"MED777","source":"PMC","pmcid":"PMC7777777",
+                     "isOpenAccess":"Y","inEPMC":"Y","hasPDF":"Y",
+                     "authMan":"N","epmcAuthMan":"Y","nihAuthMan":"N",
+                     "license":"cc by",
+                     "fullTextUrlList":{"fullTextUrl":[{
+                       "availabilityCode":"Available","documentStyle":"pdf",
+                       "site":"europepmc",
+                       "url":"https://europepmc.org/article/PMC/PMC7777777"}]}
+                   }]}}"#,
+            )
+            .await;
+
+        let resolution = sources.resolve_doi("10.1234/untyped").await;
+
+        assert!(
+            resolution
+                .ranked
+                .iter()
+                .any(|placed| placed.candidate.version == Some(Version::AuthorManuscript)),
+            "an untyped work keeps its author-manuscript placement: {:?}",
+            resolution.plan_lines()
         );
     }
 }
