@@ -796,3 +796,80 @@ S1 → S2 → (S3 ∥ S4) → S5 → S6 → S7.
 - `read_paper` output changes shape: it gains an untrusted-content
   envelope (S2).
 - The library is consulted before S7. S1–S6 don't depend on it.
+
+## Amendment — 2026-10-09 — the untrusted-content envelope (#287)
+
+An ADR is a dated record, so this is added to rather than rewritten.
+#287 found §5's one-line requirement —
+
+> `read_paper` returns full text wrapped in an explicit
+> **untrusted-content envelope**, with scripts and styles stripped.
+> Fetched content may carry prompt injection.
+
+— had never been built. Nothing had even reached the strings a
+document uses to name *itself*: a PDF's `/Title` and a served page's
+`citation_title` were parsed, stored in `papers.title`, and rendered
+raw into a terminal and into an agent's context. This amendment
+records what the original text asked for, what now exists, and what is
+deliberately still missing.
+
+### What the type is, and where it applies
+
+#290 landed `scitadel-core::untrusted::UntrustedText`, which carries a
+`Provenance::{Ours, PublisherSupplied}` beside the string and
+neutralises on render — escape sequences stripped, control and
+invisible formatting characters removed, whitespace collapsed, length
+capped at 200 characters. `Display` is the neutralised form, so a
+caller that reaches a terminal or a tool return by accident is the one
+that had to name `as_str()` out loud.
+
+#287 moved the *read* path onto it. `Paper.title` and every entry of
+`Paper.authors` are now an `UntrustedText`, so `read_paper`, the TUI's
+reader, its state and column renderers, and the CLI's `show` /
+`resolve-doi` all render through `rendered()`. `read_paper` also names
+the provenance in its return (`title_provenance`), which is what makes
+"is this ours or the publisher's?" answerable at the call site rather
+than guessable. The write side was already on the type from #290.
+
+A stored `papers.title` is labelled `Ours`, because the column is
+scitadel's record of the work — it was written from a metadata feed, a
+BibTeX import, or a human edit, and nothing writes a document's own
+title over it. The document's own claim is
+`paper_identity_checks.resolved_title`, which `resolved_title_text()`
+labels `PublisherSupplied`; the two sit side by side in `scan`,
+`attach` and `override-identity`, which is what makes ADR-007 §2's
+"both titles shown" an actionable line rather than a decorative one.
+Neither label is a licence to render unescaped: `Ours` renders through
+`rendered()` too, because a feed can carry a hostile string.
+
+### What is not done, and why
+
+- **The full-text envelope itself.** `read_paper` returns `full_text`
+  and `r#abstract` still unwrapped. `UntrustedText` caps at 200
+  characters, which is right for a title and wrong for a reader's body
+  — wrapping the body would truncate it to nothing and turn one
+  security fix into a different bug. An uncapped body neutraliser
+  (escape sequences and control characters removed, length untouched)
+  is a separate type with a separate cap, not this one reused.
+- **Scripts and styles stripped.** Nothing strips markup from the
+  returned full text. `html_to_text` drops tags on the HTML path, and
+  the PDF path has no script content to strip, but the ADR's clause as
+  written is not implemented.
+- **Prompt-injection framing.** The return does not yet tell the agent
+  in prose that the following text is fetched content it should not
+  obey. The provenance field names the *title's* origin; the body has
+  no equivalent marker.
+- **`full_text` and `r#abstract` are still plain `String`.** Same
+  reason as the first bullet. Every render path that shows a publisher
+  *title* is now closed; every render path that shows publisher *body
+  text* is not, and is unblocked by the body neutraliser above.
+
+### Status of the original requirement
+
+§5's envelope is **partially implemented**. The title and author
+envelope is built and tested against real `/Title` and `citation_title`
+payloads on both the TUI render path and the MCP return path. The
+full-text envelope, style stripping and prompt-injection framing are
+**deliberately not built**, for the reasons above, and are the work
+this amendment leaves outstanding rather than a line implying
+something that does not exist.

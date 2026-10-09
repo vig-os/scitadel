@@ -1232,7 +1232,7 @@ impl App {
                 id,
                 kind: TaskKind::OpenExternal {
                     ref_id,
-                    title: paper.title.clone(),
+                    title: paper.title.rendered().into_owned(),
                 },
                 status: TaskStatus::Queued,
                 terminal_at: None,
@@ -1790,6 +1790,7 @@ mod tests {
     use super::*;
     use scitadel_core::models::{Paper, PaperId, ResearchQuestion};
     use scitadel_core::ports::{PaperRepository, QuestionRepository};
+    use scitadel_core::untrusted::UntrustedText;
     use std::path::PathBuf;
 
     /// Build an `App` with a fresh on-disk SQLite DB and a single
@@ -1805,7 +1806,7 @@ mod tests {
         let qid = q.id.as_str().to_string();
         let mut p = Paper::new("Attention Is All You Need");
         p.id = PaperId::from("p-attn");
-        p.authors = vec!["Vaswani, A.".into()];
+        p.authors = vec![UntrustedText::ours("Vaswani, A.")];
         p.year = Some(2017);
         // Use the underlying repos directly — DataStore's API is read-
         // mostly so seeding goes through the lower-level handles.

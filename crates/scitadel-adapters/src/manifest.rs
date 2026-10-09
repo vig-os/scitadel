@@ -311,9 +311,17 @@ pub fn build(db: &Database, paper: &Paper) -> Result<Manifest, ManifestError> {
         osti_id: db.osti_id(paper_id)?,
         arxiv_id: paper.arxiv_id.clone(),
         openalex_id: paper.openalex_id.clone(),
-        title: paper.title.clone(),
+        // `as_str`, not `rendered`: the mirror is a read-only generated record
+        // of what we hold, and a title truncated at 200 characters would be a
+        // false statement about the work. Nothing renders the mirror to a
+        // terminal; `scitadel scan` prints both identity titles through the
+        // `*_text()` accessors instead.
+        title: paper.title.as_str().to_string(),
         year: paper.year,
-        first_author: paper.authors.first().cloned(),
+        first_author: paper
+            .authors
+            .first()
+            .map(|author| author.as_str().to_string()),
         // The post-fetch check is the one that can say `mismatch`, so it leads;
         // a work with only a pre-fetch check still shows that one.
         identity_check: [IdentityPhase::PostFetch, IdentityPhase::PreFetch]
@@ -475,6 +483,7 @@ mod tests {
     use super::*;
     use scitadel_core::models::PaperId;
     use scitadel_core::ports::PaperRepository as _;
+    use scitadel_core::untrusted::UntrustedText;
     use scitadel_db::sqlite::{ArtefactWrite, BlobWrite, WriteMode, blob_rel_path};
 
     struct Fx {
@@ -492,7 +501,7 @@ mod tests {
                 Paper::new("Deep learning for radiopharmaceutical image reconstruction");
             paper.id = PaperId::from("p-1".to_string());
             paper.year = Some(2020);
-            paper.authors = vec!["Young, Christopher J.".to_string()];
+            paper.authors = vec![UntrustedText::ours("Young, Christopher J.")];
             paper.doi = Some("10.99999/some.suffix.12345".to_string());
             let (repo, _, _, _, _) = db.repositories();
             repo.save(&paper).unwrap();

@@ -103,7 +103,7 @@ pub fn synthesize_offline_failure(tx: UnboundedSender<TaskUpdate>, paper: &Paper
         kind: TaskKind::Download {
             paper_id: paper.id.as_str().to_string(),
             ref_id,
-            title: paper.title.clone(),
+            title: paper.title.rendered().into_owned(),
         },
         status: TaskStatus::Queued,
         terminal_at: None,
@@ -136,7 +136,7 @@ pub fn spawn_open_external(tx: UnboundedSender<TaskUpdate>, paper: &Paper, path:
         id,
         kind: TaskKind::OpenExternal {
             ref_id,
-            title: paper.title.clone(),
+            title: paper.title.rendered().into_owned(),
         },
         status: TaskStatus::Queued,
         terminal_at: None,
@@ -206,7 +206,7 @@ pub fn spawn_download_paper(
         kind: TaskKind::Download {
             paper_id: paper.id.as_str().to_string(),
             ref_id,
-            title: paper.title.clone(),
+            title: paper.title.rendered().into_owned(),
         },
         status: TaskStatus::Queued,
         terminal_at: None,

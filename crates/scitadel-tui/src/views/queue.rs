@@ -20,7 +20,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 
 use crate::data::DataStore;
-use crate::views::util::{download_state_cell, truncate};
+use crate::views::util::{download_state_cell, format_authors, truncate};
 
 pub fn draw(
     frame: &mut Frame,
@@ -74,7 +74,7 @@ pub fn draw(
             Row::new(vec![
                 Cell::from((i + 1).to_string()),
                 Cell::from(dl_symbol).style(Style::default().fg(dl_color)),
-                Cell::from(truncate(&p.title, 60)),
+                Cell::from(truncate(&p.title.rendered(), 60)),
                 Cell::from(truncate(&authors, 30)),
                 Cell::from(year),
             ])
@@ -101,13 +101,4 @@ pub fn draw(
     let mut state = TableState::default();
     state.select(Some(selected));
     frame.render_stateful_widget(table, area, &mut state);
-}
-
-fn format_authors(authors: &[String]) -> String {
-    match authors.len() {
-        0 => "Unknown".to_string(),
-        1 => authors[0].clone(),
-        2 => format!("{}, {}", authors[0], authors[1]),
-        _ => format!("{}, {} et al.", authors[0], authors[1]),
-    }
 }

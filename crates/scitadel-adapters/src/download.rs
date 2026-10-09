@@ -954,9 +954,12 @@ impl PaperDownloader {
         established: Option<&ChainOutcome>,
     ) -> Result<(), AdapterError> {
         let expected = WorkIdentity {
-            title: Some(paper.title.clone()),
+            title: Some(paper.title.as_str().to_string()),
             year: paper.year,
-            first_author: paper.authors.first().cloned(),
+            first_author: paper
+                .authors
+                .first()
+                .map(|author| author.as_str().to_string()),
         };
         let now = Utc::now().to_rfc3339();
 
@@ -1020,7 +1023,7 @@ impl PaperDownloader {
                         source: outcome
                             .recorded_source()
                             .unwrap_or(IdentitySource::OpenAlex),
-                        expected_title: Some(paper.title.clone()),
+                        expected_title: Some(paper.title.as_str().to_string()),
                         resolved_title: resolved_title.clone(),
                     },
                     &checked,
@@ -3301,7 +3304,7 @@ mod tests {
         conn.execute(
             "INSERT INTO papers (id, title, authors, doi, created_at, updated_at)
              VALUES (?1, ?2, '[]', ?3, '2020-01-01T00:00:00+00:00', '2020-01-01T00:00:00+00:00')",
-            rusqlite::params![id, p.title, p.doi],
+            rusqlite::params![id, p.title.as_str(), p.doi],
         )
         .expect("insert paper");
         drop(conn);
@@ -3443,7 +3446,7 @@ mod tests {
             .to_string();
         fx.serve(
             &encoded,
-            openalex_best_location_with_licence(&pdf, CC, &paper.title),
+            openalex_best_location_with_licence(&pdf, CC, paper.title.as_str()),
         )
         .await;
         // Everything else misses, so the OpenAlex location is the ranked choice.
@@ -3839,7 +3842,7 @@ mod tests {
             conn.execute(
                 "INSERT INTO papers (id, title, authors, doi, created_at, updated_at)
                  VALUES (?1, ?2, '[]', ?3, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
-                rusqlite::params![paper.id.as_str(), paper.title, paper.doi],
+                rusqlite::params![paper.id.as_str(), paper.title.as_str(), paper.doi],
             )
             .expect("insert paper");
         }

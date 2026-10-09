@@ -108,9 +108,19 @@ pub fn backfill_keys<S: std::hash::BuildHasher>(
 
 fn paper_to_entry(key: &str, paper: &Paper, tags: &[String]) -> String {
     let mut fields: Vec<String> = Vec::new();
-    fields.push(fmt_field("title", &paper.title));
+    // `as_str`, not `rendered`: a BibTeX entry is a citation record, and
+    // truncating a title at 200 characters would silently corrupt it. This is
+    // a data path — the bytes go to a file a person will feed to a reference
+    // manager, not to a terminal.
+    fields.push(fmt_field("title", paper.title.as_str()));
     if !paper.authors.is_empty() {
-        fields.push(fmt_field("author", &paper.authors.join(" and ")));
+        let authors = paper
+            .authors
+            .iter()
+            .map(|author| author.as_str())
+            .collect::<Vec<_>>()
+            .join(" and ");
+        fields.push(fmt_field("author", &authors));
     }
     if let Some(y) = paper.year {
         fields.push(format!("  year = {{{y}}}"));
@@ -165,10 +175,11 @@ fn escape_bibtex(s: &str) -> String {
 mod tests {
     use super::*;
     use scitadel_core::models::PaperId;
+    use scitadel_core::untrusted::UntrustedText;
 
     fn paper(title: &str, authors: &[&str], year: Option<i32>) -> Paper {
         let mut p = Paper::new(title);
-        p.authors = authors.iter().map(|s| (*s).to_string()).collect();
+        p.authors = authors.iter().map(|s| UntrustedText::ours(*s)).collect();
         p.year = year;
         p
     }

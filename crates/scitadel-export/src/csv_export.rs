@@ -21,10 +21,18 @@ pub fn export_csv(papers: &[Paper]) -> String {
     .ok();
 
     for p in papers {
+        // `as_str`, not `rendered`: a CSV row is a data record, and the
+        // 200-character cap would truncate the title in it.
+        let authors = p
+            .authors
+            .iter()
+            .map(|author| author.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
         wtr.write_record([
             p.id.as_str(),
-            &p.title,
-            &p.authors.join("; "),
+            p.title.as_str(),
+            &authors,
             &p.year.map(|y| y.to_string()).unwrap_or_default(),
             p.journal.as_deref().unwrap_or(""),
             p.doi.as_deref().unwrap_or(""),
@@ -44,6 +52,7 @@ pub fn export_csv(papers: &[Paper]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scitadel_core::untrusted::UntrustedText;
 
     #[test]
     fn test_export_csv_header() {
@@ -54,7 +63,10 @@ mod tests {
     #[test]
     fn test_export_csv_with_paper() {
         let mut paper = Paper::new("Test Paper");
-        paper.authors = vec!["Alice Smith".into(), "Bob Jones".into()];
+        paper.authors = vec![
+            UntrustedText::ours("Alice Smith"),
+            UntrustedText::ours("Bob Jones"),
+        ];
         paper.year = Some(2024);
 
         let result = export_csv(&[paper]);

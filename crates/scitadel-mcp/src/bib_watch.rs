@@ -270,6 +270,7 @@ pub fn build_question_bib(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scitadel_core::untrusted::UntrustedText;
 
     fn dur_ms(ms: u64) -> Duration {
         Duration::from_millis(ms)
@@ -446,7 +447,7 @@ mod tests {
 
         for i in 0..n_papers {
             let mut p = Paper::new(format!("Paper {i}"));
-            p.authors = vec![format!("Author{i}, A.")];
+            p.authors = vec![UntrustedText::ours(format!("Author{i}, A."))];
             p.year = Some(2020 + i as i32);
             p.doi = Some(format!("10.1/p{i}"));
             papers.save(&p).unwrap();

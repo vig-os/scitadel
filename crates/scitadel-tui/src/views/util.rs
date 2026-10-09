@@ -1,6 +1,8 @@
 use ratatui::style::Color;
+use scitadel_core::untrusted::UntrustedText;
 use scitadel_db::sqlite::DownloadState;
 
+/// Truncate `s` to at most `max` characters, marking the cut with `...`.
 pub fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -9,6 +11,21 @@ pub fn truncate(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(keep).collect();
     out.push_str("...");
     out
+}
+
+/// `"Surname, G.", … et al."` for a row's author cell.
+///
+/// Renders through [`UntrustedText::rendered`] rather than `as_str`, because a
+/// table cell is a terminal: an author name is publisher-supplied text like any
+/// other, and `citation_author` is the tag it comes from.
+pub fn format_authors(authors: &[UntrustedText]) -> String {
+    let rendered: Vec<String> = authors.iter().map(|a| a.rendered().into_owned()).collect();
+    match rendered.len() {
+        0 => "Unknown".to_string(),
+        1 => rendered[0].clone(),
+        2 => format!("{}, {}", rendered[0], rendered[1]),
+        _ => format!("{}, {} et al.", rendered[0], rendered[1]),
+    }
 }
 
 /// The download-state cell for one row: `(glyph, colour)`.

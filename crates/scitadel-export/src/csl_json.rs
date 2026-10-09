@@ -143,11 +143,21 @@ fn paper_to_csl(id: &str, paper: &Paper, tags: &[String]) -> Value {
 
     m.insert("id".into(), Value::String(id.to_string()));
     m.insert("type".into(), Value::String(DEFAULT_CSL_TYPE.into()));
-    if !paper.title.is_empty() {
-        m.insert("title".into(), Value::String(paper.title.clone()));
+    // `as_str`, not `rendered`: a CSL record is a citation, and the 200-character
+    // cap would truncate one. The bytes go to a reference manager, not a
+    // terminal.
+    if !paper.title.as_str().is_empty() {
+        m.insert(
+            "title".into(),
+            Value::String(paper.title.as_str().to_string()),
+        );
     }
     if !paper.authors.is_empty() {
-        let authors: Vec<Value> = paper.authors.iter().map(|a| author_to_csl(a)).collect();
+        let authors: Vec<Value> = paper
+            .authors
+            .iter()
+            .map(|a| author_to_csl(a.as_str()))
+            .collect();
         m.insert("author".into(), Value::Array(authors));
     }
     if let Some(year) = paper.year {
@@ -209,11 +219,12 @@ fn author_to_csl(author: &str) -> Value {
 mod tests {
     use super::*;
     use scitadel_core::models::PaperId;
+    use scitadel_core::untrusted::UntrustedText;
     use serde_json::json;
 
     fn paper(title: &str, authors: &[&str], year: Option<i32>) -> Paper {
         let mut p = Paper::new(title);
-        p.authors = authors.iter().map(|s| (*s).to_string()).collect();
+        p.authors = authors.iter().map(|s| UntrustedText::ours(*s)).collect();
         p.year = year;
         p
     }

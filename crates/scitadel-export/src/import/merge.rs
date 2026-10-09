@@ -23,6 +23,7 @@
 //!   in `scitadel-mcp::bib_import`). See #161.
 
 use scitadel_core::models::Paper;
+use scitadel_core::untrusted::UntrustedText;
 
 use super::parse::BibEntry;
 
@@ -132,7 +133,7 @@ pub fn resolve(db_paper: Option<Paper>, bib: &BibEntry, strategy: MergeStrategy)
 pub fn paper_from_bib(bib: &BibEntry) -> Paper {
     let title = bib.title.clone().unwrap_or_default();
     let mut p = Paper::new(title);
-    p.authors.clone_from(&bib.authors);
+    p.authors = bib.authors.iter().map(UntrustedText::ours).collect();
     p.year = bib.year;
     p.doi.clone_from(&bib.doi);
     p.arxiv_id.clone_from(&bib.arxiv_id);
@@ -176,13 +177,19 @@ fn bib_wins(db: Paper, bib: &BibEntry) -> MergeOutcome {
     }
 
     if let Some(t) = bib.title.as_ref()
-        && &out.title != t
+        && out.title.as_str() != t
     {
-        out.title.clone_from(t);
+        out.title = UntrustedText::ours(t.clone());
         from_bib.push("title");
     }
-    if !bib.authors.is_empty() && bib.authors != out.authors {
-        out.authors.clone_from(&bib.authors);
+    if !bib.authors.is_empty()
+        && bib
+            .authors
+            .iter()
+            .map(|a| a.as_str())
+            .ne(out.authors.iter().map(|a| a.as_str()))
+    {
+        out.authors = bib.authors.iter().map(UntrustedText::ours).collect();
         from_bib.push("authors");
     } else if bib.authors.is_empty() && !out.authors.is_empty() {
         kept_from_db.push("authors");
@@ -298,7 +305,7 @@ mod tests {
 
     fn db_paper() -> Paper {
         let mut p = Paper::new("DB Title");
-        p.authors = vec!["DB Author".into()];
+        p.authors = vec![UntrustedText::ours("DB Author")];
         p.year = Some(2020);
         p.doi = Some("10.1/db".into());
         p.journal = Some("DB Journal".into());

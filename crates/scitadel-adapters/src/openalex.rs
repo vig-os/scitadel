@@ -413,7 +413,11 @@ pub fn work_to_paper(work: &serde_json::Value) -> scitadel_core::models::Paper {
     let candidate = work_to_candidate(work, 0);
     let mut paper = Paper::new(candidate.title);
     if !candidate.authors.is_empty() {
-        paper.authors = candidate.authors;
+        paper.authors = candidate
+            .authors
+            .iter()
+            .map(scitadel_core::untrusted::UntrustedText::ours)
+            .collect();
     }
     paper.r#abstract = candidate.r#abstract;
     paper.doi = candidate.doi;

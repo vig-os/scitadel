@@ -35,7 +35,7 @@ pub fn draw(
 
     lines.push(Line::from(vec![
         Span::styled("Title: ", label_style),
-        Span::raw(&paper.title),
+        Span::raw(paper.title.rendered().into_owned()),
     ]));
     lines.push(Line::from(""));
 
@@ -44,7 +44,12 @@ pub fn draw(
         Span::raw(if paper.authors.is_empty() {
             "Unknown".to_string()
         } else {
-            paper.authors.join(", ")
+            paper
+                .authors
+                .iter()
+                .map(|author| author.rendered().into_owned())
+                .collect::<Vec<_>>()
+                .join(", ")
         }),
     ]));
 

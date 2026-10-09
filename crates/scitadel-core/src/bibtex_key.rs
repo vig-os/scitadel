@@ -36,9 +36,13 @@ pub fn generate_key(paper: &Paper) -> String {
 }
 
 fn first_author_lastname(paper: &Paper) -> String {
-    let Some(raw) = paper.authors.first() else {
+    let Some(author) = paper.authors.first() else {
         return String::new();
     };
+    // `as_str`, not `rendered`: a citation key is an identity, computed from the
+    // bytes we stored. Neutralising here would make two works whose titles
+    // differ only by an escape sequence share a key.
+    let raw = author.as_str();
     let comma_split: Vec<&str> = raw.split(',').map(str::trim).collect();
     let name = if comma_split.len() >= 2 {
         comma_split[0]
@@ -50,7 +54,7 @@ fn first_author_lastname(paper: &Paper) -> String {
 }
 
 fn first_title_word(paper: &Paper) -> String {
-    for raw in paper.title.split_whitespace() {
+    for raw in paper.title.as_str().split_whitespace() {
         let folded: String = ascii_fold(raw)
             .to_lowercase()
             .chars()
@@ -132,10 +136,11 @@ pub fn assign_keys<S: std::hash::BuildHasher>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::untrusted::UntrustedText;
 
     fn paper(title: &str, authors: &[&str], year: Option<i32>) -> Paper {
         let mut p = Paper::new(title);
-        p.authors = authors.iter().map(|s| (*s).to_string()).collect();
+        p.authors = authors.iter().map(|s| UntrustedText::ours(*s)).collect();
         p.year = year;
         p
     }

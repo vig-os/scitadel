@@ -66,7 +66,11 @@ impl Fixture {
         conn.execute(
             "INSERT INTO papers (id, title, authors, year, created_at, updated_at)
              VALUES (?1, ?2, '[]', 2005, ?3, ?3)",
-            params![paper.id.as_str(), paper.title, "2026-01-02T03:04:05+00:00"],
+            params![
+                paper.id.as_str(),
+                paper.title.as_str(),
+                "2026-01-02T03:04:05+00:00"
+            ],
         )
         .unwrap();
         drop(conn);

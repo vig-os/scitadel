@@ -114,7 +114,7 @@ fn draw_list(
             Row::new(vec![
                 Cell::from(marker).style(Style::default().fg(Color::Yellow)),
                 Cell::from(score),
-                Cell::from(truncate(&paper.title, 40)),
+                Cell::from(truncate(&paper.title.rendered(), 40)),
                 Cell::from(year),
             ])
         })
@@ -156,14 +156,14 @@ fn draw_detail(frame: &mut Frame, area: Rect, focused: Option<&(Paper, Option<As
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(paper.title.clone()),
+        Span::raw(paper.title.rendered().into_owned()),
     ]));
     if !paper.authors.is_empty() {
         let authors = paper
             .authors
             .iter()
             .take(4)
-            .cloned()
+            .map(|author| author.rendered().into_owned())
             .collect::<Vec<_>>()
             .join(", ");
         let suffix = if paper.authors.len() > 4 {

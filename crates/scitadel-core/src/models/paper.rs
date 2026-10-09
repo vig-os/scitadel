@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::PaperId;
+use crate::untrusted::UntrustedText;
 
 /// Canonical, deduplicated paper record.
 ///
@@ -34,11 +35,36 @@ use super::PaperId;
 ///   `scitadel_db::sqlite::coverage::download_states`.
 /// - **When we last tried** — `artefacts.retrieved_at` for a fetch that
 ///   succeeded, `acquisition_state.updated_at` for a recorded gap.
+///
+/// # Which fields are the document's
+///
+/// `title` and every entry of `authors` are [`UntrustedText`], so a consumer
+/// cannot render one without going through [`UntrustedText::rendered`] or
+/// `Display` — both of which neutralise it. That is the point: #287's finding
+/// was that a crafted `/Title` reached a terminal and an agent's context
+/// unescaped, and the type that would have stopped it already existed. Render
+/// the field; never call [`UntrustedText::as_str`] on a render path.
+///
+/// Neither field is tagged `PublisherSupplied` when it comes back out of the
+/// database. The `papers` row is scitadel's own record of the work — it was
+/// stored from a feed, corrected by a human, or merged by the dedup engine — so
+/// the honest provenance is [`Provenance::Ours`], the same reading
+/// `IdentityCheckRow::expected_title_text` gives the identical column. That is
+/// not a claim the title is safe: a feed can carry a hostile string and
+/// `scitadel scan` lets a person write one, which is why `Ours` still renders
+/// through `rendered()`.
+///
+/// `r#abstract` and `full_text` are document-supplied too and are deliberately
+/// still plain `String`: the same wrapper would cap the reader's body at
+/// [`MAX_UNTRUSTED_CHARS`], which is not a reader. See the ADR-007 amendment.
+///
+/// [`Provenance::Ours`]: crate::untrusted::Provenance::Ours
+/// [`MAX_UNTRUSTED_CHARS`]: crate::untrusted::MAX_UNTRUSTED_CHARS
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Paper {
     pub id: PaperId,
-    pub title: String,
-    pub authors: Vec<String>,
+    pub title: UntrustedText,
+    pub authors: Vec<UntrustedText>,
     #[serde(default)]
     pub r#abstract: String,
     pub full_text: Option<String>,
@@ -66,12 +92,14 @@ pub struct Paper {
 }
 
 impl Paper {
+    /// A work with no facts but a title. `Ours`, because a freshly minted record
+    /// is scitadel's own statement about a work — see the struct's docs.
     #[must_use]
     pub fn new(title: impl Into<String>) -> Self {
         let now = Utc::now();
         Self {
             id: PaperId::new(),
-            title: title.into(),
+            title: UntrustedText::ours(title),
             authors: Vec::new(),
             r#abstract: String::new(),
             full_text: None,
@@ -89,6 +117,47 @@ impl Paper {
             updated_at: now,
             bibtex_key: None,
         }
+    }
+
+    /// This record as JSON for a surface a human or an agent reads.
+    ///
+    /// [`Serialize`] writes the strings exactly as stored, which is what a data
+    /// path needs — `authors` is the column the DB reads back, and
+    /// `export_json` is a file a person will hand to a reference manager. A
+    /// *display* path needs the other thing: `scitadel show --json`,
+    /// `get_paper` and `resolve_doi --json` all end up on a terminal or in an
+    /// agent's context, where a publisher's `/Title` must arrive already
+    /// neutralised. Both answers exist, so they are two methods rather than one
+    /// that has to guess.
+    ///
+    /// Field-for-field the same record as `Serialize`; only the two untrusted
+    /// fields differ, and only in that they are rendered.
+    #[must_use]
+    pub fn to_display_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id.as_str(),
+            "title": self.title.rendered(),
+            "authors": self
+                .authors
+                .iter()
+                .map(|author| author.rendered())
+                .collect::<Vec<_>>(),
+            "abstract": self.r#abstract,
+            "full_text": self.full_text,
+            "summary": self.summary,
+            "doi": self.doi,
+            "arxiv_id": self.arxiv_id,
+            "pubmed_id": self.pubmed_id,
+            "inspire_id": self.inspire_id,
+            "openalex_id": self.openalex_id,
+            "year": self.year,
+            "journal": self.journal,
+            "url": self.url,
+            "source_urls": self.source_urls,
+            "created_at": self.created_at.to_rfc3339(),
+            "updated_at": self.updated_at.to_rfc3339(),
+            "bibtex_key": self.bibtex_key,
+        })
     }
 }
 
@@ -143,5 +212,69 @@ impl CandidatePaper {
             score: None,
             raw_data: serde_json::Value::Null,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Serialize` is the data path and `to_display_json` the display path, and
+    /// the difference is exactly the two untrusted fields. A caller that picks
+    /// the wrong one either corrupts a citation export or puts a publisher's
+    /// bytes in an agent's context, so both answers are pinned here.
+    #[test]
+    fn the_two_json_forms_differ_only_in_the_untrusted_fields() {
+        let mut paper = Paper::new("Deep Learning for Imaging");
+        paper.authors = vec![UntrustedText::ours("Vaswani, A.")];
+        paper.year = Some(2017);
+        paper.doi = Some("10.1/x".into());
+
+        let stored = serde_json::to_value(&paper).expect("serialise");
+        let display = paper.to_display_json();
+
+        assert_eq!(stored["title"], "Deep Learning for Imaging");
+        assert_eq!(display["title"], "Deep Learning for Imaging");
+        assert_eq!(stored["authors"], serde_json::json!(["Vaswani, A."]));
+        assert_eq!(display["authors"], serde_json::json!(["Vaswani, A."]));
+        // Everything else is field-for-field the same record.
+        assert_eq!(stored["doi"], display["doi"]);
+        assert_eq!(stored["year"], display["year"]);
+        assert_eq!(stored["id"], display["id"]);
+        assert_eq!(stored["abstract"], display["abstract"]);
+        assert_eq!(stored["source_urls"], display["source_urls"]);
+
+        // A hostile title is written raw by `Serialize` and neutralised by the
+        // display form — and a 300-character one is capped by the display form
+        // alone, which is why the data path cannot be the display path.
+        let mut hostile = paper.clone();
+        hostile.title = UntrustedText::publisher_supplied("T\u{1b}[2Jitle");
+        hostile.authors = vec![UntrustedText::publisher_supplied("A\u{1b}[2Juthor")];
+        let stored = serde_json::to_value(&hostile).expect("serialise");
+        let display = hostile.to_display_json();
+        assert_eq!(stored["title"], "T\u{1b}[2Jitle");
+        assert_eq!(display["title"], "T itle");
+        assert_eq!(display["authors"], serde_json::json!(["A uthor"]));
+
+        let long = "x".repeat(300);
+        let mut long_paper = paper.clone();
+        long_paper.title = UntrustedText::ours(&long);
+        assert_eq!(
+            long_paper.to_display_json()["title"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            crate::untrusted::MAX_RENDERED_CHARS
+        );
+        assert_eq!(
+            serde_json::to_value(&long_paper).expect("serialise")["title"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            300,
+            "the data form keeps the whole string"
+        );
     }
 }

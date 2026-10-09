@@ -650,13 +650,13 @@ fn note_identity_disagreement(
     let Some(expected) = expected.filter(|title| !title.trim().is_empty()) else {
         return;
     };
-    if expected.trim() == paper.title.trim() {
+    if expected.trim() == paper.title.as_str().trim() {
         return;
     }
     report.identity_disagreements.push(IdentityDisagreement {
         paper_id: paper.id.as_str().to_string(),
         expected_title: expected.trim().to_string(),
-        stored_title: paper.title.clone(),
+        stored_title: paper.title.as_str().to_string(),
     });
 }
 

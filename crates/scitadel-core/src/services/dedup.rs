@@ -6,6 +6,7 @@ use crate::models::{
     CandidatePaper, Paper, SearchId, SearchResult, normalize_doi, validate_doi,
     validate_doi_detailed,
 };
+use crate::untrusted::UntrustedText;
 
 /// Normalize title for fuzzy matching: lowercase, strip punctuation/whitespace.
 fn normalize_title(title: &str) -> String {
@@ -71,7 +72,7 @@ fn merge_candidate_into_paper(paper: &mut Paper, candidate: &CandidatePaper) {
         paper.journal.clone_from(&candidate.journal);
     }
     if paper.authors.is_empty() && !candidate.authors.is_empty() {
-        paper.authors.clone_from(&candidate.authors);
+        paper.authors = candidate.authors.iter().map(UntrustedText::ours).collect();
     }
     if let Some(url) = &candidate.url {
         paper
@@ -134,7 +135,9 @@ pub fn deduplicate(
                 matched_idx = Some(idx);
             } else {
                 for &idx in title_index.values() {
-                    if title_similarity(&candidate.title, &papers[idx].title) >= title_threshold {
+                    if title_similarity(&candidate.title, papers[idx].title.as_str())
+                        >= title_threshold
+                    {
                         matched_idx = Some(idx);
                         break;
                     }
@@ -146,7 +149,7 @@ pub fn deduplicate(
             merge_candidate_into_paper(&mut papers[idx], candidate);
         } else {
             let mut paper = Paper::new(&candidate.title);
-            paper.authors.clone_from(&candidate.authors);
+            paper.authors = candidate.authors.iter().map(UntrustedText::ours).collect();
             paper.r#abstract.clone_from(&candidate.r#abstract);
             paper.doi.clone_from(&valid_doi);
             paper.arxiv_id.clone_from(&candidate.arxiv_id);

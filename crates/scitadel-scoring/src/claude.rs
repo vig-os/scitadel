@@ -136,7 +136,7 @@ impl ClaudeScorer {
                         paper_idx = i + 1,
                         total = papers.len(),
                         score = assessment.score,
-                        title = %paper.title.chars().take(60).collect::<String>(),
+                        title = %paper.title.rendered().chars().take(60).collect::<String>(),
                         "Scored paper"
                     );
                     if let Some(cb) = on_progress {
@@ -178,11 +178,14 @@ pub fn build_user_prompt(paper: &Paper, question: &ResearchQuestion) -> String {
         format!("Context: {}", question.description)
     };
 
+    // A scoring prompt is a render path: it reaches a terminal as the prompt
+    // text the person reads while the model scores, so the title and the
+    // author names go through `rendered()` rather than out as stored.
     let authors = paper
         .authors
         .iter()
         .take(5)
-        .cloned()
+        .map(|author| author.rendered())
         .collect::<Vec<_>>()
         .join("; ");
     let abstract_text = if paper.r#abstract.len() > 2000 {
@@ -196,7 +199,7 @@ pub fn build_user_prompt(paper: &Paper, question: &ResearchQuestion) -> String {
     SCORING_USER_PROMPT
         .replace("{question_text}", &question.text)
         .replace("{question_description}", &description)
-        .replace("{title}", &paper.title)
+        .replace("{title}", &paper.title.rendered())
         .replace("{authors}", &authors)
         .replace(
             "{year}",
