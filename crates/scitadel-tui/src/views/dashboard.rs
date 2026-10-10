@@ -246,3 +246,85 @@ pub fn row_count(data: &DataStore, question_id: &str) -> usize {
     data.load_question_dashboard(question_id)
         .map_or(0, |v| v.len())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use scitadel_core::models::{Assessment, AssessmentId, PaperId, ResearchQuestion};
+    use scitadel_core::ports::{AssessmentRepository, PaperRepository, QuestionRepository};
+    use scitadel_core::untrusted::{UntrustedBody, UntrustedText};
+
+    /// The dashboard is the *first* place a publisher's body text reaches a
+    /// screen — one row per work with the abstract inline, before any reader is
+    /// opened. #287 closed the reader's body path and the papers table's; this
+    /// is the third, and it was the one with no test.
+    ///
+    /// Asserted on the **remnants**, not the ESC byte. ratatui strips the ESC
+    /// itself when writing into a buffer, so "no ESC reached the screen" is a
+    /// claim about ratatui and would pass even with the call site reverted to
+    /// `as_str()`. What distinguishes `rendered()` from `as_str()` is what
+    /// ratatui leaves behind.
+    #[test]
+    fn a_hostile_abstract_is_neutralised_in_the_dashboard_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = DataStore::open(&dir.path().join("scitadel.db")).expect("open db");
+        let (paper_repo, _, question_repo, assessment_repo, _) = data.db.repositories();
+
+        let question = ResearchQuestion::new("Does it work?");
+        question_repo
+            .save_question(&question)
+            .expect("a question to hang the dashboard on");
+
+        let mut paper = Paper::new("A work");
+        paper.id = PaperId::from("p-hostile");
+        paper.authors = vec![UntrustedText::ours("Doe, J.")];
+        paper.r#abstract = UntrustedBody::publisher_supplied(
+            "First paragraph.\n\n\u{1b}[31m\u{1b}[2J\u{1b}]8;;https://attacker.example/\u{1b}\\Second paragraph.",
+        );
+        paper_repo.save(&paper).expect("save paper");
+
+        let assessment = Assessment {
+            id: AssessmentId::new(),
+            paper_id: paper.id.clone(),
+            question_id: question.id.clone(),
+            score: 0.9,
+            reasoning: String::new(),
+            model: None,
+            prompt: None,
+            temperature: None,
+            assessor: "test".to_string(),
+            created_at: Utc::now(),
+        };
+        assessment_repo.save(&assessment).expect("save assessment");
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 16)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                draw(frame, frame.area(), &data, question.id.as_str(), "lars", 0);
+            })
+            .expect("draw");
+
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        for remnant in ["[31m", "[2J", "]8;;", "attacker.example"] {
+            assert!(
+                !screen.contains(remnant),
+                "an escape sequence's remnant must not reach the screen: \
+                 {remnant} in {screen:?}"
+            );
+        }
+        assert!(
+            screen.contains("First paragraph.") && screen.contains("Second paragraph."),
+            "both paragraphs a person needs still render: {screen:?}"
+        );
+    }
+}
