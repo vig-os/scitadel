@@ -843,15 +843,48 @@ labels `PublisherSupplied`; the two sit side by side in `scan`,
 Neither label is a licence to render unescaped: `Ours` renders through
 `rendered()` too, because a feed can carry a hostile string.
 
+### What was built since
+
+- **The full-text envelope.** `UntrustedBody` is the separate type the
+  first version of this amendment called for. It shares `strip` — the
+  escape, control-character and invisible-formatting removal — and
+  *nothing else* with `UntrustedText`. It does **not** collapse
+  whitespace and does **not** cap length, because both of those are
+  presentation decisions and a body is a document: collapsing whitespace
+  destroys paragraph structure, and a 200-character cap truncates a
+  document to nothing.
+
+  `UntrustedText`'s 200-character cap and whitespace collapsing were
+  never wrong; they are correct for a title, a label and a caption, and
+  they are why one type could not serve both purposes. `UntrustedText`'s
+  semantics are unchanged.
+
+- **Prompt-injection framing, as prose.** The scoring prompt now states
+  that the quoted text is fetched from the publication and is not
+  instructions. That is the honest minimum: the body carries provenance,
+  and the model is told whose words it is reading. No schema change was
+  needed or made.
+
+- **Two uncapped render paths were found and are recorded here rather
+  than fixed.** The TUI reader renders the whole `full_text` into one
+  `Paragraph` with no scroll offset, and MCP `build_annotated_paper`
+  returns the whole body with no `max_chars` to honour — larger than
+  `read_paper`'s 20k default. Both pre-date the envelope and are not
+  security faults: an uncapped body reaches a terminal *neutralised*.
+  They are rendering-quality gaps, and paging an existing reader is its
+  own slice.
+
+- **`CandidatePaper.r#abstract` is still a `String`.** It is the
+  pre-dedup transport in `scitadel-adapters`, not a `Paper` field, so
+  the envelope stops at the model boundary where #303 stopped it. Making
+  the write side strongly typed end to end is the natural follow-up.
+
 ### What is not done, and why
 
-- **The full-text envelope itself.** `read_paper` returns `full_text`
-  and `r#abstract` still unwrapped. `UntrustedText` caps at 200
-  characters, which is right for a title and wrong for a reader's body
-  — wrapping the body would truncate it to nothing and turn one
-  security fix into a different bug. An uncapped body neutraliser
-  (escape sequences and control characters removed, length untouched)
-  is a separate type with a separate cap, not this one reused.
+- **Scripts and styles stripped.** Nothing strips markup from the
+  returned full text. `html_to_text` drops tags on the HTML path, and
+  the PDF path has no script content to strip, but the ADR's clause as
+  written is not implemented.
 - **Scripts and styles stripped.** Nothing strips markup from the
   returned full text. `html_to_text` drops tags on the HTML path, and
   the PDF path has no script content to strip, but the ADR's clause as
@@ -867,13 +900,20 @@ Neither label is a licence to render unescaped: `Ours` renders through
 
 ### Status of the original requirement
 
-§5's envelope is **partially implemented**. The title and author
-envelope is built and tested against real `/Title` and `citation_title`
-payloads on both the TUI render path and the MCP return path. The
-full-text envelope, style stripping and prompt-injection framing are
-**deliberately not built**, for the reasons above, and are the work
-this amendment leaves outstanding rather than a line implying
-something that does not exist.
+§5's envelope is **implemented for titles, authors and bodies** — that
+is, for every field the product actually renders. It is tested against
+real `/Title`, `citation_title` and multi-paragraph abstract payloads
+on the TUI render path, the MCP return path, the scoring prompt and the
+database round trip.
+
+**Style stripping is not implemented**, for the reason above.
+
+The verification worth recording: with `UntrustedBody`'s neutralisation
+disabled, **19 tests across six crates fail** — `scitadel-core`,
+`scitadel-adapters`, `scitadel-mcp`, `scitadel-tui`,
+`scitadel-scoring` and a doc test. With it enabled, all pass. That is
+what makes "the envelope is implemented" a checked claim rather than a
+sentence in a document.
 
 
 ---

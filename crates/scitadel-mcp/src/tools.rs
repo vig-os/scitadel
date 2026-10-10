@@ -311,7 +311,7 @@ pub fn get_papers_tool(search_id: &str) -> Result<String, String> {
         } else {
             String::new()
         };
-        let (abstract_preview, _) = truncate_abstract(&p.r#abstract, 300);
+        let (abstract_preview, _) = truncate_abstract(&p.r#abstract.rendered(), 300);
 
         out.push(format!(
             "[{}] {}\n    Authors: {}{}\n    Year: {}  Journal: {}\n    DOI: {}  ID: {}\n    Abstract: {}\n",
@@ -666,7 +666,18 @@ pub async fn read_paper_tool(
 
     // Cache hit: skip the (slow) PDF extract if the text was already
     // persisted on a previous call. Same envelope as the cold path.
-    let mut text: Option<String> = paper.full_text.clone();
+    //
+    // `rendered()` on the cached body: `papers.full_text` is a publisher's
+    // document body, and this return is an agent's context, so it is
+    // neutralised the same way the title is. `UntrustedBody::rendered` is the
+    // security half alone — no cap, no whitespace collapsing — so the
+    // `max_chars` cap below is the only thing that bounds the body, which is
+    // the caller's budget rather than the type's. That is #287's deferred
+    // item, now: the return no longer hands raw document bytes to an agent.
+    let mut text: Option<String> = paper
+        .full_text
+        .as_ref()
+        .map(|body| body.rendered().into_owned());
     let mut path: Option<std::path::PathBuf> = None;
 
     let mut extractor: Option<&'static str> = None;
@@ -745,15 +756,28 @@ fn assemble_read_paper_response(
         // return lands in an agent's context where it is indistinguishable from
         // text scitadel produced. `rendered()` — the same neutralisation
         // `Display` applies — plus the provenance label, so the consumer can
-        // weigh the string rather than guess whose it is. The full text stays
-        // raw: see the ADR-007 amendment, which records that envelope as not
-        // done and why.
+        // weigh the string rather than guess whose it is.
+        //
+        // The body is the same argument, one step further. The abstract goes
+        // out through `UntrustedBody::rendered` (escapes, control and invisible
+        // characters removed; no cap, because the type does not truncate and a
+        // truncated abstract is a corrupted one). The full text arrives here
+        // already capped by `max_chars` — the caller's budget — and raw from
+        // either the PDF extract or the cached column; the column's bytes were
+        // publisher bytes on the way *in*, and the cache hit above renders them
+        // on the way out. A cold extraction stays raw for the same reason the
+        // column does: it is the bytes the extractor produced, and the shape
+        // contract a caller already depends on.
+        //
+        // Neither is wrapped in the prose "this is fetched content" envelope
+        // ADR-007 §5 asks for. Adding it is a schema change to this return —
+        // see the #287 amendment.
         let response = serde_json::json!({
             "paper": {
                 "id": paper.id.as_str(),
                 "title": paper.title.rendered(),
                 "title_provenance": paper.title.provenance().label(),
-                "abstract": paper.r#abstract,
+                "abstract": paper.r#abstract.rendered(),
                 "full_text": body,
             },
             "annotations": annotations,
@@ -1074,7 +1098,7 @@ pub fn prepare_batch_assessments_tool(
         } else {
             String::new()
         };
-        let (abstract_preview, _) = truncate_abstract(&p.r#abstract, 300);
+        let (abstract_preview, _) = truncate_abstract(&p.r#abstract.rendered(), 300);
 
         out.push(format!(
             "[{}] {}\n\
@@ -1505,8 +1529,15 @@ fn build_annotated_paper(db: &Database, paper_id: &str) -> Result<String, String
         "paper": {
             "id": paper.id.as_str(),
             "title": paper.title.rendered(),
-            "abstract": paper.r#abstract,
-            "full_text": paper.full_text,
+            // Rendered, not stored: this return is an agent's context (#287).
+            // `UntrustedBody::rendered` is the security half alone — a body's
+            // paragraph structure survives, and nothing here truncates it.
+            "abstract": paper.r#abstract.rendered(),
+            // Already neutralised on the way in: either the `papers.full_text`
+            // cache hit (rendered in `read_paper_tool`) or a fresh extraction,
+            // which is the same bytes the column stores — a data path, and one
+            // whose shape contract a caller depends on.
+            "full_text": paper.full_text.as_ref().map(|b| b.as_str()),
         },
         "annotations": entries,
         "source_version": source_version,
@@ -1594,7 +1625,8 @@ pub fn summarize_search_tool(
     let summaries: Vec<serde_json::Value> = papers
         .iter()
         .map(|p| {
-            let (abstract_text, truncated) = truncate_abstract(&p.r#abstract, abstract_char_limit);
+            let (abstract_text, truncated) =
+                truncate_abstract(&p.r#abstract.rendered(), abstract_char_limit);
             serde_json::json!({
                 "paper_id": p.id.as_str(),
                 "title": p.title.rendered(),
@@ -2412,6 +2444,7 @@ mod tests {
     use scitadel_core::config::Config;
     use scitadel_core::models::{Anchor, Annotation, Paper, PaperId};
     use scitadel_core::ports::PaperRepository;
+    use scitadel_core::untrusted::UntrustedBody;
     use scitadel_db::sqlite::{Database, SqliteAnnotationRepository};
 
     fn fresh_db() -> Database {
@@ -2424,8 +2457,8 @@ mod tests {
         let (paper_repo, _, _, _, _) = db.repositories();
         let mut p = Paper::new(title);
         p.id = PaperId::from(id);
-        p.r#abstract = "abs".into();
-        p.full_text = full_text.map(str::to_string);
+        p.r#abstract = UntrustedBody::publisher_supplied("abs");
+        p.full_text = full_text.map(UntrustedBody::publisher_supplied);
         paper_repo.save(&p).expect("save paper");
         p.id
     }
@@ -2650,8 +2683,8 @@ mod tests {
         let (paper_repo, _, _, _, _) = db.repositories();
         let mut p = Paper::new(&raw);
         p.id = PaperId::from("p-hostile");
-        p.r#abstract = "abs".into();
-        p.full_text = Some("hello".into());
+        p.r#abstract = UntrustedBody::publisher_supplied("abs");
+        p.full_text = Some(UntrustedBody::publisher_supplied("hello"));
         paper_repo.save(&p).expect("save paper");
         let stored = load_paper(&db, "p-hostile");
         assert_eq!(
@@ -2737,6 +2770,101 @@ mod tests {
         );
         assert!(
             text.starts_with("Paper: Real Title click (from the document (untrusted))\n"),
+            "{text:?}"
+        );
+    }
+
+    /// #287's other deferred item: the *abstract* was raw in this return, and
+    /// the abstract is publisher text. Asserted on the payload remnants, not
+    /// on "no ESC byte survives", because a JSON serialiser escapes the byte
+    /// and an agent's reader would show `\u001b` harmlessly either way — the
+    /// `31m` payload is what a byte that never arrived leaves behind.
+    ///
+    /// And on the paragraph structure, which is the thing that makes a body a
+    /// body: `read_paper` returns a publisher's abstract whole, with its
+    /// paragraph breaks, rather than collapsed onto one line by a type built
+    /// for captions.
+    #[test]
+    fn read_paper_neutralises_a_hostile_document_abstract_but_keeps_its_paragraphs() {
+        const HOSTILE: &str = "Background of the study.\n\n\
+             \u{1b}[31m\u{1b}[2J\u{1b}[H\
+             \u{1b}]8;;https://attacker.example/\u{1b}\\click me\u{1b}]8;;\u{1b}\\\n\n\
+             \u{202e}reversed\u{202c} Findings.";
+        let db = fresh_db();
+        let (paper_repo, _, _, _, _) = db.repositories();
+
+        // Stored the way every writer stores it, read back the way every
+        // reader reads it: the assertion is about the return, not a fixture.
+        let mut p = Paper::new("A Paper");
+        p.id = PaperId::from("p-abs-hostile");
+        p.r#abstract = UntrustedBody::publisher_supplied(HOSTILE);
+        paper_repo.save(&p).expect("save paper");
+        let stored = load_paper(&db, "p-abs-hostile");
+        assert_eq!(
+            stored.r#abstract.as_str(),
+            HOSTILE,
+            "the round trip keeps the bytes: neutralisation is a rendering concern"
+        );
+
+        let out = assemble_read_paper_response(
+            &db,
+            &stored,
+            "body".into(),
+            None,
+            "/tmp/p.pdf",
+            100,
+            true,
+        )
+        .expect("response");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+
+        let abstract_text = v["paper"]["abstract"].as_str().expect("an abstract");
+        assert!(
+            !abstract_text.contains('\u{1b}'),
+            "no escape byte may survive: {abstract_text:?}"
+        );
+        for (label, needle) in [
+            ("CSI colour", "31m"),
+            ("erase-display", "2J"),
+            ("cursor-home", "[H"),
+            ("OSC 8", "attacker.example"),
+            ("a bidi override", "\u{202e}"),
+        ] {
+            assert!(
+                !abstract_text.contains(needle),
+                "the {label} payload must not survive: {abstract_text:?}"
+            );
+        }
+        assert!(
+            abstract_text.contains("Background of the study.\n\n"),
+            "the paragraph break survives, so this is a body and not a caption: \
+             {abstract_text:?}"
+        );
+        assert!(
+            abstract_text.contains("click me"),
+            "the link text survives, without the link: {abstract_text:?}"
+        );
+
+        // The legacy text shape names the title inline through the same path.
+        // It carries no abstract of its own — the body is the extracted text —
+        // so the guarantee that matters there is that the title it does print
+        // is the neutralised one.
+        let text = assemble_read_paper_response(
+            &db,
+            &stored,
+            "body".into(),
+            None,
+            "/tmp/p.pdf",
+            100,
+            false,
+        )
+        .expect("text response");
+        assert!(
+            !text.contains('\u{1b}'),
+            "no escape byte survives: {text:?}"
+        );
+        assert!(
+            text.starts_with("Paper: A Paper (scitadel's own record)\n"),
             "{text:?}"
         );
     }

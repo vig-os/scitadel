@@ -6,10 +6,11 @@
 //! > prompt injection.
 //!
 //! ADR-007 states the requirement in §5; #287 is the issue that found it did not
-//! exist. #290 landed this type, and #287 landed the fields on it: `Paper.title`
-//! and every `Paper.authors` entry are an [`UntrustedText`], so the reader, the
-//! state column and `read_paper` cannot render one without going through
-//! [`UntrustedText::rendered`] or `Display`. The type does three things:
+//! exist. #290 landed the type, and #287 landed the fields on it: `Paper.title`
+//! and every `Paper.authors` entry are an [`UntrustedText`], and `Paper.r#abstract`
+//! plus `Paper.full_text` are an [`UntrustedBody`], so the reader, the state
+//! column, `read_paper` and a scoring prompt cannot render one without going
+//! through a `rendered` method or `Display`. The types do four things:
 //!
 //! 1. **A type, not a convention.** [`UntrustedText`] carries a [`Provenance`]
 //!    next to the string, so "is this ours or the document's?" is answered by
@@ -20,6 +21,8 @@
 //!    characters, collapses whitespace and caps the length. A caller cannot
 //!    reach a terminal or a tool return with an unescaped publisher string by
 //!    accident, because the default formatting *is* the escaped form.
+//!    [`UntrustedBody::rendered`] is the same guarantee with the presentation
+//!    half taken out — see below.
 //! 3. **Provenance recoverable at the call site.** [`UntrustedText::provenance`]
 //!    and [`Provenance::label`], which is what lets a return say "from the
 //!    document (untrusted)" rather than leaving a consumer to guess (#287's
@@ -39,12 +42,26 @@
 //! - **No "safe to render" boolean.** [`Provenance::is_trusted`] answers *whose*
 //!   text this is, which is a different question from whether it has been
 //!   escaped, and a caller that wants the second one has [`UntrustedText::rendered`].
-//! - **No prompt-injection envelope.** ADR-007 §5 asks for the *returned* full
-//!   text to be wrapped and its scripts and styles stripped. That is a property
-//!   of one consumer's output, not of this type, and it stays with #287. The
-//!   #287 amendment to ADR-007 records that `read_paper`'s full text still
-//!   arrives unwrapped, and why: the same 200-character cap that makes this type
-//!   safe for a title would truncate a reader's body to nothing.
+//! - **No truncation in [`UntrustedBody`].** A type that silently truncates a
+//!   document is a document-corruption bug, so the surfaces that show one cap it
+//!   themselves: `read_paper` takes `max_chars`, the TUI reader pages, and the
+//!   dashboard and detail views have their own `truncate`. Nothing here decides
+//!   how much of a body a reader sees.
+//!
+//! # Why a body is a second type
+//!
+//! [`UntrustedText`] does two jobs at once, and only one of them is security.
+//! [`neutralise`] — escapes, control characters, invisible formatting — is the
+//! safety; [`collapse`] plus the [`MAX_UNTRUSTED_CHARS`] cap are the
+//! presentation, and they are right for a title, a label or a caption because
+//! those are one line and a terminal is finite.
+//!
+//! A body is the opposite: collapsing whitespace destroys the paragraph
+//! structure a reader came for, and 200 characters truncates a document to
+//! nothing. So [`UntrustedBody`] shares [`neutralise`] and nothing else, and
+//! its `rendered` returns the security half alone. The two halves are free
+//! functions beside the types for exactly that reason — no shared state, no
+//! inheritance, no flag to get wrong.
 //!
 //! # What a serialised `UntrustedText` is
 //!
@@ -55,6 +72,7 @@
 //! a scitadel writer, so deserialising tags [`Provenance::Ours`] rather than
 //! guessing. A display path therefore builds its JSON explicitly —
 //! [`Paper::to_display_json`] — rather than relying on the derived form.
+//! [`UntrustedBody`] serialises the same way, for the same reason.
 //!
 //! [`Paper::to_display_json`]: crate::models::Paper::to_display_json
 //!
@@ -63,7 +81,9 @@
 //! A publisher caption is not bounded by anything, and every surface that shows
 //! one — a table cell, a terminal, an agent's context window — is finite. Capping
 //! at the boundary means no surface has to remember to, and a caller that wants
-//! the whole string has to say [`UntrustedText::as_str`] out loud.
+//! the whole string has to say [`UntrustedText::as_str`] out loud. The same
+//! argument does not apply to a body, which is why the cap applies to one type
+//! and not the other.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -322,14 +342,215 @@ impl fmt::Display for UntrustedText {
     }
 }
 
+/// A publisher's **body**: an abstract, an extracted full text, the text of a
+/// landing page. The same guarantee as [`UntrustedText`], minus the two things
+/// that would make it unsafe to put a document through.
+///
+/// Construct it through [`UntrustedBody::publisher_supplied`] and render it
+/// through [`UntrustedBody::rendered`] or `Display`.
+///
+/// [`UntrustedText`] applies the security half of neutralisation — escapes,
+/// control characters, invisible formatting — and then the presentation half on
+/// top: whitespace runs collapsed to one space, the ends trimmed, the length
+/// capped at [`MAX_UNTRUSTED_CHARS`]. Both halves are correct for a caption,
+/// and both are wrong for a body. One line is not an abstract, and a document
+/// truncated to 200 characters is not a document — it is a corrupted one, and
+/// the corruption has no marker in it.
+///
+/// So this type shares [`neutralise`] and nothing else. The stored bytes are
+/// reachable as [`UntrustedBody::as_str`], which is what the data paths use:
+/// a BibTeX `abstract = {…}` field, a CSL-JSON `abstract`, a CSV column, the
+/// `papers.abstract` and `papers.full_text` columns, and a dedup abstract
+/// comparison. A truncated citation record is a corrupted citation record, and a
+/// citation record is not a terminal.
+///
+/// Nothing here truncates. A surface that shows a body caps it itself — see the
+/// module docs.
+///
+/// ```
+/// use scitadel_core::untrusted::UntrustedBody;
+///
+/// // What an extracted full text can carry: an escape that would repaint a
+/// // terminal's screen, in the middle of a paragraph.
+/// let raw = "First paragraph.\n\u{1b}[2JSecond paragraph.\n";
+/// let body = UntrustedBody::publisher_supplied(raw);
+///
+/// // Neutralised — the OSC, CSI and control characters are gone — but the
+/// // paragraph structure is the reader's, not a neutraliser's. (The escape
+/// // leaves a space behind, exactly as `UntrustedText` does: it was a
+/// // separator, not a deletion.)
+/// assert_eq!(body.rendered(), "First paragraph.\n Second paragraph.\n");
+/// assert_eq!(body.as_str(), raw, "the stored bytes are untouched");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UntrustedBody {
+    text: String,
+    provenance: Provenance,
+}
+
+/// A serialised `UntrustedBody` is its string and nothing else, for the same
+/// reason as [`UntrustedText`]: `export_json`, the `papers` columns and
+/// `read_paper`'s envelope all parse a bare string, and a two-field form would
+/// be a shape change no consumer asked for.
+impl Serialize for UntrustedBody {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.text)
+    }
+}
+
+impl<'de> Deserialize<'de> for UntrustedBody {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Ok(Self::publisher_supplied(text))
+    }
+}
+
+/// An empty body, tagged `PublisherSupplied` like every other one.
+///
+/// Needed because `Paper.r#abstract` is `#[serde(default)]`: a record that
+/// arrives with no abstract at all — the pre-body-envelope rows in an existing
+/// database — has to deserialise, and the answer to "whose is the empty
+/// abstract?" is the same as for a non-empty one.
+impl Default for UntrustedBody {
+    fn default() -> Self {
+        Self::publisher_supplied(String::new())
+    }
+}
+
+/// Comparing against a plain string is a read, not a render: the string is never
+/// put on a terminal by it. A dedup abstract comparison reads as the string it
+/// is about.
+impl PartialEq<str> for UntrustedBody {
+    fn eq(&self, other: &str) -> bool {
+        self.text == other
+    }
+}
+
+impl PartialEq<&str> for UntrustedBody {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
+}
+
+impl PartialEq<String> for UntrustedBody {
+    fn eq(&self, other: &String) -> bool {
+        &self.text == other
+    }
+}
+
+impl UntrustedBody {
+    /// Tag `text` with its provenance.
+    pub fn new(text: impl Into<String>, provenance: Provenance) -> Self {
+        Self {
+            text: text.into(),
+            provenance,
+        }
+    }
+
+    /// A body that came out of a document — see [`Provenance::PublisherSupplied`].
+    ///
+    /// The only constructor a body ever needs: everything in this field arrived
+    /// from a publisher's abstract, a landing page's text or a body extracted
+    /// out of the document's own bytes. `Deserialize` uses it too, by the same
+    /// argument `UntrustedText`'s does — a body on the wire arrived through a
+    /// scitadel writer that got it from a document.
+    #[must_use]
+    pub fn publisher_supplied(text: impl Into<String>) -> Self {
+        Self::new(text, Provenance::PublisherSupplied)
+    }
+
+    /// Where this string came from. The answer to "is this ours or the
+    /// document's?", recoverable at the call site without re-reading the code
+    /// that built it.
+    #[must_use]
+    pub fn provenance(&self) -> Provenance {
+        self.provenance
+    }
+
+    /// Did scitadel choose this string?
+    #[must_use]
+    pub fn is_trusted(&self) -> bool {
+        self.provenance.is_trusted()
+    }
+
+    /// The string **exactly as stored**, for matching, export and storage.
+    ///
+    /// Never render this. It carries whatever the publisher put in it —
+    /// terminal escape sequences included — which is the whole reason this type
+    /// exists. There is no `preview` on this type on purpose: finding the first
+    /// `n` characters of a body is a caller's decision about how much of a
+    /// document to show, and a type that makes it for you is a type that
+    /// silently truncates.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    /// Is the stored body empty?
+    ///
+    /// The stored string, not the rendered one: this answers "is there a body
+    /// in the record", which is what a dedup gap-fill asks. A consumer deciding
+    /// whether to print a heading asks the same question of the [rendered]
+    /// form, because an all-escape abstract is empty to a reader and not to the
+    /// record.
+    ///
+    /// [rendered]: Self::rendered
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    /// The string as it may be shown to a human or handed to an agent: escape
+    /// sequences stripped, control and invisible formatting characters removed,
+    /// **and nothing else**.
+    ///
+    /// No whitespace collapsing — a paragraph break is content, and a body that
+    /// arrives as one line is not the abstract a reader came for. No length cap
+    /// — the surfaces that show a body already truncate, and a type that did it
+    /// here would corrupt a document with no marker in it to say so.
+    ///
+    /// Borrows when there is nothing to neutralise, so a clean 40 kB body costs
+    /// no allocation.
+    #[must_use]
+    pub fn rendered(&self) -> Cow<'_, str> {
+        neutralise(&self.text)
+    }
+
+    /// Whether the string changed at all under neutralisation: a hint for a
+    /// caller that wants to say so ("this body carried escape sequences").
+    #[must_use]
+    pub fn needs_neutralising(&self) -> bool {
+        self.text != self.rendered()
+    }
+}
+
+/// `Display` is the neutralised form, deliberately — the same load-bearing
+/// choice [`UntrustedText`] makes, and the point of the type. A body reaching a
+/// terminal through `format!("{body}")` or a tool return through
+/// `writeln!(out, "{body}")` arrives with its escapes, control characters and
+/// invisible formatting removed, and the only way to get the raw document out is
+/// [`UntrustedBody::as_str`], which has to be named out loud.
+impl fmt::Display for UntrustedBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.rendered())
+    }
+}
+
 /// The most characters [`UntrustedText::rendered`] produces, marker included.
 ///
 /// [`MAX_UNTRUSTED_CHARS`] plus one: a caller sizing a column from this knows
 /// the width without having to reason about the marker.
 pub const MAX_RENDERED_CHARS: usize = MAX_UNTRUSTED_CHARS + 1;
 
-/// Remove everything from `text` that changes what a reader sees without
-/// changing what it says.
+/// Remove escape sequences, and control or invisible formatting characters,
+/// changing nothing else — the whitespace, and the newlines in it, survive.
+///
+/// This is the **security** half of neutralisation, and it is the only half
+/// that is about safety: what comes out could still be asked for one line (see
+/// [`collapse`]) or a short one, but it can no longer move a cursor, repaint a
+/// screen, or make two different strings look identical. [`UntrustedBody`]
+/// takes this half and nothing else, which is why it is a free function beside
+/// [`strip`] rather than a private detail of it.
 ///
 /// Three classes, and each is here for its own reason:
 ///
@@ -338,8 +559,8 @@ pub const MAX_RENDERED_CHARS: usize = MAX_UNTRUSTED_CHARS + 1;
 ///   link. This repository's TUI is a terminal application, so both reach a
 ///   human's screen.
 /// - **Control characters**, via [`char::is_control`]: C0, `DEL`, and the C1
-///   block. `newline` included — a caption with an embedded newline reflows a
-///   table row, and the whitespace collapse below already handles it as a space.
+///   block. A body that keeps its newlines is not an exception here — `newline`
+///   is whitespace, and the next paragraph says who owns it.
 /// - **Invisible formatting characters**, which are neither control characters
 ///   nor whitespace and so survive both of the checks above: the bidi overrides
 ///   (`U+202A`–`U+202E`) reorder what the string *looks* like, and the
@@ -347,9 +568,13 @@ pub const MAX_RENDERED_CHARS: usize = MAX_UNTRUSTED_CHARS + 1;
 ///   make two different strings render identically. A reader deciding whether a
 ///   document is the one they asked for is exactly the reader those attack.
 ///
-/// Whitespace runs become one space and the ends are trimmed, so the result is
-/// always a single line.
-fn strip(text: &str) -> Cow<'_, str> {
+/// Whitespace is **left alone**, and that is the whole difference from
+/// [`strip`]. A control character that is also whitespace — `\n`, `\t`,
+/// `U+00A0` — is presentation rather than an attack, so whether it is kept as a
+/// paragraph break or collapsed into a space is the caller's answer, not a
+/// security one. A caller that wants a single line composes [`collapse`] on
+/// top.
+fn neutralise(text: &str) -> Cow<'_, str> {
     let mut out = String::with_capacity(text.len());
     let mut changed = false;
     // Set by an escape sequence and spent by the next printable character. An
@@ -366,30 +591,10 @@ fn strip(text: &str) -> Cow<'_, str> {
             skip_escape_sequence(&mut chars);
             continue;
         }
-        // Before `is_invisible`, because the common control characters *are*
-        // whitespace: a caption with an embedded newline becomes one line with a
-        // single space where it was, rather than losing the word boundary.
-        if c.is_whitespace() {
-            let mut collapsed = false;
-            while chars.peek().is_some_and(|next| next.is_whitespace()) {
-                chars.next();
-                collapsed = true;
-            }
-            if out.is_empty() || out.ends_with(' ') {
-                // Leading whitespace is dropped rather than turned into a space,
-                // and a run that follows one adds nothing.
-                changed = true;
-                continue;
-            }
-            // Three ways a whitespace character stops being itself: a run became
-            // one space, a non-space (`\n`, `\t`, U+00A0) became a space at all,
-            // or an escape left a separator behind.
-            changed |= collapsed || c != ' ' || after_escape;
-            after_escape = false;
-            out.push(' ');
-            continue;
-        }
-        if is_invisible(c) {
+        // Whitespace controls are the caller's business, not this function's:
+        // dropping a `\n` here would silently take a paragraph out of a body,
+        // and keeping it is what a body needs anyway.
+        if is_invisible(c) && !c.is_whitespace() {
             changed = true;
             continue;
         }
@@ -400,17 +605,75 @@ fn strip(text: &str) -> Cow<'_, str> {
         after_escape = false;
         out.push(c);
     }
-    // Trailing whitespace is trimmed the same way — including a space an escape
-    // left behind, which would otherwise end the string.
-    while out.ends_with(' ') {
-        out.pop();
-        changed = true;
-    }
 
     if changed {
         Cow::Owned(out)
     } else {
         Cow::Borrowed(text)
+    }
+}
+
+/// The **presentation** half: one line, one space where a run was, and neither
+/// end carrying anything.
+///
+/// This is what turns a neutralised string into a table cell, and it is exactly
+/// what a body must *not* have done to it — a paragraph break is content, and
+/// an abstract read as one line is not an abstract. So it lives here, next to
+/// the security half it composes with, rather than inside it, and
+/// [`UntrustedBody`] never calls it.
+fn collapse(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_whitespace() {
+            if out.is_empty() || out.ends_with(' ') {
+                // Leading whitespace is dropped rather than turned into a space,
+                // and a run that follows one adds nothing.
+                continue;
+            }
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+    }
+    // Trailing whitespace is trimmed the same way — including a space an escape
+    // left behind, which would otherwise end the string.
+    while out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
+/// Does [`collapse`] change `text`?
+///
+/// A borrowed `Cow` has to stay borrowed, so the question is answered by
+/// looking rather than by rebuilding the string. The answer is "no" for the
+/// common shape — a short caption that is already one line — and "yes" for
+/// leading or trailing whitespace, any run, and any non-space whitespace
+/// character, which are exactly the cases collapse rewrites.
+fn needs_collapse(text: &str) -> bool {
+    text.starts_with(char::is_whitespace)
+        || text.ends_with(char::is_whitespace)
+        || text.chars().any(|c| c.is_whitespace() && c != ' ')
+        || text
+            .chars()
+            .zip(text.chars().skip(1))
+            .any(|(a, b)| a.is_whitespace() && b.is_whitespace())
+}
+
+/// Remove everything from `text` that changes what a reader sees without
+/// changing what it says, and put the result on one line.
+///
+/// [`neutralise`] for the escape sequences and the invisible characters, then
+/// [`collapse`] for the shape. Composed from the two halves rather than written
+/// as one pass, so that the half a body needs is available on its own — the
+/// 200-character cap and the whitespace collapse are correct for a caption and
+/// wrong for a reader's body, and only one of them is security.
+fn strip(text: &str) -> Cow<'_, str> {
+    let neutralised = neutralise(text);
+    if needs_collapse(&neutralised) {
+        Cow::Owned(collapse(&neutralised))
+    } else {
+        neutralised
     }
 }
 
@@ -802,5 +1065,270 @@ mod tests {
         let hostile = UntrustedText::publisher_supplied("A\u{1b}[2JTitle");
         assert_ne!(hostile, "A Title");
         assert_eq!(hostile.rendered(), "A Title");
+    }
+
+    // ------------------------------------------------------------------
+    // `UntrustedBody` — the security half alone.
+    //
+    // Every test here asserts the two things that make a body a separate type:
+    // that it is neutralised like a title, and that it keeps the shape a
+    // neutralise-then-collapse would have taken out of it.
+    // ------------------------------------------------------------------
+
+    /// A body keeps its paragraph structure. This is the assertion the whole
+    /// type exists for: a newline is content, not whitespace to be tidied.
+    #[test]
+    fn a_body_keeps_its_paragraphs_and_its_indentation() {
+        let raw = "First paragraph, with a run of   spaces kept.\n\
+                   \n\
+                       Indented second paragraph.\n\
+                   \tTab-indented third.\n";
+        let body = UntrustedBody::publisher_supplied(raw);
+
+        let rendered = body.rendered();
+        assert_eq!(
+            rendered, raw,
+            "a clean body is returned verbatim — no collapsing, no trimming"
+        );
+        assert!(
+            matches!(rendered, Cow::Borrowed(_)),
+            "and a clean body is borrowed, not rebuilt"
+        );
+
+        // What `UntrustedText::rendered` would have done to the same bytes:
+        // one line, one space per run, no tabs. Asserted so the difference is
+        // pinned rather than merely documented.
+        let text = UntrustedText::publisher_supplied(raw);
+        assert_eq!(
+            text.rendered(),
+            "First paragraph, with a run of spaces kept. Indented second paragraph. \
+             Tab-indented third."
+        );
+    }
+
+    /// The security-relevant one: a body out of a document's bytes must not be
+    /// able to reach a terminal intact.
+    ///
+    /// Asserted on the remnants (`[31m`, `[2J`, the OSC 8 payload) rather than
+    /// on "no ESC byte survives", because a terminal front end strips the byte
+    /// itself — #287's first papers-table test asserted that and passed with
+    /// the guardrail disabled. The payload is the part that survives a byte
+    /// that never arrives.
+    #[test]
+    fn a_hostile_body_is_neutralised_but_not_reshaped() {
+        let hostile = concat!(
+            "Background.\n",
+            "\u{1b}[31m\u{1b}[2J\u{1b}[H",
+            "\u{1b}]8;;https://attacker.example/\u{1b}\\click me\u{1b}]8;;\u{1b}\\",
+            "\u{1b}(B",
+            "\u{1b}]0;window title\u{07}",
+            "Method.\n",
+            " \u{7} \u{202e}reversed\u{202c}\u{200b} zero-width\n",
+            "\u{1b}]8;;https://attacker.example/never closed",
+        );
+        let body = UntrustedBody::publisher_supplied(hostile);
+
+        let rendered = body.rendered();
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "no escape byte may survive: {rendered:?}"
+        );
+        for (label, needle) in [
+            ("CSI colour", "[31m"),
+            ("erase-display", "[2J"),
+            ("cursor-home", "[H"),
+            ("OSC 8", "attacker.example"),
+            ("OSC 0", "window title"),
+            ("a bidi override", "\u{202e}"),
+            ("a zero-width joiner", "\u{200b}"),
+            ("a BEL", "\u{7}"),
+        ] {
+            assert!(
+                !rendered.contains(needle),
+                "the {label} payload must not survive: {rendered:?}"
+            );
+        }
+
+        // The paragraph breaks are content, so they survive; and the escape
+        // leaves a separator behind rather than joining the words either side,
+        // exactly as `UntrustedText` does. The `\u{7}` between two spaces
+        // leaves them standing: whitespace is a body's to keep.
+        assert_eq!(
+            rendered, "Background.\n click me Method.\n  reversed zero-width\n",
+            "the body keeps its paragraphs and its words: {rendered:?}"
+        );
+
+        // `Display` is the same path, which is what makes `{}` safe.
+        assert_eq!(rendered, body.to_string());
+        assert_eq!(rendered, format!("{body}"));
+        assert_ne!(
+            body.as_str(),
+            rendered,
+            "the stored string is untouched: neutralisation is a rendering concern"
+        );
+        assert!(
+            body.needs_neutralising(),
+            "and the caller can tell that it changed something"
+        );
+
+        // Every way to reach `Display` — `format!`, `write!` and a `{}`
+        // captured in a message — is neutralised the same way, because they
+        // all go through the one impl. This is the invariant, held from more
+        // than one direction so a revert of `Display` cannot pass by changing
+        // only one of them.
+        let mut written = String::new();
+        let mut ln = String::new();
+        {
+            use std::fmt::Write as _;
+            write!(&mut written, "{body}").expect("write to a String cannot fail");
+            writeln!(&mut ln, "reader: {body}").expect("write to a String cannot fail");
+        }
+        assert_eq!(written, rendered, "a `write!` goes through `Display`");
+        assert_eq!(
+            ln,
+            format!("reader: {rendered}\n"),
+            "and so does `writeln!`"
+        );
+        assert!(
+            !format!("{body}").contains('\u{1b}'),
+            "no escape byte survives a format either"
+        );
+        assert!(
+            !format!("{body}").contains('\u{1b}'),
+            "no escape byte survives a format either"
+        );
+    }
+
+    /// A body is not capped, at any length. `UntrustedText`'s 200-character
+    /// limit is the reason this type exists, so its absence is asserted rather
+    /// than assumed.
+    #[test]
+    fn a_body_is_not_capped_and_not_marked_truncated() {
+        let long = "word ".repeat(1_000);
+        let body = UntrustedBody::publisher_supplied(&long);
+        let rendered = body.rendered();
+
+        assert_eq!(
+            rendered.chars().count(),
+            5_000,
+            "the whole body survives, character for character"
+        );
+        assert!(
+            !rendered.contains(TRUNCATION_MARKER),
+            "nothing in this module truncates a body: {rendered:?}"
+        );
+        assert_eq!(
+            body.as_str().chars().count(),
+            5_000,
+            "and the stored string was never the thing at risk"
+        );
+
+        // The contrast with the sibling type, so the two caps stay visibly
+        // different rather than drifting together in a refactor.
+        assert_eq!(
+            UntrustedText::publisher_supplied(&long)
+                .rendered()
+                .chars()
+                .count(),
+            MAX_RENDERED_CHARS
+        );
+    }
+
+    /// A body with no escape and no separator to fix is returned as-is, so the
+    /// 200-character cap's absence is not paid for by a rebuild.
+    #[test]
+    fn a_clean_body_is_borrowed_rather_than_rebuilt() {
+        let clean = UntrustedBody::publisher_supplied("One.\nTwo.\n");
+        assert!(matches!(clean.rendered(), Cow::Borrowed(_)));
+
+        // One escape anywhere is enough to make it owned — but only the escape
+        // is removed, not the shape. It leaves a separator behind, the same rule
+        // `UntrustedText` follows: an escape is a separator, not a deletion, and
+        // joining the words either side of it would invent one nobody wrote.
+        let one_escape = UntrustedBody::publisher_supplied("One.\n\u{1b}[0mTwo.\n");
+        let rendered = one_escape.rendered();
+        assert!(matches!(rendered, Cow::Owned(_)));
+        assert_eq!(rendered, "One.\n Two.\n");
+    }
+
+    /// A truncated escape sequence must not leave its payload behind as text,
+    /// on the body path either. An unterminated OSC is the case that matters.
+    #[test]
+    fn a_body_consumes_a_truncated_escape_sequence_to_the_end() {
+        for hostile in [
+            "Abstract.\u{1b}]8;;https://attacker.example/never closed",
+            "Abstract.\u{1b}[31",
+            "Abstract.\u{1b}",
+            "Abstract.\u{1b}]",
+            "Abstract.\u{1b}]0;window\u{1b}\\still open",
+        ] {
+            let body = UntrustedBody::publisher_supplied(hostile);
+            let rendered = body.rendered();
+            assert!(
+                !rendered.contains('\u{1b}'),
+                "no escape survives: {hostile:?} → {rendered:?}"
+            );
+            assert!(
+                !rendered.contains("attacker.example"),
+                "an unterminated payload is not left as text: {rendered:?}"
+            );
+        }
+    }
+
+    /// Storage, serialisation and matching take the raw string, and the shape a
+    /// serialised body takes is the shape every consumer already parses — a
+    /// bare string, with no provenance in it.
+    #[test]
+    fn a_serialised_body_is_a_bare_string_and_a_deserialised_one_is_the_documents() {
+        let hostile = UntrustedBody::publisher_supplied("Abstract\u{1b}[2J");
+        let json = serde_json::to_string(&hostile).expect("serialise");
+        assert_eq!(json, "\"Abstract\\u001b[2J\"");
+        assert_eq!(
+            serde_json::to_string(hostile.as_str()).expect("serialise"),
+            json,
+            "the two forms agree, so a data path and a JSON path write the same bytes"
+        );
+
+        let back: UntrustedBody = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(back.as_str(), hostile.as_str());
+        assert_eq!(back, hostile.as_str());
+        assert_eq!(back, String::from("Abstract\u{1b}[2J"));
+        assert!(
+            !back.is_trusted(),
+            "a body from JSON is the document's, not ours"
+        );
+        assert!(!back.needs_neutralising() || back.rendered() == "Abstract");
+        // Neutralisation is a rendering concern, so the round trip through JSON
+        // does not lose the bytes and does not make them safe either.
+        assert_eq!(back.rendered(), "Abstract");
+    }
+
+    /// A body never calls the other half: no `preview`, no `is_empty` on the
+    /// rendered form, no `provenance` reachable without naming it. The type
+    /// surface is asserted here so a well-meaning addition has to argue with
+    /// this test.
+    #[test]
+    fn a_body_exposes_no_truncation_of_its_own() {
+        // `Provenance` is reused rather than duplicated, so a body answers the
+        // same question the same way.
+        let body = UntrustedBody::new("text", Provenance::Ours);
+        assert!(body.is_trusted());
+        assert_eq!(body.provenance().label(), "scitadel's own record");
+        assert_eq!(
+            UntrustedBody::publisher_supplied("x").provenance().label(),
+            "from the document (untrusted)"
+        );
+
+        // `is_empty` is a question about the record, not about the screen.
+        assert!(UntrustedBody::publisher_supplied(String::new()).is_empty());
+        assert!(!UntrustedBody::publisher_supplied("A.").is_empty());
+        // An all-escape abstract is empty to a reader and not to the record,
+        // which is why a caller that wants the first answer renders first.
+        assert!(!UntrustedBody::publisher_supplied("\u{1b}[2J").is_empty());
+        assert!(
+            UntrustedBody::publisher_supplied("\u{1b}[2J")
+                .rendered()
+                .is_empty()
+        );
     }
 }

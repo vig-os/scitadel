@@ -139,7 +139,9 @@ fn paper_to_entry(key: &str, paper: &Paper, tags: &[String]) -> String {
         fields.push("  eprinttype = {arxiv}".to_string());
     }
     if !paper.r#abstract.is_empty() {
-        fields.push(fmt_field("abstract", &paper.r#abstract));
+        // `as_str`, not `rendered`: a truncated citation record is a corrupted
+        // citation record, and 200 characters of an abstract is not an abstract.
+        fields.push(fmt_field("abstract", paper.r#abstract.as_str()));
     }
     if !tags.is_empty() {
         // Comma-separated, preserving caller-supplied order.
@@ -175,13 +177,24 @@ fn escape_bibtex(s: &str) -> String {
 mod tests {
     use super::*;
     use scitadel_core::models::PaperId;
-    use scitadel_core::untrusted::UntrustedText;
+    use scitadel_core::untrusted::{UntrustedBody, UntrustedText};
 
     fn paper(title: &str, authors: &[&str], year: Option<i32>) -> Paper {
         let mut p = Paper::new(title);
         p.authors = authors.iter().map(|s| UntrustedText::ours(*s)).collect();
         p.year = year;
         p
+    }
+
+    /// An abstract long enough that a 200-character cap would cut it, with
+    /// paragraph breaks a whitespace collapse would destroy and an escape a
+    /// render would strip — the three things a data path must not do.
+    fn long_abstract() -> String {
+        format!(
+            "First paragraph.\n\nSecond paragraph: {}.\n\u{1b}[2J\n\nThird paragraph: {}.",
+            "lorem ipsum dolor sit amet ".repeat(10),
+            "consectetur adipiscing elit ".repeat(10),
+        )
     }
 
     #[test]
@@ -220,6 +233,40 @@ mod tests {
         let out = export_bibtex(&[p]);
         assert!(out.contains("Über quantum"));
         assert!(out.contains("Müller"));
+    }
+
+    /// #287's data-path half: `abstract` is a citation *record* field, so it is
+    /// written as stored — whole, newlines and escape bytes included.
+    ///
+    /// A 200-character cap would truncate it to a fragment, and a fragment in
+    /// a `.bib` a person hands to a reference manager is a corrupt citation
+    /// with nothing in it to say so. Rendering it would strip the escape and
+    /// collapse the paragraphs for the same reason. Asserted against both.
+    #[test]
+    fn export_writes_the_abstract_as_stored_not_as_rendered() {
+        let mut p = paper("A Study", &["Smith"], Some(2024));
+        p.bibtex_key = Some("smith2024study".into());
+        let raw = long_abstract();
+        assert!(
+            raw.chars().count() > 200,
+            "the fixture really is longer than the cap"
+        );
+        p.r#abstract = UntrustedBody::publisher_supplied(raw.as_str());
+
+        let out = export_bibtex(&[p]);
+
+        assert!(
+            out.contains(&escape_bibtex(&raw)),
+            "the abstract field is the stored record: {out}"
+        );
+        assert!(
+            out.contains(&escape_bibtex("\u{1b}[2J")),
+            "including its escape byte, because the record is the bytes: {out}"
+        );
+        assert!(
+            !out.contains("First paragraph. Second paragraph."),
+            "and it was not collapsed onto one line: {out}"
+        );
     }
 
     #[test]

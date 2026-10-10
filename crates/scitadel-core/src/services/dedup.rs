@@ -6,7 +6,7 @@ use crate::models::{
     CandidatePaper, Paper, SearchId, SearchResult, normalize_doi, validate_doi,
     validate_doi_detailed,
 };
-use crate::untrusted::UntrustedText;
+use crate::untrusted::{UntrustedBody, UntrustedText};
 
 /// Normalize title for fuzzy matching: lowercase, strip punctuation/whitespace.
 fn normalize_title(title: &str) -> String {
@@ -62,8 +62,12 @@ fn merge_candidate_into_paper(paper: &mut Paper, candidate: &CandidatePaper) {
     if paper.openalex_id.is_none() && candidate.openalex_id.is_some() {
         paper.openalex_id.clone_from(&candidate.openalex_id);
     }
+    // The abstract is a data path: the stored bytes are what a citation record
+    // is made of, and a body rendered (capped, collapsed) here is a corrupted
+    // citation record. Provenance is rewritten to `PublisherSupplied` because
+    // the merged body is the document's abstract, not scitadel's own statement.
     if paper.r#abstract.is_empty() && !candidate.r#abstract.is_empty() {
-        paper.r#abstract.clone_from(&candidate.r#abstract);
+        paper.r#abstract = UntrustedBody::publisher_supplied(candidate.r#abstract.clone());
     }
     if paper.year.is_none() && candidate.year.is_some() {
         paper.year = candidate.year;
@@ -150,7 +154,7 @@ pub fn deduplicate(
         } else {
             let mut paper = Paper::new(&candidate.title);
             paper.authors = candidate.authors.iter().map(UntrustedText::ours).collect();
-            paper.r#abstract.clone_from(&candidate.r#abstract);
+            paper.r#abstract = UntrustedBody::publisher_supplied(candidate.r#abstract.clone());
             paper.doi.clone_from(&valid_doi);
             paper.arxiv_id.clone_from(&candidate.arxiv_id);
             paper.pubmed_id.clone_from(&candidate.pubmed_id);

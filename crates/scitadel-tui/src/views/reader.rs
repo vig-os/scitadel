@@ -65,11 +65,17 @@ pub fn draw(
         .map(|a| a.id.as_str().to_string())
         .collect();
 
+    // The body is the document's own text, so it is neutralised like the title
+    // — `UntrustedBody::rendered` is the security half alone, which is the
+    // whole point of the type: escapes, control characters and invisible
+    // formatting go, paragraph structure and every other space stay. The
+    // reader pages rather than truncating, so nothing here bounds the length.
     let body = paper
         .full_text
-        .as_deref()
+        .as_ref()
+        .map(|body| body.rendered())
         .filter(|t| !t.trim().is_empty())
-        .unwrap_or(&paper.r#abstract);
+        .unwrap_or_else(|| paper.r#abstract.rendered());
 
     if body.trim().is_empty() {
         let block = Block::default()
@@ -94,7 +100,7 @@ pub fn draw(
         frame,
         chunks[0],
         &paper.title.rendered(),
-        body,
+        &body,
         &roots,
         focus,
     );
@@ -406,7 +412,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use scitadel_core::models::{Anchor, AnchorStatus, Annotation, Paper, PaperId};
     use scitadel_core::ports::PaperRepository as _;
-    use scitadel_core::untrusted::UntrustedText;
+    use scitadel_core::untrusted::{UntrustedBody, UntrustedText};
 
     fn root_at(quote: &str, range: Option<(usize, usize)>) -> Annotation {
         let mut a = Annotation::new_root(
@@ -505,6 +511,16 @@ mod tests {
     /// Render `paper` in the reader and hand back every character the terminal
     /// would be asked to print.
     fn rendered_screen(paper: &Paper) -> String {
+        rendered_rows(paper).concat()
+    }
+
+    /// Render `paper` in the reader, one string per terminal row.
+    ///
+    /// Row structure is the only way to assert that a body's *paragraphs*
+    /// survived: a body collapsed to one line and a body that kept its newlines
+    /// both contain the same words, and only one of them puts them on separate
+    /// rows.
+    fn rendered_rows(paper: &Paper) -> Vec<String> {
         let dir = tempfile::tempdir().expect("tempdir");
         let data = DataStore::open(&dir.path().join("scitadel.db")).expect("open db");
         let (paper_repo, _, _, _, _) = data.db.repositories();
@@ -518,9 +534,25 @@ mod tests {
             .backend()
             .buffer()
             .content()
-            .iter()
-            .map(|cell| cell.symbol())
+            .chunks(100)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
             .collect()
+    }
+
+    /// Which row a phrase landed on, so a test can ask whether two phrases are
+    /// on the same one.
+    fn row_of(rows: &[String], needle: &str) -> Option<usize> {
+        rows.iter().position(|row| row.contains(needle))
+    }
+
+    /// How many of the reader test's three short paragraphs one terminal row
+    /// holds. Two on one row means the body was collapsed; a newline is the
+    /// only thing that keeps them apart.
+    fn phrases_on(row: &str) -> usize {
+        ["Background.", "click me", "Findings."]
+            .iter()
+            .filter(|p| row.contains(**p))
+            .count()
     }
 
     /// #287's TUI half: the reader is a terminal application, so a crafted
@@ -539,7 +571,7 @@ mod tests {
         // An abstract but no full text, so the reader takes its two-pane branch
         // — the one that puts the title in a block header *and* passes it into
         // the text pane, which is where an escape would reach the terminal.
-        paper.r#abstract = "An abstract.".into();
+        paper.r#abstract = UntrustedBody::publisher_supplied("An abstract.");
         paper.title = UntrustedText::publisher_supplied(HOSTILE);
         paper.authors = vec![UntrustedText::publisher_supplied("Attacker\u{1b}[2J, A.")];
 
@@ -567,5 +599,73 @@ mod tests {
             screen.contains("Real Title click"),
             "the words survive, so a reader can still weigh the document: {screen:?}"
         );
+    }
+
+    /// #287's body half: the abstract is the document's text, and the reader is
+    /// a terminal application, so an escape carried in the *body* must not
+    /// reach the screen either — while the paragraph structure the reader came
+    /// for does.
+    ///
+    /// Asserted on the payload remnants (`31m`, `2J`, the OSC 8 URL) rather than
+    /// on "no ESC byte survives": ratatui drops escape bytes itself, so an
+    /// assertion on the byte alone passes with the render path disabled. The
+    /// payload is what a byte that never arrived leaves behind.
+    ///
+    /// And on the paragraph structure. The three phrases are short enough that
+    /// none of them wraps in a 60%-wide pane, so the only way two of them can
+    /// share a row is if the body was collapsed to one line — which is the
+    /// assertion that cannot pass on a no-op, and cannot pass on a title wrapper
+    /// either.
+    #[test]
+    fn a_hostile_body_is_neutralised_and_keeps_its_paragraph_structure() {
+        const HOSTILE: &str = "Background.\n\n\
+             \u{1b}[31m\u{1b}[2J\u{1b}[H\
+             \u{1b}]8;;https://attacker.example/\u{1b}\\click me\u{1b}]8;;\u{1b}\\\n\n\
+             \u{202e}reversed\u{202c} Findings.";
+        let mut paper = Paper::new("A Paper");
+        paper.id = PaperId::from("p-body-hostile");
+        paper.r#abstract = UntrustedBody::publisher_supplied(HOSTILE);
+        paper.title = UntrustedText::ours("A Paper");
+        assert!(
+            HOSTILE.contains("\n\n"),
+            "the fixture really does carry paragraph breaks, which is what \
+             makes the paragraph assertion below more than a restatement"
+        );
+
+        let screen = rendered_screen(&paper);
+        let rows = rendered_rows(&paper);
+
+        assert!(
+            !screen.contains('\u{1b}'),
+            "no escape byte may reach the terminal: {screen:?}"
+        );
+        for (label, needle) in [
+            ("CSI colour", "31m"),
+            ("erase-display", "2J"),
+            ("cursor-home", "[H"),
+            ("OSC 8", "attacker.example"),
+            ("a bidi override", "\u{202e}"),
+        ] {
+            assert!(
+                !screen.contains(needle),
+                "the {label} payload must not reach the terminal: {screen:?}"
+            );
+        }
+        assert!(
+            screen.contains("click me"),
+            "the link text survives, without the link: {screen:?}"
+        );
+
+        for phrase in ["Background.", "click me", "Findings."] {
+            let row = row_of(&rows, phrase);
+            assert!(row.is_some(), "{phrase:?} reached the screen: {rows:?}");
+            // No row holds two of them: collapsed to one line they would share
+            // one, and the only thing that keeps them apart is the newline.
+            assert!(
+                rows.iter().all(|r| phrases_on(r) < 2),
+                "the {phrase:?} paragraph is on its own row, not joined to the \
+                 next one: {rows:?}"
+            );
+        }
     }
 }

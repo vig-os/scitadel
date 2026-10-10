@@ -217,13 +217,19 @@ fn draw_detail(frame: &mut Frame, area: Rect, focused: Option<&(Paper, Option<As
         }
     }
 
-    if !paper.r#abstract.is_empty() {
+    if !paper.r#abstract.rendered().is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "Abstract:",
-            Style::default().fg(Color::Yellow),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         )));
-        for line in paper.r#abstract.lines() {
+        // `rendered()`, not the stored string: this is a terminal, and an
+        // abstract is a publisher's body text like any other. `lines()` is the
+        // paragraph structure surviving the render — the body type exists so it
+        // does.
+        for line in paper.r#abstract.rendered().lines() {
             lines.push(Line::from(line.to_string()));
         }
     }

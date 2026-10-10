@@ -22,7 +22,7 @@
 use scitadel_adapters::identity;
 use scitadel_core::models::{Paper, PaperId};
 use scitadel_core::ports::PaperRepository;
-use scitadel_core::untrusted::{Provenance, UntrustedText};
+use scitadel_core::untrusted::{Provenance, UntrustedBody, UntrustedText};
 use scitadel_db::sqlite::{Database, SqlitePaperRepository};
 
 /// `ESC [31m` (colour), `ESC [2J` (erase display) and an OSC 8 hyperlink whose
@@ -144,4 +144,105 @@ fn a_documents_title_survives_the_database_round_trip_and_renders_neutral() {
         UntrustedText::ours(raw.as_str()).provenance().is_trusted(),
         "and an `Ours` string is still neutralised on the way out"
     );
+}
+
+/// The body's round trip, which is the one #287's amendment deferred and this
+/// branch closes.
+///
+/// The two halves of the envelope meet here: the *column* keeps the bytes
+/// (neutralisation is a rendering concern, not a storage one), and the render
+/// comes out with the escapes gone but the paragraph structure intact. A
+/// 200-character cap and a whitespace collapse — the two things `UntrustedText`
+/// does that a body must not have done to it — are asserted absent, because
+/// either one silently turns a document into something that is not the
+/// document.
+#[test]
+fn a_documents_body_survives_the_database_round_trip_intact_and_renders_neutral() {
+    // Long enough that a cap would cut it, with paragraph breaks a collapse
+    // would destroy and an escape a render would strip.
+    let raw = format!(
+        "First paragraph: {}.\n\nSecond paragraph: {}.\n\u{1b}[2J\n\nThird paragraph.",
+        "lorem ipsum dolor sit amet ".repeat(10),
+        "consectetur adipiscing elit ".repeat(10),
+    );
+    assert!(
+        raw.chars().count() > 200,
+        "the fixture really is longer than the cap"
+    );
+    assert!(
+        raw.contains("\n\n"),
+        "and really does carry paragraph breaks, so the assertions below cross \
+         the boundary rather than passing on a no-op"
+    );
+
+    let db = Database::open_in_memory().expect("open db");
+    db.migrate().expect("migrate");
+    let repo = SqlitePaperRepository::new(db.clone());
+
+    let mut paper = Paper::new("A Paper");
+    paper.id = PaperId::from("p-body");
+    paper.r#abstract = UntrustedBody::publisher_supplied(raw.as_str());
+    paper.full_text = Some(UntrustedBody::publisher_supplied(raw.as_str()));
+    repo.save(&paper).expect("save paper");
+
+    let back = repo.get("p-body").expect("get").expect("present");
+
+    // The data path: the columns are the record, byte for byte.
+    assert_eq!(
+        back.r#abstract.as_str(),
+        raw,
+        "the stored abstract keeps its bytes: a truncated citation record is a \
+         corrupted citation record"
+    );
+    assert_eq!(
+        back.full_text.as_ref().map(UntrustedBody::as_str),
+        Some(raw.as_str()),
+        "and so does the stored full text"
+    );
+    // `PublisherSupplied`, unlike the title: a body has no scitadel-authored
+    // form, so the honest answer to "whose words are these?" is the
+    // document's.
+    assert!(!back.r#abstract.provenance().is_trusted());
+    assert_eq!(back.r#abstract.provenance(), Provenance::PublisherSupplied);
+
+    // The render path: neutralised, whole, and still shaped like the document.
+    let rendered_expected = raw.replace("\u{1b}[2J", " ");
+    for (label, body) in [
+        ("the abstract", &back.r#abstract),
+        ("the full text", back.full_text.as_ref().expect("a body")),
+    ] {
+        let rendered = body.rendered();
+        assert_eq!(
+            rendered, rendered_expected,
+            "{label} renders as the stored body, minus the escape and nothing else"
+        );
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "{label}: the security half is not optional — {rendered:?}"
+        );
+        assert!(
+            !rendered
+                .chars()
+                .any(|c| c.is_control() && !c.is_whitespace()),
+            "{label} carries no control character that is not whitespace: unlike a \
+             caption, a body is entitled to keep its own newlines — that is the \
+             whole reason it is a second type — and only to those: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("\n\n"),
+            "{label} keeps its paragraph breaks, so a reader gets the abstract \
+             rather than a fragment of it"
+        );
+        assert!(
+            rendered.chars().count() > 200,
+            "{label} is not capped at 200: {} characters",
+            rendered.chars().count()
+        );
+        assert_ne!(
+            body.as_str(),
+            rendered,
+            "{label} was not written back over: neutralisation is a rendering \
+             concern"
+        );
+    }
 }
