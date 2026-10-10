@@ -1,19 +1,19 @@
 ---
 type: issue
-state: open
+state: closed
 created: 2026-10-02T12:20:49Z
-updated: 2026-10-08T23:26:45Z
+updated: 2026-10-09T21:31:14Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/260
-comments: 3
+comments: 4
 labels: bug, effort:medium, priority:high
 assignees: none
 milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-10-09T08:09:15.248Z
+synced: 2026-10-10T07:53:25.505Z
 ---
 
 # [Issue 260]: [fix(acquire): preprint and publisher-direct OA routes are missing — 52 free papers reported unreachable (bioRxiv 3/3 missed)](https://github.com/vig-os/scitadel/issues/260)
@@ -153,4 +153,87 @@ I lean (a), because clause 1's wording — "obtains the PDF with no network inde
 ## On clause 2's "52-DOI set"
 
 The set this issue calls "above" is **not enumerated in the issue** — it names seven DOIs. #297's harness carries 16, each tagged with its provenance (`Issue260` or a recorded live query), and `LIVE_QUERY_PROVENANCE` records the queries. Until someone can name the 52, ≥90% cannot be measured as written. If the original run's DOI list is recoverable from raid's `tools/fetch/fulltext.py`, adding it to `crates/scitadel-adapters/src/oa_live.rs` would close this properly.
+
+---
+
+# [Comment #4]() by [gerchowl]()
+
+_Posted on October 9, 2026 at 09:31 PM_
+
+Option (a) is implemented and merged: #305.
+
+## What changed
+
+ADR-007 §3's `OA VoR > AM > preprint` rule now has a narrowed domain — the
+author-manuscript rung applies only to a work whose version of record is **not**
+open. A work that is itself a preprint has no version of record to prefer over, so
+a repository's author-manuscript copy of it ranks as `preprint`.
+
+The decision is made at the point a repository's flag becomes a `Version`, not in
+the comparator. `Rank` is untouched and the 128-cell ordering test still pins
+`version > licence > fetch step`; what changed is the *data* on one class of
+candidates.
+
+The gate is the **work-level** signal, because a repository flag says which copy
+that service holds and cannot know whether a better version exists elsewhere.
+`source: PPR` and Crossref's `posted-content`/`subtype: preprint` are both
+consulted, and both spellings agree on every probe in `oa_live.rs`.
+
+Deliberately left standing: `VersionOfRecord` from a repository (a stronger
+claim), `Unstated` (nothing to downgrade), and an **untyped** work — "we do not
+know what this is" is not evidence that it has no version of record.
+
+## Measured, on the three probe DOIs
+
+| | before | after |
+|---|---|---|
+| rank 1 = PubMed citation page | 2/3 | **0/3** |
+| rank 1 = a preprint-version document | 0/3 | **3/3** |
+| rank 1 = the bioRxiv PDF | 0/3 | **1/3** |
+
+The plan line now names both facts, so it is checkable against Europe PMC rather
+than against us:
+
+```
+version preprint [europepmc says `author-manuscript copy of a preprint work`]
+```
+
+`10.1101/2024.10.10.615955` obtained a 206 with `application/pdf`. The other two
+rank a preprint document from an OA source at an earlier fetch step (Europe PMC
+step 1, PMC step 3) and obtained bytes there, with the bioRxiv transform at rank
+4-5 — **named, not chosen**. Those two returned real bytes on one live run and
+Cloudflare HTML on another, so "obtained as PDF" for them is flaky rather than
+settled.
+
+## The limit of option (a), recorded in the ADR
+
+This was always going to stop short of 3/3, and it did. After the downgrade the
+two copies **tie** on version and licence, so the fetch order decides, and Europe
+PMC is step 1. Reaching 3/3 needs a separate decision — *whether a preprint server
+outranks an index for a preprint work* — which ADR-007's fetch order currently
+answers the other way. That is in the amendment as "Not decided here", not
+silently resolved.
+
+## One thing worth flagging about how this was verified
+
+The first draft of the lead test passed **vacuously**. The fixture omitted
+`hitCount`, `parse_search` returned `Unreadable`, Europe PMC contributed nothing
+at all, and the bioRxiv DOI transform carried every assertion by itself. The test
+now guards on a `RouteId::EuropePmc` candidate existing, with a comment saying it
+is there because of that, and the whole set was checked by disabling the
+amendment: the downgrade test fails, the two guards still pass.
+
+## Clause 1's status
+
+Read literally, clause 1 asks that `acquire` "obtains the PDF with no network
+index lookup, **or says which of those servers it tried**". The second disjunct
+is satisfied — the resolve pass reports every source it consulted, and the plan
+names the bioRxiv transform. The first is now 1/3 rather than 0/3.
+
+Closing this as **partially resolved** rather than done: clause 2 (≥90% of the
+52-DOI set) remains unmeasurable, because the set is not enumerated in this issue
+and the 16-probe harness in `oa_live.rs` is a cited proxy. If the original run's
+DOI list is recoverable from raid's `tools/fetch/fulltext.py`, adding it would let
+clause 2 be measured at all.
+
 

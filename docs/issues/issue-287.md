@@ -1,19 +1,19 @@
 ---
 type: issue
-state: open
+state: closed
 created: 2026-10-04T20:46:33Z
-updated: 2026-10-04T20:46:33Z
+updated: 2026-10-09T18:39:48Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/287
-comments: 0
+comments: 1
 labels: effort:medium, security, priority:high
 assignees: none
 milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-10-05T07:53:08.848Z
+synced: 2026-10-10T07:53:24.882Z
 ---
 
 # [Issue 287]: [security(reader): read_paper renders attacker-controlled text with no untrusted-content envelope — blocks any release](https://github.com/vig-os/scitadel/issues/287)
@@ -64,3 +64,37 @@ Mark the boundary once, at the point text enters the system, and make it survive
 - `read_paper` and the TUI's reader are the two consumers. `find_cached_file` and the TUI's state column are also still on the legacy dual-write (see #253's S2e) and should move in the same pass.
 
 Refs: #253, ADR-007 §1.
+---
+
+# [Comment #1]() by [gerchowl]()
+
+_Posted on October 9, 2026 at 06:39 PM_
+
+Fixed in #303, and its fourth acceptance box is answered by an ADR amendment rather than by code.
+
+## Implemented
+
+`Paper.title` and `Paper.authors` are `UntrustedText` — 37 files, because the compiler enumerated the call sites rather than a judgement being made about which surface to wrap.
+
+The reader's title path and the papers-table's title path each have a render test, and `Display` being the neutralised form is now a **checked** invariant: reverting it to `as_str()` fails those tests.
+
+The payload is extracted by the real extractors — a PDF `/Title` in UTF-16BE hex, and a `citation_title` as numeric entities — so the suite cannot pass on a fixture production would never produce. The test also asserts the raw string still contains ESC *before* asserting the rendered form is neutral, so it cannot pass on a no-op.
+
+## A correction that changed the test
+
+My first papers-table assertion was "no ESC byte reaches the screen". Reverting `Display` did **not** fail it, and neither did reverting the call site to `as_str()`. A probe showed why: **ratatui drops the ESC byte itself** when writing into a buffer, so that assertion was a claim about ratatui rather than about this code.
+
+The test now asserts the *remnants* — `[31m`, `[2J`, the OSC 8 payload — which is what actually distinguishes `rendered()` from `as_str()`. Mutating the call site now fails it and names the remnant in the rendered output.
+
+## Deliberately not done, recorded in the ADR amendment
+
+The full-text envelope itself. `full_text` and `r#abstract` are publisher-controlled and still arrive unwrapped, because `UntrustedText` caps at 200 characters and wrapping a body would truncate a reader to nothing — one security fix traded for a different bug. An uncapped body neutraliser is a separate type with a separate cap.
+
+Scripts/styles stripping and prompt-injection framing are named there too, rather than left as a line in an accepted ADR that nothing implements.
+
+## Flagged, not fixed
+
+Provenance on `papers.title` read-back is not recoverable from the schema — a title stored from a document reads back labelled `Ours`, because nothing records which side of the boundary a stored title came from. It is honest today only because the NDJSON importer refuses to write a document's title into that column.
+
+`decode_pdf_literal` also drops both bytes of a PDF backslash escape, where the spec says a backslash before an unrecognised character yields the character, so a `/Title` ending in a backslash-paren returns `None`. Both want their own slices.
+
