@@ -180,7 +180,13 @@ fn paper_to_csl(id: &str, paper: &Paper, tags: &[String]) -> Value {
         m.insert("URL".into(), Value::String(u.clone()));
     }
     if !paper.r#abstract.is_empty() {
-        m.insert("abstract".into(), Value::String(paper.r#abstract.clone()));
+        // `as_str`, not `rendered`: a citation record's abstract is a citation
+        // record's abstract whole, and a reference manager opening this file
+        // has no way to know it was cut.
+        m.insert(
+            "abstract".into(),
+            Value::String(paper.r#abstract.as_str().to_string()),
+        );
     }
     if !tags.is_empty() {
         // Spec: `keyword` is a single string ("comma-separated keywords"
@@ -219,7 +225,7 @@ fn author_to_csl(author: &str) -> Value {
 mod tests {
     use super::*;
     use scitadel_core::models::PaperId;
-    use scitadel_core::untrusted::UntrustedText;
+    use scitadel_core::untrusted::{UntrustedBody, UntrustedText};
     use serde_json::json;
 
     fn paper(title: &str, authors: &[&str], year: Option<i32>) -> Paper {
@@ -540,7 +546,7 @@ mod tests {
         p.doi = Some("10.48550/arXiv.1706.03762".into());
         p.url = Some("https://arxiv.org/abs/1706.03762".into());
         p.journal = Some("NeurIPS".into());
-        p.r#abstract = "We propose…".into();
+        p.r#abstract = UntrustedBody::publisher_supplied("We propose…");
         let out =
             export_csl_json_with_tags(&[p], |_| vec!["transformer".into(), "attention".into()]);
         validate_csl_array(&out).expect("full-metadata entry must validate");
@@ -570,5 +576,36 @@ mod tests {
         p.bibtex_key = Some("smith2024x".into());
         let out = export_csl_json(&[p]);
         validate_csl_array(&out).expect("multi-author entry must validate");
+    }
+
+    /// #287's data-path half: the CSL `abstract` is a citation *record* field,
+    /// written as stored rather than rendered.
+    ///
+    /// The two failure modes this pins against: a 200-character cap, which
+    /// would truncate a document's abstract to a fragment in a file a person
+    /// hands to a reference manager; and a whitespace collapse, which would
+    /// destroy the paragraph structure. A truncated or flattened abstract in a
+    /// citation record is a corrupt citation record.
+    #[test]
+    fn the_csl_abstract_is_the_stored_record_not_the_rendered_one() {
+        let mut p = paper("A Study", &["Smith, J."], Some(2024));
+        p.bibtex_key = Some("smith2024study".into());
+        let raw = format!(
+            "First paragraph.\n\nSecond paragraph: {}.\n\u{1b}[2J\n\nThird paragraph: {}.",
+            "lorem ipsum dolor sit amet ".repeat(10),
+            "consectetur adipiscing elit ".repeat(10),
+        );
+        assert!(
+            raw.chars().count() > 200,
+            "the fixture really is longer than the cap"
+        );
+        p.r#abstract = UntrustedBody::publisher_supplied(raw.clone());
+
+        let out = export_csl_json(&[p]);
+        let value: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        assert_eq!(value[0]["abstract"], raw);
+        // Validate the whole record rather than the field in isolation: the
+        // schema is what a reference manager checks.
+        validate_csl_array(&out).expect("the long abstract still validates");
     }
 }

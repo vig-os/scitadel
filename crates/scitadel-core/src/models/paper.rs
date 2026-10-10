@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::PaperId;
-use crate::untrusted::UntrustedText;
+use crate::untrusted::{UntrustedBody, UntrustedText};
 
 /// Canonical, deduplicated paper record.
 ///
@@ -38,12 +38,21 @@ use crate::untrusted::UntrustedText;
 ///
 /// # Which fields are the document's
 ///
-/// `title` and every entry of `authors` are [`UntrustedText`], so a consumer
-/// cannot render one without going through [`UntrustedText::rendered`] or
-/// `Display` — both of which neutralise it. That is the point: #287's finding
-/// was that a crafted `/Title` reached a terminal and an agent's context
-/// unescaped, and the type that would have stopped it already existed. Render
-/// the field; never call [`UntrustedText::as_str`] on a render path.
+/// `title`, every entry of `authors`, `r#abstract` and `full_text` are
+/// untrusted: a consumer cannot render one without going through
+/// [`UntrustedText::rendered`] or [`UntrustedBody::rendered`], both of which
+/// neutralise it. That is the point: #287's finding was that a crafted
+/// `/Title` reached a terminal and an agent's context unescaped, and the type
+/// that would have stopped it already existed. Render the field; never call
+/// `as_str` on a render path.
+///
+/// `title` and `authors` are an [`UntrustedText`], which caps and collapses: a
+/// caption is one line and every surface showing one is finite.
+/// `r#abstract` and `full_text` are an [`UntrustedBody`], which caps nothing
+/// and collapses nothing — a body's paragraph structure is content, and a
+/// document truncated to 200 characters is a corrupted document. Surfaces that
+/// show one truncate it themselves: `read_paper` takes `max_chars`, the TUI
+/// reader pages, the dashboard and detail views cap with their own `truncate`.
 ///
 /// Neither field is tagged `PublisherSupplied` when it comes back out of the
 /// database. The `papers` row is scitadel's own record of the work — it was
@@ -54,20 +63,24 @@ use crate::untrusted::UntrustedText;
 /// `scitadel scan` lets a person write one, which is why `Ours` still renders
 /// through `rendered()`.
 ///
-/// `r#abstract` and `full_text` are document-supplied too and are deliberately
-/// still plain `String`: the same wrapper would cap the reader's body at
-/// [`MAX_UNTRUSTED_CHARS`], which is not a reader. See the ADR-007 amendment.
+/// A body is the exception, and it is `PublisherSupplied` at rest: there is no
+/// scitadel-authored abstract or full text — a `summary` is a different field,
+/// written by a model about the work — so the only honest answer to "whose is
+/// this?" for a `papers.abstract` is "the document's". That is why
+/// [`row_to_paper`] tags one where the title above is `Ours`: a body is *the*
+/// document, the one field where a reader wants to know whose words they are
+/// reading.
 ///
+/// [`row_to_paper`]: crate::ports::PaperRepository
 /// [`Provenance::Ours`]: crate::untrusted::Provenance::Ours
-/// [`MAX_UNTRUSTED_CHARS`]: crate::untrusted::MAX_UNTRUSTED_CHARS
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Paper {
     pub id: PaperId,
     pub title: UntrustedText,
     pub authors: Vec<UntrustedText>,
     #[serde(default)]
-    pub r#abstract: String,
-    pub full_text: Option<String>,
+    pub r#abstract: UntrustedBody,
+    pub full_text: Option<UntrustedBody>,
     pub summary: Option<String>,
     pub doi: Option<String>,
     pub arxiv_id: Option<String>,
@@ -101,7 +114,7 @@ impl Paper {
             id: PaperId::new(),
             title: UntrustedText::ours(title),
             authors: Vec::new(),
-            r#abstract: String::new(),
+            r#abstract: UntrustedBody::default(),
             full_text: None,
             summary: None,
             doi: None,
@@ -130,7 +143,7 @@ impl Paper {
     /// neutralised. Both answers exist, so they are two methods rather than one
     /// that has to guess.
     ///
-    /// Field-for-field the same record as `Serialize`; only the two untrusted
+    /// Field-for-field the same record as `Serialize`; only the untrusted
     /// fields differ, and only in that they are rendered.
     #[must_use]
     pub fn to_display_json(&self) -> serde_json::Value {
@@ -142,8 +155,12 @@ impl Paper {
                 .iter()
                 .map(|author| author.rendered())
                 .collect::<Vec<_>>(),
-            "abstract": self.r#abstract,
-            "full_text": self.full_text,
+            // The body renders through `UntrustedBody::rendered`, which is the
+            // security half alone: no cap, no collapsing. A 200-character cap
+            // here is the bug #287's amendment deferred, and `truncate` at the
+            // surface is the fix — not a cap on the type.
+            "abstract": self.r#abstract.rendered(),
+            "full_text": self.full_text.as_ref().map(UntrustedBody::rendered),
             "summary": self.summary,
             "doi": self.doi,
             "arxiv_id": self.arxiv_id,
@@ -220,13 +237,14 @@ mod tests {
     use super::*;
 
     /// `Serialize` is the data path and `to_display_json` the display path, and
-    /// the difference is exactly the two untrusted fields. A caller that picks
-    /// the wrong one either corrupts a citation export or puts a publisher's
+    /// the difference is exactly the untrusted fields. A caller that picks the
+    /// wrong one either corrupts a citation export or puts a publisher's
     /// bytes in an agent's context, so both answers are pinned here.
     #[test]
     fn the_two_json_forms_differ_only_in_the_untrusted_fields() {
         let mut paper = Paper::new("Deep Learning for Imaging");
         paper.authors = vec![UntrustedText::ours("Vaswani, A.")];
+        paper.r#abstract = UntrustedBody::publisher_supplied("We propose a transformer.");
         paper.year = Some(2017);
         paper.doi = Some("10.1/x".into());
 
@@ -250,11 +268,14 @@ mod tests {
         let mut hostile = paper.clone();
         hostile.title = UntrustedText::publisher_supplied("T\u{1b}[2Jitle");
         hostile.authors = vec![UntrustedText::publisher_supplied("A\u{1b}[2Juthor")];
+        hostile.r#abstract = UntrustedBody::publisher_supplied("Abs\u{1b}[2Jtract");
         let stored = serde_json::to_value(&hostile).expect("serialise");
         let display = hostile.to_display_json();
         assert_eq!(stored["title"], "T\u{1b}[2Jitle");
         assert_eq!(display["title"], "T itle");
         assert_eq!(display["authors"], serde_json::json!(["A uthor"]));
+        assert_eq!(stored["abstract"], "Abs\u{1b}[2Jtract");
+        assert_eq!(display["abstract"], "Abs tract");
 
         let long = "x".repeat(300);
         let mut long_paper = paper.clone();
@@ -275,6 +296,42 @@ mod tests {
                 .count(),
             300,
             "the data form keeps the whole string"
+        );
+    }
+
+    /// #287's deferred item, on the two JSON paths: a body is neutralised on the
+    /// display path and left whole on the data path.
+    ///
+    /// The assertions that would have caught the deferral, and that a title-only
+    /// wrapper could not have made: the paragraph structure survives
+    /// `to_display_json`, and the body is *not* capped there. A body rendered
+    /// through `UntrustedText` instead would arrive as one line, 200 characters
+    /// of it.
+    #[test]
+    fn a_body_reaches_the_display_json_whole_and_unreshaped() {
+        let raw = "First paragraph, 300 words of background.\n\nSecond paragraph, \
+                   the method.\n";
+        let mut paper = Paper::new("A Paper");
+        paper.r#abstract = UntrustedBody::publisher_supplied(raw);
+        paper.full_text = Some(UntrustedBody::publisher_supplied("Body.\n\u{1b}[2JMore."));
+
+        let display = paper.to_display_json();
+        let stored = serde_json::to_value(&paper).expect("serialise");
+
+        assert_eq!(
+            display["abstract"].as_str().expect("an abstract"),
+            raw,
+            "no whitespace collapsing and no length cap on the display path"
+        );
+        assert_eq!(
+            display["full_text"].as_str().expect("a body"),
+            "Body.\n More.",
+            "but the escape is gone — the security half is not optional"
+        );
+        assert_eq!(stored["abstract"], raw, "and the data path keeps the bytes");
+        assert_eq!(
+            stored["full_text"], "Body.\n\u{1b}[2JMore.",
+            "including the escape, because a stored column is a record"
         );
     }
 }

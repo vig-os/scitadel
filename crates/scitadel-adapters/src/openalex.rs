@@ -5,6 +5,7 @@ use scitadel_core::config::OpenAlexAuth;
 use scitadel_core::error::CoreError;
 use scitadel_core::models::{CandidatePaper, Paper, normalize_doi, validate_doi};
 use scitadel_core::ports::SourceAdapter;
+use scitadel_core::untrusted::UntrustedBody;
 
 pub const OPENALEX_API_URL: &str = "https://api.openalex.org/works";
 
@@ -419,7 +420,11 @@ pub fn work_to_paper(work: &serde_json::Value) -> scitadel_core::models::Paper {
             .map(scitadel_core::untrusted::UntrustedText::ours)
             .collect();
     }
-    paper.r#abstract = candidate.r#abstract;
+    // `publisher_supplied` rather than `ours` like the title: this body is the
+    // document's abstract rebuilt from OpenAlex's inverted index, and it is the
+    // body — the one field where whose words they are matters. Stored whole:
+    // a body is never truncated on the way into a record.
+    paper.r#abstract = UntrustedBody::publisher_supplied(candidate.r#abstract);
     paper.doi = candidate.doi;
     paper.openalex_id.clone_from(&candidate.openalex_id);
     paper.pubmed_id = candidate.pubmed_id;

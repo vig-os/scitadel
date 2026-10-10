@@ -23,7 +23,7 @@
 //!   in `scitadel-mcp::bib_import`). See #161.
 
 use scitadel_core::models::Paper;
-use scitadel_core::untrusted::UntrustedText;
+use scitadel_core::untrusted::{UntrustedBody, UntrustedText};
 
 use super::parse::BibEntry;
 
@@ -150,7 +150,12 @@ pub fn paper_from_bib(bib: &BibEntry) -> Paper {
         p.url = Some(u.clone());
     }
     if let Some(a) = bib.extra.get("abstract") {
-        p.r#abstract.clone_from(a);
+        // `publisher_supplied`, not `ours` like the title: an abstract in a
+        // dropped-in `.bib` is the document's own abstract, and unlike the
+        // title it is the body — the one field where whose words they are
+        // matters to a reader. Stored whole, because a citation record is
+        // made of stored bytes.
+        p.r#abstract = UntrustedBody::publisher_supplied(a.as_str());
     }
     p
 }

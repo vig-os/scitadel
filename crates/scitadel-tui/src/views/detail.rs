@@ -89,10 +89,14 @@ pub fn draw(
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled("Abstract:", label_style)));
 
-    if paper.r#abstract.is_empty() {
+    let abstract_text = paper.r#abstract.rendered();
+    if abstract_text.trim().is_empty() {
         lines.push(Line::from("  (no abstract available)"));
     } else {
-        for line in paper.r#abstract.lines() {
+        // Rendered, then split on the rendered form's own newlines: the body
+        // type keeps a paragraph break, so the reader gets the abstract as
+        // paragraphs rather than one collapsed line.
+        for line in abstract_text.lines() {
             lines.push(Line::from(format!("  {line}")));
         }
     }

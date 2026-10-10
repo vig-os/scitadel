@@ -4,7 +4,7 @@ use rusqlite::params;
 use scitadel_core::error::CoreError;
 use scitadel_core::models::{Paper, PaperId};
 use scitadel_core::ports::PaperRepository;
-use scitadel_core::untrusted::UntrustedText;
+use scitadel_core::untrusted::{UntrustedBody, UntrustedText};
 
 use super::Database;
 use crate::error::DbError;
@@ -131,8 +131,12 @@ impl SqlitePaperRepository {
             // 200-character cap belongs to a display surface.
             Box::new(paper.title.as_str().to_string()),
             Box::new(serde_json::to_string(&paper.authors).unwrap_or_default()),
-            Box::new(paper.r#abstract.clone()),
-            Box::new(paper.full_text.clone()),
+            // `as_str`, not `rendered`, on both body columns: a stored column is
+            // a record, and `UntrustedText`'s cap belongs to a display surface.
+            // A truncated abstract in `papers.abstract` is a corrupted abstract
+            // in every export downstream of the row.
+            Box::new(paper.r#abstract.as_str().to_string()),
+            Box::new(paper.full_text.as_ref().map(|b| b.as_str().to_string())),
             Box::new(paper.summary.clone()),
             Box::new(paper.doi.clone()),
             Box::new(paper.arxiv_id.clone()),
@@ -338,8 +342,10 @@ fn row_to_paper(row: &rusqlite::Row) -> rusqlite::Result<Paper> {
         // see the `Provenance::Ours` note on `scitadel_core::models::Paper`.
         title: UntrustedText::ours(row.get::<_, String>("title")?),
         authors: serde_json::from_str::<Vec<UntrustedText>>(&authors_json).unwrap_or_default(),
-        r#abstract: row.get("abstract")?,
-        full_text: row.get("full_text")?,
+        r#abstract: UntrustedBody::publisher_supplied(row.get::<_, String>("abstract")?),
+        full_text: row
+            .get::<_, Option<String>>("full_text")?
+            .map(UntrustedBody::publisher_supplied),
         summary: row.get("summary")?,
         doi: row.get("doi")?,
         arxiv_id: row.get("arxiv_id")?,
