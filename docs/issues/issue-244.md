@@ -2,7 +2,7 @@
 type: issue
 state: open
 created: 2026-09-29T12:26:32Z
-updated: 2026-10-16T23:07:05Z
+updated: 2026-10-17T15:25:52Z
 author: renovate[bot]
 author_url: https://github.com/renovate[bot]
 url: https://github.com/vig-os/scitadel/issues/244
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-10-17T06:22:39.628Z
+synced: 2026-10-18T06:47:13.625Z
 ---
 
 # [Issue 244]: [Dependency Dashboard](https://github.com/vig-os/scitadel/issues/244)
@@ -35,6 +35,7 @@ The following updates are awaiting their schedule. To get an update now, click o
  - [ ] <!-- unschedule-branch=renovate/serde_json-1.x-lockfile -->chore(deps): update rust crate serde_json to v1.0.154
  - [ ] <!-- unschedule-branch=renovate/thiserror-2.x-lockfile -->chore(deps): update rust crate thiserror to v2.0.21
  - [ ] <!-- unschedule-branch=renovate/tokio-tracing-monorepo -->chore(deps): update rust crate tracing-subscriber to v0.3.23
+ - [ ] <!-- unschedule-branch=renovate/unicode-normalization-0.x-lockfile -->chore(deps): update rust crate unicode-normalization to v0.1.26
  - [ ] <!-- unschedule-branch=renovate/github-actions-(minor-and-patch) -->ci(actions): update vig-os/commit-action action to v0.3.3
  - [ ] <!-- unschedule-branch=renovate/assert_cmd-2.x-lockfile -->chore(deps): update rust crate assert_cmd to v2.2.2
  - [ ] <!-- unschedule-branch=renovate/clap-4.x-lockfile -->chore(deps): update rust crate clap to v4.6.7
@@ -99,7 +100,7 @@ The following updates are awaiting their schedule. To get an update now, click o
  - `scraper 0.20` → [Updates: `0.27`]
  - `strsim 0.11`
  - `sha1 0.10` → [Updates: `0.11`]
- - `unicode-normalization 0.1`
+ - `unicode-normalization 0.1` → [Updates: `0.1`]
  - `insta 1` → [Updates: `1`]
  - `wiremock 0.6`
  - `assert_cmd 2` → [Updates: `2`]
