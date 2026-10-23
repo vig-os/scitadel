@@ -2,7 +2,7 @@
 type: issue
 state: open
 created: 2026-09-29T12:26:32Z
-updated: 2026-10-17T15:25:52Z
+updated: 2026-10-22T08:09:40Z
 author: renovate[bot]
 author_url: https://github.com/renovate[bot]
 url: https://github.com/vig-os/scitadel/issues/244
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-10-18T06:47:13.625Z
+synced: 2026-10-23T06:42:18.314Z
 ---
 
 # [Issue 244]: [Dependency Dashboard](https://github.com/vig-os/scitadel/issues/244)
@@ -36,7 +36,7 @@ The following updates are awaiting their schedule. To get an update now, click o
  - [ ] <!-- unschedule-branch=renovate/thiserror-2.x-lockfile -->chore(deps): update rust crate thiserror to v2.0.21
  - [ ] <!-- unschedule-branch=renovate/tokio-tracing-monorepo -->chore(deps): update rust crate tracing-subscriber to v0.3.23
  - [ ] <!-- unschedule-branch=renovate/unicode-normalization-0.x-lockfile -->chore(deps): update rust crate unicode-normalization to v0.1.26
- - [ ] <!-- unschedule-branch=renovate/github-actions-(minor-and-patch) -->ci(actions): update vig-os/commit-action action to v0.3.3
+ - [ ] <!-- unschedule-branch=renovate/github-actions-(minor-and-patch) -->ci(actions): update github-actions (minor and patch) (`rust-lang/crates-io-auth-action`, `vig-os/commit-action`)
  - [ ] <!-- unschedule-branch=renovate/assert_cmd-2.x-lockfile -->chore(deps): update rust crate assert_cmd to v2.2.2
  - [ ] <!-- unschedule-branch=renovate/clap-4.x-lockfile -->chore(deps): update rust crate clap to v4.6.7
  - [ ] <!-- unschedule-branch=renovate/insta-1.x-lockfile -->chore(deps): update rust crate insta to v1.49.0
@@ -45,13 +45,13 @@ The following updates are awaiting their schedule. To get an update now, click o
  - [ ] <!-- unschedule-branch=renovate/quick-xml-0.x -->chore(deps): update rust crate quick-xml to 0.42
  - [ ] <!-- unschedule-branch=renovate/r2d2_sqlite-0.x -->chore(deps): update rust crate r2d2_sqlite to 0.35
  - [ ] <!-- unschedule-branch=renovate/reqwest-0.x -->chore(deps): update rust crate reqwest to 0.13
- - [ ] <!-- unschedule-branch=renovate/rmcp-3.x-lockfile -->chore(deps): update rust crate rmcp to v3.5.1
+ - [ ] <!-- unschedule-branch=renovate/rmcp-3.x-lockfile -->chore(deps): update rust crate rmcp to v3.6.0
  - [ ] <!-- unschedule-branch=renovate/rusqlite-0.x -->chore(deps): update rust crate rusqlite to 0.40
- - [ ] <!-- unschedule-branch=renovate/scraper-0.x -->chore(deps): update rust crate scraper to 0.27
+ - [ ] <!-- unschedule-branch=renovate/scraper-0.x -->chore(deps): update rust crate scraper to 0.29
  - [ ] <!-- unschedule-branch=renovate/sha1-0.x -->chore(deps): update rust crate sha1 to 0.11
  - [ ] <!-- unschedule-branch=renovate/sha2-0.x -->chore(deps): update rust crate sha2 to 0.11
  - [ ] <!-- unschedule-branch=renovate/tempfile-3.x-lockfile -->chore(deps): update rust crate tempfile to v3.27.0
- - [ ] <!-- unschedule-branch=renovate/tokio-1.x-lockfile -->chore(deps): update rust crate tokio to v1.53.3
+ - [ ] <!-- unschedule-branch=renovate/tokio-1.x-lockfile -->chore(deps): update rust crate tokio to v1.54.1
  - [ ] <!-- unschedule-branch=renovate/uuid-1.x-lockfile -->chore(deps): update rust crate uuid to v1.28.0
  - [ ] <!-- unschedule-branch=renovate/zeroize-1.x-lockfile -->chore(deps): update rust crate zeroize to v1.9.1
  - [ ] <!-- unschedule-branch=renovate/biblatex-0.x -->fix(deps): update rust crate biblatex to 0.12
@@ -97,7 +97,7 @@ The following updates are awaiting their schedule. To get an update now, click o
  - `rmcp 3.4` → [Updates: `3.4`]
  - `schemars 1` → [Updates: `1`]
  - `pdf-extract 0.7` → [Updates: `0.12`]
- - `scraper 0.20` → [Updates: `0.27`]
+ - `scraper 0.20` → [Updates: `0.29`]
  - `strsim 0.11`
  - `sha1 0.10` → [Updates: `0.11`]
  - `unicode-normalization 0.1` → [Updates: `0.1`]
@@ -248,7 +248,7 @@ The following updates are awaiting their schedule. To get an update now, click o
  - `Swatinem/rust-cache v2`
  - `actions/checkout v6` → [Updates: `v7`]
  - `Swatinem/rust-cache v2`
- - `rust-lang/crates-io-auth-action v1.0.5@c6f97d42243bad5fab37ca0427f495c86d5b1a18`
+ - `rust-lang/crates-io-auth-action v1.0.5@c6f97d42243bad5fab37ca0427f495c86d5b1a18` → [Updates: `v1.0.6`]
 
 </details>
 
