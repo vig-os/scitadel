@@ -2,7 +2,7 @@
 type: issue
 state: open
 created: 2026-09-29T12:26:32Z
-updated: 2026-10-24T12:54:29Z
+updated: 2026-10-30T03:58:10Z
 author: renovate[bot]
 author_url: https://github.com/renovate[bot]
 url: https://github.com/vig-os/scitadel/issues/244
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-10-25T07:05:37.996Z
+synced: 2026-10-30T07:52:59.924Z
 ---
 
 # [Issue 244]: [Dependency Dashboard](https://github.com/vig-os/scitadel/issues/244)
@@ -45,7 +45,7 @@ The following updates are awaiting their schedule. To get an update now, click o
  - [ ] <!-- unschedule-branch=renovate/quick-xml-0.x -->chore(deps): update rust crate quick-xml to 0.42
  - [ ] <!-- unschedule-branch=renovate/r2d2_sqlite-0.x -->chore(deps): update rust crate r2d2_sqlite to 0.35
  - [ ] <!-- unschedule-branch=renovate/reqwest-0.x -->chore(deps): update rust crate reqwest to 0.13
- - [ ] <!-- unschedule-branch=renovate/rmcp-3.x-lockfile -->chore(deps): update rust crate rmcp to v3.7.0
+ - [ ] <!-- unschedule-branch=renovate/rmcp-3.x-lockfile -->chore(deps): update rust crate rmcp to v3.8.0
  - [ ] <!-- unschedule-branch=renovate/rusqlite-0.x -->chore(deps): update rust crate rusqlite to 0.41
  - [ ] <!-- unschedule-branch=renovate/scraper-0.x -->chore(deps): update rust crate scraper to 0.29
  - [ ] <!-- unschedule-branch=renovate/sha1-0.x -->chore(deps): update rust crate sha1 to 0.11
