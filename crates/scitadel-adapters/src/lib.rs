@@ -25,7 +25,7 @@ pub mod registry;
 pub mod resolve;
 pub mod scan;
 
-use scitadel_core::config::OpenAlexAuth;
+use scitadel_core::config::{OpenAlexAuth, SourceConfig};
 use scitadel_core::ports::SourceAdapter;
 
 pub use openalex::SearchField;
@@ -51,11 +51,15 @@ pub fn build_adapters_full(
     epo_key: &str,
     epo_secret: &str,
 ) -> Result<Vec<Box<dyn SourceAdapter>>, error::AdapterError> {
+    let patentsview = SourceConfig {
+        api_key: patentsview_key.to_string(),
+        ..SourceConfig::default()
+    };
     build_adapters_with_field(
         sources,
         pubmed_api_key,
         openalex,
-        patentsview_key,
+        &patentsview,
         lens_token,
         epo_key,
         epo_secret,
@@ -66,12 +70,15 @@ pub fn build_adapters_full(
 /// Same as `build_adapters_full` but lets the caller pick the OpenAlex
 /// relevance mode (#210). Non-OpenAlex adapters are unaffected — their
 /// search shapes don't map cleanly onto a single "field" knob.
+///
+/// PatentsView takes its whole [`SourceConfig`] so a configured
+/// `base_url` reaches the adapter (#268).
 #[allow(clippy::too_many_arguments)]
 pub fn build_adapters_with_field(
     sources: &[String],
     pubmed_api_key: &str,
     openalex: &OpenAlexAuth,
-    patentsview_key: &str,
+    patentsview: &SourceConfig,
     lens_token: &str,
     epo_key: &str,
     epo_secret: &str,
@@ -100,10 +107,12 @@ pub fn build_adapters_with_field(
                 adapters.push(Box::new(inspire::InspireAdapter::new(30.0)));
             }
             "patentsview" => {
-                adapters.push(Box::new(patentsview::PatentsViewAdapter::new(
-                    patentsview_key.to_string(),
-                    30.0,
-                )));
+                let mut adapter =
+                    patentsview::PatentsViewAdapter::new(patentsview.api_key.clone(), 30.0);
+                if let Some(url) = &patentsview.base_url {
+                    adapter = adapter.with_base_url(url.clone());
+                }
+                adapters.push(Box::new(adapter));
             }
             "lens" => {
                 adapters.push(Box::new(lens::LensAdapter::new(

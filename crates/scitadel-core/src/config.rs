@@ -13,6 +13,11 @@ pub struct SourceConfig {
     pub max_retries: u32,
     #[serde(default)]
     pub api_key: String,
+    /// Alternative endpoint for a source whose API has more than one host
+    /// speaking the same grammar. Only `patentsview` honours it today
+    /// (#268); `None` keeps the adapter's built-in default.
+    #[serde(default)]
+    pub base_url: Option<String>,
 }
 
 impl Default for SourceConfig {
@@ -22,6 +27,7 @@ impl Default for SourceConfig {
             timeout: 30.0,
             max_retries: 3,
             api_key: String::new(),
+            base_url: None,
         }
     }
 }
@@ -360,6 +366,12 @@ pub fn load_config() -> Config {
     .map(crate::credentials::Secret::into_string)
     .unwrap_or_default();
 
+    if let Ok(url) = std::env::var("SCITADEL_PATENTSVIEW_URL")
+        && !url.trim().is_empty()
+    {
+        config.patentsview.base_url = Some(url.trim().to_string());
+    }
+
     config.lens.api_key = resolve(
         "lens.api_token",
         "SCITADEL_LENS_TOKEN",
@@ -510,5 +522,18 @@ mod tests {
         assert!(config.openalex.auth().is_anonymous());
         assert!(config.openalex.enabled);
         assert!((config.openalex.timeout - 30.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_source_base_url_is_optional_and_read_from_toml() {
+        let unset: SourceConfig = toml::from_str(r#"api_key = "k""#).unwrap();
+        assert_eq!(unset.base_url, None);
+
+        let set: SourceConfig =
+            toml::from_str(r#"base_url = "https://mirror.example.org/api/v1/patent/""#).unwrap();
+        assert_eq!(
+            set.base_url.as_deref(),
+            Some("https://mirror.example.org/api/v1/patent/")
+        );
     }
 }

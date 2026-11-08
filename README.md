@@ -361,7 +361,7 @@ Credentials resolve in this order: **secret store → environment variable → `
 | PubMed | `pubmed.api_key` | `SCITADEL_PUBMED_API_KEY` | Optional, higher rate limits |
 | OpenAlex | `openalex.api_key` | `SCITADEL_OPENALEX_API_KEY` | Required in practice — see below |
 | OpenAlex | `openalex.email` | `SCITADEL_OPENALEX_EMAIL` | Optional polite-pool `mailto` |
-| PatentsView | `patentsview.api_key` | `SCITADEL_PATENTSVIEW_KEY` | Free registration |
+| PatentsView | `patentsview.api_key` | `SCITADEL_PATENTSVIEW_KEY` | PatentRef key — see below |
 | Lens | `lens.api_token` | `SCITADEL_LENS_TOKEN` | Free tier |
 | EPO OPS | `epo.consumer_key` + `epo.consumer_secret` | `SCITADEL_EPO_KEY`, `SCITADEL_EPO_SECRET` | Registered app |
 | Anthropic | _(not stored)_ | `ANTHROPIC_API_KEY` | Required for `assess`, `snowball`, MCP scoring |
@@ -399,11 +399,26 @@ as the email. Rewrite it as `[openalex] email = "…"` when convenient, and
 keep the real key in the secret store rather than in a committed
 `config.toml`.
 
+### PatentsView endpoint
+
+USPTO paused its PatentSearch API (`search.patentsview.org`) on 2026-03-20,
+and new PatentsView keys can no longer be requested. The `patentsview`
+source now defaults to [PatentRef](https://patentref.io/docs/migration.html),
+which answers the same PatentSearch v1 grammar. PatentRef is an
+**independent third party, not USPTO**, in free beta: US grants from 1976
+on, no pre-grant publications, and a free key allows 1,000 requests a month
+and 45 a minute. Store its key with `scitadel auth login patentsview`.
+
+To use another endpoint that speaks the same grammar, set
+`[patentsview] base_url = "…/api/v1/patent/"` in `.scitadel/config.toml`
+or `SCITADEL_PATENTSVIEW_URL`.
+
 Other knobs:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SCITADEL_DB` | `./.scitadel/scitadel.db` | Database path |
+| `SCITADEL_PATENTSVIEW_URL` | `https://patentref.io/api/v1/patent/` | PatentSearch-grammar endpoint for `patentsview` |
 | `SCITADEL_CREDENTIAL_BACKEND` | auto-detected | `macos-keychain`, `secret-service` or `file` |
 | `SCITADEL_CHAT_MODEL` | `claude-sonnet-4-6` | Model used for scoring |
 | `SCITADEL_CHAT_MAX_TOKENS` | `4096` | Max completion tokens |

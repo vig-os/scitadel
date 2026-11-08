@@ -153,6 +153,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The `patentsview` source works again**
+  ([#268](https://github.com/vig-os/scitadel/issues/268)). USPTO paused
+  its PatentSearch API on 2026-03-20 and `search.patentsview.org` no
+  longer resolves, so every PatentsView search failed at the connection.
+  The adapter now defaults to PatentRef
+  (`https://patentref.io/api/v1/patent/`), an independent third-party
+  API (not USPTO, free beta: US grants 1976+, no pre-grant publications,
+  1,000 requests a month) that answers the same grammar. The endpoint is
+  configurable with `[patentsview] base_url` or
+  `SCITADEL_PATENTSVIEW_URL`. The request also asked for `patent_kind`,
+  which the grammar does not have (the kind code is `wipo_kind`) and
+  which a strict server rejects with 400 `ERR_Q`; it now asks for
+  `wipo_kind`. A 400's `X-Status-Reason` header is included in the
+  error, and the missing-key hint no longer points at the retired
+  PatentsView signup page. `build_adapters_with_field` takes the
+  PatentsView `SourceConfig` instead of its key. Offline tests check
+  every requested field against the grammar's field list and replay a
+  recorded response.
 - **MCP tools now accept the short IDs they print**
   ([#232](https://github.com/vig-os/scitadel/issues/232)). Every
   ID-accepting tool (`add_search_terms`, `save_assessment`,

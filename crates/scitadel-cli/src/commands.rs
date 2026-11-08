@@ -349,7 +349,7 @@ pub async fn search(
         &source_list,
         &config.pubmed.api_key,
         &config.openalex.auth(),
-        &config.patentsview.api_key,
+        &config.patentsview,
         &config.lens.api_key,
         &config.epo.consumer_key,
         &config.epo.consumer_secret,
