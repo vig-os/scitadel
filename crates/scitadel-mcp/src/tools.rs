@@ -75,7 +75,7 @@ pub async fn search_tool(
         &source_list,
         &config.pubmed.api_key,
         &config.openalex.auth(),
-        &config.patentsview,
+        &config.patentsview_adapter,
         &config.lens.api_key,
         &config.epo.consumer_key,
         &config.epo.consumer_secret,

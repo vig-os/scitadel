@@ -638,6 +638,26 @@ pub static PATENTSVIEW_CREDENTIALS: SourceCredentials = SourceCredentials {
     }],
 };
 
+/// Secret-store account name that carries the host a stored
+/// `patentsview.api_key` is bound to (#268).
+///
+/// `scitadel auth login patentsview` writes this alongside the key so
+/// the adapter can refuse to send it to any other endpoint. A missing
+/// value is treated as a *legacy* unbound key by
+/// [`crate::config::resolve_patentsview_adapter`], i.e. bound to the
+/// retired USPTO PatentSearch host.
+pub const PATENTSVIEW_HOST_STORE_KEY: &str = "patentsview.api_host";
+
+/// Default host `scitadel auth login patentsview` binds a new key to
+/// when the operator does not pass `--host`. Must match the host in
+/// [`scitadel_adapters::patentsview::PATENTSVIEW_API_URL`].
+pub const PATENTSVIEW_DEFAULT_HOST: &str = "patentref.io";
+
+/// Where a legacy unbound `patentsview.api_key` is *treated* as pointing
+/// — the retired USPTO PatentSearch host. The key is not sent anywhere
+/// else, so the migration prompt names this host explicitly.
+pub const PATENTSVIEW_LEGACY_HOST: &str = "search.patentsview.org";
+
 pub static PUBMED_CREDENTIALS: SourceCredentials = SourceCredentials {
     source: "pubmed",
     keys: &[CredentialKey {
@@ -912,6 +932,57 @@ mod tests {
             file_delete_at(&path, "openalex.api_key").is_err(),
             "deleting an absent credential is an error, not a silent no-op"
         );
+    }
+
+    #[test]
+    fn the_patentsview_host_binding_round_trips_through_the_file_backend() {
+        // The host binding is stored alongside the key under a
+        // dedicated account name so `auth logout patentsview`
+        // clears both in one pass and the resolver can decide the
+        // key's policy at startup (#268). The three backends share
+        // the same get/store/delete contract, so the file backend
+        // (which we can exercise without a Keychain or a Secret
+        // Service) is enough to prove the round-trip.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.toml");
+
+        assert!(file_get_at(&path, PATENTSVIEW_HOST_STORE_KEY).is_none());
+
+        file_store_at(&path, "patentsview.api_key", &Secret::new("pr-key-123")).unwrap();
+        file_store_at(
+            &path,
+            PATENTSVIEW_HOST_STORE_KEY,
+            &Secret::new(PATENTSVIEW_DEFAULT_HOST),
+        )
+        .unwrap();
+
+        assert_eq!(
+            file_get_at(&path, PATENTSVIEW_HOST_STORE_KEY)
+                .as_ref()
+                .map(Secret::expose),
+            Some(PATENTSVIEW_DEFAULT_HOST)
+        );
+
+        // Re-pointing the binding (e.g. `auth login patentsview --host <mirror>`)
+        // must not leave the previous host behind.
+        file_store_at(
+            &path,
+            PATENTSVIEW_HOST_STORE_KEY,
+            &Secret::new("mirror.example.org"),
+        )
+        .unwrap();
+        assert_eq!(
+            file_get_at(&path, PATENTSVIEW_HOST_STORE_KEY)
+                .as_ref()
+                .map(Secret::expose),
+            Some("mirror.example.org")
+        );
+
+        // `auth logout patentsview` clears both entries.
+        file_delete_at(&path, "patentsview.api_key").unwrap();
+        file_delete_at(&path, PATENTSVIEW_HOST_STORE_KEY).unwrap();
+        assert!(file_get_at(&path, "patentsview.api_key").is_none());
+        assert!(file_get_at(&path, PATENTSVIEW_HOST_STORE_KEY).is_none());
     }
 
     #[cfg(unix)]

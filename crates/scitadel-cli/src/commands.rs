@@ -349,7 +349,7 @@ pub async fn search(
         &source_list,
         &config.pubmed.api_key,
         &config.openalex.auth(),
-        &config.patentsview,
+        &config.patentsview_adapter,
         &config.lens.api_key,
         &config.epo.consumer_key,
         &config.epo.consumer_secret,
@@ -1147,9 +1147,34 @@ pub async fn bib_watch(
     Ok(())
 }
 
-pub fn auth_login(source: &str) -> Result<()> {
+pub fn auth_login(source: &str, host: Option<&str>) -> Result<()> {
     let creds = find_source_credentials(source)?;
     let backend = credentials::backend();
+
+    // `--host` only binds a patentsview key (#268); for every other
+    // source it is a no-op, which is quieter than erroring out from
+    // a shared CI script that always passes it.
+    let patentsview_host: Option<String> = if source == "patentsview" {
+        let bound = host
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| credentials::PATENTSVIEW_DEFAULT_HOST.to_string());
+        // Keep validation shallow — the adapter builder and
+        // `validate_patentsview_base_url` have the real policy. Here
+        // we just refuse obviously-broken input so the stored binding
+        // is a single hostname, not a URL or a path.
+        if bound.contains("://") || bound.contains('/') || bound.contains(char::is_whitespace) {
+            bail!(
+                "--host must be a bare hostname (e.g. `patentref.io`), not a URL or path: {bound:?}"
+            );
+        }
+        Some(bound)
+    } else {
+        if host.is_some() {
+            println!("  Note: --host is only meaningful for `patentsview`; ignoring.");
+        }
+        None
+    };
 
     println!(
         "Storing credentials for '{source}' — backend: {}",
@@ -1160,6 +1185,9 @@ pub fn auth_login(source: &str) -> Result<()> {
             "  Note: no OS secret service was found, so credentials go to a \
              plain-text file with mode 0600."
         );
+    }
+    if let Some(ref h) = patentsview_host {
+        println!("  The stored key will be bound to host: {h}");
     }
 
     for key in creds.keys {
@@ -1183,6 +1211,20 @@ pub fn auth_login(source: &str) -> Result<()> {
         println!("  Stored: {}", key.store_key);
     }
 
+    // The host binding is written AFTER the key, so a half-stored
+    // (key without binding) entry is never left behind by a cancelled
+    // prompt. The value is not a secret, but it goes through the same
+    // store so `scitadel auth logout patentsview` clears it alongside
+    // the key.
+    if let Some(h) = patentsview_host {
+        credentials::store(
+            credentials::PATENTSVIEW_HOST_STORE_KEY,
+            &credentials::Secret::new(&h),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        println!("  Stored: {}", credentials::PATENTSVIEW_HOST_STORE_KEY);
+    }
+
     println!("Done. Credentials saved to the {backend} store.");
     Ok(())
 }
@@ -1194,6 +1236,16 @@ pub fn auth_logout(source: &str) -> Result<()> {
         match credentials::delete(key.store_key) {
             Ok(()) => println!("  Removed: {}", key.store_key),
             Err(e) => println!("  Skip: {} ({e})", key.store_key),
+        }
+    }
+
+    // The patentsview host binding lives alongside the key but is
+    // not a `CredentialKey` (it is not prompted for, it is set by
+    // `--host`), so clear it here (#268).
+    if source == "patentsview" {
+        match credentials::delete(credentials::PATENTSVIEW_HOST_STORE_KEY) {
+            Ok(()) => println!("  Removed: {}", credentials::PATENTSVIEW_HOST_STORE_KEY),
+            Err(e) => println!("  Skip: {} ({e})", credentials::PATENTSVIEW_HOST_STORE_KEY),
         }
     }
 
@@ -1217,6 +1269,27 @@ pub fn auth_status() -> Result<()> {
         for key in creds.keys {
             // Location only — the value itself is never printed.
             println!("      {}: {}", key.label, credentials::key_location(key));
+        }
+
+        // The patentsview key can carry a host binding; surface it
+        // here so a stored key with no binding (a legacy entry) is
+        // visible as "legacy / search.patentsview.org" rather than
+        // silently refused at first search (#268).
+        if creds.source == "patentsview" {
+            let has_stored_key = credentials::get("patentsview.api_key").is_some();
+            if has_stored_key {
+                let binding = credentials::get(credentials::PATENTSVIEW_HOST_STORE_KEY)
+                    .map_or_else(
+                        || {
+                            format!(
+                                "legacy (treated as {})",
+                                credentials::PATENTSVIEW_LEGACY_HOST
+                            )
+                        },
+                        |s| s.into_string(),
+                    );
+                println!("      Bound to host: {binding}");
+            }
         }
     }
 

@@ -25,6 +25,7 @@ futures = { workspace = true }
 sha1 = { workspace = true }
 unicode-normalization = { workspace = true }
 zeroize = { workspace = true }
+url = { workspace = true } # patentsview host-binding resolution (#268)
 
 # Keychain access is macOS-only; on every other platform the CLI in
 # `credentials.rs` is not reachable and this dependency must not build.

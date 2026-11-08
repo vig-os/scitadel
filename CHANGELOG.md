@@ -164,25 +164,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configurable with `[patentsview] base_url` or
   `SCITADEL_PATENTSVIEW_URL`; the base URL is validated at adapter build
   (https-only, with http allowed for loopback hosts) and an empty value
-  falls back to the default. The reqwest client uses
-  `redirect::Policy::none()` so the keychain-stored `X-Api-Key` cannot
-  be replayed to a 3xx-nominated host — a redirect is surfaced as an
-  error naming the `Location` host. The request also asked for
-  `patent_kind`, which the grammar does not have (the kind code is
-  `wipo_kind`) and which a strict server rejects with 400 `ERR_Q`; it
-  now asks for `wipo_kind`. A 400's `X-Status-Reason` header is
-  included in the error, and the missing-key hint no longer points at
-  the retired PatentsView signup page. `build_adapters_with_field`
-  takes the PatentsView `SourceConfig` instead of its key.
-  **Credential compatibility:** a previously stored
-  `patentsview.api_key` is a USPTO-issued PatentsView key and will now
-  be sent to the new default endpoint (PatentRef, `patentref.io`); the
-  USPTO key will not authenticate there, so request a PatentRef key at
-  `https://patentref.io/docs/migration.html` and store it with
-  `scitadel auth login patentsview`, or set `[patentsview] base_url` to
-  a PatentsView-grammar mirror that accepts the existing key. Offline
-  tests check every requested field against the grammar's field list
-  and replay a recorded response.
+  falls back to the default. Error messages that echo a configured or
+  redirect URL now print scheme + host (+ port) only — no `userinfo`,
+  no path, no query — so a bearer token smuggled into any of those
+  cannot ride into logs. The request also asked for `patent_kind`,
+  which the grammar does not have (the kind code is `wipo_kind`) and
+  which a strict server rejects with 400 `ERR_Q`; it now asks for
+  `wipo_kind`. A 400's `X-Status-Reason` header is included in the
+  error, and the missing-key hint no longer points at the retired
+  PatentsView signup page. `build_adapters_with_field` takes a
+  resolved `PatentsViewAdapterConfig` instead of a plain `SourceConfig`
+  so the host-binding below can be enforced before any adapter is
+  built. The reqwest client uses `redirect::Policy::none()` so the
+  `X-Api-Key` cannot be replayed to a 3xx-nominated host, and a
+  redirect is surfaced as an error naming only the `Location` origin.
+  **Host-bound keys.** `scitadel auth login patentsview` now binds the
+  stored key to a host (default `patentref.io`, overridable with
+  `--host <host>`). The adapter refuses to send the key to any other
+  host and names the binding in the error, so a repo-level
+  `.scitadel/config.toml` committing a malicious `[patentsview]
+  base_url` cannot replay a keychain-stored key to that host — the
+  build fails and zero requests are made. An env-set
+  `SCITADEL_PATENTSVIEW_KEY` is sent only when `base_url` also comes
+  from the env or the default (never when it comes from the file).
+  **Migration for pre-#268 users.** A previously stored
+  `patentsview.api_key` has no host binding and is treated as a USPTO
+  PatentSearch key (bound to `search.patentsview.org`, which was
+  retired); the adapter therefore does NOT silently forward it to
+  PatentRef — it refuses and tells the user to request a PatentRef
+  key at `https://patentref.io/docs/migration.html` and re-run
+  `scitadel auth login patentsview`. Running `auth login patentsview
+  --host <mirror>` is the way to point the stored key at a
+  PatentSearch-grammar mirror instead. Offline tests check every
+  requested field against the grammar's field list, replay a recorded
+  response, and cover the four host-binding cases (cross-host refusal
+  with zero requests, matching host, legacy-unbound refusal with the
+  migration message, and the storage round-trip of the binding).
 - **MCP tools now accept the short IDs they print**
   ([#232](https://github.com/vig-os/scitadel/issues/232)). Every
   ID-accepting tool (`add_search_terms`, `save_assessment`,

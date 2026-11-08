@@ -59,6 +59,34 @@ impl PatentsViewAdapter {
     }
 }
 
+/// Render a `Location` header value for safe echoing in a redirect
+/// refusal (#268).
+///
+/// Keeps scheme + host + port and drops everything else: `userinfo`,
+/// the path and the query string. Falls back to the host portion of
+/// the raw value when the header is not a parseable absolute URL.
+fn sanitise_redirect_location(raw: &str) -> String {
+    if let Ok(u) = url::Url::parse(raw) {
+        let scheme = u.scheme();
+        let host_display = match u.host() {
+            Some(url::Host::Ipv6(ip)) => format!("[{ip}]"),
+            Some(url::Host::Ipv4(ip)) => ip.to_string(),
+            Some(url::Host::Domain(d)) => d.to_string(),
+            None => return format!("{scheme}://<no host>"),
+        };
+        return match u.port() {
+            Some(p) => format!("{scheme}://{host_display}:{p}"),
+            None => format!("{scheme}://{host_display}"),
+        };
+    }
+    // Relative or malformed Location. Drop everything past the first
+    // path/query/fragment separator so we still never echo a path or
+    // a query string (where tokens live) — the operator keeps enough
+    // to trace what happened on their side.
+    let cut = raw.find(['/', '?', '#']).unwrap_or(raw.len());
+    format!("<unparseable Location: {}>", &raw[..cut])
+}
+
 /// The POST body for one search: a `_text_any` match on the abstract,
 /// newest grants first.
 pub fn request_body(query: &str, max_results: usize) -> serde_json::Value {
@@ -115,22 +143,29 @@ impl SourceAdapter for PatentsViewAdapter {
 
         let status = resp.status();
         if status.is_redirection() {
-            let location = resp
+            // Echo the Location as scheme+host(+port) only: a redirect
+            // target's path or query could carry a token the attacker
+            // tried to smuggle into our logs, and `user:pass@` in a
+            // Location is a niche but real way for a secret to leak
+            // the other direction (#268).
+            let (target, raw_present) = resp
                 .headers()
                 .get(reqwest::header::LOCATION)
                 .and_then(|v| v.to_str().ok())
-                .unwrap_or("<missing Location header>");
-            let target_host = url::Url::parse(location)
-                .ok()
-                .and_then(|u| u.host_str().map(str::to_owned))
-                .unwrap_or_else(|| location.to_string());
+                .map_or_else(
+                    || ("<missing Location header>".to_string(), false),
+                    |loc| (sanitise_redirect_location(loc), true),
+                );
+            let hint = if raw_present {
+                "The X-Api-Key header would otherwise be replayed to the new host. \
+                 The target's path and query are omitted from this message in case \
+                 they carry a secret."
+            } else {
+                "The X-Api-Key header would otherwise be replayed to the new host."
+            };
             return Err(CoreError::Adapter(
                 "patentsview".into(),
-                format!(
-                    "HTTP {status}: refusing to follow a redirect to {target_host} \
-                     (Location: {location}). The X-Api-Key header would otherwise \
-                     be replayed to the new host."
-                ),
+                format!("HTTP {status}: refusing to follow a redirect to {target}. {hint}"),
             ));
         }
 
@@ -216,7 +251,7 @@ fn patent_to_candidate(patent: &serde_json::Value, rank: i32) -> CandidatePaper 
 
     // Compose the "(type kind)" tail without a trailing space when the
     // kind code is missing — the grammar is lenient about it, so an older
-    // record can arrive without one. `patent_kind` (which the request now
+    // record can arrive without one. `wipo_kind` (which the request now
     // uses) always comes back on recent records, but the formatter should
     // not paper over a missing value with "utility ".
     let type_tag = match (patent_type.is_empty(), wipo_kind.is_empty()) {

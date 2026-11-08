@@ -214,6 +214,35 @@ impl Default for UiConfig {
     }
 }
 
+/// Fully-resolved PatentsView adapter configuration (#268).
+///
+/// Carries the `api_key` plus the host it is allowed to reach, so a
+/// malicious `[patentsview] base_url` in a repo-level `.scitadel/config.toml`
+/// cannot replay a keychain-stored key to an attacker-controlled host.
+///
+/// The field `bound_host` works as follows:
+///
+/// * `Some(h)` — the key is bound to that host and the adapter builder
+///   refuses to construct an adapter whose effective base-URL host is
+///   anything else. A legacy keychain entry with no stored host is
+///   treated as bound to the retired USPTO PatentSearch host.
+/// * `None` — no binding check. Reserved for env-only keys with an
+///   env-or-default URL (an explicit per-process choice the operator
+///   made), and for config-file keys whose base_url sits in the same
+///   file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PatentsViewAdapterConfig {
+    /// Resolved key (keychain → env → config-file fallback → empty).
+    pub api_key: String,
+    /// Effective base URL (env override → config file → `None` = adapter default).
+    pub base_url: Option<String>,
+    /// Host the key is bound to. See the struct docs.
+    pub bound_host: Option<String>,
+    /// `bound_host` was derived from a legacy keychain entry with no
+    /// stored host, so the error should point at the PatentRef migration.
+    pub legacy_unbound: bool,
+}
+
 /// Top-level application configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -238,6 +267,11 @@ pub struct Config {
     pub chat: ChatConfig,
     #[serde(default)]
     pub ui: UiConfig,
+    /// Fully-resolved PatentsView adapter config (#268). Not serialized;
+    /// filled by [`load_config`] from the keychain-stored host binding,
+    /// env overrides and the raw config file.
+    #[serde(skip)]
+    pub patentsview_adapter: PatentsViewAdapterConfig,
 }
 
 fn default_sources() -> Vec<String> {
@@ -274,6 +308,7 @@ impl Default for Config {
             epo: EpoConfig::default(),
             chat: ChatConfig::default(),
             ui: UiConfig::default(),
+            patentsview_adapter: PatentsViewAdapterConfig::default(),
         }
     }
 }
@@ -309,6 +344,130 @@ fn default_db_path(workspace: &Path) -> PathBuf {
         return PathBuf::from(expanded);
     }
     workspace.join(".scitadel").join("scitadel.db")
+}
+
+/// Resolve the PatentsView adapter configuration (#268).
+///
+/// The patentsview key is a bearer token sent as `X-Api-Key`, and
+/// `[patentsview] base_url` can be committed in a repo-level
+/// `.scitadel/config.toml`. The combination is dangerous: a cloned
+/// repo could point the adapter at an attacker-controlled host and
+/// collect any key the current user has stored. The mitigation is to
+/// **bind** the key to a host at store time (`scitadel auth login
+/// patentsview [--host <host>]`) and refuse to send it to any other
+/// host at adapter-build time.
+///
+/// # Parameters
+///
+/// * `file_api_key` — `[patentsview] api_key` as it appeared in the
+///   TOML file (or `""` if absent). Kept as a fallback so a user who
+///   writes the key in their own config.toml is not pushed into the
+///   keychain.
+/// * `file_base_url` — `[patentsview] base_url` as it appeared in the
+///   TOML file, BEFORE applying the `SCITADEL_PATENTSVIEW_URL` env
+///   override. Knowing it came from the file is load-bearing: a
+///   base-URL in the file is the one case where an env-set key must
+///   refuse to send (the file could have been committed by an attacker).
+///
+/// # Returned binding
+///
+/// | key source | URL source | `bound_host` | `legacy_unbound` |
+/// |------------|------------|--------------|------------------|
+/// | keychain + stored host | — | `Some(stored_host)` | `false` |
+/// | keychain, no stored host | — | `Some(LEGACY_HOST)` | `true` |
+/// | env | env or default | `None` | `false` |
+/// | env | file | `Some(DEFAULT_HOST)` [^1] | `false` |
+/// | file | — | `None` | `false` |
+/// | none | — | `None` | `false` |
+///
+/// [^1]: forces the adapter builder to refuse against any file-set
+///       URL that is not the default host; the operator has to either
+///       clear the file's `base_url` or bind the key explicitly.
+pub fn resolve_patentsview_adapter(
+    file_api_key: &str,
+    file_base_url: Option<&str>,
+) -> PatentsViewAdapterConfig {
+    // 1. Effective base URL: env wins over file, which wins over
+    //    "none" (the adapter then uses its built-in default).
+    let env_url = std::env::var("SCITADEL_PATENTSVIEW_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let file_base_url = file_base_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let effective_base_url = env_url.clone().or_else(|| file_base_url.clone());
+
+    // 2. Pick the key source. `credentials::get` only inspects the
+    //    active secret store, so we can distinguish keychain from env
+    //    from file-fallback instead of collapsing them with `resolve`.
+    let stored_key = crate::credentials::get("patentsview.api_key").map(|s| s.into_string());
+    let env_key = std::env::var("SCITADEL_PATENTSVIEW_KEY")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let file_key = Some(file_api_key.trim().to_string()).filter(|s| !s.is_empty());
+
+    if let Some(key) = stored_key {
+        // Stored key — the binding (if any) travels with it. A stored
+        // key with no stored host is a legacy entry written before
+        // host-binding existed; treat it as USPTO so the error
+        // message can be migration-specific.
+        let stored_host = crate::credentials::get(crate::credentials::PATENTSVIEW_HOST_STORE_KEY)
+            .map(|s| s.into_string().trim().to_string())
+            .filter(|s| !s.is_empty());
+        let legacy_unbound = stored_host.is_none();
+        let bound_host =
+            stored_host.unwrap_or_else(|| crate::credentials::PATENTSVIEW_LEGACY_HOST.to_string());
+        return PatentsViewAdapterConfig {
+            api_key: key,
+            base_url: effective_base_url,
+            bound_host: Some(bound_host),
+            legacy_unbound,
+        };
+    }
+
+    if let Some(key) = env_key {
+        // Env key: an explicit per-process choice the operator made.
+        // Honour it when the URL is also from env or the default,
+        // but refuse to let it ride a `base_url` set in a repo file —
+        // that file could be committed by someone else.
+        let bound_host = if env_url.is_some() || file_base_url.is_none() {
+            None
+        } else {
+            // base_url comes from the file and no env override is set
+            // — the adapter builder must refuse against any non-default
+            // host.
+            Some(crate::credentials::PATENTSVIEW_DEFAULT_HOST.to_string())
+        };
+        return PatentsViewAdapterConfig {
+            api_key: key,
+            base_url: effective_base_url,
+            bound_host,
+            legacy_unbound: false,
+        };
+    }
+
+    if let Some(key) = file_key {
+        // Key in the same config.toml the user wrote themselves. If
+        // they set a different host there, that is their choice; no
+        // binding check is enforced. The https-only validator in the
+        // adapter builder still rejects plaintext non-loopback URLs.
+        return PatentsViewAdapterConfig {
+            api_key: key,
+            base_url: effective_base_url,
+            bound_host: None,
+            legacy_unbound: false,
+        };
+    }
+
+    PatentsViewAdapterConfig {
+        api_key: String::new(),
+        base_url: effective_base_url,
+        bound_host: None,
+        legacy_unbound: false,
+    }
 }
 
 /// Load configuration from keychain, environment variables, and optional TOML file.
@@ -358,19 +517,26 @@ pub fn load_config() -> Config {
     .map(crate::credentials::Secret::into_string)
     .unwrap_or_default();
 
-    config.patentsview.api_key = resolve(
-        "patentsview.api_key",
-        "SCITADEL_PATENTSVIEW_KEY",
-        &config.patentsview.api_key,
-    )
-    .map(crate::credentials::Secret::into_string)
-    .unwrap_or_default();
-
-    if let Ok(url) = std::env::var("SCITADEL_PATENTSVIEW_URL")
-        && !url.trim().is_empty()
-    {
-        config.patentsview.base_url = Some(url.trim().to_string());
-    }
+    // The patentsview key is bound to a host at store time (#268), so
+    // its resolution is more involved than the other sources. The
+    // helper picks a source for the key, decides which host it is
+    // allowed to reach, and tracks whether the stored key is a
+    // legacy (pre-binding) entry so the error points at the migration.
+    //
+    // `config.patentsview.api_key` and `config.patentsview.base_url`
+    // keep the resolved values for callers that read them directly
+    // (e.g. the `!is_empty()` check in the MCP source listing); the
+    // full resolution, including `bound_host`, lives on
+    // `config.patentsview_adapter`.
+    let file_base_url = config.patentsview.base_url.clone();
+    let file_api_key = config.patentsview.api_key.clone();
+    let adapter_cfg = resolve_patentsview_adapter(&file_api_key, file_base_url.as_deref());
+    config.patentsview.api_key.clone_from(&adapter_cfg.api_key);
+    config
+        .patentsview
+        .base_url
+        .clone_from(&adapter_cfg.base_url);
+    config.patentsview_adapter = adapter_cfg;
 
     config.lens.api_key = resolve(
         "lens.api_token",

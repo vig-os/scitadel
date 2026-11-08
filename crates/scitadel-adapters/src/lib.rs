@@ -25,7 +25,7 @@ pub mod registry;
 pub mod resolve;
 pub mod scan;
 
-use scitadel_core::config::{OpenAlexAuth, SourceConfig};
+use scitadel_core::config::{OpenAlexAuth, PatentsViewAdapterConfig};
 use scitadel_core::error::CoreError;
 use scitadel_core::ports::SourceAdapter;
 
@@ -43,6 +43,12 @@ pub fn build_adapters(
 /// Build adapter instances with all credential options. Keeps the
 /// legacy signature: the OpenAlex adapter uses its default relevance
 /// mode (`SearchField::Any` — pre-#210 broad `search=`).
+///
+/// The PatentsView adapter is built UNBOUND here (no host binding
+/// check), matching the pre-#268 signature. Callers that want the
+/// host binding enforced must use [`build_adapters_with_field`] and
+/// pass a [`PatentsViewAdapterConfig`] produced by
+/// [`scitadel_core::config::resolve_patentsview_adapter`].
 pub fn build_adapters_full(
     sources: &[String],
     pubmed_api_key: &str,
@@ -52,9 +58,11 @@ pub fn build_adapters_full(
     epo_key: &str,
     epo_secret: &str,
 ) -> Result<Vec<Box<dyn SourceAdapter>>, error::AdapterError> {
-    let patentsview = SourceConfig {
+    let patentsview = PatentsViewAdapterConfig {
         api_key: patentsview_key.to_string(),
-        ..SourceConfig::default()
+        base_url: None,
+        bound_host: None,
+        legacy_unbound: false,
     };
     build_adapters_with_field(
         sources,
@@ -72,14 +80,16 @@ pub fn build_adapters_full(
 /// relevance mode (#210). Non-OpenAlex adapters are unaffected — their
 /// search shapes don't map cleanly onto a single "field" knob.
 ///
-/// PatentsView takes its whole [`SourceConfig`] so a configured
-/// `base_url` reaches the adapter (#268).
+/// PatentsView takes its fully-resolved [`PatentsViewAdapterConfig`]
+/// (#268) so the host-binding check runs here: if the key is bound to
+/// a host and the effective base URL's host does not match, no
+/// adapter is built and no request is ever made.
 #[allow(clippy::too_many_arguments)]
 pub fn build_adapters_with_field(
     sources: &[String],
     pubmed_api_key: &str,
     openalex: &OpenAlexAuth,
-    patentsview: &SourceConfig,
+    patentsview: &PatentsViewAdapterConfig,
     lens_token: &str,
     epo_key: &str,
     epo_secret: &str,
@@ -112,9 +122,16 @@ pub fn build_adapters_with_field(
                 // `X-Api-Key`; a `base_url` from `.scitadel/config.toml`
                 // (committable at the repo top level) or
                 // `SCITADEL_PATENTSVIEW_URL` reaches here via `patentsview`.
-                // Validate it once, so http-non-loopback and malformed URLs
-                // never see the key (#268).
+                // Validate it once (so http-non-loopback and malformed
+                // URLs never see the key), then enforce the host binding
+                // (so a bound key never reaches a different host) — both
+                // before any adapter is built (#268).
                 let validated = validate_patentsview_base_url(patentsview.base_url.as_deref())?;
+                let effective_url = validated
+                    .as_deref()
+                    .unwrap_or(patentsview::PATENTSVIEW_API_URL);
+                enforce_patentsview_host_binding(patentsview, effective_url)?;
+
                 let mut adapter =
                     patentsview::PatentsViewAdapter::new(patentsview.api_key.clone(), 30.0);
                 if let Some(url) = validated {
@@ -162,12 +179,21 @@ pub fn build_adapters_with_field(
 ///   `localhost`), which the wiremock-backed tests need.
 /// - Anything else is a [`CoreError::Config`] with a message that names
 ///   what was wrong.
+///
+/// Error messages echo the configured URL as its origin (scheme + host +
+/// port) only. `userinfo` (`user:pass@`) is stripped, and the path and
+/// query are dropped — the grammar's path is a fixed `/api/v1/patent/`
+/// and bearer tokens routinely ride in query strings (e.g. `?key=…`), so
+/// echoing either would push them into logs.
 pub fn validate_patentsview_base_url(raw: Option<&str>) -> Result<Option<String>, CoreError> {
     let Some(trimmed) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
 
     let parsed = url::Url::parse(trimmed).map_err(|e| {
+        // The input is not a URL, so there is nothing to parse userinfo
+        // out of; echo it as given. Still quote it so the shape of the
+        // typo is visible.
         CoreError::Config(format!(
             "patentsview base_url is not a valid URL ({e}): {trimmed:?}"
         ))
@@ -185,18 +211,99 @@ pub fn validate_patentsview_base_url(raw: Option<&str>) -> Result<Option<String>
             if is_loopback {
                 Ok(Some(trimmed.to_string()))
             } else {
+                let safe = url_origin_for_display(&parsed);
                 Err(CoreError::Config(format!(
                     "patentsview base_url must use https; plaintext http is only allowed \
-                     for loopback hosts (127.0.0.1, ::1, localhost). Got {trimmed:?}. \
+                     for loopback hosts (127.0.0.1, ::1, localhost). Got {safe}. \
                      The adapter posts the stored API key as X-Api-Key, so the key would \
                      leave the machine in cleartext."
                 )))
             }
         }
-        other => Err(CoreError::Config(format!(
-            "patentsview base_url must use https (got scheme {other:?}): {trimmed:?}"
-        ))),
+        other => {
+            let safe = url_origin_for_display(&parsed);
+            Err(CoreError::Config(format!(
+                "patentsview base_url must use https (got scheme {other:?}): {safe}"
+            )))
+        }
     }
+}
+
+/// Render a URL as `scheme://host[:port]` for safe echoing in errors.
+///
+/// Drops `userinfo` (`user:pass@`), the path and the query string. The
+/// path on this adapter is a fixed `/api/v1/patent/`, so the operator
+/// already knows what it is; bearer tokens, however, do sometimes
+/// appear in query strings (`?api_key=…`) by mistake, and echoing them
+/// would push the secret into any shell or CI log that captured the
+/// error.
+pub(crate) fn url_origin_for_display(u: &url::Url) -> String {
+    let scheme = u.scheme();
+    match u.host_str() {
+        Some(host) => {
+            // Ipv6 hosts need brackets in URL syntax.
+            let host_display = match u.host() {
+                Some(url::Host::Ipv6(ip)) => format!("[{ip}]"),
+                _ => host.to_string(),
+            };
+            match u.port() {
+                Some(p) => format!("{scheme}://{host_display}:{p}"),
+                None => format!("{scheme}://{host_display}"),
+            }
+        }
+        None => format!("{scheme}://<no host>"),
+    }
+}
+
+/// Enforce the host binding of a stored PatentsView key (#268).
+///
+/// If the key has a `bound_host`, the effective URL's host must match
+/// it exactly. Otherwise the adapter is not built and no request is
+/// ever made.
+///
+/// `effective_url` is what [`build_adapters_with_field`] computed — the
+/// validated `base_url`, or the built-in default. It is assumed to be
+/// a valid URL; a malformed one is treated as "no host", which
+/// refuses as a mismatch.
+pub(crate) fn enforce_patentsview_host_binding(
+    cfg: &PatentsViewAdapterConfig,
+    effective_url: &str,
+) -> Result<(), CoreError> {
+    let Some(bound_host) = cfg.bound_host.as_deref() else {
+        return Ok(());
+    };
+
+    let parsed = url::Url::parse(effective_url).ok();
+    let request_host = parsed.as_ref().and_then(|u| u.host_str());
+    let origin = parsed
+        .as_ref()
+        .map_or_else(|| format!("{effective_url:?}"), url_origin_for_display);
+
+    if request_host == Some(bound_host) {
+        return Ok(());
+    }
+
+    let msg = if cfg.legacy_unbound {
+        format!(
+            "the stored patentsview key has no host binding and is treated as a USPTO \
+             PatentSearch key (search.patentsview.org), which USPTO retired on \
+             2026-03-20. The configured endpoint is {origin}, so the key is NOT being \
+             sent. Request a PatentRef key at https://patentref.io/docs/migration.html \
+             and run `scitadel auth login patentsview` to replace it; or, if you trust \
+             the configured endpoint, run `scitadel auth login patentsview --host \
+             {req}` with a key that mirror issues.",
+            req = request_host.unwrap_or("<no host>"),
+        )
+    } else {
+        format!(
+            "the stored patentsview key is bound to {bound}; the configured endpoint \
+             is {origin}. Run `scitadel auth login patentsview --host {req}` to bind \
+             a key to that host if you trust it.",
+            bound = bound_host,
+            req = request_host.unwrap_or("<no host>"),
+        )
+    };
+    Err(CoreError::Config(msg))
 }
 
 #[cfg(test)]

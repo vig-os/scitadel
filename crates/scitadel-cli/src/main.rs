@@ -544,6 +544,13 @@ enum AuthCommands {
     Login {
         /// Source name (pubmed, openalex, lens, epo)
         source: String,
+        /// For `patentsview`: bind the stored key to this host. The
+        /// adapter refuses to send the key to any other host, so a
+        /// committed `[patentsview] base_url` cannot replay it to an
+        /// attacker-controlled endpoint (#268). Default: `patentref.io`.
+        /// Ignored for other sources.
+        #[arg(long)]
+        host: Option<String>,
     },
     /// Remove stored credentials for a source
     Logout {
@@ -632,7 +639,7 @@ async fn main() -> Result<()> {
             } => commands::question_add_terms(&question_id, &terms, query),
         },
         Commands::Auth { command } => match command {
-            AuthCommands::Login { source } => commands::auth_login(&source),
+            AuthCommands::Login { source, host } => commands::auth_login(&source, host.as_deref()),
             AuthCommands::Logout { source } => commands::auth_logout(&source),
             AuthCommands::Status => commands::auth_status(),
         },

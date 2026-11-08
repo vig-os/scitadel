@@ -413,6 +413,35 @@ To use another endpoint that speaks the same grammar, set
 `[patentsview] base_url = "…/api/v1/patent/"` in `.scitadel/config.toml`
 or `SCITADEL_PATENTSVIEW_URL`.
 
+#### Host-bound keys
+
+The `patentsview` key is sent as `X-Api-Key`, and `base_url` is a value a
+repo can commit in `.scitadel/config.toml`. To keep a committed
+`base_url` from replaying a stored key to an arbitrary host, the stored
+key is **bound** to a host at store time:
+
+```sh
+scitadel auth login patentsview                       # bound to patentref.io (the default)
+scitadel auth login patentsview --host mirror.example # bound to a PatentSearch-grammar mirror
+```
+
+At adapter build time, the effective endpoint's host must match the
+binding, or the adapter is NOT built — zero requests, with an error
+that names the binding and the configured host, and tells you how to
+rebind if the endpoint is trusted.
+
+`SCITADEL_PATENTSVIEW_KEY` (an env-set key) is sent only when the
+endpoint also comes from the env or the default. A `base_url` in a
+`.scitadel/config.toml` is **not** authority for an env-set key to reach
+that host — bind the key with `auth login --host <host>` instead.
+
+**Migrating from a pre-#268 key.** A key stored before host binding
+existed is treated as bound to the retired USPTO host
+`search.patentsview.org` and the adapter refuses to forward it to
+PatentRef. Request a PatentRef key at
+<https://patentref.io/docs/migration.html> and run
+`scitadel auth login patentsview` again to replace it.
+
 Other knobs:
 
 | Variable | Default | Description |

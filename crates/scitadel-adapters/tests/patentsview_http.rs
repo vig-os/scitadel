@@ -10,9 +10,10 @@ use std::collections::HashSet;
 use scitadel_adapters::patentsview::{
     PATENT_FIELDS, PATENTSVIEW_API_URL, PatentsViewAdapter, request_body,
 };
+use scitadel_core::config::PatentsViewAdapterConfig;
 use scitadel_core::ports::SourceAdapter;
 use wiremock::matchers::{body_json, header, method, path};
-use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// `components.schemas.PatentFields` of the PatentSearch grammar, from
 /// PatentRef's OpenAPI document (API 1.21.0, fetched 2026-11-08).
@@ -151,39 +152,15 @@ async fn search_posts_the_body_with_the_key_and_parses_the_page() {
     assert!(results[1].authors.is_empty());
 }
 
-/// Even without the literal matcher, the body must contain `wipo_kind`
-/// and must NOT contain `patent_kind` (the field name a strict server
-/// rejects with 400 ERR_Q — the reason this bug exists).
-#[tokio::test]
-async fn the_posted_body_contains_wipo_kind_and_lacks_patent_kind() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/api/v1/patent/"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(recorded_page()))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let _ = PatentsViewAdapter::new("k".into(), 5.0)
-        .with_base_url(format!("{}/api/v1/patent/", server.uri()))
-        .search("x", 10)
-        .await
-        .expect("search should succeed");
-
-    let reqs: Vec<Request> = server.received_requests().await.unwrap_or_default();
-    assert_eq!(reqs.len(), 1, "exactly one POST");
-    let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).expect("body must be JSON");
-    let f = body["f"].as_array().expect("f is a JSON array");
-    let names: Vec<&str> = f.iter().filter_map(|v| v.as_str()).collect();
-    assert!(
-        names.contains(&"wipo_kind"),
-        "body.f lacks wipo_kind: {names:?}"
-    );
-    assert!(
-        !names.contains(&"patent_kind"),
-        "body.f must not include patent_kind (strict servers reject it): {names:?}"
-    );
-}
+// The redundant `the_posted_body_contains_wipo_kind_and_lacks_patent_kind`
+// test, which replayed the wipo/patent_kind check against a running mock
+// server, lived here. The literal body matcher in
+// `search_posts_the_body_with_the_key_and_parses_the_page` already
+// asserts both (its expected body contains `wipo_kind` and does not
+// contain `patent_kind`), and `request_body_asks_for_wipo_kind_not_patent_kind`
+// asserts it at the source. The extra wire-level copy only differed in
+// that it inspected the posted bytes after the fact — removed as
+// redundant (#268).
 
 #[tokio::test]
 async fn a_rejected_query_surfaces_the_status_reason_header() {
@@ -222,16 +199,19 @@ async fn a_missing_key_points_at_where_to_get_one() {
 /// reqwest's default redirect policy keeps custom headers across 3xx
 /// hops, and `X-Api-Key` is one of ours — a redirect to an attacker
 /// controlled host would leak the key. The adapter must refuse to
-/// follow, and the error must name the Location host so the operator
-/// can trace what happened (#268).
+/// follow, name the Location origin (scheme + host) without echoing
+/// the path or query (which could carry a token), and not call again
+/// (#268).
 #[tokio::test]
 async fn a_cross_host_redirect_is_refused_with_the_location_host_named() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(
-            ResponseTemplate::new(302)
-                .insert_header("Location", "https://attacker.example.com/steal/"),
-        )
+        .respond_with(ResponseTemplate::new(302).insert_header(
+            "Location",
+            // Path and query deliberately carry a token-shaped string:
+            // the error must NOT echo them.
+            "https://attacker.example.com/steal?token=sekrit",
+        ))
         .expect(1)
         .mount(&server)
         .await;
@@ -242,17 +222,201 @@ async fn a_cross_host_redirect_is_refused_with_the_location_host_named() {
         .await
         .expect_err("a 3xx must be an adapter error, not a silent follow");
     let msg = err.to_string();
+
+    // `CoreError::Adapter` serialises as `adapter error: patentsview — <body>`;
+    // make the assertion specific to that shape rather than "it mentions 302
+    // somewhere".
     assert!(
-        msg.contains("attacker.example.com"),
-        "error must name the Location host: {msg}"
+        msg.contains("patentsview"),
+        "the adapter name tags the error: {msg}"
     );
-    assert!(msg.contains("302"), "error must name the status: {msg}");
     assert!(
-        msg.contains("X-Api-Key") || msg.contains("redirect"),
-        "error should explain why the hop was refused: {msg}"
+        msg.contains("refusing to follow a redirect to https://attacker.example.com"),
+        "error must name the Location origin exactly: {msg}"
+    );
+    assert!(
+        msg.contains("302"),
+        "error must name the redirect status: {msg}"
+    );
+    assert!(
+        msg.contains("X-Api-Key"),
+        "error must explain why the hop was refused (header replay): {msg}"
+    );
+    // The reason this test exists: path and query stay out of the
+    // echoed Location. A redirect target's query string can carry a
+    // bearer token the attacker tried to smuggle into a log.
+    assert!(
+        !msg.contains("/steal"),
+        "error must NOT echo the redirect path: {msg}"
+    );
+    assert!(
+        !msg.contains("token="),
+        "error must NOT echo the redirect query: {msg}"
+    );
+    assert!(
+        !msg.contains("sekrit"),
+        "error must NOT echo a value from the query: {msg}"
     );
 
     // The adapter must have sent exactly ONE request — no redirect follow.
     let reqs = server.received_requests().await.unwrap_or_default();
     assert_eq!(reqs.len(), 1, "no redirect follow allowed");
+}
+
+// -------------------------------------------------------------------
+// Host-binding tests (#268).
+//
+// The threat these guard against: a cloned repo commits
+// `.scitadel/config.toml` with `[patentsview] base_url` pointing at an
+// attacker-controlled host. A keychain-stored key must not be sent to
+// that host. The check runs at `build_adapters_with_field` time, so a
+// mismatch surfaces as a build error — no request is ever made (the
+// wiremock below MUST stay at zero received requests).
+// -------------------------------------------------------------------
+
+fn pv_cfg(
+    api_key: &str,
+    base_url: Option<&str>,
+    bound_host: Option<&str>,
+    legacy_unbound: bool,
+) -> PatentsViewAdapterConfig {
+    PatentsViewAdapterConfig {
+        api_key: api_key.to_string(),
+        base_url: base_url.map(str::to_string),
+        bound_host: bound_host.map(str::to_string),
+        legacy_unbound,
+    }
+}
+
+#[tokio::test]
+async fn a_bound_key_refuses_a_different_configured_host_and_makes_no_request() {
+    // A wiremock server stands in for the attacker-nominated host. The
+    // contract the test enforces: adapter build fails, and the mock
+    // sees ZERO requests. No `Mock` is mounted, so any call would
+    // surface as an unmatched-request panic at drop.
+    let attacker = MockServer::start().await;
+    let attacker_url = format!("{}/api/v1/patent/", attacker.uri());
+
+    let cfg = pv_cfg(
+        "pr-key-123",
+        Some(&attacker_url),
+        Some("patentref.io"),
+        false,
+    );
+    let openalex = scitadel_core::config::OpenAlexAuth::default();
+    let result = scitadel_adapters::build_adapters_with_field(
+        &["patentsview".to_string()],
+        "",
+        &openalex,
+        &cfg,
+        "",
+        "",
+        "",
+        scitadel_adapters::SearchField::default(),
+    );
+    let Err(err) = result else {
+        panic!("a cross-host base_url against a bound key must refuse");
+    };
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("bound to patentref.io"),
+        "error must name the key's binding: {msg}"
+    );
+    assert!(
+        msg.contains("scitadel auth login patentsview --host"),
+        "error must point at the rebind command: {msg}"
+    );
+    // The echoed origin stays scheme + host + port only — no path, no query.
+    assert!(
+        !msg.contains("/api/v1/patent/"),
+        "the configured endpoint's path must NOT be echoed: {msg}"
+    );
+
+    assert_eq!(
+        attacker.received_requests().await.unwrap_or_default().len(),
+        0,
+        "no request must reach the attacker-nominated host",
+    );
+}
+
+#[tokio::test]
+async fn a_bound_key_accepts_a_matching_configured_host() {
+    // The wiremock server impersonates the bound host by having the
+    // test bind the key to the server's loopback host (127.0.0.1).
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/patent/"))
+        .and(header("X-Api-Key", "pr-key-123"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(recorded_page()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let base_url = format!("{}/api/v1/patent/", server.uri());
+    let cfg = pv_cfg("pr-key-123", Some(&base_url), Some("127.0.0.1"), false);
+    let openalex = scitadel_core::config::OpenAlexAuth::default();
+    let adapters = scitadel_adapters::build_adapters_with_field(
+        &["patentsview".to_string()],
+        "",
+        &openalex,
+        &cfg,
+        "",
+        "",
+        "",
+        scitadel_adapters::SearchField::default(),
+    )
+    .expect("matching host must build the adapter");
+
+    let results = adapters[0]
+        .search("quantum", 2)
+        .await
+        .expect("search should succeed");
+    assert_eq!(results.len(), 2);
+}
+
+#[tokio::test]
+async fn a_legacy_unbound_key_is_refused_against_the_default_endpoint_with_the_migration_message() {
+    // No `base_url` set. The default endpoint is `patentref.io`; a
+    // legacy entry is treated as bound to `search.patentsview.org`,
+    // so the two do not match and the migration message points at
+    // PatentRef.
+    let cfg = pv_cfg(
+        "legacy-uspto-key",
+        None,
+        Some("search.patentsview.org"),
+        true,
+    );
+    let openalex = scitadel_core::config::OpenAlexAuth::default();
+    let result = scitadel_adapters::build_adapters_with_field(
+        &["patentsview".to_string()],
+        "",
+        &openalex,
+        &cfg,
+        "",
+        "",
+        "",
+        scitadel_adapters::SearchField::default(),
+    );
+    let Err(err) = result else {
+        panic!("a legacy unbound key must not be sent to the new default host");
+    };
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("no host binding"),
+        "error must say the key is unbound: {msg}"
+    );
+    assert!(
+        msg.contains("search.patentsview.org"),
+        "error must name the retired USPTO host: {msg}"
+    );
+    assert!(
+        msg.contains("https://patentref.io/docs/migration.html"),
+        "error must point at the PatentRef migration guide: {msg}"
+    );
+    assert!(
+        msg.contains("scitadel auth login patentsview"),
+        "error must tell the user to log in again: {msg}"
+    );
 }
