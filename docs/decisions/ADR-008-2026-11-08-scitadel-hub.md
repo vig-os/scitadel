@@ -103,6 +103,13 @@ gated by licence.
 13. **Quality is a growing test suite** (§13): a golden set, a red/green
     quarantine loop, and random-sample QC on every batch, for papers and
     patents alike.
+14. **Serving runs on CPU; the GPU is for ingest** (§14). Extraction
+    tiers T1 and T3, bulk embedding, figure descriptions and
+    re-embedding after a model upgrade go to the 5090 through
+    `gpu_submit`; filters, BM25, ANN search, graph hops and fusion
+    serve from CPU and NVMe. Query embedding is client-side by
+    default; the hub advertises the exact embedding model and rejects
+    mismatched query vectors.
 
 ## 1 · Repo split
 
@@ -643,6 +650,69 @@ our reading, to be confirmed with ETH Library (open question 7).
   Only after review is the corpus re-derived.
 - **Patents too.** The same harness covers the patent corpus (§6).
 
+## 14 · Serving model: where compute runs
+
+The hub separates **ingest** (GPU, queued, latency does not matter)
+from **serving** (CPU, interactive). No index, embedder or reranker
+is resident on the 5090; every GPU use goes through `gpu_submit`
+(§8). This matches anvil's shared-GPU rule: the 5090 is held by
+inference workloads, so the hub cannot rely on it for a search's
+tail latency.
+
+**Per-step placement** *(latency estimates)*:
+
+| Step | Where | Latency *(estimate)* |
+|---|---|---|
+| Filters / metadata (DataFusion over tessera) | Hub, CPU + NVMe | ms to tens of ms |
+| BM25 (tantivy) | Hub, CPU | <50 ms at 10⁸ docs |
+| Query embedding | Client or hub, CPU | ~10–50 ms with a small text model (e.g. `Qwen3-Embedding-0.6B`); ~0.2–1 s for the 2B VL embedder on a laptop CPU |
+| ANN search | Hub, CPU + RAM or NVMe | ms |
+| RRF fusion, filters, graph hops | Hub, CPU | ms |
+| Rerank of the top 50 (`Qwen3-VL-Reranker`) | Optional; hub GPU queue or sage | ~0.1–0.5 s on GPU |
+| System One scoring of the shortlist (#246) | Client-side Kev, or hosted Jev | Kev-4B ~300 ms for 5 questions on a 32 GB Mac |
+| LLM reading pass | API, or local | varies |
+
+**Rerank fallback.** If the GPU queue is busy, the hub returns
+unreranked results flagged `reranked: false` rather than block the
+search. The client may choose to wait and re-request, or score the
+shortlist with #246 directly.
+
+**The wire carries references, not documents.** The client receives
+IDs, scores and snippets. Bytes flow only on `open` or `detach`
+(§12), so a search round-trip stays small even for a long
+shortlist.
+
+**Client-side query embedding is the default.** It offloads the
+hub, works offline against detached subsets (§9, §12), and keeps
+the exact Matryoshka truncation the index was built with. The hub's
+`coverage` response (§7) advertises, per index: the embedding model
+id, version, output dims, Matryoshka truncation applied, the BM25
+analyzer configuration, and the available rerankers. The hub
+**rejects a query vector whose declared model id, version or dims
+do not match the target index** with an explicit error, rather than
+embedding it under the wrong model and silently degrading recall.
+Hub-side query embedding (text in, hub embeds) remains a fallback
+for thin clients and for the window between an index re-embedding
+and a client refresh.
+
+**Hub sizing** *(estimates)*. A 50M-chunk corpus at 512-d fp16 is
+about 51 GB of raw vectors — resident in RAM on a sized box, or
+served through an IVF-PQ / DiskANN-style on-disk index at a few GB
+RAM plus NVMe. A lab of ~20 users is trivial for a CPU hub:
+tantivy and the ANN cache both sustain hundreds to thousands of
+QPS per core, and search is compute-bound on fusion and scoring,
+not on I/O.
+
+**Offline mode.** A detached topic subset with its own indexes
+(e.g. 50k papers: text, chunk embeddings and BM25, ~1–3 GB
+*(estimate)*) gives fully local millisecond search on a laptop.
+Remote reads of a hub's `.tsra` over HTTP range requests (tessera
+ADR-0034) suit column scans and `get`-by-ID, not BM25 or ANN random
+access — those want the subset on local NVMe, which `detach`
+arranges (§12). The protocol routes a search to a local subset when
+one is available for the query's topic, and to the hub otherwise;
+`answered_by` reports which path answered (§7).
+
 ## Slices
 
 | Slice | Issue | Where | Depends on |
@@ -746,6 +816,17 @@ Upstream: vig-os/tessera#778 waves:
   spend.
 - The golden set is a permanent asset to curate: its private half
   needs a private bucket and fleet runners.
+- Serving on CPU means an index that needs more RAM than the server
+  box has must fall back to an on-disk ANN (IVF-PQ or DiskANN-style),
+  paying tens of ms per probe rather than the RAM path's ms.
+  The 51 GB raw-vectors estimate is a ceiling, not a floor.
+- Client-side query embedding couples the client to the hub's
+  embedding-model identity, version and output dims. The `coverage`
+  advertisement plus the hub's explicit mismatch rejection keeps
+  that coupling safe, but a client that cannot run the current
+  embedder (thin clients, old builds, a window after a hub
+  re-embedding) has to fall back to hub-side embedding and pays the
+  hub's CPU for it.
 
 ## Open questions for the owner
 
@@ -768,3 +849,8 @@ Upstream: vig-os/tessera#778 waves:
 9. **T3 model:** which Qwen vision-language model size fits sage? sage's
    specs are unverified.
 10. **T3/T4 budgets:** the daily caps for sage time and Opus API spend.
+11. **Rerank placement (§14):** on the hub's `gpu_submit` queue by
+    default (co-located, but shares the 5090 queue with inference
+    and ingest), on sage (lower-contention GPU, one more hop), or
+    either, chosen by cost and queue depth? The `reranked: false`
+    fallback covers each choice either way.
