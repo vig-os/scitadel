@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use reqwest::Client;
+use reqwest::{Client, redirect};
 
 use scitadel_core::error::CoreError;
 use scitadel_core::models::CandidatePaper;
@@ -92,8 +92,16 @@ impl SourceAdapter for PatentsViewAdapter {
             )));
         }
 
+        // Follow NO redirects. reqwest's default redirect policy keeps
+        // custom headers across 3xx hops, and `X-Api-Key` is one of ours
+        // — a redirect to an attacker-controlled host would leak the key.
+        // The grammar is a POST-only API with a stable path; an upstream
+        // 3xx on this endpoint is itself a signal of misconfiguration or
+        // compromise, so we surface it as an error that names the hop
+        // target instead of silently chasing it (#268).
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs_f64(self.timeout))
+            .redirect(redirect::Policy::none())
             .build()
             .map_err(|e| CoreError::Adapter("patentsview".into(), e.to_string()))?;
 
@@ -105,8 +113,28 @@ impl SourceAdapter for PatentsViewAdapter {
             .await
             .map_err(|e| CoreError::Adapter("patentsview".into(), e.to_string()))?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
+        let status = resp.status();
+        if status.is_redirection() {
+            let location = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<missing Location header>");
+            let target_host = url::Url::parse(location)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_owned))
+                .unwrap_or_else(|| location.to_string());
+            return Err(CoreError::Adapter(
+                "patentsview".into(),
+                format!(
+                    "HTTP {status}: refusing to follow a redirect to {target_host} \
+                     (Location: {location}). The X-Api-Key header would otherwise \
+                     be replayed to the new host."
+                ),
+            ));
+        }
+
+        if !status.is_success() {
             // The grammar puts the reason for a 400 in a header, not the body.
             let reason = resp
                 .headers()
@@ -186,6 +214,18 @@ fn patent_to_candidate(patent: &serde_json::Value, rank: i32) -> CandidatePaper 
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
+    // Compose the "(type kind)" tail without a trailing space when the
+    // kind code is missing — the grammar is lenient about it, so an older
+    // record can arrive without one. `patent_kind` (which the request now
+    // uses) always comes back on recent records, but the formatter should
+    // not paper over a missing value with "utility ".
+    let type_tag = match (patent_type.is_empty(), wipo_kind.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => format!(" ({patent_type})"),
+        (true, false) => format!(" ({wipo_kind})"),
+        (false, false) => format!(" ({patent_type} {wipo_kind})"),
+    };
+
     let url = format!("https://patents.google.com/patent/US{patent_id}");
 
     CandidatePaper {
@@ -195,7 +235,7 @@ fn patent_to_candidate(patent: &serde_json::Value, rank: i32) -> CandidatePaper 
         authors: inventors,
         r#abstract: abstract_text,
         year,
-        journal: assignee.map(|a| format!("{a} ({patent_type} {wipo_kind})")),
+        journal: assignee.map(|a| format!("{a}{type_tag}")),
         url: Some(url),
         rank: Some(rank),
         raw_data: patent.clone(),
@@ -270,6 +310,44 @@ mod tests {
     fn test_extract_inventors_empty() {
         let patent = serde_json::json!({});
         assert!(extract_inventors(&patent).is_empty());
+    }
+
+    #[test]
+    fn the_journal_tag_has_no_trailing_space_when_wipo_kind_is_missing() {
+        // Older records can arrive without a wipo_kind — the grammar is
+        // lenient. Before the fix, the formatter produced "Quantum Corp
+        // (utility )"; it must now drop the trailing space.
+        let patent = serde_json::json!({
+            "patent_id": "11234567",
+            "patent_title": "t",
+            "patent_type": "utility",
+            "assignees": [{"assignee_organization": "Quantum Corp"}],
+        });
+        let c = patent_to_candidate(&patent, 1);
+        assert_eq!(c.journal.as_deref(), Some("Quantum Corp (utility)"));
+    }
+
+    #[test]
+    fn the_journal_tag_is_omitted_when_both_patent_type_and_wipo_kind_are_missing() {
+        let patent = serde_json::json!({
+            "patent_id": "11234567",
+            "patent_title": "t",
+            "assignees": [{"assignee_organization": "Quantum Corp"}],
+        });
+        let c = patent_to_candidate(&patent, 1);
+        assert_eq!(c.journal.as_deref(), Some("Quantum Corp"));
+    }
+
+    #[test]
+    fn the_journal_tag_is_just_the_wipo_kind_when_patent_type_is_missing() {
+        let patent = serde_json::json!({
+            "patent_id": "11234567",
+            "patent_title": "t",
+            "wipo_kind": "B2",
+            "assignees": [{"assignee_organization": "Quantum Corp"}],
+        });
+        let c = patent_to_candidate(&patent, 1);
+        assert_eq!(c.journal.as_deref(), Some("Quantum Corp (B2)"));
     }
 
     #[test]

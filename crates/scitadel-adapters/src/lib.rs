@@ -26,6 +26,7 @@ pub mod resolve;
 pub mod scan;
 
 use scitadel_core::config::{OpenAlexAuth, SourceConfig};
+use scitadel_core::error::CoreError;
 use scitadel_core::ports::SourceAdapter;
 
 pub use openalex::SearchField;
@@ -107,10 +108,17 @@ pub fn build_adapters_with_field(
                 adapters.push(Box::new(inspire::InspireAdapter::new(30.0)));
             }
             "patentsview" => {
+                // The patentsview adapter posts the keychain-stored key as
+                // `X-Api-Key`; a `base_url` from `.scitadel/config.toml`
+                // (committable at the repo top level) or
+                // `SCITADEL_PATENTSVIEW_URL` reaches here via `patentsview`.
+                // Validate it once, so http-non-loopback and malformed URLs
+                // never see the key (#268).
+                let validated = validate_patentsview_base_url(patentsview.base_url.as_deref())?;
                 let mut adapter =
                     patentsview::PatentsViewAdapter::new(patentsview.api_key.clone(), 30.0);
-                if let Some(url) = &patentsview.base_url {
-                    adapter = adapter.with_base_url(url.clone());
+                if let Some(url) = validated {
+                    adapter = adapter.with_base_url(url);
                 }
                 adapters.push(Box::new(adapter));
             }
@@ -134,4 +142,120 @@ pub fn build_adapters_with_field(
     }
 
     Ok(adapters)
+}
+
+/// Validate a configured `base_url` for the PatentsView adapter (#268).
+///
+/// The adapter posts the keychain-stored API key as `X-Api-Key`, so a
+/// user-supplied endpoint has to be guarded: plaintext http would expose
+/// the key on the wire, a non-https scheme makes no sense for this
+/// grammar, and a malformed URL would surface as a confusing reqwest
+/// error at search time instead of a config error at startup.
+///
+/// Rules:
+/// - `None`, or a value that is empty or whitespace-only after trimming,
+///   is normalised to `None` so an empty `base_url = ""` in
+///   `.scitadel/config.toml` behaves like an unset
+///   `SCITADEL_PATENTSVIEW_URL` and the adapter's built-in default wins.
+/// - `https://` is accepted.
+/// - `http://` is accepted only for loopback hosts (`127.0.0.1`, `::1`,
+///   `localhost`), which the wiremock-backed tests need.
+/// - Anything else is a [`CoreError::Config`] with a message that names
+///   what was wrong.
+pub fn validate_patentsview_base_url(raw: Option<&str>) -> Result<Option<String>, CoreError> {
+    let Some(trimmed) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+
+    let parsed = url::Url::parse(trimmed).map_err(|e| {
+        CoreError::Config(format!(
+            "patentsview base_url is not a valid URL ({e}): {trimmed:?}"
+        ))
+    })?;
+
+    match parsed.scheme() {
+        "https" => Ok(Some(trimmed.to_string())),
+        "http" => {
+            let is_loopback = match parsed.host() {
+                Some(url::Host::Domain(d)) => d == "localhost",
+                Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                None => false,
+            };
+            if is_loopback {
+                Ok(Some(trimmed.to_string()))
+            } else {
+                Err(CoreError::Config(format!(
+                    "patentsview base_url must use https; plaintext http is only allowed \
+                     for loopback hosts (127.0.0.1, ::1, localhost). Got {trimmed:?}. \
+                     The adapter posts the stored API key as X-Api-Key, so the key would \
+                     leave the machine in cleartext."
+                )))
+            }
+        }
+        other => Err(CoreError::Config(format!(
+            "patentsview base_url must use https (got scheme {other:?}): {trimmed:?}"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn https_base_url_is_accepted() {
+        let got = validate_patentsview_base_url(Some("https://mirror.example.org/api/v1/patent/"))
+            .expect("https must be accepted");
+        assert_eq!(
+            got.as_deref(),
+            Some("https://mirror.example.org/api/v1/patent/")
+        );
+    }
+
+    #[test]
+    fn http_to_a_non_loopback_host_is_rejected() {
+        let err = validate_patentsview_base_url(Some("http://mirror.example.org/api/v1/patent/"))
+            .expect_err("plaintext http to a non-loopback host must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("https"), "{msg}");
+        assert!(msg.contains("loopback"), "{msg}");
+        assert!(msg.contains("X-Api-Key"), "{msg}");
+    }
+
+    #[test]
+    fn http_to_a_loopback_host_is_accepted_for_wiremock() {
+        for url in [
+            "http://127.0.0.1:1234/api/v1/patent/",
+            "http://localhost:4567/api/v1/patent/",
+            "http://[::1]:1/api/v1/patent/",
+        ] {
+            let got = validate_patentsview_base_url(Some(url))
+                .unwrap_or_else(|e| panic!("loopback http must be accepted for {url}: {e}"));
+            assert_eq!(got.as_deref(), Some(url));
+        }
+    }
+
+    #[test]
+    fn an_empty_or_whitespace_base_url_falls_back_to_the_default() {
+        for raw in [None, Some(""), Some("   "), Some("\t\n")] {
+            let got = validate_patentsview_base_url(raw)
+                .unwrap_or_else(|e| panic!("empty should be None (got {raw:?}): {e}"));
+            assert!(got.is_none(), "{raw:?} -> {got:?}");
+        }
+    }
+
+    #[test]
+    fn a_non_http_scheme_is_rejected() {
+        let err = validate_patentsview_base_url(Some("ftp://mirror.example.org/patents"))
+            .expect_err("ftp must be rejected");
+        assert!(err.to_string().contains("https"), "{err}");
+    }
+
+    #[test]
+    fn a_malformed_url_is_rejected_with_a_clear_message() {
+        let err = validate_patentsview_base_url(Some("not-a-url"))
+            .expect_err("a non-URL must be rejected");
+        assert!(err.to_string().contains("not a valid URL"), "{err}");
+    }
 }

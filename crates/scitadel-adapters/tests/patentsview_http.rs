@@ -12,7 +12,7 @@ use scitadel_adapters::patentsview::{
 };
 use scitadel_core::ports::SourceAdapter;
 use wiremock::matchers::{body_json, header, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 /// `components.schemas.PatentFields` of the PatentSearch grammar, from
 /// PatentRef's OpenAPI document (API 1.21.0, fetched 2026-11-08).
@@ -94,13 +94,40 @@ fn default_endpoint_is_not_the_retired_uspto_host() {
     assert!(PATENTSVIEW_API_URL.ends_with("/api/v1/patent/"));
 }
 
+/// The expected POST body, written out as a literal — the SUT builds its
+/// own `request_body(..)`, so matching with `body_json(request_body(..))`
+/// would be testing serde_json's determinism against itself and would
+/// silently pass if the shape drifted on both sides together. Each field
+/// is spelled out here to catch a change in the request grammar.
+fn expected_request_body(query: &str, size: usize) -> serde_json::Value {
+    serde_json::json!({
+        "q": { "_text_any": { "patent_abstract": query } },
+        "f": [
+            "patent_id",
+            "patent_title",
+            "patent_abstract",
+            "patent_date",
+            "patent_type",
+            "wipo_kind",
+            "assignees.assignee_organization",
+            "inventors.inventor_name_first",
+            "inventors.inventor_name_last",
+        ],
+        "o": { "size": size },
+        "s": [{ "patent_date": "desc" }],
+    })
+}
+
 #[tokio::test]
 async fn search_posts_the_body_with_the_key_and_parses_the_page() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/v1/patent/"))
         .and(header("X-Api-Key", "pr-key-123"))
-        .and(body_json(request_body("quantum error", 10)))
+        // Literal expected body: contains wipo_kind, lacks patent_kind,
+        // keeps the grammar's q/f/s/o shape. This is the assertion the
+        // previous `body_json(request_body(..))` matcher failed to make.
+        .and(body_json(expected_request_body("quantum error", 10)))
         .respond_with(ResponseTemplate::new(200).set_body_json(recorded_page()))
         .expect(1)
         .mount(&server)
@@ -122,6 +149,40 @@ async fn search_posts_the_body_with_the_key_and_parses_the_page() {
     assert_eq!(results[1].source_id, "RE49999");
     assert_eq!(results[1].year, Some(2022));
     assert!(results[1].authors.is_empty());
+}
+
+/// Even without the literal matcher, the body must contain `wipo_kind`
+/// and must NOT contain `patent_kind` (the field name a strict server
+/// rejects with 400 ERR_Q — the reason this bug exists).
+#[tokio::test]
+async fn the_posted_body_contains_wipo_kind_and_lacks_patent_kind() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/patent/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(recorded_page()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let _ = PatentsViewAdapter::new("k".into(), 5.0)
+        .with_base_url(format!("{}/api/v1/patent/", server.uri()))
+        .search("x", 10)
+        .await
+        .expect("search should succeed");
+
+    let reqs: Vec<Request> = server.received_requests().await.unwrap_or_default();
+    assert_eq!(reqs.len(), 1, "exactly one POST");
+    let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).expect("body must be JSON");
+    let f = body["f"].as_array().expect("f is a JSON array");
+    let names: Vec<&str> = f.iter().filter_map(|v| v.as_str()).collect();
+    assert!(
+        names.contains(&"wipo_kind"),
+        "body.f lacks wipo_kind: {names:?}"
+    );
+    assert!(
+        !names.contains(&"patent_kind"),
+        "body.f must not include patent_kind (strict servers reject it): {names:?}"
+    );
 }
 
 #[tokio::test]
@@ -156,4 +217,42 @@ async fn a_missing_key_points_at_where_to_get_one() {
     let msg = err.to_string();
     assert!(msg.contains("patentref.io"), "{msg}");
     assert!(!msg.contains("patentsview.org/apis"), "{msg}");
+}
+
+/// reqwest's default redirect policy keeps custom headers across 3xx
+/// hops, and `X-Api-Key` is one of ours — a redirect to an attacker
+/// controlled host would leak the key. The adapter must refuse to
+/// follow, and the error must name the Location host so the operator
+/// can trace what happened (#268).
+#[tokio::test]
+async fn a_cross_host_redirect_is_refused_with_the_location_host_named() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("Location", "https://attacker.example.com/steal/"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let err = PatentsViewAdapter::new("pr-key-123".into(), 5.0)
+        .with_base_url(server.uri())
+        .search("x", 1)
+        .await
+        .expect_err("a 3xx must be an adapter error, not a silent follow");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("attacker.example.com"),
+        "error must name the Location host: {msg}"
+    );
+    assert!(msg.contains("302"), "error must name the status: {msg}");
+    assert!(
+        msg.contains("X-Api-Key") || msg.contains("redirect"),
+        "error should explain why the hop was refused: {msg}"
+    );
+
+    // The adapter must have sent exactly ONE request — no redirect follow.
+    let reqs = server.received_requests().await.unwrap_or_default();
+    assert_eq!(reqs.len(), 1, "no redirect follow allowed");
 }

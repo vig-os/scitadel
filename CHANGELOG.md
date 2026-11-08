@@ -162,15 +162,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   API (not USPTO, free beta: US grants 1976+, no pre-grant publications,
   1,000 requests a month) that answers the same grammar. The endpoint is
   configurable with `[patentsview] base_url` or
-  `SCITADEL_PATENTSVIEW_URL`. The request also asked for `patent_kind`,
-  which the grammar does not have (the kind code is `wipo_kind`) and
-  which a strict server rejects with 400 `ERR_Q`; it now asks for
-  `wipo_kind`. A 400's `X-Status-Reason` header is included in the
-  error, and the missing-key hint no longer points at the retired
-  PatentsView signup page. `build_adapters_with_field` takes the
-  PatentsView `SourceConfig` instead of its key. Offline tests check
-  every requested field against the grammar's field list and replay a
-  recorded response.
+  `SCITADEL_PATENTSVIEW_URL`; the base URL is validated at adapter build
+  (https-only, with http allowed for loopback hosts) and an empty value
+  falls back to the default. The reqwest client uses
+  `redirect::Policy::none()` so the keychain-stored `X-Api-Key` cannot
+  be replayed to a 3xx-nominated host — a redirect is surfaced as an
+  error naming the `Location` host. The request also asked for
+  `patent_kind`, which the grammar does not have (the kind code is
+  `wipo_kind`) and which a strict server rejects with 400 `ERR_Q`; it
+  now asks for `wipo_kind`. A 400's `X-Status-Reason` header is
+  included in the error, and the missing-key hint no longer points at
+  the retired PatentsView signup page. `build_adapters_with_field`
+  takes the PatentsView `SourceConfig` instead of its key.
+  **Credential compatibility:** a previously stored
+  `patentsview.api_key` is a USPTO-issued PatentsView key and will now
+  be sent to the new default endpoint (PatentRef, `patentref.io`); the
+  USPTO key will not authenticate there, so request a PatentRef key at
+  `https://patentref.io/docs/migration.html` and store it with
+  `scitadel auth login patentsview`, or set `[patentsview] base_url` to
+  a PatentsView-grammar mirror that accepts the existing key. Offline
+  tests check every requested field against the grammar's field list
+  and replay a recorded response.
 - **MCP tools now accept the short IDs they print**
   ([#232](https://github.com/vig-os/scitadel/issues/232)). Every
   ID-accepting tool (`add_search_terms`, `save_assessment`,
