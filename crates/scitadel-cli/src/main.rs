@@ -548,6 +548,14 @@ enum AuthCommands {
         /// adapter refuses to send the key to any other host, so a
         /// committed `[patentsview] base_url` cannot replay it to an
         /// attacker-controlled endpoint (#268). Default: `patentref.io`.
+        ///
+        /// Binding is **host-only, any port**: give a bare hostname
+        /// (`patentref.io`), not `https://...`, not `host:port`, not a
+        /// path. IDN labels are stored in punycode and the comparison
+        /// is case-insensitive, so `Patentref.IO`, `patentref.io.` and
+        /// `patentref.io` are the same host. The request URL's port
+        /// is ignored at comparison time.
+        ///
         /// Ignored for other sources.
         #[arg(long)]
         host: Option<String>,

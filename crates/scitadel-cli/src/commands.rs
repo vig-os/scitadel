@@ -1154,20 +1154,18 @@ pub fn auth_login(source: &str, host: Option<&str>) -> Result<()> {
     // `--host` only binds a patentsview key (#268); for every other
     // source it is a no-op, which is quieter than erroring out from
     // a shared CI script that always passes it.
+    //
+    // The binding is **host-only, any port** — stored without a
+    // `:port`, compared without a `:port`. `normalize_patentsview_host`
+    // is the single normaliser both sides share (`--host` storage
+    // here, and `enforce_patentsview_host_binding` at build time).
     let patentsview_host: Option<String> = if source == "patentsview" {
-        let bound = host
-            .map(|h| h.trim().to_string())
-            .filter(|h| !h.is_empty())
-            .unwrap_or_else(|| credentials::PATENTSVIEW_DEFAULT_HOST.to_string());
-        // Keep validation shallow — the adapter builder and
-        // `validate_patentsview_base_url` have the real policy. Here
-        // we just refuse obviously-broken input so the stored binding
-        // is a single hostname, not a URL or a path.
-        if bound.contains("://") || bound.contains('/') || bound.contains(char::is_whitespace) {
-            bail!(
-                "--host must be a bare hostname (e.g. `patentref.io`), not a URL or path: {bound:?}"
-            );
-        }
+        let bound = match host.map(str::trim).filter(|h| !h.is_empty()) {
+            Some(h) => {
+                credentials::normalize_patentsview_host(h).map_err(|e| anyhow::anyhow!("{e}"))?
+            }
+            None => credentials::PATENTSVIEW_DEFAULT_HOST.to_string(),
+        };
         Some(bound)
     } else {
         if host.is_some() {
@@ -1187,8 +1185,16 @@ pub fn auth_login(source: &str, host: Option<&str>) -> Result<()> {
         );
     }
     if let Some(ref h) = patentsview_host {
-        println!("  The stored key will be bound to host: {h}");
+        println!("  The stored key will be bound to host: {h} (any port)");
     }
+
+    // Track whether the primary key for this source was actually
+    // stored this invocation. The host binding (patentsview only) is
+    // written only if the key was: an empty-enter skip, or a cancelled
+    // prompt reaching here some other way, must NOT rewrite the host
+    // binding to the default on top of an already-bound key (#268
+    // round-3 nit).
+    let mut stored_any_required_key = false;
 
     for key in creds.keys {
         let label = if key.optional {
@@ -1209,6 +1215,9 @@ pub fn auth_login(source: &str, host: Option<&str>) -> Result<()> {
         credentials::store(key.store_key, &credentials::Secret::new(&value))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         println!("  Stored: {}", key.store_key);
+        if !key.optional {
+            stored_any_required_key = true;
+        }
     }
 
     // The host binding is written AFTER the key, so a half-stored
@@ -1216,7 +1225,21 @@ pub fn auth_login(source: &str, host: Option<&str>) -> Result<()> {
     // prompt. The value is not a secret, but it goes through the same
     // store so `scitadel auth logout patentsview` clears it alongside
     // the key.
+    //
+    // Only write if a required key was actually stored this invocation:
+    // the required-key loop bails on an empty value, so in practice we
+    // reached this line because the key was stored, but the explicit
+    // flag defends against a future refactor turning the key optional
+    // and silently reauthorising an already-bound binding on an
+    // empty-enter.
     if let Some(h) = patentsview_host {
+        if !stored_any_required_key {
+            bail!(
+                "no patentsview key was stored this invocation, so the host binding \
+                 is not being rewritten. Run `scitadel auth login patentsview` and \
+                 enter a key to rebind."
+            );
+        }
         credentials::store(
             credentials::PATENTSVIEW_HOST_STORE_KEY,
             &credentials::Secret::new(&h),

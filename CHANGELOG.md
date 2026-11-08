@@ -173,7 +173,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `wipo_kind`. A 400's `X-Status-Reason` header is included in the
   error, and the missing-key hint no longer points at the retired
   PatentsView signup page. `build_adapters_with_field` takes a
-  resolved `PatentsViewAdapterConfig` instead of a plain `SourceConfig`
+  resolved `PatentsViewAdapterConfig` instead of a `&str patentsview_key`
   so the host-binding below can be enforced before any adapter is
   built. The reqwest client uses `redirect::Policy::none()` so the
   `X-Api-Key` cannot be replayed to a 3xx-nominated host, and a

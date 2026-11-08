@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use scitadel_adapters::patentsview::{
     PATENT_FIELDS, PATENTSVIEW_API_URL, PatentsViewAdapter, request_body,
 };
-use scitadel_core::config::PatentsViewAdapterConfig;
+use scitadel_core::config::{PatentsViewAdapterConfig, PatentsViewKeySource};
 use scitadel_core::ports::SourceAdapter;
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -285,6 +285,13 @@ fn pv_cfg(
         base_url: base_url.map(str::to_string),
         bound_host: bound_host.map(str::to_string),
         legacy_unbound,
+        // Every binding exercised here is a stored key — the integration
+        // tests do not exercise env-key or file-key branches.
+        key_source: if bound_host.is_some() {
+            PatentsViewKeySource::Stored
+        } else {
+            PatentsViewKeySource::None
+        },
     }
 }
 

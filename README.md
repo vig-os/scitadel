@@ -427,13 +427,27 @@ scitadel auth login patentsview --host mirror.example # bound to a PatentSearch-
 
 At adapter build time, the effective endpoint's host must match the
 binding, or the adapter is NOT built — zero requests, with an error
-that names the binding and the configured host, and tells you how to
-rebind if the endpoint is trusted.
+that names the binding and the configured host.
+
+**Port semantics: host-only, any port.** `--host` takes a bare hostname
+(`patentref.io`), never `host:port`, never a URL or a path. The
+comparison at build time ignores the request URL's port, so a mirror
+served on `https://mirror.example:8443/` still matches a binding to
+`mirror.example`. This keeps the binding stable across environments
+where the mirror is reached on a different port (local testing, port
+forwards). `--host` is case-insensitive, IDN labels are stored in
+punycode, and a trailing dot (`patentref.io.`) is normalised away;
+pass whichever spelling is convenient.
 
 `SCITADEL_PATENTSVIEW_KEY` (an env-set key) is sent only when the
 endpoint also comes from the env or the default. A `base_url` in a
-`.scitadel/config.toml` is **not** authority for an env-set key to reach
-that host — bind the key with `auth login --host <host>` instead.
+`.scitadel/config.toml` is **not** authority for an env-set key to
+reach that host. When the two disagree, the refusal is
+**source-aware**: a stored-key error points at `scitadel auth login
+patentsview --host <host>` (rebind); an env-key error points at
+`SCITADEL_PATENTSVIEW_URL=<trusted URL>` or at clearing `[patentsview]
+base_url` in `.scitadel/config.toml` — `auth login` does not help with
+an env-set key.
 
 **Migrating from a pre-#268 key.** A key stored before host binding
 existed is treated as bound to the retired USPTO host

@@ -214,6 +214,26 @@ impl Default for UiConfig {
     }
 }
 
+/// Where the resolved `patentsview.api_key` came from (#268).
+///
+/// Drives the source-aware remediation hint in
+/// [`scitadel_adapters::enforce_patentsview_host_binding`]: a stored
+/// key is rebound with `scitadel auth login patentsview --host <h>`,
+/// while an env-set key is only ever fixed by changing env (set
+/// `SCITADEL_PATENTSVIEW_URL`) or by clearing the file-set `base_url`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PatentsViewKeySource {
+    /// No key configured.
+    #[default]
+    None,
+    /// Secret store (keychain / Secret Service / 0600 file backend).
+    Stored,
+    /// `SCITADEL_PATENTSVIEW_KEY` in the process environment.
+    Env,
+    /// `[patentsview] api_key` in `.scitadel/config.toml`.
+    File,
+}
+
 /// Fully-resolved PatentsView adapter configuration (#268).
 ///
 /// Carries the `api_key` plus the host it is allowed to reach, so a
@@ -241,6 +261,9 @@ pub struct PatentsViewAdapterConfig {
     /// `bound_host` was derived from a legacy keychain entry with no
     /// stored host, so the error should point at the PatentRef migration.
     pub legacy_unbound: bool,
+    /// Where `api_key` came from — drives the source-aware remediation
+    /// hint when the binding refuses.
+    pub key_source: PatentsViewKeySource,
 }
 
 /// Top-level application configuration.
@@ -346,7 +369,80 @@ fn default_db_path(workspace: &Path) -> PathBuf {
     workspace.join(".scitadel").join("scitadel.db")
 }
 
+/// The per-process inputs [`resolve_patentsview_adapter`] uses besides
+/// the TOML file (#268).
+///
+/// Factored out so the resolver is driven by a value, not by hidden
+/// reads of `std::env` and the secret store — the function is then
+/// table-testable end-to-end without poking the process environment.
+///
+/// `from_process()` reads the real env and the active secret store;
+/// tests build this struct inline.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PatentsViewEnv {
+    /// Value in the active secret store under `patentsview.api_key`,
+    /// or `None`.
+    pub stored_key: Option<String>,
+    /// Value in the active secret store under
+    /// [`crate::credentials::PATENTSVIEW_HOST_STORE_KEY`], or `None`.
+    /// Absence with `stored_key = Some(..)` is the "legacy unbound"
+    /// case: the key was stored before host binding existed and is
+    /// treated as pointing at the retired USPTO host.
+    pub stored_host: Option<String>,
+    /// `SCITADEL_PATENTSVIEW_KEY` in the process environment, trimmed,
+    /// `None` if empty or unset.
+    pub env_key: Option<String>,
+    /// `SCITADEL_PATENTSVIEW_URL` in the process environment, trimmed,
+    /// `None` if empty or unset.
+    pub env_url: Option<String>,
+}
+
+impl PatentsViewEnv {
+    /// Read the real process environment and the active secret store.
+    ///
+    /// The public [`resolve_patentsview_adapter`] uses this; tests
+    /// construct the struct themselves instead.
+    pub fn from_process() -> Self {
+        let stored_key = crate::credentials::get("patentsview.api_key").map(|s| s.into_string());
+        let stored_host = crate::credentials::get(crate::credentials::PATENTSVIEW_HOST_STORE_KEY)
+            .map(|s| s.into_string().trim().to_string())
+            .filter(|s| !s.is_empty());
+        let env_key = std::env::var("SCITADEL_PATENTSVIEW_KEY")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let env_url = std::env::var("SCITADEL_PATENTSVIEW_URL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        Self {
+            stored_key,
+            stored_host,
+            env_key,
+            env_url,
+        }
+    }
+}
+
 /// Resolve the PatentsView adapter configuration (#268).
+///
+/// Reads the process environment and the active secret store via
+/// [`PatentsViewEnv::from_process`]. Thin wrapper over
+/// [`resolve_patentsview_adapter_with_env`], which is what the tests
+/// drive directly.
+pub fn resolve_patentsview_adapter(
+    file_api_key: &str,
+    file_base_url: Option<&str>,
+) -> PatentsViewAdapterConfig {
+    resolve_patentsview_adapter_with_env(
+        &PatentsViewEnv::from_process(),
+        file_api_key,
+        file_base_url,
+    )
+}
+
+/// Resolve the PatentsView adapter configuration from explicit inputs
+/// (#268).
 ///
 /// The patentsview key is a bearer token sent as `X-Api-Key`, and
 /// `[patentsview] base_url` can be committed in a repo-level
@@ -359,6 +455,7 @@ fn default_db_path(workspace: &Path) -> PathBuf {
 ///
 /// # Parameters
 ///
+/// * `env` — process env + secret store state, see [`PatentsViewEnv`].
 /// * `file_api_key` — `[patentsview] api_key` as it appeared in the
 ///   TOML file (or `""` if absent). Kept as a fallback so a user who
 ///   writes the key in their own config.toml is not pushed into the
@@ -371,64 +468,54 @@ fn default_db_path(workspace: &Path) -> PathBuf {
 ///
 /// # Returned binding
 ///
-/// | key source | URL source | `bound_host` | `legacy_unbound` |
-/// |------------|------------|--------------|------------------|
-/// | keychain + stored host | — | `Some(stored_host)` | `false` |
-/// | keychain, no stored host | — | `Some(LEGACY_HOST)` | `true` |
-/// | env | env or default | `None` | `false` |
-/// | env | file | `Some(DEFAULT_HOST)` [^1] | `false` |
-/// | file | — | `None` | `false` |
-/// | none | — | `None` | `false` |
+/// | key source | URL source | `bound_host` | `legacy_unbound` | `key_source` |
+/// |------------|------------|--------------|------------------|--------------|
+/// | stored + stored host | — | `Some(stored_host)` | `false` | `Stored` |
+/// | stored, no stored host | — | `Some(LEGACY_HOST)` | `true` | `Stored` |
+/// | env | env or default | `None` | `false` | `Env` |
+/// | env | file | `Some(DEFAULT_HOST)` [^1] | `false` | `Env` |
+/// | file | — | `None` | `false` | `File` |
+/// | none | — | `None` | `false` | `None` |
 ///
 /// [^1]: forces the adapter builder to refuse against any file-set
 ///       URL that is not the default host; the operator has to either
 ///       clear the file's `base_url` or bind the key explicitly.
-pub fn resolve_patentsview_adapter(
+pub fn resolve_patentsview_adapter_with_env(
+    env: &PatentsViewEnv,
     file_api_key: &str,
     file_base_url: Option<&str>,
 ) -> PatentsViewAdapterConfig {
     // 1. Effective base URL: env wins over file, which wins over
     //    "none" (the adapter then uses its built-in default).
-    let env_url = std::env::var("SCITADEL_PATENTSVIEW_URL")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let env_url = env.env_url.clone();
     let file_base_url = file_base_url
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
     let effective_base_url = env_url.clone().or_else(|| file_base_url.clone());
 
-    // 2. Pick the key source. `credentials::get` only inspects the
-    //    active secret store, so we can distinguish keychain from env
-    //    from file-fallback instead of collapsing them with `resolve`.
-    let stored_key = crate::credentials::get("patentsview.api_key").map(|s| s.into_string());
-    let env_key = std::env::var("SCITADEL_PATENTSVIEW_KEY")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
     let file_key = Some(file_api_key.trim().to_string()).filter(|s| !s.is_empty());
 
-    if let Some(key) = stored_key {
+    if let Some(key) = env.stored_key.clone() {
         // Stored key — the binding (if any) travels with it. A stored
         // key with no stored host is a legacy entry written before
         // host-binding existed; treat it as USPTO so the error
         // message can be migration-specific.
-        let stored_host = crate::credentials::get(crate::credentials::PATENTSVIEW_HOST_STORE_KEY)
-            .map(|s| s.into_string().trim().to_string())
-            .filter(|s| !s.is_empty());
-        let legacy_unbound = stored_host.is_none();
-        let bound_host =
-            stored_host.unwrap_or_else(|| crate::credentials::PATENTSVIEW_LEGACY_HOST.to_string());
+        let legacy_unbound = env.stored_host.is_none();
+        let bound_host = env
+            .stored_host
+            .clone()
+            .unwrap_or_else(|| crate::credentials::PATENTSVIEW_LEGACY_HOST.to_string());
         return PatentsViewAdapterConfig {
             api_key: key,
             base_url: effective_base_url,
             bound_host: Some(bound_host),
             legacy_unbound,
+            key_source: PatentsViewKeySource::Stored,
         };
     }
 
-    if let Some(key) = env_key {
+    if let Some(key) = env.env_key.clone() {
         // Env key: an explicit per-process choice the operator made.
         // Honour it when the URL is also from env or the default,
         // but refuse to let it ride a `base_url` set in a repo file —
@@ -446,6 +533,7 @@ pub fn resolve_patentsview_adapter(
             base_url: effective_base_url,
             bound_host,
             legacy_unbound: false,
+            key_source: PatentsViewKeySource::Env,
         };
     }
 
@@ -459,6 +547,7 @@ pub fn resolve_patentsview_adapter(
             base_url: effective_base_url,
             bound_host: None,
             legacy_unbound: false,
+            key_source: PatentsViewKeySource::File,
         };
     }
 
@@ -467,6 +556,7 @@ pub fn resolve_patentsview_adapter(
         base_url: effective_base_url,
         bound_host: None,
         legacy_unbound: false,
+        key_source: PatentsViewKeySource::None,
     }
 }
 
@@ -474,10 +564,24 @@ pub fn resolve_patentsview_adapter(
 ///
 /// Resolution priority per credential: keychain → env var → config.toml → empty default.
 pub fn load_config() -> Config {
+    let workspace = find_workspace_root().unwrap_or_else(|| std::env::current_dir().unwrap());
+    load_config_with(&workspace, &PatentsViewEnv::from_process())
+}
+
+/// Load configuration with an explicit workspace root and patentsview
+/// env snapshot (#268).
+///
+/// The split exists so the round-2 attack path — stored key +
+/// attacker-committed `[patentsview] base_url` in a repo-level
+/// `.scitadel/config.toml` — can be driven end-to-end from a test with
+/// a temp workspace and a synthetic [`PatentsViewEnv`], without
+/// mutating the real process environment or the real secret store.
+/// Every other credential still reads from the real environment; the
+/// test can leave those unset.
+pub fn load_config_with(workspace: &Path, pv_env: &PatentsViewEnv) -> Config {
     use crate::credentials::resolve;
 
-    let workspace = find_workspace_root().unwrap_or_else(|| std::env::current_dir().unwrap());
-    let db_path = default_db_path(&workspace);
+    let db_path = default_db_path(workspace);
 
     // Try loading TOML config file as base
     let config_path = workspace.join(".scitadel").join("config.toml");
@@ -530,7 +634,8 @@ pub fn load_config() -> Config {
     // `config.patentsview_adapter`.
     let file_base_url = config.patentsview.base_url.clone();
     let file_api_key = config.patentsview.api_key.clone();
-    let adapter_cfg = resolve_patentsview_adapter(&file_api_key, file_base_url.as_deref());
+    let adapter_cfg =
+        resolve_patentsview_adapter_with_env(pv_env, &file_api_key, file_base_url.as_deref());
     config.patentsview.api_key.clone_from(&adapter_cfg.api_key);
     config
         .patentsview
@@ -701,5 +806,240 @@ mod tests {
             set.base_url.as_deref(),
             Some("https://mirror.example.org/api/v1/patent/")
         );
+    }
+
+    // ---------------------------------------------------------------
+    // resolve_patentsview_adapter_with_env (#268)
+    //
+    // Every row of the resolver's dispatch table has a test, so that
+    // adding a row later (e.g. an MCP-tool-provided key) fails loudly
+    // if it misses its binding or its key_source. The CLI's host-bind
+    // round-trip through the secret store is already covered by
+    // `credentials::tests::the_patentsview_host_binding_round_trips_through_the_file_backend`.
+    // ---------------------------------------------------------------
+
+    fn env(
+        stored_key: Option<&str>,
+        stored_host: Option<&str>,
+        env_key: Option<&str>,
+        env_url: Option<&str>,
+    ) -> PatentsViewEnv {
+        PatentsViewEnv {
+            stored_key: stored_key.map(str::to_string),
+            stored_host: stored_host.map(str::to_string),
+            env_key: env_key.map(str::to_string),
+            env_url: env_url.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn stored_key_with_default_url_binds_to_stored_host() {
+        let e = env(Some("stored-k"), Some("patentref.io"), None, None);
+        let got = resolve_patentsview_adapter_with_env(&e, "", None);
+        assert_eq!(got.api_key, "stored-k");
+        assert_eq!(got.base_url, None);
+        assert_eq!(got.bound_host.as_deref(), Some("patentref.io"));
+        assert!(!got.legacy_unbound);
+        assert_eq!(got.key_source, PatentsViewKeySource::Stored);
+    }
+
+    #[test]
+    fn stored_key_with_file_url_matching_bound_host_builds() {
+        // Store-time binding was `patentref.io`; the file URL names the
+        // same host. The resolver lets both through — the adapter
+        // builder's host comparison is what decides.
+        let e = env(Some("stored-k"), Some("patentref.io"), None, None);
+        let got = resolve_patentsview_adapter_with_env(
+            &e,
+            "",
+            Some("https://patentref.io/api/v1/patent/"),
+        );
+        assert_eq!(got.api_key, "stored-k");
+        assert_eq!(
+            got.base_url.as_deref(),
+            Some("https://patentref.io/api/v1/patent/")
+        );
+        assert_eq!(got.bound_host.as_deref(), Some("patentref.io"));
+        assert_eq!(got.key_source, PatentsViewKeySource::Stored);
+    }
+
+    #[test]
+    fn stored_key_with_file_url_mismatching_bound_host_still_carries_the_binding() {
+        // The resolver carries the stored binding through — the
+        // adapter builder refuses at search time. We assert the shape
+        // the builder sees.
+        let e = env(Some("stored-k"), Some("patentref.io"), None, None);
+        let got = resolve_patentsview_adapter_with_env(
+            &e,
+            "",
+            Some("https://attacker.example/api/v1/patent/"),
+        );
+        assert_eq!(got.api_key, "stored-k");
+        assert_eq!(
+            got.base_url.as_deref(),
+            Some("https://attacker.example/api/v1/patent/")
+        );
+        assert_eq!(got.bound_host.as_deref(), Some("patentref.io"));
+    }
+
+    #[test]
+    fn stored_key_with_env_url_still_binds_to_stored_host() {
+        // An env URL does not loosen the stored binding — the key was
+        // bound at store time for a reason.
+        let e = env(
+            Some("stored-k"),
+            Some("patentref.io"),
+            None,
+            Some("https://mirror.example/api/v1/patent/"),
+        );
+        let got = resolve_patentsview_adapter_with_env(&e, "", None);
+        assert_eq!(
+            got.base_url.as_deref(),
+            Some("https://mirror.example/api/v1/patent/")
+        );
+        assert_eq!(got.bound_host.as_deref(), Some("patentref.io"));
+    }
+
+    #[test]
+    fn env_key_with_env_url_runs_unbound() {
+        // Operator chose both the key and the URL explicitly this
+        // invocation — no file was involved.
+        let e = env(
+            None,
+            None,
+            Some("env-k"),
+            Some("https://mirror.example/api/v1/patent/"),
+        );
+        let got = resolve_patentsview_adapter_with_env(&e, "", None);
+        assert_eq!(got.api_key, "env-k");
+        assert_eq!(
+            got.base_url.as_deref(),
+            Some("https://mirror.example/api/v1/patent/")
+        );
+        assert_eq!(got.bound_host, None);
+        assert_eq!(got.key_source, PatentsViewKeySource::Env);
+    }
+
+    #[test]
+    fn env_key_with_default_url_runs_unbound() {
+        let e = env(None, None, Some("env-k"), None);
+        let got = resolve_patentsview_adapter_with_env(&e, "", None);
+        assert_eq!(got.api_key, "env-k");
+        assert_eq!(got.base_url, None);
+        assert_eq!(got.bound_host, None);
+        assert_eq!(got.key_source, PatentsViewKeySource::Env);
+    }
+
+    #[test]
+    fn env_key_with_file_url_refuses_via_default_host_binding() {
+        // THE round-2 attack mitigation on the env-key path: a
+        // committed `[patentsview] base_url` is not authority for an
+        // env-set key to reach that host. The resolver binds the key
+        // to the DEFAULT host, so the adapter builder refuses any
+        // non-default `base_url`.
+        let e = env(None, None, Some("env-k"), None);
+        let got = resolve_patentsview_adapter_with_env(
+            &e,
+            "",
+            Some("https://attacker.example/api/v1/patent/"),
+        );
+        assert_eq!(got.api_key, "env-k");
+        assert_eq!(
+            got.base_url.as_deref(),
+            Some("https://attacker.example/api/v1/patent/")
+        );
+        assert_eq!(
+            got.bound_host.as_deref(),
+            Some(crate::credentials::PATENTSVIEW_DEFAULT_HOST),
+        );
+        assert_eq!(got.key_source, PatentsViewKeySource::Env);
+    }
+
+    #[test]
+    fn legacy_stored_key_without_binding_is_treated_as_uspto() {
+        // A `patentsview.api_key` written before #268 existed has no
+        // companion host entry. Treat it as bound to the retired USPTO
+        // host so the adapter builder's error points at the migration.
+        let e = env(Some("legacy-uspto-k"), None, None, None);
+        let got = resolve_patentsview_adapter_with_env(&e, "", None);
+        assert_eq!(got.api_key, "legacy-uspto-k");
+        assert_eq!(
+            got.bound_host.as_deref(),
+            Some(crate::credentials::PATENTSVIEW_LEGACY_HOST),
+        );
+        assert!(got.legacy_unbound);
+        assert_eq!(got.key_source, PatentsViewKeySource::Stored);
+    }
+
+    #[test]
+    fn file_key_runs_unbound() {
+        // The user wrote both the key and the URL into their own
+        // config.toml — the decision is theirs.
+        let e = env(None, None, None, None);
+        let got = resolve_patentsview_adapter_with_env(
+            &e,
+            "file-k",
+            Some("https://mirror.example/api/v1/patent/"),
+        );
+        assert_eq!(got.api_key, "file-k");
+        assert_eq!(got.bound_host, None);
+        assert_eq!(got.key_source, PatentsViewKeySource::File);
+    }
+
+    #[test]
+    fn no_key_anywhere_yields_a_disabled_config() {
+        let e = env(None, None, None, None);
+        let got = resolve_patentsview_adapter_with_env(&e, "", None);
+        assert_eq!(got.api_key, "");
+        assert_eq!(got.bound_host, None);
+        assert!(!got.legacy_unbound);
+        assert_eq!(got.key_source, PatentsViewKeySource::None);
+    }
+
+    #[test]
+    fn the_attacker_committed_base_url_against_a_stored_key_refuses_adapter_build() {
+        // End-to-end round-2 attack path: a cloned repo commits
+        // `.scitadel/config.toml` with `[patentsview] base_url` pointing
+        // at an attacker-controlled host, AND the operator already has
+        // a `patentsview.api_key` bound to `patentref.io`. `load_config`
+        // must surface a `bound_host = Some("patentref.io")`, and
+        // feeding that into `build_adapters_with_field` must refuse
+        // without ever building an adapter (zero requests). The
+        // resolver's binding is what guarantees that.
+        let dir = tempfile::tempdir().unwrap();
+        let scitadel_dir = dir.path().join(".scitadel");
+        std::fs::create_dir_all(&scitadel_dir).unwrap();
+        std::fs::write(
+            scitadel_dir.join("config.toml"),
+            r#"db_path = "scitadel.db"
+
+[patentsview]
+base_url = "https://attacker.example/api/v1/patent/"
+"#,
+        )
+        .unwrap();
+
+        let pv_env = env(Some("stored-k"), Some("patentref.io"), None, None);
+        let config = load_config_with(dir.path(), &pv_env);
+
+        assert_eq!(config.patentsview_adapter.api_key, "stored-k");
+        assert_eq!(
+            config.patentsview_adapter.base_url.as_deref(),
+            Some("https://attacker.example/api/v1/patent/"),
+        );
+        assert_eq!(
+            config.patentsview_adapter.bound_host.as_deref(),
+            Some("patentref.io"),
+        );
+        assert!(!config.patentsview_adapter.legacy_unbound);
+        assert_eq!(
+            config.patentsview_adapter.key_source,
+            PatentsViewKeySource::Stored,
+        );
+        // The round-trip through `build_adapters_with_field` lives in
+        // the scitadel-adapters test suite
+        // (`patentsview_http::a_bound_key_refuses_a_different_configured_host_and_makes_no_request`);
+        // the shape we assert here is the input that drives that
+        // refusal.
     }
 }
