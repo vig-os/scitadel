@@ -110,6 +110,31 @@ gated by licence.
     serve from CPU and NVMe. Query embedding is client-side by
     default; the hub advertises the exact embedding model and rejects
     mismatched query vectors.
+15. **Build first on a strictly licence-clean corpus** (§15). Phase 1
+    ingests only content that is CC0, CC-BY or public-domain per
+    item, and whose access terms allow bulk harvest. The whole
+    phase-1 corpus is therefore also publishable on Hugging Face as
+    `.tsra`, giving us one audience — internal and external — on one
+    licence surface. Within that envelope phase 1 goes for **maximum
+    depth** (full text, figures, tables, cross-links, embeddings for
+    as much of the corpus as we can fit), not minimum viable. The
+    sources are listed in §15.
+16. **Licence-gated features are designed but disabled in phase 1.**
+    The entitlement classes and per-class gating of H4 (#318), local
+    display of licensed content for entitled lab users, and COUNTER
+    5.1 / SUSHI reporting for publisher usage, are designed and
+    wired through the schema and the protocol so later turn-on is a
+    configuration change — but no code path that reads, caches or
+    serves non-CC0/CC-BY content is enabled in phase 1. `get` and
+    `search` cannot return anything outside the licence-clean set.
+17. **The ETH Library approach comes after the demo.** A Research
+    Collection harvest agreement (ETH's institutional repository,
+    which today rate-limits off-network bulk callers), the lab's
+    reading of CopA Art. 24d for internal mining of free-to-read
+    works, a publisher local-hosting addendum negotiated through the
+    Consortium of Swiss Academic Libraries, and COUNTER 5.1 / SUSHI
+    reporting are deferred until a working phase-1 demo exists. We
+    approach ETH Library with a running hub, not a slide deck.
 
 ## 1 · Repo split
 
@@ -334,11 +359,18 @@ verified). The hub computes embeddings only for works they miss.
 
 | Call | Input | Output |
 |---|---|---|
-| `search` | query text, filters, mode (`bm25` / `vector` / `hybrid`), limit | Ranked candidates, each with a score and the mode that produced it |
+| `search` | query text **or** a client-supplied query vector (tagged with embedding model id, version and dims), filters, mode (`bm25` / `vector` / `hybrid`), limit | Snippet-only candidates (IDs, scores, snippets, provenance), each with the mode that produced it, plus a search-level `reranked: bool` |
 | `get` | Up to 100 IDs | Records |
 | `neighbours` | ID, edge kind, depth | Graph neighbours |
-| `coverage` | — | The sources, subsets and product versions the hub holds |
+| `coverage` | — | Which sources, subsets and product versions the hub holds — a client reads this to decide when to fall through to a live API |
+| `capabilities` | — (optionally an index id) | Per index: embedding model id, version, output dims, Matryoshka truncation applied, BM25 analyzer configuration, and the available rerankers — a client reads this to decide whether to send a query vector or fall back to text (#316) |
 
+- **Two separate advertisements.** `coverage` says *what the hub
+  holds*; `capabilities` says *how each index is built*. They change
+  at different cadences — `coverage` on every delta or release,
+  `capabilities` on an index rebuild — and clients cache them
+  independently. Mixing them would force every embedder update to
+  look like a coverage change.
 - **Provenance on every response:** it names the product seal or
   version that produced it.
 - **Untrusted text:** every text field arrives as `UntrustedText`
@@ -346,6 +378,11 @@ verified). The hub computes embeddings only for works they miss.
 - **Fallback:** the client asks the hub only for what `coverage`
   covers, and falls through to the live API on a miss, an error, or a
   bounded timeout. Every result records `answered_by: hub | <source>`.
+- **Model mismatch is explicit.** A client-supplied query vector
+  whose declared model id, version or dims do not match the target
+  index's `capabilities` response is rejected with an explicit
+  protocol error — the hub never silently re-embeds it under the
+  wrong model (§14).
 - **Transport:** HTTP+JSON first. The types do not assume it.
 
 ## 8 · Infrastructure
@@ -685,15 +722,18 @@ shortlist.
 **Client-side query embedding is the default.** It offloads the
 hub, works offline against detached subsets (§9, §12), and keeps
 the exact Matryoshka truncation the index was built with. The hub's
-`coverage` response (§7) advertises, per index: the embedding model
-id, version, output dims, Matryoshka truncation applied, the BM25
-analyzer configuration, and the available rerankers. The hub
-**rejects a query vector whose declared model id, version or dims
-do not match the target index** with an explicit error, rather than
-embedding it under the wrong model and silently degrading recall.
-Hub-side query embedding (text in, hub embeds) remains a fallback
-for thin clients and for the window between an index re-embedding
-and a client refresh.
+**`capabilities` response** (§7, #316) advertises, per index: the
+embedding model id, version, output dims, Matryoshka truncation
+applied, the BM25 analyzer configuration, and the available
+rerankers. (`coverage` is a separate call that lists what the hub
+holds, not how each index is built — they change at different
+cadences and clients cache them independently.) The hub **rejects a
+query vector whose declared model id, version or dims do not match
+the target index** with an explicit error, rather than embedding it
+under the wrong model and silently degrading recall. Hub-side query
+embedding (text in, hub embeds) remains a fallback for thin clients
+and for the window between an index re-embedding and a client
+refresh.
 
 **Hub sizing** *(estimates)*. A 50M-chunk corpus at 512-d fp16 is
 about 51 GB of raw vectors — resident in RAM on a sized box, or
@@ -712,6 +752,209 @@ access — those want the subset on local NVMe, which `detach`
 arranges (§12). The protocol routes a search to a local subset when
 one is available for the query's topic, and to the hub otherwise;
 `answered_by` reports which path answered (§7).
+
+## 15 · Sequencing: build first, licence-clean
+
+The owner's decision (2026-11-08): BUILD FIRST on a strictly
+licence-clean corpus, then approach ETH Library with a working
+demo. No licensed/paywalled caches, no grey-area sources, no
+scraping, in phase 1. Within that envelope phase 1 goes for
+**maximum depth** (full text, figures, tables, cross-links,
+embeddings for as much as we can fit), not minimum viable. The
+whole phase-1 corpus is therefore also publishable on Hugging Face
+as `.tsra`, giving us one audience — internal and external — on
+one licence surface.
+
+### Phase 1 — licence-clean sources
+
+Only sources whose content is **CC0, CC-BY or public-domain per
+item**, with per-item filterability, and whose access terms allow
+bulk harvest, are in scope. The triage in #323 is load-bearing;
+one line per source here, full matrix there.
+
+**Already locked in by shipping issues:**
+
+- **USPTO Grant Full Text XML** (#314) — PD-USGov, via ODP Bulk Data
+  Directory on `data.uspto.gov` (per #323's top comment), weekly;
+  100 % PD; full text + drawings + MathML.
+- **USPTO Pre-Grant Publication XML** — PD-USGov; weekly; same ICE
+  DTD; captures filings that never issue. Folded into #314 as a
+  second product sharing the H5 cascade.
+- **PatentsView PVGPATDIS** (#314) — CC BY 4.0; quarterly; US
+  disambiguated inventors / assignees / locations / CPC / citations.
+- **OpenAlex quarterly snapshot subset + free-key sync** (#315) —
+  CC0; abstracts (inverted index), no FT.
+
+**New phase-1 sibling slices (file as sub-issues under #311):**
+
+- **PMC OA `oa_comm` packages** — JATS tables and MathML + the
+  original figure files, filtered per article to CC0 / CC BY only;
+  biomedical FT backbone (H9).
+- **SureChEMBL** — CC BY 4.0; every 2 weeks; SMILES/InChI + patent →
+  compound maps; drops straight into the patent corpus (H10).
+- **DataCite + Crossref metadata** — CC0 (DataCite) + public-domain
+  metadata graph + references (Crossref); publish the graph, strip
+  publisher-supplied abstracts (H11).
+- **OpenAIRE Graph** — CC BY 4.0; Zenodo v10.5.0 (321 GB); EU
+  funding linkage (FP7 / H2020 / Horizon Europe) + Scholix (CC0).
+- **OpenCitations Index + Meta** — CC0; 2.56 B citations (dump
+  2026-07-28); strictly more open-citation coverage than Crossref's
+  own refs subset.
+- **DOAJ** — CC0 article + journal metadata; monthly public dump.
+- **DBLP** — CC0; monthly DOI'd XML snapshots on DROPS; sharper
+  author disambiguation for CS.
+- **ACL Anthology, 2016+ CC BY subset** — CC BY 4.0; metadata XML
+  - `anthology.bib.gz` + per-paper PDFs. Pre-2016 NC-SA is
+  cache-internal only.
+- **DOAB / OAPEN** — CC0 metadata + per-title CC0/CC-BY book FT
+  subset; exclude NC/ND; CC-BY-SA cache-internal.
+- **ORCID Public Data File** — CC0; annual on Figshare; identity +
+  affiliations + works list.
+- **OSF Preprints, CC0/CC-BY subset** — PsyArXiv / SocArXiv /
+  EarthArXiv / engrXiv / LawArXiv / MetaArXiv full text filtered
+  per preprint.
+- **HAL metadata** (CC0) + **HAL file-level CC-BY/CC0 subset** only
+  after the Jan-2026 mandatory-licence rollout propagates; legacy
+  no-licence files excluded.
+- **Research Square** — editorial policy CC BY 4.0 across the
+  corpus; include subject to confirming the request-API permits
+  bulk harvest.
+- **Zenodo, CC0/CC-BY per-record subset** — metadata CC0; monthly
+  dumps via `/api/exporter`; lowest-friction add after OpenAlex
+  and PMC OA.
+- **ChemRxiv, CC-BY subset only** — include subject to re-verifying
+  the public-API endpoint and TDM rate limits.
+- **arXiv CC-BY/CC0 subset** — LaTeX **source** via bulk S3 for
+  papers whose per-paper licence is CC-BY/CC0; perfect equations,
+  tables, often-vector figures. Non-redistributable majority stays
+  out of phase 1.
+- **bioRxiv + medRxiv CC-BY/CC0 subset** — MECA packages (JATS +
+  figures), filtered per paper.
+- **Europe PMC CC-BY/CC0 subset** — same per-article licence model
+  as PMC OA.
+- **INSPIRE-HEP metadata** — CC0; HEP citation graph (not FT —
+  duplicates arXiv).
+- **Retraction Watch via Crossref** — QC must-have (see below).
+  Licence footnote: treat as **CC BY 4.0 "data via Crossref /
+  Retraction Watch"** until Crossref states otherwise.
+
+### Phase-1 ingest shape — maximum depth
+
+Within the licence-clean envelope phase 1 goes deep, not shallow:
+
+- **Structured sources first (T0 — cheap, best quality):** JATS /
+  LaTeX / XML sources are ingested as native structure (equations,
+  tables with MathML, figure references, bibliographies), not
+  reduced to plain text. The GPU-heavy extraction tiers (Docling /
+  Marker / math OCR under §10 T1–T3) are reserved for PDF-only
+  items. Sources in this bucket: PMC OA `oa_comm` (JATS + original
+  figures); arXiv LaTeX source (CC-BY/CC0 subset); bioRxiv /
+  medRxiv JATS; US patent XML; ACL / OAPEN / DOAB / Zenodo CC-BY
+  items.
+- **Crossref TDM-link harvester** for CC-BY/CC0 publisher full text:
+  filter Crossref metadata to CC-BY/CC0 `license` URLs and follow
+  the `link[intended-application=text-mining]` entries through
+  scitadel's paced per-publisher buckets (ADR-007). This is the
+  main non-biomed lever for ETH fields: MDPI, Frontiers, Copernicus,
+  IOP, APS (PRX etc.), Springer Nature OA, IEEE Access, ACS
+  AuthorChoice CC-BY. Open question 12 checks that Crossref still
+  exposes both fields and notes per-publisher terms.
+- **Hugging Face as the cold store for the licence-clean public
+  corpus** — the full corpus (especially figure and patent-drawing
+  products) lives on HF and is read by HTTP range (tessera#777);
+  anvil keeps the indexes (BM25 / ANN / graph), the metadata, the
+  text blocks and the hot set. Sizing *(estimates)*: ~5–10 M
+  licence-clean papers × (text ~8 KB + tables ~5 KB + figures
+  ~200 KB JXL + vectors ~30 KB) ≈ 1–2.5 TB; US patent drawings
+  ≈ 0.5–1.5 TB. This exceeds anvil's 2 TB 990 PRO, which is why
+  "HF cold + anvil hot" is the layout, not "everything on anvil".
+- **Embedding levels** — work, section, chunk, figure (Qwen3-VL),
+  table (serialised + caption → text embedder), independent claim,
+  graph node. GPU budget *(estimates)*: ~250 M text chunks ≈ 1–2
+  days on the 5090; ~100 M+ figures / drawings with the 2 B VL
+  embedder ≈ days–weeks — staged (hot topics first, the rest at
+  `priority=low` in the shared queue).
+- **Retraction flags are a must-have, not an enrichment.** Every
+  record the hub holds that matches a Retraction Watch entry (by
+  DOI or PMID) is surfaced with its retraction status and date on
+  `search` and `get` responses; search result rendering says so.
+  Flags are joined at index-build time (§5, §6), not at query
+  time, and travel with the published `.tsra` on HF.
+
+### Phase 1 — gated features designed but disabled
+
+The licence-gating code paths are wired through the schema and the
+protocol so phase 2 is a configuration change, not a rewrite:
+
+- **H4 (#318) entitlement classes** — licence-class columns on every
+  row and every artefact; the protocol carries them. Phase 1 writes
+  them with a single class (`public-licence-clean`), and `get` /
+  `search` cannot return rows outside that class. The infrastructure
+  for additional classes is designed; no code path that reads caches
+  or serves non-CC0/CC-BY content is enabled.
+- **Local display of licensed content** for entitled lab users —
+  schema, retention policy (§12) and `detach` shape are designed;
+  no licensed content is ingested in phase 1, so no reader path
+  exercises them.
+- **COUNTER 5.1 / SUSHI reporting** for publisher usage — the event
+  schema, hub-side counters and the SUSHI emit point are designed;
+  the recording path is a no-op when no licensed content is served
+  (all phase-1 content is CC0/CC-BY/PD and not COUNTER-reportable).
+
+### Phase 1 — deferred until the ETH Library conversation
+
+Defer everything that needs an agreement, a legal reading, or a
+publisher contract. We approach ETH Library with a running hub,
+not a slide deck.
+
+- **ETH Research Collection bulk harvest** — the Library
+  rate-limits off-network bulk callers; harvest needs an agreement
+  (coordinator-verified facts in #323).
+- **CORE full text** — CORE's own licence is under review and the
+  per-item licence of underlying works is not tracked at CORE's
+  level.
+- **Semantic Scholar / S2ORC** — the AI2 Datasets API licence blocks
+  redistribution; even non-commercial internal use needs ETH legal
+  clearance.
+- **Unlicensed bronze / green OA full text** — free-to-read but no
+  explicit CC licence; falls under CopA Art. 24d, needs the lab's
+  legal reading before caching.
+- **Paywalled caches** — anything behind a publisher paywall, via
+  any vehicle (library IP, SUSHI, OpenAthens, …); phase-2 by
+  definition.
+- **EPO paid bulk** (DOCDB / INPADOC / EP full text) — subscriber
+  contract forbids redistribution; cache-internal only if the lab
+  subscribes.
+- **Swiss institutional repositories** (EPFL Infoscience, ZORA,
+  BORIS Portal, SERVAL) — all roll into the ETH-Library
+  conversation as a Swiss repository federation discussion. EPFL's
+  CC0 metadata is phase-1-eligible in principle but subsumed by
+  OpenAlex's EPFL coverage, so no net gain.
+- **NASA ADS, RePEc, Software Heritage (source code), Preprints.org,
+  BASE** — each fails on licence, access channel or terms; see
+  the matrix in #323.
+
+### Phase 2 — what the ETH Library conversation unlocks
+
+In a single conversation, not before, and only after a running
+phase-1 demo:
+
+- a **Research Collection harvest agreement** (ETH content, now
+  licence-cleared and rate-limited properly);
+- the lab's reading of **CopA Art. 24d** for internal text/data
+  mining of free-to-read works (unlocks unlicensed bronze / green
+  for internal use);
+- a **publisher local-hosting addendum** negotiated through the
+  **Consortium of Swiss Academic Libraries** (the vehicle for
+  publisher paid caches, EPO bulk and Swiss repository
+  federation);
+- **COUNTER 5.1 / SUSHI** reporting plumbing — the recording path
+  designed in H4 switches from no-op to live.
+
+Nothing in phase 2 reopens the phase-1 licence surface: the
+HF-publishable `.tsra` corpus stays CC0/CC-BY/PD by definition,
+and phase-2 licensed content goes into a separate licence class
+that is lab-internal only.
 
 ## Slices
 
@@ -821,12 +1064,12 @@ Upstream: vig-os/tessera#778 waves:
   paying tens of ms per probe rather than the RAM path's ms.
   The 51 GB raw-vectors estimate is a ceiling, not a floor.
 - Client-side query embedding couples the client to the hub's
-  embedding-model identity, version and output dims. The `coverage`
-  advertisement plus the hub's explicit mismatch rejection keeps
-  that coupling safe, but a client that cannot run the current
-  embedder (thin clients, old builds, a window after a hub
-  re-embedding) has to fall back to hub-side embedding and pays the
-  hub's CPU for it.
+  embedding-model identity, version and output dims. The
+  `capabilities` advertisement (§7) plus the hub's explicit mismatch
+  rejection keeps that coupling safe, but a client that cannot run
+  the current embedder (thin clients, old builds, a window after a
+  hub re-embedding) has to fall back to hub-side embedding and pays
+  the hub's CPU for it.
 
 ## Open questions for the owner
 
@@ -854,3 +1097,11 @@ Upstream: vig-os/tessera#778 waves:
     and ingest), on sage (lower-contention GPU, one more hop), or
     either, chosen by cost and queue depth? The `reranked: false`
     fallback covers each choice either way.
+12. **Crossref TDM fields (§15):** does Crossref still expose both
+    the `license` URL and
+    `link[intended-application=text-mining]` entries on current
+    records, for every CC-BY/CC0 publisher we'd harvest through
+    (MDPI, Frontiers, Copernicus, IOP, APS, Springer Nature OA,
+    IEEE Access, ACS AuthorChoice CC-BY)? And which of those
+    publishers add TDM-specific terms on top of the CC licence
+    that we must honour per-publisher in the paced buckets?
