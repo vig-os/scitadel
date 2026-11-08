@@ -2,7 +2,7 @@
 type: issue
 state: open
 created: 2026-09-29T12:26:32Z
-updated: 2026-11-02T04:09:38Z
+updated: 2026-11-07T11:31:57Z
 author: renovate[bot]
 author_url: https://github.com/renovate[bot]
 url: https://github.com/vig-os/scitadel/issues/244
@@ -13,53 +13,53 @@ milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-11-02T08:35:50.382Z
+synced: 2026-11-08T08:16:20.802Z
 ---
 
 # [Issue 244]: [Dependency Dashboard](https://github.com/vig-os/scitadel/issues/244)
 
 This issue lists Renovate updates and detected dependencies. Read the [Dependency Dashboard](https://docs.renovatebot.com/key-concepts/dashboard/) docs to learn more.<br>[View this repository on the Mend.io Web Portal](https://developer.mend.io/github/vig-os/scitadel).
 
-## Rate-Limited
+## Awaiting Schedule
 
-The following updates are currently rate-limited. To force their creation now, click on a checkbox below.
+The following updates are awaiting their schedule. To get an update now, click on a checkbox below.
 
- - [ ] <!-- unlimit-branch=renovate/async-trait-0.x-lockfile -->chore(deps): update rust crate async-trait to v0.1.92
- - [ ] <!-- unlimit-branch=renovate/chrono-0.x-lockfile -->chore(deps): update rust crate chrono to v0.4.45
- - [ ] <!-- unlimit-branch=renovate/rust-futures-monorepo -->chore(deps): update rust crate futures to v0.3.34
- - [ ] <!-- unlimit-branch=renovate/libc-0.x-lockfile -->chore(deps): update rust crate libc to v0.2.191
- - [ ] <!-- unlimit-branch=renovate/schemars-1.x-lockfile -->chore(deps): update rust crate schemars to v1.2.3
- - [ ] <!-- unlimit-branch=renovate/serde-monorepo -->chore(deps): update rust crate serde to v1.0.229
- - [ ] <!-- unlimit-branch=renovate/serde_json-1.x-lockfile -->chore(deps): update rust crate serde_json to v1.0.154
- - [ ] <!-- unlimit-branch=renovate/thiserror-2.x-lockfile -->chore(deps): update rust crate thiserror to v2.0.21
- - [ ] <!-- unlimit-branch=renovate/tokio-tracing-monorepo -->chore(deps): update rust crate tracing-subscriber to v0.3.23
- - [ ] <!-- unlimit-branch=renovate/unicode-normalization-0.x-lockfile -->chore(deps): update rust crate unicode-normalization to v0.1.26
- - [ ] <!-- unlimit-branch=renovate/github-actions-(minor-and-patch) -->ci(actions): update github-actions (minor and patch) (`rust-lang/crates-io-auth-action`, `vig-os/commit-action`)
- - [ ] <!-- unlimit-branch=renovate/assert_cmd-2.x-lockfile -->chore(deps): update rust crate assert_cmd to v2.2.2
- - [ ] <!-- unlimit-branch=renovate/clap-4.x-lockfile -->chore(deps): update rust crate clap to v4.6.7
- - [ ] <!-- unlimit-branch=renovate/insta-1.x-lockfile -->chore(deps): update rust crate insta to v1.49.0
- - [ ] <!-- unlimit-branch=renovate/pdf-extract-0.x -->chore(deps): update rust crate pdf-extract to 0.12
- - [ ] <!-- unlimit-branch=renovate/proptest-1.x-lockfile -->chore(deps): update rust crate proptest to v1.12.0
- - [ ] <!-- unlimit-branch=renovate/quick-xml-0.x -->chore(deps): update rust crate quick-xml to 0.42
- - [ ] <!-- unlimit-branch=renovate/r2d2_sqlite-0.x -->chore(deps): update rust crate r2d2_sqlite to 0.35
- - [ ] <!-- unlimit-branch=renovate/reqwest-0.x -->chore(deps): update rust crate reqwest to 0.13
- - [ ] <!-- unlimit-branch=renovate/rmcp-3.x-lockfile -->chore(deps): update rust crate rmcp to v3.8.0
- - [ ] <!-- unlimit-branch=renovate/rusqlite-0.x -->chore(deps): update rust crate rusqlite to 0.41
- - [ ] <!-- unlimit-branch=renovate/scraper-0.x -->chore(deps): update rust crate scraper to 0.29
- - [ ] <!-- unlimit-branch=renovate/sha1-0.x -->chore(deps): update rust crate sha1 to 0.11
- - [ ] <!-- unlimit-branch=renovate/sha2-0.x -->chore(deps): update rust crate sha2 to 0.11
- - [ ] <!-- unlimit-branch=renovate/tempfile-3.x-lockfile -->chore(deps): update rust crate tempfile to v3.27.0
- - [ ] <!-- unlimit-branch=renovate/tokio-1.x-lockfile -->chore(deps): update rust crate tokio to v1.54.1
- - [ ] <!-- unlimit-branch=renovate/uuid-1.x-lockfile -->chore(deps): update rust crate uuid to v1.29.0
- - [ ] <!-- unlimit-branch=renovate/zeroize-1.x-lockfile -->chore(deps): update rust crate zeroize to v1.9.1
- - [ ] <!-- unlimit-branch=renovate/biblatex-0.x -->fix(deps): update rust crate biblatex to 0.12
- - [ ] <!-- unlimit-branch=renovate/toml-0.x -->fix(deps): update rust crate toml to 0.9
- - [ ] <!-- unlimit-branch=renovate/keyring-4.x -->chore(deps): update rust crate keyring to v4
- - [ ] <!-- unlimit-branch=renovate/actions-checkout-7.x -->ci(actions): update actions/checkout action to v7
- - [ ] <!-- unlimit-branch=renovate/ubuntu-26.x -->ci(actions): update dependency ubuntu to v26
- - [ ] <!-- unlimit-branch=renovate/toml-1.x -->fix(deps): update rust crate toml to v1
- - [ ] <!-- unlimit-branch=renovate/lock-file-maintenance -->chore(deps): lock file maintenance
- - [ ] <!-- create-all-rate-limited-prs -->🔐 **Create all rate-limited PRs at once** 🔐
+ - [ ] <!-- unschedule-branch=renovate/async-trait-0.x-lockfile -->chore(deps): update rust crate async-trait to v0.1.92
+ - [ ] <!-- unschedule-branch=renovate/chrono-0.x-lockfile -->chore(deps): update rust crate chrono to v0.4.45
+ - [ ] <!-- unschedule-branch=renovate/rust-futures-monorepo -->chore(deps): update rust crate futures to v0.3.34
+ - [ ] <!-- unschedule-branch=renovate/libc-0.x-lockfile -->chore(deps): update rust crate libc to v0.2.191
+ - [ ] <!-- unschedule-branch=renovate/schemars-1.x-lockfile -->chore(deps): update rust crate schemars to v1.2.3
+ - [ ] <!-- unschedule-branch=renovate/serde-monorepo -->chore(deps): update rust crate serde to v1.0.229
+ - [ ] <!-- unschedule-branch=renovate/serde_json-1.x-lockfile -->chore(deps): update rust crate serde_json to v1.0.154
+ - [ ] <!-- unschedule-branch=renovate/thiserror-2.x-lockfile -->chore(deps): update rust crate thiserror to v2.0.21
+ - [ ] <!-- unschedule-branch=renovate/tokio-tracing-monorepo -->chore(deps): update rust crate tracing-subscriber to v0.3.23
+ - [ ] <!-- unschedule-branch=renovate/unicode-normalization-0.x-lockfile -->chore(deps): update rust crate unicode-normalization to v0.1.26
+ - [ ] <!-- unschedule-branch=renovate/github-actions-(minor-and-patch) -->ci(actions): update github-actions (minor and patch) (`rust-lang/crates-io-auth-action`, `vig-os/commit-action`)
+ - [ ] <!-- unschedule-branch=renovate/assert_cmd-2.x-lockfile -->chore(deps): update rust crate assert_cmd to v2.2.2
+ - [ ] <!-- unschedule-branch=renovate/clap-4.x-lockfile -->chore(deps): update rust crate clap to v4.6.7
+ - [ ] <!-- unschedule-branch=renovate/insta-1.x-lockfile -->chore(deps): update rust crate insta to v1.49.0
+ - [ ] <!-- unschedule-branch=renovate/pdf-extract-0.x -->chore(deps): update rust crate pdf-extract to 0.12
+ - [ ] <!-- unschedule-branch=renovate/proptest-1.x-lockfile -->chore(deps): update rust crate proptest to v1.12.0
+ - [ ] <!-- unschedule-branch=renovate/quick-xml-0.x -->chore(deps): update rust crate quick-xml to 0.42
+ - [ ] <!-- unschedule-branch=renovate/r2d2_sqlite-0.x -->chore(deps): update rust crate r2d2_sqlite to 0.35
+ - [ ] <!-- unschedule-branch=renovate/reqwest-0.x -->chore(deps): update rust crate reqwest to 0.13
+ - [ ] <!-- unschedule-branch=renovate/rmcp-3.x-lockfile -->chore(deps): update rust crate rmcp to v3.9.0
+ - [ ] <!-- unschedule-branch=renovate/rusqlite-0.x -->chore(deps): update rust crate rusqlite to 0.41
+ - [ ] <!-- unschedule-branch=renovate/scraper-0.x -->chore(deps): update rust crate scraper to 0.29
+ - [ ] <!-- unschedule-branch=renovate/sha1-0.x -->chore(deps): update rust crate sha1 to 0.11
+ - [ ] <!-- unschedule-branch=renovate/sha2-0.x -->chore(deps): update rust crate sha2 to 0.11
+ - [ ] <!-- unschedule-branch=renovate/tempfile-3.x-lockfile -->chore(deps): update rust crate tempfile to v3.27.0
+ - [ ] <!-- unschedule-branch=renovate/tokio-1.x-lockfile -->chore(deps): update rust crate tokio to v1.54.1
+ - [ ] <!-- unschedule-branch=renovate/uuid-1.x-lockfile -->chore(deps): update rust crate uuid to v1.29.1
+ - [ ] <!-- unschedule-branch=renovate/zeroize-1.x-lockfile -->chore(deps): update rust crate zeroize to v1.9.1
+ - [ ] <!-- unschedule-branch=renovate/biblatex-0.x -->fix(deps): update rust crate biblatex to 0.12
+ - [ ] <!-- unschedule-branch=renovate/toml-0.x -->fix(deps): update rust crate toml to 0.9
+ - [ ] <!-- unschedule-branch=renovate/keyring-4.x -->chore(deps): update rust crate keyring to v4
+ - [ ] <!-- unschedule-branch=renovate/actions-checkout-7.x -->ci(actions): update actions/checkout action to v7
+ - [ ] <!-- unschedule-branch=renovate/ubuntu-26.x -->ci(actions): update dependency ubuntu to v26
+ - [ ] <!-- unschedule-branch=renovate/toml-1.x -->fix(deps): update rust crate toml to v1
+ - [ ] <!-- unschedule-branch=renovate/lock-file-maintenance -->chore(deps): lock file maintenance
+ - [ ] <!-- create-all-awaiting-schedule-prs -->🔐 **Create all awaiting schedule PRs at once** 🔐
 
 ## Open
 
@@ -71,7 +71,7 @@ The following updates have all been created. To force a retry/rebase of any, cli
 
 ## Detected Dependencies
 
-<details><summary>cargo (10)</summary>
+<details><summary>cargo (5)</summary>
 <blockquote>
 
 <details><summary>Cargo.toml (37)</summary>
@@ -116,24 +116,9 @@ The following updates have all been created. To force a retry/rebase of any, cli
 
 </details>
 
-<details><summary>crates/scitadel-adapters/Cargo.toml</summary>
-
-
-</details>
-
-<details><summary>crates/scitadel-cli/Cargo.toml</summary>
-
-
-</details>
-
 <details><summary>crates/scitadel-core/Cargo.toml (1)</summary>
 
  - `toml 0.8` → [Updates: `0.9`, `1.0`]
-
-</details>
-
-<details><summary>crates/scitadel-db/Cargo.toml</summary>
-
 
 </details>
 
@@ -150,16 +135,6 @@ The following updates have all been created. To force a retry/rebase of any, cli
 
 </details>
 
-<details><summary>crates/scitadel-mcp/Cargo.toml</summary>
-
-
-</details>
-
-<details><summary>crates/scitadel-scoring/Cargo.toml</summary>
-
-
-</details>
-
 <details><summary>crates/scitadel-tui/Cargo.toml (1)</summary>
 
  - `libc 0.2` → [Updates: `0.2`]
@@ -169,13 +144,8 @@ The following updates have all been created. To force a retry/rebase of any, cli
 </blockquote>
 </details>
 
-<details><summary>github-actions (20)</summary>
+<details><summary>github-actions (8)</summary>
 <blockquote>
-
-<details><summary>.github/actions/setup-devkit-toolchain/action.yml</summary>
-
-
-</details>
 
 <details><summary>.github/workflows/abandon-release.yml (5)</summary>
 
@@ -191,21 +161,6 @@ The following updates have all been created. To force a retry/rebase of any, cli
 
  - `actions/checkout v6` → [Updates: `v7`]
  - `Swatinem/rust-cache v2`
-
-</details>
-
-<details><summary>.github/workflows/ci.yml</summary>
-
-
-</details>
-
-<details><summary>.github/workflows/codeql.yml</summary>
-
-
-</details>
-
-<details><summary>.github/workflows/devkit-upgrade.yml</summary>
-
 
 </details>
 
@@ -238,16 +193,6 @@ The following updates have all been created. To force a retry/rebase of any, cli
 
 </details>
 
-<details><summary>.github/workflows/prepare-release.yml</summary>
-
-
-</details>
-
-<details><summary>.github/workflows/promote-release.yml</summary>
-
-
-</details>
-
 <details><summary>.github/workflows/publish-crates.yml (5)</summary>
 
  - `actions/checkout v6` → [Updates: `v7`]
@@ -258,25 +203,10 @@ The following updates have all been created. To force a retry/rebase of any, cli
 
 </details>
 
-<details><summary>.github/workflows/release-core.yml</summary>
-
-
-</details>
-
 <details><summary>.github/workflows/release-extension.yml (2)</summary>
 
  - `actions/checkout v6` → [Updates: `v7`]
  - `ubuntu 24.04` → [Updates: `26.04`]
-
-</details>
-
-<details><summary>.github/workflows/release-publish.yml</summary>
-
-
-</details>
-
-<details><summary>.github/workflows/release.yml</summary>
-
 
 </details>
 
@@ -286,21 +216,6 @@ The following updates have all been created. To force a retry/rebase of any, cli
  - `Swatinem/rust-cache v2`
  - `actions/checkout v6` → [Updates: `v7`]
  - `Swatinem/rust-cache v2`
-
-</details>
-
-<details><summary>.github/workflows/scorecard.yml</summary>
-
-
-</details>
-
-<details><summary>.github/workflows/sync-issues.yml</summary>
-
-
-</details>
-
-<details><summary>.github/workflows/sync-main-to-dev.yml</summary>
-
 
 </details>
 
