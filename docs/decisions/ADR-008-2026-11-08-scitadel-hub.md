@@ -3,7 +3,7 @@
 **Status**: Proposed.
 **Date**: 2026-11-08
 **Supersedes**: —
-**Context**: #311 (epic), #313–#316 (H0–H3), #268 (PatentsView retirement), #246 (System One ranking), vig-os/tessera#778, gerchowl/g-fleet#1121
+**Context**: #311 (epic), #313–#316 (H0–H3), #318–#321 (H4–H7), #268 (PatentsView retirement), #246 (System One ranking), vig-os/tessera#778, gerchowl/g-fleet#1121
 
 Figures marked *(estimate)* are back-of-envelope numbers, not measurements.
 Prices and limits for third-party services are as published on 2026-11-08.
@@ -49,9 +49,11 @@ ADR-007. Four things changed:
 
 ADR-007 settled how scitadel *acquires* full text for a curated set of
 works. This ADR settles where a lab keeps a *searchable copy of the
-corpus* and how clients use it. The two do not overlap: the hub holds
-metadata, abstracts, patent full text (public domain) and derived
-indexes; it does not fetch publisher full text.
+corpus* and how clients use it. The hub does not crawl publishers: it
+holds metadata, abstracts, patent full text (public domain), the
+derived indexes, and the full text that **clients acquire** through
+ADR-007 (§12), stored once per lab instead of once per laptop and
+gated by licence.
 
 ## Decision
 
@@ -83,6 +85,24 @@ indexes; it does not fetch publisher full text.
    research-data store (versitygw, g-fleet#1121), a POSIX working copy
    under `/srv/anvil/projects/<project>/`, and GPU work only as queued
    batch jobs.
+9. **Full text is stored as a document model, not as documents** (§9).
+   Papers become Arrow-shaped tables in tessera/Vortex shard products,
+   one block per element type, linked by keys. JATS, TEI, HTML and
+   PDF are ingest sources; Typst, HTML and Markdown are rendered views.
+10. **Extraction runs as a tiered cascade** (§10): each tier, from
+    parsing up to a frontier model, sees only what the cheaper tier
+    could not settle, and the tiers are gated by licence.
+11. **Every process leaves full provenance** (§11): tool, version,
+    config, weights, inputs, job and every cascade verdict.
+12. **Heavy originals stay out of the database** (§12). PDFs and raw
+    XML live in a content-addressed artefact store. A raw-retention
+    policy by size and by the cost of fetching again decides what is
+    kept, and licence classes gate who may read what. Clients keep
+    identity and annotations; the hub keeps bytes; `detach` brings full
+    copies back to a client.
+13. **Quality is a growing test suite** (§13): a golden set, a red/green
+    quarantine loop, and random-sample QC on every batch, for papers and
+    patents alike.
 
 ## 1 · Repo split
 
@@ -106,26 +126,57 @@ indexes; it does not fetch publisher full text.
 
 The repo is created only after this ADR is Accepted (#313).
 
-## 2 · Data model on tessera
+## 2 · Data model on tessera: layout and lifecycle
 
-- **Products.** One product per (corpus, release):
-  - `openalex-works-subset@2026-10` (quarterly base);
-  - `openalex-works-delta@2026-11-08` (daily delta);
-  - `uspto-grants@2026-W45` (weekly delta);
-  - a quarterly patent re-seal.
+- **Shard products, not one product per paper.** A release is a
+  collection of shard products of about 1–10 GB *(estimate)*:
+  - OpenAlex: one shard per field (26) × publication-year bucket,
+    grouped in a collection per field under the release's base
+    collection;
+  - patents: one shard per grant year × CPC section (A–H, Y).
 
-  Each product records its provenance: the upstream release, the
-  filter that defined the subset, and the code version that built it.
-- **Tables:** works, authorships, abstracts, patents, claims,
-  description sections, CPC codes, and edge tables (§4). These are
-  Vortex table blocks.
-- **Add-only.** Nothing is rewritten in place. A delta product shadows
-  rows of the base by ID; a periodic compaction writes a new base. This
-  matches the fleet rule that existing data under `/srv/anvil` is never
-  moved, rewritten or deleted.
+  The blocks inside a shard are the document model of §9. Each product
+  records its provenance (§11): the upstream release, the filter that
+  defined the subset, and the code version that built it.
+- **Base + deltas + a pointer** (H6, #320):
+
+  ```
+  base/<release>/     a collection per quarterly snapshot (OpenAlex) or
+                      PatentsView release (patents): shards + derived products
+  delta/<date>.tsra   the same blocks: upserted rows + tombstones
+                      (id, merged → W… | deleted), with small caches of its own
+  current             a tiny content-addressed collection {base, deltas[]};
+                      the only thing that moves
+  ```
+
+  OpenAlex deltas are daily (§5); patent deltas are the weekly grant
+  XML (§6).
+- **Reads are newest-wins.** The logical table is base ⊕ deltas: the
+  newest row per ID wins and tombstones drop or redirect IDs. In
+  DataFusion this is a union plus an anti-join on the small delta ID
+  set. Search runs on the base and delta caches, merges the top-k and
+  masks superseded rows. tessera has no keyed delta semantics yet:
+  tessera#781 (upsert/tombstone/redirect, newest-wins read,
+  compaction, retention).
+- **Compaction writes a new base.** A new quarterly release becomes the
+  new base, the deltas older than its snapshot date retire, and
+  `current` moves atomically. Deltas may also be merged monthly along
+  the way. Nothing is rewritten in place.
+- **Retention is an explicit policy.** Hub data lives in its own
+  versitygw bucket (g-fleet#1121), with a retention policy (default:
+  keep the last 2 bases and their deltas). The fleet's add-only rule
+  for `/srv/anvil` covers research data written by GPU jobs. The hub's
+  working copy is a rebuildable mirror of the bucket, and a generation
+  expires by that policy, never by an ad-hoc delete. How the two rules
+  meet is settled in g-fleet#1121 (H6).
 - **Derived means rebuildable.** Every product can be rebuilt from
-  upstream. That is why tessera's pre-1.0 format is acceptable here: a
-  format change costs a rebuild, not data.
+  upstream or from the artefact store (§12). That is why tessera's
+  pre-1.0 format is acceptable here: a format change costs a rebuild,
+  not data.
+- **Size blocker: tessera#628.** String-heavy tables seal about 3×
+  larger than Parquet today. The architect triaged it as a format
+  decision (a determinism test on ksb, then an ADR). Until it lands,
+  sealed shards are estimated at about 3× their Parquet size.
 - **Internal Parquet staging until tessera is ready.** Until tessera
   W0/W1 land (tessera#778), the hub may stage ingest as Parquet on its
   own disk and re-seal later. That staging is never published: what
@@ -237,6 +288,23 @@ verified). The hub computes embeddings only for works they miss.
   Embeddings: PatentSBERTa (768-d) over title+abstract, about 8M
   grants, about 12 GB at fp16 *(estimate)*.
 - **Weekly delta:** the new grant XML becomes a new delta product.
+- **Same cascade and QC as papers** (§10, §13):
+  - **T0** parses the USPTO full-text XML (ICE DTD) into the §9 model:
+    abstract, description, claims, embedded tables, math and chemistry
+    (MathML / CWU chemical structures), and the description of the
+    drawings. The claim dependency tree becomes edges (claim → the
+    claim it depends on).
+  - **Drawings** are TIFF images. They take the figure path of §9:
+    stored as JPEG XL lossless, embedded with Qwen3-VL-Embedding, and
+    sent to the vision model at T3 when needed.
+  - **PatentsView TSVs** supply the disambiguated bibliographic data
+    (assignees, inventors, locations).
+  - **Licence:** US patent text is public domain, so every tier,
+    including T4, is allowed. Other offices (e.g. EPO) are a later
+    extension, each with its own licence check.
+  - **Out of scope:** pre-1976 patents, which are images only and would
+    need OCR.
+  - **The golden set has a patent stratum** (§13).
 - **Publication.** A Hugging Face dataset under a `vig-os` org,
   shipped as **`.tsra` only**, with a dataset card (tessera#777).
   Consumers read columns straight from HF over HTTP range reads through
@@ -285,6 +353,9 @@ verified). The hub computes embeddings only for works they miss.
   - patents: 100–150 GB;
   - OpenAlex subsets: 5–50 GB each;
   - indexes: ~1.5× the text they cover;
+  - artefact store (§12): kept TEI for a 2M-paper subset ~8–10 GB
+    zstd; paywalled PDFs at ~1.5 MB each, growing with what the lab
+    acquires;
   - initial total: about 1 TB including working copies.
 
   A full OpenAlex mirror is ~770 GB as Parquet and an estimated ~2.5 TB
@@ -301,6 +372,277 @@ verified). The hub computes embeddings only for works they miss.
 - **Scoring.** System One scoring follows #246 (hosted Clef or local
   Kev). Where Kev runs is a deployment detail of #246, not of this ADR.
 
+## 9 · Document model
+
+TEI, JATS, publisher HTML and PDF are **ingest sources** (raw input,
+§12), not storage. Storage is Arrow-shaped tables in tessera/Vortex,
+designed for column access, compression and embedding (H5, #319).
+
+**Blocks in a shard product,** each sorted by `(work_id, ord)`:
+
+| Block | Columns |
+|---|---|
+| `works` | work_id, DOI, licence class, source (`jats` / `html` / `tei` / `pdf`), extractor@version, per-work content hash, raw-input hashes + URLs, QC metrics (§13) |
+| `elements` | work_id, ord, parent_ord, kind (heading, paragraph, equation, list, caption, …), text, page, bbox[4] |
+| `inline_refs` | work_id, ord, span, target kind (citation, figure, table, formula), target id |
+| `bib` | work_id, bib_id, parsed fields, DOI, `matched_work_id`, the source of citation edges |
+| `table_cells` | work_id, table_id, row, col, text, `num: f64?`, unit |
+| `figures` | work_id, fig_id, caption ord, bbox, blob ref |
+| `chunks` | work_id, chunk_id, element span, tokens: 300–400-token spans for #246 (derived) |
+
+**Derived products next to each shard:**
+- embeddings, one product per model: chunk and figure vectors,
+  row-aligned with `chunks` and `figures` (tessera ADR-0062 row
+  alignment; vector columns per tessera#768);
+- figure blobs, in their own product so text scans never touch images
+  (storage rules below);
+- figure descriptions written by the T3 vision model (chart type,
+  axes, variables, trend) as a derived text column for BM25 and text
+  embeddings. These cover the hot set only, generated lazily, not the
+  whole corpus;
+- a work_id → shard index, so a citation to a work in another shard
+  resolves cheaply (tessera#780).
+
+**Figure storage is lossless only:**
+
+| Source image | Stored as | Why |
+|---|---|---|
+| Vector graphics in the PDF | SVG, in a string column (zstd) | Exact and small |
+| Embedded JPEG | JPEG XL lossless transcode | ~20% smaller, and the original JPEG is reconstructed bit-exactly, so its hash still verifies |
+| Lossless raster (PNG, TIFF, patent drawings) | JPEG XL lossless | Smaller than PNG; no generational loss |
+| 16-bit / high bit-depth | JPEG XL | WebP is 8-bit only and capped at 16,383 px per side |
+
+- **Never re-encode lossily for storage.** WebP/AVIF thumbnails exist
+  only as on-demand display views.
+- **Rust:** jxl-oxide decodes; encoding goes through libjxl (C++). A
+  pure-Rust lossless encoder is unverified.
+- **tessera has no binary columns today,** by design. Declared
+  media-typed binary columns are tessera#779.
+
+**Figure embeddings: Qwen3-VL-Embedding** (`Qwen/Qwen3-VL-Embedding-2B`,
+2048-d, or the 8B at 4096-d; released 2026-01, arXiv 2601.04720).
+- It puts text, images and page screenshots in one shared space, so a
+  text query finds a chart.
+- Matryoshka truncation to e.g. 512–1024 dims keeps the store small;
+  the quality loss is checked on the golden set (§13).
+- The Qwen3-VL-Reranker reorders the top-k.
+- CLIP and SigLIP were considered and are weak on charts and plots.
+- **Where it runs:** bulk embedding on the 5090 via `gpu_submit`,
+  interactive work on sage.
+
+**Linking:**
+- **Within a shard, by keys.** Sorting by `(work_id, ord)` keeps one
+  paper's rows together in every block, so "give me paper W" touches a
+  few chunks per block, found by chunk statistics (tessera ADR-0059).
+- **Across products, by provenance** (§11).
+- Declared keyed links between blocks (`bib.matched_work_id` →
+  `works.work_id`) and the work_id → product index are tessera#780;
+  binary columns for figure bytes are tessera#779. Both are tessera gap
+  issues under tessera#778.
+
+**Compression comes from the layout:**
+- sorted keys compress to runs and deltas;
+- `kind` and section names use dictionaries;
+- prose uses string encodings (tessera#628);
+- numbers stay apart from text: `table_cells.num`, bbox and pages are
+  typed columns for pcodec;
+- embeddings are f16 or int8 + scale (tessera#768).
+
+Rough per-paper size *(estimate)*:
+
+| Part | Size |
+|---|---|
+| PDF | ~1.5 MB |
+| Text | ~5–8 KB compressed |
+| Tables | a few KB |
+| Figures | ~100 KB–1 MB, lossless (JPEG XL / SVG) |
+| Vectors | ~10 KB |
+
+Figures dominate what is left. H5 measures the real numbers.
+
+**Rendered views are not storage.** Typst, HTML and Markdown are
+generated on demand for the TUI reader, the GUI and LLM context.
+Converting a PDF into Typst is lossy (layout, reading order,
+equations) and the result is not queryable; storing it would also make
+the Typst compiler a dependency for reading our own data.
+
+**No per-paper `.tsra` in the hub.** Per-paper products would have
+three costs:
+- their overhead (manifest, seals, footers) would exceed a paper's
+  ~20 KB of text;
+- tiny blocks compress badly;
+- a corpus-wide query would open millions of objects.
+
+A per-paper `.tsra` exists only as the output of a client-side
+`detach` (§12).
+
+## 10 · Extraction pipeline
+
+**Source preference per work:**
+1. JATS (PMC / Europe PMC bulk);
+2. publisher HTML;
+3. Grobid TEI from the OpenAlex content API. OpenAlex holds ~71M TEI
+   files (~1.5 TB, ~73M PDFs at ~113 TB), but each download costs
+   $0.01, so a free key fetches 100 a day. It fills gaps only;
+4. our own PDF extraction.
+
+**Tables** come from JATS first. **Figures** are cut by their
+coordinates and stored losslessly (SVG, or JPEG XL; §9), with captions
+linked. **Formulas** come as
+LaTeX/MathML from JATS or from math OCR; Grobid's flattened formula
+text is a fallback only. **Chunks** of 300–400 tokens feed #246 pass 2.
+
+**A tiered cascade.** Each tier runs only on what the cheaper tier
+could not settle:
+
+| Tier | What | Where | Escalates when |
+|---|---|---|---|
+| T0 | Parse JATS / publisher HTML / USPTO XML | CPU | No structured source, or a QC flag |
+| T1 | Tool extraction: Grobid, Docling, Marker, math OCR | CPU + the 5090 (`gpu_submit`) | A QC flag, or two extractors disagree |
+| T2 | System One yes/no checks (Clef/Kev, #246): "is this table complete?", "is this the reading order?" | Clef hosted / Kev local | The answer is below the calibrated confidence |
+| T3 | A Qwen vision-language model compares the page image with the extraction and repairs it (model size to be decided) | sage | It cannot repair, or its confidence is low |
+| T4 | Opus (`claude-opus-5-5`) via the API gives the final verdict | external API | Fails → quarantine + a red fixture (§13) |
+
+**Guardrails:**
+- **Tiers are licence-gated.** T4 is an external API: only CC-BY/CC0
+  and public-domain content (US patents) may reach it. Paywalled or
+  unlicensed content stops at T3, which runs on our own hardware,
+  unless its licence allows more.
+- **T3 and T4 have budget caps,** and work queues when a cap is reached;
+  nothing is skipped silently.
+- **Every tier's verdict goes into provenance** (§11): model and
+  version, prompt hash, decision, confidence.
+- **Escalation thresholds are calibrated** against the golden set
+  (§13), and recalibrated when a tier's model changes.
+
+Patents run the same cascade with a USPTO-specific T0 (§6).
+
+## 11 · Provenance of every process
+
+- **Every derived product records** (tessera Generation /
+  `derived_from`):
+  - tool and version, and config;
+  - model-weights hash;
+  - input hashes (raw artefacts or upstream products);
+  - GPU job ID and host;
+  - the cascade verdicts that shaped it.
+- **Per work, as columns on `works`:** which source and extractor
+  produced the rows, and the highest cascade tier reached.
+- **Raw inputs are referenced by hash and URL even when not held**
+  (§12). tessera ADR-0033 assumes originals are kept, so tessera
+  provenance needs records for external inputs it does not hold
+  (held / cold / discarded, with a `--fetch-check`): tessera#782,
+  which amends ADR-0033. Today a blake3-digest source reference
+  *fails* `tessera provenance --require-complete`.
+- **Multi-step and per-row provenance.** One shard passes through
+  several tools and cascade tiers, and different works reach different
+  tiers. tessera#782 also adds typed multi-step pipeline provenance and
+  per-row provenance via a `prov_id` column. Today tessera records
+  provenance only per product.
+- **Originals are never touched.** Re-extraction or re-embedding writes
+  new derived products.
+
+## 12 · Artefact store, raw retention, licences and the client store
+
+**Heavy originals stay out of the corpus database** (H4, #318). PDFs
+and raw JATS/TEI/HTML live in a content-addressed artefact store:
+- keys are blake3 hashes, the identity tessera and ADR-007 already use;
+- it is a cold bucket on versitygw (g-fleet#1121);
+- `works` rows reference it by hash and source URL;
+- raw XML never goes into tessera products.
+
+**Raw retention is set by size and by the cost of fetching again:**
+
+| Raw input | Policy | Why |
+|---|---|---|
+| Open-access PDF | Delete after ingest. Keep blake3 + URL + fetch date; a re-fetch is verified against the hash. | Large (~1.5 MB), free to fetch again |
+| Paywalled, acquired PDF | Keep, in cold storage, as the version of record | Hard to obtain again |
+| JATS from PMC / Europe PMC bulk | Either way; default keep (small) | Free to fetch again |
+| TEI from the OpenAlex content API | Keep, zstd-compressed: ~40 GB raw, ~8–10 GB zstd for a 2M-paper subset *(estimate)* | $0.01 per fetch |
+
+Keeping the XML lets us re-derive after extractor upgrades without
+paying again, and protects against upstream link rot and retractions.
+
+**Licence classes, recorded per artefact:**
+
+| Class | Hub cache | Embed / index | Cascade up to | Publish on HF |
+|---|---|---|---|---|
+| CC-BY / CC0 / public domain | yes | yes | T4 | yes, with attribution |
+| Free to read, no licence (bronze/green) | lab-internal only | internal only | T3 | no |
+| Paywalled, obtained with a member's access rights | entitled users only (same licence, e.g. ETH members) | internal only | T3 | never |
+
+The free-to-read row relies on the Swiss Copyright Act's
+text-and-data-mining exception for research (CopA Art. 24d). That is
+our reading, to be confirmed with ETH Library (open question 7).
+
+**The client store model:**
+- **The client keeps references.** A local scitadel stores identity
+  (DOI, OpenAlex ID, content hash), annotations, reviews and its
+  configured hub. By default it stores no PDF bytes.
+- **The hub keeps bytes, once per lab.** When a client acquires a work
+  through ADR-007 (including tier-2 TDM #258 and tier-4 capture #256),
+  it offers the artefact to the hub (upload-on-acquire). The upload
+  carries the licence class, the entitlement and the acquisition
+  provenance. Entitled colleagues then get it from the hub instead of
+  the publisher.
+- **`scitadel detach` / `export`** pulls full copies of tracked papers
+  into local storage, checking the licence per artefact. It can emit a
+  per-paper `.tsra` whose provenance points at the hub shard's seal.
+- **Guardrails:**
+  - never a bulk proxy for paywalled content: the hub caches only what
+    members fetched individually, and the ADR-007 pacer still applies
+    upstream;
+  - minimal access logging: entitlement checks, not reading histories,
+    with bounded retention.
+
+## 13 · Quality: golden set, red/green loop, random-sample QC
+
+(H7, #321.)
+
+- **Golden set.** A stratified fixture set of about 500–2,000 papers:
+  - strata: source type (JATS / HTML / TEI / PDF), publisher, field,
+    year, language;
+  - hard cases: math-heavy, table-heavy, scanned, two-column,
+    supplementary material, retracted;
+  - **a patent stratum:** utility, design, plant and reissue patents;
+    chemistry-heavy, many-claims and drawings-heavy patents.
+
+  Each fixture is the raw input plus the expected tessera output, as
+  `insta` snapshot tests.
+- **Split by licence.** CC-BY/CC0 and public-domain fixtures live in
+  the repo or on HF and run in public CI. All others live in a private
+  fixture bucket and run on fleet runners only.
+- **The red/green loop.** Every extraction failure or QC flag goes
+  through the same steps:
+  1. quarantine the raw input;
+  2. add a fixture with a failing test (red);
+  3. fix it (green);
+  4. the case joins the golden set permanently.
+
+  The hub may open the issue itself, respecting the licence split.
+- **QC metrics per work,** as columns on `works`:
+  extracted-text-to-PDF ratio, empty sections, table parse rate,
+  extractor confidence.
+- **Random-sample QC on every batch,** for silent errors:
+  - **Ingest:**
+    - a fixed random sample per batch goes through T3/T4 (licence
+      permitting) regardless of flags. 300 samples with 0 errors put
+      the error rate below ~1% at 95% confidence (rule of three);
+    - error rates are tracked per source and per extractor version.
+  - **Embeddings:**
+    - NaN, norm and duplicate checks;
+    - self-retrieval;
+    - recall@k on golden queries;
+    - ANN recall against exact search (tessera#769);
+    - drift between model versions on the golden set before any
+      re-embedding.
+
+  Confirmed errors become red fixtures.
+- **Upgrades go through the golden set first.** An extractor, model or
+  threshold change runs on the golden set and produces a diff report.
+  Only after review is the corpus re-derived.
+- **Patents too.** The same harness covers the patent corpus (§6).
+
 ## Slices
 
 | Slice | Issue | Where | Depends on |
@@ -309,12 +651,22 @@ verified). The hub computes embeddings only for works they miss.
 | H1 — patent corpus + HF publication | #314 | hub | H0; tessera W0/W1 (internal Parquet staging first is fine), W2 for indexes, #777 for publication; g-fleet#1121 |
 | H2 — OpenAlex lab mirror | #315 | hub | H0; tessera W0 (#628) and W1; g-fleet#1121 |
 | H3 — `hub` source adapter + protocol | #316 | scitadel | H0; a mock hub for tests, H1/H2 for end-to-end |
+| H4 — artefact store, raw retention, licence gating, upload-on-acquire, `detach` | #318 | both | H0, H5; ADR-007 acquisition; g-fleet#1121 |
+| H5 — document model + tiered extraction pipeline | #319 | hub | H0, H4, H7; tessera W0–W2, tessera#779, #780, #782 |
+| H6 — base + delta lifecycle, compaction, retention | #320 | hub | H0, H5; tessera#781; g-fleet#1121 |
+| H7 — golden set, red/green loop, random-sample QC | #321 | hub | H0; runs alongside H1, H2 and H5 from their first batch |
 
 Upstream: vig-os/tessera#778 waves:
 - W0: #758, #628;
 - W1: #654, #666, #668;
 - W2: #768 → #769, #775, #777;
-- W3: #776.
+- W3: #776;
+- the gap issues filed for the hub:
+  - W1: tessera#780 (declared keys and keyed references, work_id →
+    product index), tessera#782 (pipeline and per-row provenance,
+    external inputs not held);
+  - W2: tessera#781 (keyed delta products);
+  - tessera#779 (media-typed binary columns for figure bytes).
 
 ## Alternatives considered
 
@@ -348,6 +700,21 @@ Upstream: vig-os/tessera#778 waves:
   Face dataset viewer and `load_dataset()` compatibility. A Parquet
   projection can be added later if consumers ask for it, as a derived
   export of the sealed products.
+- **TEI, JATS or Typst as the storage format.** Rejected: XML trees and
+  typesetting source are not queryable at corpus scale, compress
+  worse than typed columns, and Typst conversion is lossy. They are
+  ingest sources (TEI, JATS) or render views (Typst) instead (§9).
+- **One `.tsra` per paper.** Rejected for the hub: per-product overhead
+  exceeds a paper's text, tiny blocks compress badly, and corpus
+  queries would open millions of objects. Kept for client-side
+  `detach` (§12).
+- **PDFs inside tessera products.** Rejected: ~1.5 MB per paper of
+  mostly fonts and rasters would dominate every shard. Originals live
+  in the artefact store, under a retention policy (§12).
+- **Sending every paper to a frontier model.** Rejected: cost, and
+  licences forbid sending unlicensed or paywalled text to an external
+  API. The cascade (§10) spends each tier only on what the cheaper
+  tiers could not settle.
 - **USPTO ODP API as the patent source.** Rejected for search: it
   serves application metadata, not full-text search, and allows only
   one concurrent call per key. It remains useful for single-record
@@ -371,6 +738,14 @@ Upstream: vig-os/tessera#778 waves:
 - A public Hugging Face dataset under `vig-os` brings a maintenance
   promise: a dataset card, a weekly or quarterly cadence, and licence
   attribution.
+- The hub holds licensed content. Licence classes, entitlement checks
+  and the T4 gate are security-relevant code and need tests, not
+  conventions.
+- T3 (sage) and T4 (the Opus API) cost GPU time and money. Budget caps
+  and queueing bound them; the random-sample QC sets a floor on that
+  spend.
+- The golden set is a permanent asset to curate: its private half
+  needs a private bucket and fleet runners.
 
 ## Open questions for the owner
 
@@ -385,3 +760,11 @@ Upstream: vig-os/tessera#778 waves:
    g-fleet#1121?
 6. **Default subset:** which subscriptions should the first lab mirror
    carry (topics, the lab's institution, members' libraries)?
+7. **Licence reading:** does ETH Library confirm that free-to-read
+   works without a licence may be cached and mined lab-internally
+   under CopA Art. 24d, and which publisher licences allow sharing
+   among ETH members through a hub?
+8. **Retention:** keep the last 2 bases (default), or more?
+9. **T3 model:** which Qwen vision-language model size fits sage? sage's
+   specs are unverified.
+10. **T3/T4 budgets:** the daily caps for sage time and Opus API spend.
