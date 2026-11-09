@@ -1704,6 +1704,20 @@ fn neutralise_window(window: &str) -> String {
 /// Char-based, like `assemble_read_paper_response`'s own slice: this is
 /// a character budget, not a byte budget, so multi-byte scripts cap at
 /// a predictable count.
+///
+/// Window edges snap to `UntrustedBody`'s escape-sequence boundaries so
+/// an OSC 8 hyperlink (or any ANSI/CSI/OSC sequence) is never split
+/// across windows. A split would leave the sequence's tail — including
+/// the URL of an OSC 8 — as visible text in the next window, because
+/// `neutralise` needs the opening `ESC` to recognise the payload. The
+/// snap preserves `char_range` coordinate consistency (positions stay
+/// in stored-text char coordinates), unlike neutralising the full body
+/// first and slicing after, which would drift positions whenever a
+/// zero-width or bidi character was stripped. The window may extend a
+/// few chars past `offset + max_chars` to cover a straddling sequence;
+/// `max_chars` stays a floor on progress rather than a hard cap, and
+/// `next_offset` reflects the snapped end so a paging caller crosses
+/// the boundary cleanly.
 fn window_body(
     body: &str,
     offset: usize,
@@ -1711,7 +1725,8 @@ fn window_body(
 ) -> (Option<String>, usize, bool, Option<usize>) {
     let total_chars = body.chars().count();
     let start = offset.min(total_chars);
-    let end = start.saturating_add(max_chars).min(total_chars);
+    let preferred_end = start.saturating_add(max_chars).min(total_chars);
+    let end = snap_window_end(body, start, preferred_end, total_chars);
     let slice: String = body.chars().skip(start).take(end - start).collect();
     // `truncated` captures *either* side of the window being cut: a
     // mid-document offset with no body past it is still a truncation on
@@ -1720,6 +1735,31 @@ fn window_body(
     let was_truncated = start > 0 || end < total_chars;
     let next_offset = if end < total_chars { Some(end) } else { None };
     (Some(slice), total_chars, was_truncated, next_offset)
+}
+
+/// Snap `preferred_end` forward past any escape sequence that would be
+/// split by cutting the body there. Returns the end to use, capped at
+/// `total_chars`.
+///
+/// A sequence that starts inside `[start, preferred_end)` but extends
+/// past `preferred_end` is extended to its full span. A sequence that
+/// starts at or after `preferred_end` is left alone — it belongs to
+/// the next window, which starts at the returned end. A sequence that
+/// started before `start` is not our concern: this window is one in a
+/// paged walk, and the previous window's snap already included the
+/// whole sequence.
+fn snap_window_end(body: &str, start: usize, preferred_end: usize, total_chars: usize) -> usize {
+    use scitadel_core::untrusted::escape_ranges;
+    let mut end = preferred_end;
+    for (es, ee) in escape_ranges(body) {
+        if es >= start && es < end && ee > end {
+            end = ee;
+        }
+        if es >= end {
+            break;
+        }
+    }
+    end.min(total_chars)
 }
 
 /// Full-text search over stored search queries. Returns a JSON array of
@@ -3112,6 +3152,135 @@ mod tests {
             "an EOF point anchor is outside a non-final window: \
              {first_window}"
         );
+    }
+
+    /// A window boundary that cuts through an ANSI/OSC escape
+    /// sequence used to leave the sequence's tail — including the
+    /// URL of an OSC 8 hyperlink — as visible text in the next
+    /// window: `neutralise` needs the opening `ESC` to recognise
+    /// the payload, and the tail arrives without it. `window_body`
+    /// now snaps the window's end past a straddling sequence, so
+    /// every window renders clean of ESC, control and bidi/
+    /// zero-width characters, and the hidden URL never appears as
+    /// visible text. The snap keeps `char_range` coordinate
+    /// consistency intact (positions are still stored-text char
+    /// offsets). (#307 review nit.)
+    #[test]
+    fn get_annotated_paper_windows_never_leak_escape_or_invisible_chars() {
+        let db = fresh_db();
+        // Build a body that lands each class of hazard across a
+        // `max_chars = 20` window boundary:
+        //  * an OSC 8 hyperlink carrying a URL that straddles
+        //    boundary 20 (first OSC at char 6..38, URL mid-boundary),
+        //  * a CSI colour sequence that straddles boundary 60 (SGR
+        //    at char 59..63, cut after `ESC [`),
+        //  * a zero-width joiner and a bidi RLO interleaved with
+        //    prose (single-char invisibles, dropped per-char),
+        //  * a bare BEL control char in body text.
+        // Positions are counted out in the comments next to each
+        // piece so an edit knows what moves.
+        let osc = "\u{1b}]8;;http://evil.example/secret\u{7}click here\u{1b}]8;;\u{7}";
+        let csi = "\u{1b}[31mred\u{1b}[0m";
+        let invisibles = "zwj\u{200d}joiner bidi\u{202e}reversed\u{7}bell";
+        let body = format!("start {osc} mid {csi} end {invisibles} tail");
+
+        save_paper(&db, "p-esc", "Escapes across windows", Some(&body));
+        let total = body.chars().count();
+
+        // `max_chars = 20` cuts inside the first OSC's URL (boundary
+        // ~20 falls at char 20 of the body, inside `http://evil…` at
+        // positions 6..38) and inside the first CSI at boundary
+        // ~60 (CSI at 59..63). The snap must advance each window's
+        // end past these sequences, and the next window must start
+        // on clean text.
+        let page = 20usize;
+
+        // Walk every page via `next_offset`, collect rendered windows.
+        let mut rendered = Vec::<String>::new();
+        let mut offset = 0usize;
+        let mut covered_through: usize = 0;
+        loop {
+            let v: serde_json::Value =
+                serde_json::from_str(&build_annotated_paper(&db, "p-esc", page, offset).unwrap())
+                    .unwrap();
+            let window_text = v["paper"]["full_text"]
+                .as_str()
+                .expect("rendered window text")
+                .to_string();
+            let reported_offset = v["paper"]["offset"].as_u64().unwrap() as usize;
+            assert_eq!(reported_offset, offset);
+            rendered.push(window_text);
+            match v["paper"]["next_offset"].as_u64() {
+                Some(next) => {
+                    let next = next as usize;
+                    assert!(
+                        next > offset,
+                        "next_offset must advance past the current window"
+                    );
+                    covered_through = next;
+                    offset = next;
+                }
+                None => {
+                    covered_through = total;
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            covered_through, total,
+            "paging via next_offset reaches total_chars: {covered_through} / {total}"
+        );
+
+        // Every window is clean: no raw ESC / BEL / control / bidi /
+        // zero-width chars, and no fragment of the hidden URL.
+        for (i, win) in rendered.iter().enumerate() {
+            assert!(
+                !win.contains('\u{1b}'),
+                "window {i} still carries ESC: {win:?}"
+            );
+            assert!(
+                !win.contains('\u{7}'),
+                "window {i} still carries BEL: {win:?}"
+            );
+            for c in win.chars() {
+                assert!(
+                    !c.is_control() || c.is_whitespace(),
+                    "window {i} carries non-whitespace control {c:?}: {win:?}"
+                );
+            }
+            for bad in [
+                '\u{200b}', '\u{200c}', '\u{200d}', '\u{2060}', '\u{feff}', '\u{200e}', '\u{200f}',
+                '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}',
+                '\u{2068}', '\u{2069}',
+            ] {
+                assert!(
+                    !win.contains(bad),
+                    "window {i} carries invisible/bidi {bad:?}: {win:?}"
+                );
+            }
+            // The URL (and the "evil" substring that tells us we
+            // leaked its text) must never appear — the OSC 8 wraps
+            // it, and `neutralise` strips the whole sequence.
+            assert!(
+                !win.contains("evil"),
+                "window {i} leaked the OSC 8 URL: {win:?}"
+            );
+            assert!(
+                !win.contains("http://"),
+                "window {i} leaked the URL scheme: {win:?}"
+            );
+            assert!(
+                !win.contains("[31m") && !win.contains("[0m"),
+                "window {i} leaked a CSI parameter list: {win:?}"
+            );
+        }
+
+        // Positive check: the visible label from the hyperlink and
+        // the plain prose survive across the paged walk.
+        let joined = rendered.concat();
+        assert!(joined.contains("click here"), "label kept: {joined:?}");
+        assert!(joined.contains("start"), "start kept: {joined:?}");
+        assert!(joined.contains("tail"), "tail kept: {joined:?}");
     }
 
     /// Annotations with no `char_range` are counted in a separate
