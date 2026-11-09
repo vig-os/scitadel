@@ -81,7 +81,7 @@ Verify with `claude mcp list`.
 
 ## Quick start
 
-Every project-aware command (`history`, `export`, `question list`, `bib *`, `acquire`, `gc`, `coverage`, the TUI, the MCP server, …) requires `scitadel init` first; a `.scitadel/` marker is how scitadel knows which directory is your project root. Only `scitadel init` creates it.
+Every project-aware command needs a `.scitadel/` marker — that directory is how scitadel knows which cwd ancestor is your project root. Read-only and inspection commands (`history`, `show`, `export`, `diff`, `question list`, `coverage`, `action list`, `bib snapshot`, `bib rekey`, `bib diff --question-id`, `resolve-doi --no-save`, `acquire --dry-run`, `gc`, the TUI) refuse with an init hint if the marker is not visible. Write-side commands (`search`, `assess`, `download`, real `acquire`, `snowball`, `scan`, `attach`, `bib import`, `bib watch`, `question create`, `question add-terms`, `override-identity`, `resolve-doi` saving, `import-flat`) will create the marker in cwd if none exists above you, so a first real acquisition in a fresh tree still Just Works. `scitadel init` is the documented creator and the one to use when you want control over where the project lives.
 
 ```bash
 # Initialize the database (creates ./.scitadel/scitadel.db)
