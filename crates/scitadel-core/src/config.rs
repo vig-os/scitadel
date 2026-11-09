@@ -187,20 +187,66 @@ fn default_scoring_concurrency() -> u32 {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AcquireConfig {
     /// Override for the per-fetch body cap (ADR-007 §1 "Storage"; #288),
-    /// in bytes.
+    /// in **bytes**.
     ///
     /// `None` — the serde default — keeps the workspace-wide constant
     /// `scitadel_adapters::download::FETCH_BODY_CAP_BYTES` (which is the
-    /// one re-export of `cap_for_kind("fulltext_pdf")`, so the fetch path
-    /// and `scan` can never drift). Setting a value **raises or lowers**
-    /// the cap — raising it is how an operator unlocks a cap-refused work
-    /// for a named re-acquire (`scitadel acquire --paper <id>`), which is
-    /// the one way out of `too_large` (ADR-007 §2 doc / migration 015).
+    /// one re-export of `cap_for_kind("fulltext_pdf")`). Setting a value
+    /// **raises or lowers** the fulltext row of ADR-007 §1's cap table in
+    /// one place: `scitadel_db::sqlite::cap_for_kind_with_override` reads
+    /// it, and *both* the fetch path (`scitadel_adapters::download`) and
+    /// the drop-in path (`scitadel_adapters::scan::{scan, plan, attach}`)
+    /// pass the same `body_cap_bytes` through it, so a manual import of an
+    /// oversized fulltext is admitted iff a fetch of the same bytes would
+    /// be. SI / figure / table caps are not touched: the knob names *the
+    /// fetch body cap* and the fetch body is a fulltext.
+    ///
+    /// Raising the cap is how an operator unlocks a cap-refused work for a
+    /// named re-acquire (`scitadel acquire --paper <id>`), which is the one
+    /// way out of `too_large` (ADR-007 §2 doc / migration 015); "fetch
+    /// manually and import" works for the same reason, now that scan reads
+    /// the same cap.
     ///
     /// Env override: `SCITADEL_ACQUIRE_BODY_CAP_BYTES` (parsed as `u64`).
-    /// Precedence: env > TOML > unset (keep the default).
+    /// Precedence: env > TOML > unset (keep the default). The value is
+    /// validated at load time against [`BODY_CAP_MIN_BYTES`] — a cap under
+    /// 1 MiB would refuse every full-text PDF the ladder ever fetches, so
+    /// values under the floor (and the "`100` meant as MB" mistake) are
+    /// rejected rather than silently applied.
     #[serde(default)]
     pub body_cap_bytes: Option<u64>,
+}
+
+/// The lowest `body_cap_bytes` the loader accepts, in bytes (#288).
+///
+/// 1 MiB — a cap below this would refuse every real full-text PDF. The floor
+/// exists to catch the "`100` meant as MB" mistake at load time rather than
+/// discovering it when every fetch lands in terminal `too_large`.
+pub const BODY_CAP_MIN_BYTES: u64 = 1024 * 1024;
+
+impl AcquireConfig {
+    /// Validate the acquire knobs against their valid ranges (#288).
+    ///
+    /// Today one check — `body_cap_bytes >= BODY_CAP_MIN_BYTES` when set. The
+    /// error names the key, its unit (bytes), the valid range, and the common
+    /// "I meant megabytes" mistake, because the error message is the one the
+    /// operator sees when the CLI refuses to start.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(bytes) = self.body_cap_bytes
+            && bytes < BODY_CAP_MIN_BYTES
+        {
+            return Err(format!(
+                "acquire.body_cap_bytes = {bytes} is below the {min} B floor; \
+                 this knob is measured in **bytes** (not MB), so a cap under \
+                 1 MiB would refuse every full-text PDF the ladder fetches. \
+                 Valid range: {min}..=u64::MAX (bytes). For 100 MB write \
+                 acquire.body_cap_bytes = {hundred_mb}.",
+                min = BODY_CAP_MIN_BYTES,
+                hundred_mb = 100 * 1024 * 1024_u64,
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// UI/UX preferences (TUI-only today; extensible for future surfaces).
@@ -349,6 +395,15 @@ pub fn load_config() -> Config {
         .and_then(|contents| toml::from_str(&contents).ok())
         .unwrap_or_default();
 
+    // Enforce the acquire-knob floor from the TOML side (#288). The infallible
+    // loader can't return `Err`, but a sub-floor value would otherwise land
+    // every fetch in terminal `too_large`; warn and discard the override so the
+    // CLI starts on the safe default instead.
+    if let Err(msg) = config.acquire.validate() {
+        tracing::warn!(error = %msg, "acquire config invalid; keeping the default");
+        config.acquire.body_cap_bytes = None;
+    }
+
     config.db_path = db_path;
 
     // Resolve credentials: keychain → env → config.toml value
@@ -428,11 +483,25 @@ pub fn load_config() -> Config {
     }
 
     // Acquire knobs (#288). `None` in the TOML keeps the workspace-wide
-    // default; a parse failure is ignored rather than surfaced so a typo
-    // never stops the CLI starting — the warning goes through `tracing`.
+    // default; a parse failure *or* a sub-floor value is ignored rather than
+    // surfaced so a typo never stops the CLI starting — the warning goes
+    // through `tracing` and the override stays whatever the TOML resolved to.
     if let Ok(bytes) = std::env::var("SCITADEL_ACQUIRE_BODY_CAP_BYTES") {
         match bytes.parse::<u64>() {
-            Ok(v) => config.acquire.body_cap_bytes = Some(v),
+            Ok(v) => {
+                let candidate = AcquireConfig {
+                    body_cap_bytes: Some(v),
+                };
+                if let Err(msg) = candidate.validate() {
+                    tracing::warn!(
+                        env = "SCITADEL_ACQUIRE_BODY_CAP_BYTES",
+                        error = %msg,
+                        "env override rejected; keeping the TOML/default value"
+                    );
+                } else {
+                    config.acquire.body_cap_bytes = Some(v);
+                }
+            }
             Err(e) => tracing::warn!(
                 value = %bytes,
                 error = %e,
@@ -445,11 +514,20 @@ pub fn load_config() -> Config {
 }
 
 /// Load config from a specific TOML file path.
+///
+/// Unlike [`load_config`], this is **fallible**: a TOML that parses but
+/// violates [`AcquireConfig::validate`] (#288) returns
+/// [`crate::error::CoreError::Config`] rather than being silently discarded —
+/// a path-named load is the explicit "please tell me what's wrong" shape.
 pub fn load_config_from(path: &Path) -> Result<Config, crate::error::CoreError> {
     let contents = std::fs::read_to_string(path)?;
     let mut config: Config =
         toml::from_str(&contents).map_err(|e| crate::error::CoreError::Config(e.to_string()))?;
     config.openalex.migrate_legacy_email();
+    config
+        .acquire
+        .validate()
+        .map_err(crate::error::CoreError::Config)?;
     Ok(config)
 }
 
@@ -580,5 +658,107 @@ mod tests {
 
         let config = load_config_from(&path).unwrap();
         assert_eq!(config.acquire.body_cap_bytes, None);
+    }
+
+    // -----------------------------------------------------------------
+    // #288: `body_cap_bytes` validation.
+    //
+    // A value of 0, or 100 meant as megabytes, would silently refuse every
+    // real full-text PDF the ladder ever fetches (every body > cap → terminal
+    // `too_large`). The loader rejects such values at load time instead of
+    // discovering the mistake on the first fetch.
+    // -----------------------------------------------------------------
+
+    /// The infallible `validate` reports 0 as a config mistake, naming the
+    /// key, the unit and the valid range.
+    #[test]
+    fn body_cap_bytes_of_zero_fails_validation() {
+        let cfg = AcquireConfig {
+            body_cap_bytes: Some(0),
+        };
+        let err = cfg
+            .validate()
+            .expect_err("zero bytes is below the 1 MiB floor");
+        assert!(
+            err.contains("acquire.body_cap_bytes"),
+            "names the key: {err}"
+        );
+        assert!(
+            err.contains("bytes"),
+            "spells out the unit (bytes, not MB): {err}"
+        );
+        assert!(
+            err.contains(&BODY_CAP_MIN_BYTES.to_string()),
+            "names the floor of the valid range: {err}"
+        );
+    }
+
+    /// The common mistake — `100` meant as megabytes. 100 bytes is below the
+    /// floor, so validation rejects it with the same clear error.
+    #[test]
+    fn body_cap_bytes_of_one_hundred_fails_validation_as_below_the_floor() {
+        let cfg = AcquireConfig {
+            body_cap_bytes: Some(100),
+        };
+        let err = cfg
+            .validate()
+            .expect_err("100 bytes is below the 1 MiB floor (the MB-mistake case)");
+        assert!(err.contains("100"), "quotes the bad value: {err}");
+        assert!(
+            err.contains("100") && err.contains("MB"),
+            "names the MB mistake explicitly: {err}"
+        );
+    }
+
+    /// A value at or above the floor passes.
+    #[test]
+    fn a_valid_body_cap_passes_validation() {
+        for bytes in [BODY_CAP_MIN_BYTES, 100 * 1024 * 1024, 500 * 1024 * 1024] {
+            AcquireConfig {
+                body_cap_bytes: Some(bytes),
+            }
+            .validate()
+            .unwrap_or_else(|e| panic!("{bytes} must pass: {e}"));
+        }
+    }
+
+    /// `None` is the default and has no cap to validate.
+    #[test]
+    fn a_none_body_cap_passes_validation() {
+        AcquireConfig::default().validate().unwrap();
+    }
+
+    /// `load_config_from` is the fallible loader, so a TOML with a sub-floor
+    /// value is a `CoreError::Config` rather than a silent reset — the one
+    /// path that lets a tool (or a test) say "please tell me what's wrong".
+    #[test]
+    fn load_config_from_rejects_a_sub_floor_body_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "db_path = \"/tmp/x.db\"\n\n[acquire]\nbody_cap_bytes = 0\n",
+        )
+        .unwrap();
+
+        let err = load_config_from(&path).expect_err("a zero cap is a config error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("acquire.body_cap_bytes"),
+            "surfaces the key: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_config_from_rejects_the_mb_mistake() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "db_path = \"/tmp/x.db\"\n\n[acquire]\nbody_cap_bytes = 100\n",
+        )
+        .unwrap();
+
+        load_config_from(&path).expect_err("100 bytes is the MB-mistake case");
     }
 }
