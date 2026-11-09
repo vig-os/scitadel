@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-10-02T15:41:29Z
-updated: 2026-10-02T15:41:29Z
+updated: 2026-11-09T03:51:32Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/266
-comments: 0
-labels: bug, effort:small, security, priority:high
+comments: 1
+labels: bug, effort:small, security, priority:high, semver:patch
 assignees: none
-milestone: none
+milestone: 0.9.0
 projects: none
-parent: none
+parent: 329
 children: none
-synced: 2026-10-03T07:15:42.296Z
+synced: 2026-11-09T08:51:03.799Z
 ---
 
 # [Issue 266]: [security(mcp): bib import/export accept agent-supplied filesystem paths — same class as #249](https://github.com/vig-os/scitadel/issues/266)
@@ -55,3 +55,11 @@ The two read paths are a different, milder shape: an agent can make scitadel rea
 ## Related
 
 - #249 (`download_paper` `output_dir`, fixed in #265), #247 (whose new acquisition verbs must not inherit this shape).
+---
+
+# [Comment #1]() by [gerchowl]()
+
+_Posted on November 9, 2026 at 03:51 AM_
+
+Triage decision 2026-11-09: scope agent-supplied read paths (ImportBibRequest.path, DiffRequest.file_a/file_b) to the workspace root (canonicalised, no symlink escape), and generate export filenames as in #249. The MCP is the product's agent-grounding surface (#329), so it must not be a file-read primitive.
+

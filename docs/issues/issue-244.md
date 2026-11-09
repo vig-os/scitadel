@@ -2,7 +2,7 @@
 type: issue
 state: open
 created: 2026-09-29T12:26:32Z
-updated: 2026-11-07T11:31:57Z
+updated: 2026-11-09T08:01:06Z
 author: renovate[bot]
 author_url: https://github.com/renovate[bot]
 url: https://github.com/vig-os/scitadel/issues/244
@@ -13,53 +13,47 @@ milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-11-08T08:16:20.802Z
+synced: 2026-11-09T08:51:06.929Z
 ---
 
 # [Issue 244]: [Dependency Dashboard](https://github.com/vig-os/scitadel/issues/244)
 
 This issue lists Renovate updates and detected dependencies. Read the [Dependency Dashboard](https://docs.renovatebot.com/key-concepts/dashboard/) docs to learn more.<br>[View this repository on the Mend.io Web Portal](https://developer.mend.io/github/vig-os/scitadel).
 
-## Awaiting Schedule
+## Rate-Limited
 
-The following updates are awaiting their schedule. To get an update now, click on a checkbox below.
+The following updates are currently rate-limited. To force their creation now, click on a checkbox below.
 
- - [ ] <!-- unschedule-branch=renovate/async-trait-0.x-lockfile -->chore(deps): update rust crate async-trait to v0.1.92
- - [ ] <!-- unschedule-branch=renovate/chrono-0.x-lockfile -->chore(deps): update rust crate chrono to v0.4.45
- - [ ] <!-- unschedule-branch=renovate/rust-futures-monorepo -->chore(deps): update rust crate futures to v0.3.34
- - [ ] <!-- unschedule-branch=renovate/libc-0.x-lockfile -->chore(deps): update rust crate libc to v0.2.191
- - [ ] <!-- unschedule-branch=renovate/schemars-1.x-lockfile -->chore(deps): update rust crate schemars to v1.2.3
- - [ ] <!-- unschedule-branch=renovate/serde-monorepo -->chore(deps): update rust crate serde to v1.0.229
- - [ ] <!-- unschedule-branch=renovate/serde_json-1.x-lockfile -->chore(deps): update rust crate serde_json to v1.0.154
- - [ ] <!-- unschedule-branch=renovate/thiserror-2.x-lockfile -->chore(deps): update rust crate thiserror to v2.0.21
- - [ ] <!-- unschedule-branch=renovate/tokio-tracing-monorepo -->chore(deps): update rust crate tracing-subscriber to v0.3.23
- - [ ] <!-- unschedule-branch=renovate/unicode-normalization-0.x-lockfile -->chore(deps): update rust crate unicode-normalization to v0.1.26
- - [ ] <!-- unschedule-branch=renovate/github-actions-(minor-and-patch) -->ci(actions): update github-actions (minor and patch) (`rust-lang/crates-io-auth-action`, `vig-os/commit-action`)
- - [ ] <!-- unschedule-branch=renovate/assert_cmd-2.x-lockfile -->chore(deps): update rust crate assert_cmd to v2.2.2
- - [ ] <!-- unschedule-branch=renovate/clap-4.x-lockfile -->chore(deps): update rust crate clap to v4.6.7
- - [ ] <!-- unschedule-branch=renovate/insta-1.x-lockfile -->chore(deps): update rust crate insta to v1.49.0
- - [ ] <!-- unschedule-branch=renovate/pdf-extract-0.x -->chore(deps): update rust crate pdf-extract to 0.12
- - [ ] <!-- unschedule-branch=renovate/proptest-1.x-lockfile -->chore(deps): update rust crate proptest to v1.12.0
- - [ ] <!-- unschedule-branch=renovate/quick-xml-0.x -->chore(deps): update rust crate quick-xml to 0.42
- - [ ] <!-- unschedule-branch=renovate/r2d2_sqlite-0.x -->chore(deps): update rust crate r2d2_sqlite to 0.35
- - [ ] <!-- unschedule-branch=renovate/reqwest-0.x -->chore(deps): update rust crate reqwest to 0.13
- - [ ] <!-- unschedule-branch=renovate/rmcp-3.x-lockfile -->chore(deps): update rust crate rmcp to v3.9.0
- - [ ] <!-- unschedule-branch=renovate/rusqlite-0.x -->chore(deps): update rust crate rusqlite to 0.41
- - [ ] <!-- unschedule-branch=renovate/scraper-0.x -->chore(deps): update rust crate scraper to 0.29
- - [ ] <!-- unschedule-branch=renovate/sha1-0.x -->chore(deps): update rust crate sha1 to 0.11
- - [ ] <!-- unschedule-branch=renovate/sha2-0.x -->chore(deps): update rust crate sha2 to 0.11
- - [ ] <!-- unschedule-branch=renovate/tempfile-3.x-lockfile -->chore(deps): update rust crate tempfile to v3.27.0
- - [ ] <!-- unschedule-branch=renovate/tokio-1.x-lockfile -->chore(deps): update rust crate tokio to v1.54.1
- - [ ] <!-- unschedule-branch=renovate/uuid-1.x-lockfile -->chore(deps): update rust crate uuid to v1.29.1
- - [ ] <!-- unschedule-branch=renovate/zeroize-1.x-lockfile -->chore(deps): update rust crate zeroize to v1.9.1
- - [ ] <!-- unschedule-branch=renovate/biblatex-0.x -->fix(deps): update rust crate biblatex to 0.12
- - [ ] <!-- unschedule-branch=renovate/toml-0.x -->fix(deps): update rust crate toml to 0.9
- - [ ] <!-- unschedule-branch=renovate/keyring-4.x -->chore(deps): update rust crate keyring to v4
- - [ ] <!-- unschedule-branch=renovate/actions-checkout-7.x -->ci(actions): update actions/checkout action to v7
- - [ ] <!-- unschedule-branch=renovate/ubuntu-26.x -->ci(actions): update dependency ubuntu to v26
- - [ ] <!-- unschedule-branch=renovate/toml-1.x -->fix(deps): update rust crate toml to v1
- - [ ] <!-- unschedule-branch=renovate/lock-file-maintenance -->chore(deps): lock file maintenance
- - [ ] <!-- create-all-awaiting-schedule-prs -->🔐 **Create all awaiting schedule PRs at once** 🔐
+ - [ ] <!-- unlimit-branch=renovate/serde_json-1.x-lockfile -->chore(deps): update rust crate serde_json to v1.0.154
+ - [ ] <!-- unlimit-branch=renovate/thiserror-2.x-lockfile -->chore(deps): update rust crate thiserror to v2.0.21
+ - [ ] <!-- unlimit-branch=renovate/tokio-tracing-monorepo -->chore(deps): update rust crate tracing-subscriber to v0.3.23
+ - [ ] <!-- unlimit-branch=renovate/unicode-normalization-0.x-lockfile -->chore(deps): update rust crate unicode-normalization to v0.1.26
+ - [ ] <!-- unlimit-branch=renovate/github-actions-(minor-and-patch) -->ci(actions): update github-actions (minor and patch) (`rust-lang/crates-io-auth-action`, `vig-os/commit-action`)
+ - [ ] <!-- unlimit-branch=renovate/assert_cmd-2.x-lockfile -->chore(deps): update rust crate assert_cmd to v2.2.2
+ - [ ] <!-- unlimit-branch=renovate/clap-4.x-lockfile -->chore(deps): update rust crate clap to v4.6.7
+ - [ ] <!-- unlimit-branch=renovate/insta-1.x-lockfile -->chore(deps): update rust crate insta to v1.49.0
+ - [ ] <!-- unlimit-branch=renovate/pdf-extract-0.x -->chore(deps): update rust crate pdf-extract to 0.12
+ - [ ] <!-- unlimit-branch=renovate/proptest-1.x-lockfile -->chore(deps): update rust crate proptest to v1.12.0
+ - [ ] <!-- unlimit-branch=renovate/quick-xml-0.x -->chore(deps): update rust crate quick-xml to 0.42
+ - [ ] <!-- unlimit-branch=renovate/r2d2_sqlite-0.x -->chore(deps): update rust crate r2d2_sqlite to 0.35
+ - [ ] <!-- unlimit-branch=renovate/reqwest-0.x -->chore(deps): update rust crate reqwest to 0.13
+ - [ ] <!-- unlimit-branch=renovate/rmcp-3.x-lockfile -->chore(deps): update rust crate rmcp to v3.9.0
+ - [ ] <!-- unlimit-branch=renovate/rusqlite-0.x -->chore(deps): update rust crate rusqlite to 0.41
+ - [ ] <!-- unlimit-branch=renovate/scraper-0.x -->chore(deps): update rust crate scraper to 0.29
+ - [ ] <!-- unlimit-branch=renovate/sha1-0.x -->chore(deps): update rust crate sha1 to 0.11
+ - [ ] <!-- unlimit-branch=renovate/sha2-0.x -->chore(deps): update rust crate sha2 to 0.11
+ - [ ] <!-- unlimit-branch=renovate/tempfile-3.x-lockfile -->chore(deps): update rust crate tempfile to v3.27.0
+ - [ ] <!-- unlimit-branch=renovate/tokio-1.x-lockfile -->chore(deps): update rust crate tokio to v1.54.1
+ - [ ] <!-- unlimit-branch=renovate/uuid-1.x-lockfile -->chore(deps): update rust crate uuid to v1.29.2
+ - [ ] <!-- unlimit-branch=renovate/zeroize-1.x-lockfile -->chore(deps): update rust crate zeroize to v1.9.1
+ - [ ] <!-- unlimit-branch=renovate/biblatex-0.x -->fix(deps): update rust crate biblatex to 0.12
+ - [ ] <!-- unlimit-branch=renovate/toml-0.x -->fix(deps): update rust crate toml to 0.9
+ - [ ] <!-- unlimit-branch=renovate/keyring-4.x -->chore(deps): update rust crate keyring to v4
+ - [ ] <!-- unlimit-branch=renovate/actions-checkout-7.x -->ci(actions): update actions/checkout action to v7
+ - [ ] <!-- unlimit-branch=renovate/ubuntu-26.x -->ci(actions): update dependency ubuntu to v26
+ - [ ] <!-- unlimit-branch=renovate/toml-1.x -->fix(deps): update rust crate toml to v1
+ - [ ] <!-- unlimit-branch=renovate/lock-file-maintenance -->chore(deps): lock file maintenance
+ - [ ] <!-- create-all-rate-limited-prs -->🔐 **Create all rate-limited PRs at once** 🔐
 
 ## Open
 
@@ -67,6 +61,12 @@ The following updates have all been created. To force a retry/rebase of any, cli
 
  - [ ] <!-- rebase-branch=renovate/actions-create-github-app-token-digest -->[chore(deps): update actions/create-github-app-token digest to 64ab729](../pull/309)
  - [ ] <!-- rebase-branch=renovate/anyhow-1.x-lockfile -->[chore(deps): update rust crate anyhow to v1.0.104](../pull/310)
+ - [ ] <!-- rebase-branch=renovate/async-trait-0.x-lockfile -->[chore(deps): update rust crate async-trait to v0.1.92](../pull/342)
+ - [ ] <!-- rebase-branch=renovate/chrono-0.x-lockfile -->[chore(deps): update rust crate chrono to v0.4.45](../pull/343)
+ - [ ] <!-- rebase-branch=renovate/rust-futures-monorepo -->[chore(deps): update rust crate futures to v0.3.34](../pull/347)
+ - [ ] <!-- rebase-branch=renovate/libc-0.x-lockfile -->[chore(deps): update rust crate libc to v0.2.191](../pull/348)
+ - [ ] <!-- rebase-branch=renovate/schemars-1.x-lockfile -->[chore(deps): update rust crate schemars to v1.2.3](../pull/349)
+ - [ ] <!-- rebase-branch=renovate/serde-monorepo -->[chore(deps): update rust crate serde to v1.0.229](../pull/350)
  - [ ] <!-- rebase-all-open-prs -->**Click on this checkbox to rebase all open PRs at once**
 
 ## Detected Dependencies

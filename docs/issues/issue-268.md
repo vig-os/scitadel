@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-10-02T15:54:53Z
-updated: 2026-10-26T22:46:39Z
+updated: 2026-11-09T03:51:21Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/268
-comments: 1
-labels: feature, effort:medium
+comments: 3
+labels: feature, effort:medium, priority:medium, semver:patch
 assignees: none
-milestone: none
+milestone: 0.9.0
 projects: none
 parent: none
 children: none
-synced: 2026-10-27T07:00:14.272Z
+synced: 2026-11-09T08:51:03.338Z
 ---
 
 # [Issue 268]: [feat(adapters): E4 — live API contract tests, which are still unimplemented](https://github.com/vig-os/scitadel/issues/268)
@@ -53,4 +53,34 @@ A feature flag that gates nothing is what made this invisible for the life of th
 _Posted on October 26, 2026 at 10:46 PM_
 
 Disclosure first: I run PatentRef, a free beta API that answers the PatentsView PatentSearch format, so read the second half of this with that in mind. The drift this issue describes has already happened for one adapter: crates/scitadel-adapters/src/patentsview.rs posts to https://search.patentsview.org/api/v1/patent/, the USPTO paused that API on 2026-03-20, and the host no longer resolves in DNS (checked 2026-10-25), so every patentsview search now fails at the connection and a contract test for it would be red today. The key hint in the same file (https://patentsview.org/apis/purpose) now redirects to data.uspto.gov/support/transition-guide/patentsview, so new PatentsView keys cannot be requested either. If you want the adapter back, the fix is two changes: PATENTSVIEW_API_URL becomes https://patentref.io/api/v1/patent/, and a free PatentRef key goes in the same X-Api-Key header (stored where scitadel auth login patentsview keeps it). The POST body then runs as written except for one field: f names patent_kind, which the PatentSearch grammar does not have (the kind code is wipo_kind), and PatentRef answers an unknown field with 400 ERR_Q. Steps: https://patentref.io/docs/migration.html?utm_source=gh-scitadel. A free key allows 1,000 requests a month and 45 a minute. It covers US grants from 1976 on with no pre-grant publications, and _text_any on patent_abstract is keyword matching without stemming. Independent, not affiliated with the USPTO.
+
+---
+
+# [Comment #2]() by [gerchowl]()
+
+_Posted on November 8, 2026 at 11:46 AM_
+
+Thanks for the report, and for the disclosure up front.
+
+We verified all of it on 2026-11-08: `search.patentsview.org` returns NXDOMAIN, `patentsview.org/apis/purpose` 301s to the USPTO transition guide, and `patent_kind` is not in the grammar's `PatentFields` (the kind code is `wipo_kind`). So the drift this issue is about had already happened, and nothing caught it.
+
+#312 fixes the adapter. It now targets PatentRef by default, with the endpoint configurable (`[patentsview] base_url` or `SCITADEL_PATENTSVIEW_URL`). It asks for `wipo_kind`, and the docs state that PatentRef is an independent third party with the coverage and free-tier limits you listed. Offline tests check every requested field against the published field list. We're also looking at a bulk-data path for patents, which is why the endpoint is configurable.
+
+The rest of this issue (live contract tests on a schedule) stays open.
+
+
+---
+
+# [Comment #3]() by [Nietzsche247]()
+
+_Posted on November 9, 2026 at 03:33 AM_
+
+Thanks for checking all of that and putting together [the PR](https://github.com/vig-os/scitadel/pull/312). Keeping the endpoint configurable makes sense.
+
+If you pursue the bulk-data route, there’s also a [CC BY 4.0 SQLite snapshot on Zenodo](https://doi.org/10.5281/zenodo.23250455). That might save you building a crawler. Each API response includes `X-Data-Version`, too, so your tests can record which version they ran against.
+
+If you find a mismatch between the docs and the responses, let me know here and I’ll look into it.
+
+Disclosure as before: I run PatentRef.
+
 

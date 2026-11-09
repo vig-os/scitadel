@@ -1,19 +1,19 @@
 ---
 type: issue
-state: open
+state: closed
 created: 2026-09-23T16:43:44Z
-updated: 2026-09-29T22:49:17Z
+updated: 2026-11-09T03:51:29Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/211
-comments: 1
+comments: 2
 labels: none
 assignees: none
 milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-09-30T07:41:27.509Z
+synced: 2026-11-09T08:51:07.870Z
 ---
 
 # [Issue 211]: [idea: non-generative relevance scoring — calibrated/reranker scores for ordering, generation only for the shortlist](https://github.com/vig-os/scitadel/issues/211)
@@ -130,4 +130,12 @@ Concrete follow-on: #246 picks the model family and adds a full-text stage.
 - Jev (hosted) or Kev (open weights, same `/v1/systemone` API) scores the question against each abstract first.
 - The shortlist's full text is then scored in chunks, and each paper gets a "candlestick" of chunk relevance.
 - The generative model then reads only the top-scoring passages.
+
+---
+
+# [Comment #2]() by [gerchowl]()
+
+_Posted on November 9, 2026 at 03:51 AM_
+
+Superseded by #246, which is the concrete design of this idea (calibrated System One scoring, generation only for the shortlist). Its slice 1 is #334.
 
