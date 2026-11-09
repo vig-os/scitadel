@@ -34,8 +34,10 @@
 //! component walk, so a local-filesystem attacker who can swap a
 //! parent directory with `renameat2` between the canonicalise and
 //! the open could aim the read elsewhere. The FD's real path is
-//! `fstat`-verified before the read, which narrows but does not
-//! eliminate that window; closing it requires write access to the
+//! read back after the open (`/proc/self/fd/<fd>` on Linux,
+//! `fcntl(F_GETPATH)` on macOS) and refused if it no longer sits
+//! under the workspace root — narrowing the window without fully
+//! closing it. Closing it requires write access to the
 //! project tree — a capability the attacker already has if they can
 //! stage the swap. Not fixed here; see #266 round 5.
 //!
@@ -163,16 +165,22 @@ impl From<ProjectRootError> for PathScopeError {
 /// fallback path even on Linux, so tests can drive the
 /// ENOSYS-fallback race through the fd-path verification without
 /// actually blocking `openat2` (or running on a kernel < 5.6).
-/// Always `false` outside tests.
-#[cfg(target_os = "linux")]
-#[doc(hidden)]
-pub static FORCE_FALLBACK_FOR_TESTS: std::sync::atomic::AtomicBool =
+/// `#[cfg(test)]`-gated so it does not exist in release builds —
+/// a production binary cannot disable the kernel fast path.
+#[cfg(all(target_os = "linux", test))]
+pub(crate) static FORCE_FALLBACK_FOR_TESTS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-#[cfg(target_os = "linux")]
-#[doc(hidden)]
-pub fn force_fallback_for_tests() -> bool {
+#[cfg(all(target_os = "linux", test))]
+pub(crate) fn force_fallback_for_tests() -> bool {
     FORCE_FALLBACK_FOR_TESTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The production fast-path. Stays `false` in release builds so the
+/// kernel path is always taken; only tests override it.
+#[cfg(all(target_os = "linux", not(test)))]
+fn force_fallback_for_tests() -> bool {
+    false
 }
 
 /// Workspace root for MCP path scoping. Routes through the PINNED
@@ -855,10 +863,11 @@ fn verify_fd_inside_root(
     root: &Path,
     rel: &str,
 ) -> Result<(), PathScopeError> {
-    let got = fd_real_path(file).ok_or_else(|| PathScopeError::NotAccessible {
-        input: rel.to_string(),
-        reason: "could not resolve the opened FD's real path to verify confinement".into(),
-    })?;
+    let got =
+        scitadel_core::fd::fd_real_path(file).ok_or_else(|| PathScopeError::NotAccessible {
+            input: rel.to_string(),
+            reason: "could not resolve the opened FD's real path to verify confinement".into(),
+        })?;
     // The FD path may resolve to a directory inside root's canonical
     // form; compare canonicalised prefixes.
     let got_canon = got.canonicalize().unwrap_or(got);
@@ -869,43 +878,6 @@ fn verify_fd_inside_root(
         });
     }
     Ok(())
-}
-
-/// Return the current real path of an open file descriptor on
-/// Linux and macOS.
-#[cfg(all(unix, target_os = "linux"))]
-fn fd_real_path(file: &std::fs::File) -> Option<PathBuf> {
-    use std::os::fd::AsRawFd;
-    let link = format!("/proc/self/fd/{}", file.as_raw_fd());
-    std::fs::read_link(&link).ok()
-}
-
-#[cfg(all(unix, target_os = "macos"))]
-fn fd_real_path(file: &std::fs::File) -> Option<PathBuf> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::ffi::OsStringExt;
-    // F_GETPATH writes up to MAXPATHLEN bytes into the buffer.
-    let mut buf = vec![0u8; libc::PATH_MAX as usize];
-    // SAFETY: fcntl with a mutable buffer sized MAXPATHLEN.
-    let rc = unsafe {
-        libc::fcntl(
-            file.as_raw_fd(),
-            libc::F_GETPATH,
-            buf.as_mut_ptr().cast::<libc::c_void>(),
-        )
-    };
-    if rc != 0 {
-        return None;
-    }
-    // Trim at the first NUL and coerce to a PathBuf.
-    let n = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
-    buf.truncate(n);
-    Some(PathBuf::from(OsString::from_vec(buf)))
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn fd_real_path(_file: &std::fs::File) -> Option<PathBuf> {
-    None
 }
 
 #[cfg(unix)]

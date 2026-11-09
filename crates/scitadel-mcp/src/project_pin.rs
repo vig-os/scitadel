@@ -162,8 +162,13 @@ fn ensure_pinned() -> PinOutcome {
 /// [`crate::TEST_ENV_LOCK`][crate::TEST_ENV_LOCK] while calling
 /// this; the lock also serialises the `SCITADEL_*` / `HOME` env
 /// writes those tests do.
-#[doc(hidden)]
-pub fn reset_pin_for_tests() {
+///
+/// `#[cfg(test)]`-gated so the hook does not exist in release
+/// builds — the sticky pin is part of the production contract
+/// (round 5), and a shipped binary cannot be asked to re-resolve
+/// a running server's project root.
+#[cfg(test)]
+pub(crate) fn reset_pin_for_tests() {
     *PIN_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
