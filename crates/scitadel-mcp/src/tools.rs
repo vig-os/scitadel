@@ -1867,6 +1867,12 @@ pub fn list_starred_tool(reader: &str) -> Result<String, String> {
 /// the import pipeline. Returns a JSON summary mirroring what the CLI
 /// prints, so downstream agents can decide whether to follow up
 /// (resolve ambiguous aliases, retry rejected entries, etc).
+///
+/// `path` is a caller-controlled read, so it is funnelled through the
+/// workspace-root confinement helper first (#266). Relative paths
+/// resolve against the workspace root rather than the process CWD,
+/// absolute paths outside the root and `..` traversal are refused,
+/// and symlinks are followed before the containment check.
 pub fn import_bibtex_tool(
     path: &str,
     strategy: Option<&str>,
@@ -1886,6 +1892,8 @@ pub fn import_bibtex_tool(
         )
     })?;
 
+    let confined = crate::paths::confine_read_path(path).map_err(|e| e.to_string())?;
+
     let db = open_db()?;
     let papers = SqlitePaperRepository::new(db.clone());
     let aliases = SqlitePaperAliasRepository::new(db.clone());
@@ -1901,15 +1909,8 @@ pub fn import_bibtex_tool(
         // per-row failure path as `merge` for ambiguous-alias rows.
         prompt_resolver: None,
     };
-    let report = import_bibtex_file(
-        std::path::Path::new(path),
-        &options,
-        &papers,
-        &aliases,
-        &annotations,
-        &tags,
-    )
-    .map_err(|e| e.to_string())?;
+    let report = import_bibtex_file(&confined, &options, &papers, &aliases, &annotations, &tags)
+        .map_err(|e| e.to_string())?;
 
     let rows: Vec<serde_json::Value> = report
         .rows
@@ -2148,9 +2149,16 @@ fn load_papers_and_tags(
     (papers, tags)
 }
 
+/// `bib_snapshot` MCP tool — write a deterministic export of a
+/// question's shortlist to disk, plus the drift-tracking sidecar.
+///
+/// The output path is **not** caller-supplied (#266): the agent names
+/// *what* to snapshot (`question_prefix` + `format`), scitadel picks
+/// *where* — `.scitadel/bib/<sanitised-question-id>.<ext>`. This is
+/// the same arbitrary-write class #249 closed on `download_paper`,
+/// lifted to a shared helper so future MCP tools cannot forget.
 pub fn bib_snapshot_tool(
     question_prefix: &str,
-    output: &str,
     reader: &str,
     no_lock: bool,
     format: &str,
@@ -2176,12 +2184,25 @@ pub fn bib_snapshot_tool(
         render_shortlist_bibtex(&db, &paper_ids)?
     };
 
-    let output_path = std::path::Path::new(output);
-    std::fs::write(output_path, &content).map_err(|e| e.to_string())?;
+    // Generate the output path the #249 way: derive the filename from
+    // the inputs, pin the directory to a configured location under the
+    // workspace. `sanitize_filename_component` strips `/` and `.` so
+    // the sanitised question id cannot carry any path semantics.
+    let config = load_config();
+    let export_dir = crate::paths::mcp_export_dir(&config).map_err(|e| e.to_string())?;
+    let ext = if is_csl { "json" } else { "bib" };
+    let fname = format!(
+        "{}.{ext}",
+        crate::paths::sanitize_filename_component(question.id.as_str())
+    );
+    let output_path = export_dir.join(&fname);
+    let output = output_path.to_string_lossy().into_owned();
 
-    let sidecar = sidecar_path_for(output_path);
+    std::fs::write(&output_path, &content).map_err(|e| e.to_string())?;
+
+    let sidecar = sidecar_path_for(&output_path);
     let mut response = serde_json::Map::new();
-    response.insert("output".into(), serde_json::Value::String(output.into()));
+    response.insert("output".into(), serde_json::Value::String(output));
     response.insert("papers".into(), serde_json::Value::from(papers.len()));
 
     if no_lock {
@@ -2221,11 +2242,14 @@ pub fn bib_snapshot_tool(
     Ok(serde_json::Value::Object(response).to_string())
 }
 
+/// `bib_verify` MCP tool — confirm a `.bib` matches its sidecar
+/// lockfile. `file` is caller-supplied and read, so it is confined to
+/// the workspace root first (#266).
 pub fn bib_verify_tool(file: &str, question_override: Option<&str>) -> Result<String, String> {
-    let bib_path = std::path::Path::new(file);
-    let bib_bytes = std::fs::read_to_string(bib_path).map_err(|e| e.to_string())?;
+    let bib_path = crate::paths::confine_read_path(file).map_err(|e| e.to_string())?;
+    let bib_bytes = std::fs::read_to_string(&bib_path).map_err(|e| e.to_string())?;
 
-    let sidecar = sidecar_path_for(bib_path);
+    let sidecar = sidecar_path_for(&bib_path);
     if !sidecar.exists() {
         return Ok(serde_json::json!({
             "status": "stale",
@@ -2305,19 +2329,23 @@ pub fn bib_verify_tool(file: &str, question_override: Option<&str>) -> Result<St
 /// Returns: JSON `{added, removed, changed}` (empty arrays if zero
 /// drift). Exit-code semantics live in the CLI; the MCP tool returns
 /// the structure unconditionally so the caller can branch on it.
+///
+/// Both `file_a` and `file_b` are caller-supplied reads, so each is
+/// routed through the workspace-root confinement helper first (#266).
 pub fn bib_diff_tool(
     file_a: &str,
     file_b: Option<&str>,
     question_id: Option<&str>,
     reader: Option<&str>,
 ) -> Result<String, String> {
-    let path_a = std::path::Path::new(file_a);
-    let (entries_a, fmt_a) = scitadel_export::load_entries_from_path(path_a)?;
+    let path_a = crate::paths::confine_read_path(file_a).map_err(|e| e.to_string())?;
+    let (entries_a, fmt_a) = scitadel_export::load_entries_from_path(&path_a)?;
     let entries_b = match (file_b, question_id) {
         (Some(_), Some(_)) => return Err("pass file_b OR question_id, not both".into()),
         (None, None) => return Err("pass file_b or question_id".into()),
         (Some(b), None) => {
-            let (e, _) = scitadel_export::load_entries_from_path(std::path::Path::new(b))?;
+            let path_b = crate::paths::confine_read_path(b).map_err(|e| e.to_string())?;
+            let (e, _) = scitadel_export::load_entries_from_path(&path_b)?;
             e
         }
         (None, Some(qid)) => {

@@ -3,6 +3,7 @@ pub mod bib_rekey;
 pub mod bib_watch;
 pub mod events;
 pub mod extract;
+pub mod paths;
 #[allow(clippy::unused_self, clippy::needless_pass_by_value)]
 pub mod server;
 pub mod tools;
