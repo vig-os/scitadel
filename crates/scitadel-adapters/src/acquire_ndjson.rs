@@ -695,14 +695,17 @@ mod tests {
     fn stored_status_preserves_raid_and_never_translates() {
         use scitadel_db::sqlite::ALL_STATUSES;
 
-        // Every one of ADR-007 §2's own words passes through, whatever the case
-        // the queue file used. The list is the schema's, not a hand-written one,
-        // so adding a status there makes this test cover it rather than let it
-        // fall through to the `pending` arm and be quietly translated.
+        // Every status the vocabulary carries passes through, whatever the
+        // case the queue file used. The list is the schema's, not a
+        // hand-written one, so adding a status there makes this test cover it
+        // rather than let it fall through to the `pending` arm and be quietly
+        // translated. (ADR-007 §2's own table has 13 rows; `too_large` is the
+        // 14th, added for #288's split out of `unavailable`.)
         assert_eq!(
             ALL_STATUSES.len(),
-            13,
-            "ADR-007 §2's table has 13 statuses; a new one must be covered here"
+            14,
+            "ADR-007 §2's 13 rows plus `too_large` (#288, migration 015); a new \
+             status must be covered here"
         );
         for vocab in ALL_STATUSES {
             let raid = vocab.status;
