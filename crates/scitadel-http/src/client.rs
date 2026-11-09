@@ -358,6 +358,92 @@ impl PacedResponse {
             })
     }
 
+    /// Read the body, aborting if it exceeds `cap` bytes (ADR-007 §1 "Storage").
+    ///
+    /// Issue #288: the publisher-side defence against a route that serves a
+    /// multi-gigabyte blob. The cap is enforced *during* the streaming read, not
+    /// via `Content-Length` alone — the header is a *claim* and the single most
+    /// common way to elicit this bug is a server that declares one length and
+    /// sends another. A declared length over `cap` refuses *early* (so nothing
+    /// is pulled), but it is **never** used to raise the enforced limit.
+    ///
+    /// On refusal the response is dropped, which on reqwest's streaming
+    /// transport closes the connection and discards any remaining body. No
+    /// partial file is written here, because this layer only produces
+    /// in-memory bytes — the caller stages them from a `Vec<u8>` and gets
+    /// nothing to clean up on this path.
+    ///
+    /// # Errors
+    ///
+    /// - [`FetchError::BodyTooLarge`] with `from_content_length: true` when the
+    ///   declared length is already over the cap, or `false` when the running
+    ///   read passed the cap (the `observed` byte count is a lower bound in that
+    ///   case).
+    /// - [`FetchError::Transport`] on any underlying read failure, URL-redacted
+    ///   the same way [`Self::bytes`] does it.
+    pub async fn bytes_capped(mut self, cap: u64) -> Result<Vec<u8>> {
+        let url = self.url.to_string();
+
+        // Pre-flight on the declared length: refuse early when the server is
+        // honest about it, so nothing is pulled from the socket. A declared
+        // length under the cap is **not** used to grow the enforced limit:
+        // the stream check is still the one that decides, because a publisher
+        // may understate the length too.
+        if let Some(declared) = self.content_length()
+            && declared > cap
+        {
+            // Drop the body so the connection can close cleanly.
+            drop(self.response);
+            return Err(FetchError::BodyTooLarge {
+                url: crate::error::redact_url(url.as_ref()),
+                cap,
+                observed: declared,
+                from_content_length: true,
+            });
+        }
+
+        // `cap + 1` so that a stream exactly at the cap fits without a
+        // re-allocation and a stream *just over* the cap is detected on the
+        // first chunk that crosses the line. A huge `usize` cast would allow a
+        // hostile `Content-Length` to drive an allocation we never actually
+        // need; the honest-case cap for fulltext is 100 MB, well inside
+        // `usize`, but we clamp to be safe.
+        let initial_capacity = usize::try_from(cap.saturating_add(1)).unwrap_or(usize::MAX);
+        let mut body: Vec<u8> = Vec::with_capacity(initial_capacity.min(64 * 1024));
+        let mut total: u64 = 0;
+
+        loop {
+            let chunk = self
+                .response
+                .chunk()
+                .await
+                .map_err(|source| FetchError::Transport {
+                    url: crate::error::redact_url(url.as_ref()),
+                    source: crate::error::TransportSource::new(source),
+                })?;
+            let Some(chunk) = chunk else {
+                break;
+            };
+            total = total.saturating_add(chunk.len() as u64);
+            if total > cap {
+                // Drop the response to abort the body — reqwest's streaming
+                // transport closes the connection on drop, so we neither
+                // continue pulling nor leak a socket. `total` is a lower bound
+                // on what the server would have sent.
+                drop(self.response);
+                return Err(FetchError::BodyTooLarge {
+                    url: crate::error::redact_url(url.as_ref()),
+                    cap,
+                    observed: total,
+                    from_content_length: false,
+                });
+            }
+            body.extend_from_slice(&chunk);
+        }
+
+        Ok(body)
+    }
+
     /// Read the body as UTF-8 text.
     pub async fn text(self) -> Result<String> {
         let url = self.url.to_string();
@@ -1211,6 +1297,253 @@ mod tests {
             client.policy().policy_for(&Bucket("elsevier".into())),
             BucketPolicy::new(10_000, 300, 100)
         );
+    }
+
+    // ---------- #288: a cap on a fetched body ----------
+
+    /// Four bodies, one rule: whatever the publisher claims and however it
+    /// frames the body, the cap is what was *read*, not what was *declared*.
+    /// The four cases are the acceptance criteria of #288.
+    mod bytes_capped {
+        use wiremock::ResponseTemplate;
+
+        use super::*;
+
+        async fn serve(server: &MockServer, template: ResponseTemplate) -> PacedResponse {
+            Mock::given(method("GET"))
+                .and(path("/body"))
+                .respond_with(template)
+                .mount(server)
+                .await;
+            let client = client(FakePacer::new(), BucketPolicyTable::new());
+            client
+                .get(
+                    url(&format!("{}/body", server.uri())),
+                    PaceTier::Tdm,
+                    SafeHeaders::unauthenticated(),
+                )
+                .await
+                .expect("a 200 response")
+        }
+
+        /// A body exactly at the cap must land. The cap is the *first* size
+        /// that is refused, not the last that is accepted.
+        #[tokio::test]
+        async fn a_body_exactly_at_the_cap_is_accepted() {
+            let server = MockServer::start().await;
+            let body = vec![b'x'; 1024];
+            let response = serve(
+                &server,
+                ResponseTemplate::new(200).set_body_bytes(body.clone()),
+            )
+            .await;
+            let bytes = response.bytes_capped(1024).await.expect("exactly at cap");
+            assert_eq!(bytes.len(), 1024);
+            assert_eq!(bytes, body);
+        }
+
+        /// A body just under the cap is accepted, with every byte intact.
+        #[tokio::test]
+        async fn a_body_just_under_the_cap_is_accepted() {
+            let server = MockServer::start().await;
+            let body = vec![b'y'; 1023];
+            let response = serve(
+                &server,
+                ResponseTemplate::new(200).set_body_bytes(body.clone()),
+            )
+            .await;
+            let bytes = response
+                .bytes_capped(1024)
+                .await
+                .expect("one byte of slack");
+            assert_eq!(bytes.len(), 1023);
+            assert_eq!(bytes, body);
+        }
+
+        /// A chunked body (no `Content-Length`) over the cap must still be
+        /// bounded: the streaming read is the rule, not the header.
+        #[tokio::test]
+        async fn a_chunked_body_over_the_cap_is_refused_at_the_stream() {
+            let server = MockServer::start().await;
+            // 4 KiB body, no `Content-Length` set: wiremock streams this
+            // chunked and reqwest sees chunks. `cap = 1024`, so the running
+            // total passes the cap before the end.
+            let body = vec![b'z'; 4 * 1024];
+            let response = serve(
+                &server,
+                ResponseTemplate::new(200)
+                    .insert_header("transfer-encoding", "chunked")
+                    .set_body_bytes(body),
+            )
+            .await;
+            let err = response
+                .bytes_capped(1024)
+                .await
+                .expect_err("a 4 KiB body over a 1 KiB cap");
+            match err {
+                FetchError::BodyTooLarge {
+                    cap,
+                    observed,
+                    from_content_length,
+                    ..
+                } => {
+                    assert_eq!(cap, 1024);
+                    assert!(
+                        !from_content_length,
+                        "no honest Content-Length — the stream caught it"
+                    );
+                    assert!(observed > cap, "observed {observed} must exceed cap {cap}");
+                }
+                other => panic!("expected BodyTooLarge, got {other:?}"),
+            }
+        }
+
+        /// A publisher that **lies** about `Content-Length` must not raise the
+        /// enforced limit: the number the cap compares against is the byte
+        /// count actually read, never the declared one (#288).
+        ///
+        /// Two shapes under one assertion:
+        ///
+        /// 1. Declared length well **under** the cap but the real body is
+        ///    **over** both the declared length and the cap. On the wire the
+        ///    body is served chunked (no honest `Content-Length`), so the
+        ///    pre-flight sees nothing to refuse and the running read is the
+        ///    only check standing between the cap and a 2 GB blob — which is
+        ///    the case #288 opens with.
+        /// 2. Declared length well **under** the cap and the real body is
+        ///    **at** the declared length. The pre-flight does not refuse; the
+        ///    stream returns the body intact. The lie is harmless, and the
+        ///    cap did not get in the way.
+        ///
+        /// Driven through a raw TCP listener for shape 1 — hyper on the
+        /// server side refuses to send more bytes than it claimed.
+        #[tokio::test]
+        async fn a_lying_content_length_does_not_raise_the_limit() {
+            use std::fmt::Write as _;
+
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            // Shape 1: chunked body 4 KiB, no `Content-Length` header at all —
+            // the server declares *nothing* about the size and the running
+            // read is what must bound the response.
+            const BODY_LEN: usize = 4 * 1024;
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("a loopback port");
+            let addr = listener.local_addr().expect("an addr");
+            let endpoint = format!("http://{addr}/lie");
+
+            tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.expect("one request");
+                let mut discard = [0_u8; 1024];
+                let _ = socket.read(&mut discard).await;
+                let payload = vec![b'q'; BODY_LEN];
+                let head = "HTTP/1.1 200 OK\r\n\
+                            Content-Type: application/octet-stream\r\n\
+                            Transfer-Encoding: chunked\r\n\
+                            Connection: close\r\n\
+                            \r\n";
+                let mut framed = String::new();
+                let _ = write!(framed, "{BODY_LEN:X}\r\n");
+                let mut wire = framed.into_bytes();
+                wire.extend_from_slice(&payload);
+                wire.extend_from_slice(b"\r\n0\r\n\r\n");
+                socket.write_all(head.as_bytes()).await.expect("head");
+                let _ = socket.write_all(&wire).await;
+                let _ = socket.shutdown().await;
+            });
+
+            let client = client(FakePacer::new(), BucketPolicyTable::new());
+            let response = client
+                .get(
+                    url(&endpoint),
+                    PaceTier::Tdm,
+                    SafeHeaders::unauthenticated(),
+                )
+                .await
+                .expect("the server answered 200");
+            assert_eq!(
+                response.content_length(),
+                None,
+                "no honest declared length — the stream check is what bounds this"
+            );
+            let err = response
+                .bytes_capped(1024)
+                .await
+                .expect_err("the running read must refuse a 4 KiB body");
+            match err {
+                FetchError::BodyTooLarge {
+                    cap,
+                    observed,
+                    from_content_length,
+                    ..
+                } => {
+                    assert_eq!(cap, 1024);
+                    assert!(
+                        !from_content_length,
+                        "no declared length — the enforced limit came from the read"
+                    );
+                    assert!(observed > cap, "observed {observed} > cap {cap}");
+                }
+                other => panic!("expected BodyTooLarge, got {other:?}"),
+            }
+        }
+
+        /// Shape 2 of the lying-Content-Length invariant: the server declares
+        /// a small length and the real body is at the declared length. Pre-flight
+        /// sees "under cap" and does not refuse, the stream returns the body
+        /// intact, and the enforced limit is still the cap — a declared length
+        /// *under* the cap is never used to extend it, because the stream
+        /// count is what the cap compares against.
+        #[tokio::test]
+        async fn a_declared_length_under_the_cap_is_not_a_license_to_relax_it() {
+            let server = MockServer::start().await;
+            // Body is exactly 128 bytes, declared Content-Length: 128.
+            let honest_small_body = vec![b'r'; 128];
+            let response = serve(
+                &server,
+                ResponseTemplate::new(200).set_body_bytes(honest_small_body.clone()),
+            )
+            .await;
+            assert_eq!(response.content_length(), Some(128));
+            // cap = 1024: the small declaration has no power to raise the cap,
+            // and the honest small body fits cleanly inside it.
+            let bytes = response
+                .bytes_capped(1024)
+                .await
+                .expect("an honest small body is accepted");
+            assert_eq!(bytes, honest_small_body);
+        }
+
+        /// A Content-Length over the cap refuses *early*: nothing is pulled,
+        /// and `observed` is the declared length verbatim.
+        #[tokio::test]
+        async fn an_honest_content_length_over_the_cap_refuses_early() {
+            let server = MockServer::start().await;
+            // 8 KiB body with its honest Content-Length — wiremock computes
+            // it for a plain `set_body_bytes` response.
+            let body = vec![b'p'; 8 * 1024];
+            let response = serve(&server, ResponseTemplate::new(200).set_body_bytes(body)).await;
+            assert_eq!(response.content_length(), Some(8 * 1024));
+            let err = response
+                .bytes_capped(1024)
+                .await
+                .expect_err("declared length is over the cap");
+            match err {
+                FetchError::BodyTooLarge {
+                    cap,
+                    observed,
+                    from_content_length,
+                    ..
+                } => {
+                    assert_eq!(cap, 1024);
+                    assert!(from_content_length, "the pre-flight caught this one");
+                    assert_eq!(observed, 8 * 1024);
+                }
+                other => panic!("expected BodyTooLarge, got {other:?}"),
+            }
+        }
     }
 
     /// A campaign fetches many works concurrently, so the future has to be

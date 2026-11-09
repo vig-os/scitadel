@@ -376,6 +376,21 @@ impl Endpoints {
     }
 }
 
+/// The in-stream cap on a fetched body, in bytes (ADR-007 §1 "Storage").
+///
+/// Every route in [`PaperDownloader`] fetches a full-text artefact
+/// (`fulltext_pdf`/`fulltext_html`/`fulltext_xml`), and those share one row
+/// in the ADR's size-cap table. `cap_for_kind("fulltext_pdf")` is the canonical
+/// value; this constant pulls that number so #288's fetch-path cap and #286's
+/// scan-path cap are the *same number* under two names. A caller that wants a
+/// different value for a test or an operator override says so through
+/// [`PaperDownloader::with_body_cap`].
+///
+/// The future scitadel-hub harvesters will reuse this fetch path at scale —
+/// [`cap_for_kind`] is the single source of truth and this constant is its one
+/// re-export into the fetch chain, so there is no second cap to drift against.
+pub const FETCH_BODY_CAP_BYTES: u64 = scitadel_db::sqlite::CAP_FULLTEXT_BYTES as u64;
+
 /// Downloads papers by DOI using Unpaywall (OA PDFs) with publisher HTML fallback.
 pub struct PaperDownloader {
     /// The only way a request leaves this process (ADR-007 §3).
@@ -385,6 +400,14 @@ pub struct PaperDownloader {
     /// ever needs the email; the OpenAlex leg needs both (#212).
     openalex: OpenAlexAuth,
     endpoints: Endpoints,
+    /// Cap on the body the ladder is willing to pull off a publisher
+    /// (ADR-007 §1 "Storage"; #288). Enforced during the streaming read, not
+    /// via `Content-Length` alone — a server that declares one length and
+    /// sends another is the shape of the bug this exists to close. The
+    /// workspace-wide default is [`FETCH_BODY_CAP_BYTES`]; tests override it
+    /// through [`Self::with_body_cap`] to exercise the limit on bodies small
+    /// enough to fit in a unit test.
+    body_cap: u64,
 }
 
 impl PaperDownloader {
@@ -448,7 +471,22 @@ impl PaperDownloader {
             db,
             openalex,
             endpoints,
+            body_cap: FETCH_BODY_CAP_BYTES,
         }
+    }
+
+    /// Lower the fetch body cap (ADR-007 §1 "Storage"; #288).
+    ///
+    /// The one knob through which a caller sets the cap, for tests that must
+    /// exercise the `too_large` path on bodies small enough for a unit test
+    /// to serve, and for a future operator override that wants to tighten the
+    /// default. There is no raise-the-cap API: the workspace-wide default is
+    /// [`FETCH_BODY_CAP_BYTES`], derived from `cap_for_kind("fulltext_pdf")`,
+    /// and nothing in the ADR raises that.
+    #[must_use]
+    pub fn with_body_cap(mut self, cap: u64) -> Self {
+        self.body_cap = cap;
+        self
     }
 
     /// The endpoint set in force, for a test that asserts on it.
@@ -767,6 +805,25 @@ impl PaperDownloader {
             Ok(fetched) => self.finish(&work, Some(paper), fetched).await,
             Err(e) => {
                 let (error, outcome) = e.into_parts();
+                // #288: a body over the cap is recorded in `acquisition_attempts`
+                // alongside the other fetch outcomes migration 013 declares —
+                // the same table `scan` writes `too_large` to for a dropped-in
+                // file (#286). Best-effort: a failure to record the audit row
+                // must never mask the error the caller is about to receive.
+                if let LegOutcome::TooLarge {
+                    cap,
+                    observed,
+                    from_content_length,
+                } = &outcome
+                {
+                    self.record_too_large_attempt(
+                        paper,
+                        chosen.candidate.route,
+                        *cap,
+                        *observed,
+                        *from_content_length,
+                    );
+                }
                 ladder.record(leg_of(chosen.candidate.route), outcome);
                 tracing::info!(
                     paper_id = %paper.id,
@@ -779,6 +836,56 @@ impl PaperDownloader {
             }
         };
         (result, resolution)
+    }
+
+    /// Record an `acquisition_attempts.outcome = 'too_large'` row for a fetch
+    /// the cap refused (ADR-007 §1 "Storage"; #288).
+    ///
+    /// The counterpart to `scan`'s refuser (`crates/scitadel-adapters/src/scan.rs`,
+    /// `record_attempt`), so the fetch path and the scan path write the same
+    /// row for the same rule — the one sentence ADR-007 §1 makes of it. The
+    /// audit row is **best-effort**: a failure to insert is logged, because a
+    /// row about a refused fetch must never become the refusal the caller sees.
+    fn record_too_large_attempt(
+        &self,
+        paper: &Paper,
+        route: RouteId,
+        cap: u64,
+        observed: u64,
+        from_content_length: bool,
+    ) {
+        let now = Utc::now().to_rfc3339();
+        let detail = if from_content_length {
+            format!(
+                "Content-Length declared {observed} bytes, over the {cap}-byte cap ADR-007 §1 \
+                 \"Storage\" sets for a full-text artefact; nothing was pulled from the wire, so \
+                 no blob was staged"
+            )
+        } else {
+            format!(
+                "the streamed body passed the {cap}-byte cap ADR-007 §1 \"Storage\" sets for a \
+                 full-text artefact after {observed}+ bytes; the read was aborted and no blob \
+                 was staged"
+            )
+        };
+        if let Err(error) = self.db.record_attempt(&AttemptWrite {
+            paper_id: Some(paper.id.as_str().to_string()),
+            kind: GAP_FULLTEXT_KIND.to_string(),
+            locator: FULLTEXT_LOCATOR.to_string(),
+            route: route.label().to_string(),
+            bucket: None,
+            started_at: now,
+            outcome: "too_large".to_string(),
+            http_status: None,
+            detail: Some(detail),
+        }) {
+            tracing::warn!(
+                paper_id = %paper.id,
+                route = route.label(),
+                %error,
+                "could not record the too-large fetch in acquisition_attempts"
+            );
+        }
     }
 
     /// The metadata pass, built from this downloader's own endpoints.    ///
@@ -847,12 +954,12 @@ impl PaperDownloader {
         // URLs are files whose extension is not always to be trusted.
         let is_pdf = !matches!(route, RouteId::Publisher | RouteId::ManualUrl)
             && looks_like_pdf(url, response.content_type());
-        // Read the URL off before `bytes()` consumes the response: this is the
-        // post-redirect URL, which is where the bytes actually live and what
-        // `artefacts.source_url` records.
+        // Read the URL off before `bytes_capped()` consumes the response: this
+        // is the post-redirect URL, which is where the bytes actually live and
+        // what `artefacts.source_url` records.
         let source_url = response.url.to_string();
         let bytes = response
-            .bytes()
+            .bytes_capped(self.body_cap)
             .await
             .map_err(|e| fetch_failure("failed to read bytes", e))?;
 
@@ -1629,11 +1736,11 @@ impl PaperDownloader {
         // decide the format on its own — the same rule the OpenAlex leg
         // already applies, shared rather than re-derived.
         let is_pdf = looks_like_pdf(url, response.content_type());
-        // Read the URL off before `bytes()` consumes the response: this is the
-        // post-redirect URL, which is where the bytes actually live.
+        // Read the URL off before `bytes_capped()` consumes the response: this
+        // is the post-redirect URL, which is where the bytes actually live.
         let source_url = response.url.to_string();
         let bytes = response
-            .bytes()
+            .bytes_capped(self.body_cap)
             .await
             .map_err(|e| fetch_failure("failed to read preprint bytes", e))?;
 
@@ -1799,7 +1906,7 @@ impl PaperDownloader {
         let response = self.get(work, url, tier, what).await?;
         let source_url = response.url.to_string();
         let bytes = response
-            .bytes()
+            .bytes_capped(self.body_cap)
             .await
             .map_err(|e| fetch_failure("failed to read bytes", e))?;
         Ok((bytes, source_url))
@@ -2127,6 +2234,24 @@ enum LegOutcome {
     /// Asked, and we could not find out: transport failure, pacing refusal, a
     /// login redirect, a 5xx, an unparseable body.
     Inconclusive { detail: String },
+    /// Asked, and the body is over the cap (ADR-007 §1 "Storage"; #288).
+    ///
+    /// A route answered usefully — the publisher accepted the connection and
+    /// started sending — but the body would have been over the per-kind cap,
+    /// so the fetch refused to keep it and the staging file never existed. A
+    /// place of its own and not a sub-case of [`Self::Refused`]: refusal is the
+    /// publisher's answer, this is **ours**, and conflating them would turn
+    /// "we refused to file what came back" into "the server would not serve
+    /// it".
+    ///
+    /// `observed` is a lower bound when the running stream caught the overrun
+    /// (`from_content_length == false`) and exact when the declared
+    /// `Content-Length` refused early.
+    TooLarge {
+        cap: u64,
+        observed: u64,
+        from_content_length: bool,
+    },
     /// Asked, and it **answered with locations**, which the metadata pass ranked
     /// and the fetch either took or did not.
     ///
@@ -2154,7 +2279,10 @@ impl LegOutcome {
     fn was_attempted(&self) -> bool {
         matches!(
             self,
-            Self::Refused { .. } | Self::NoLocation { .. } | Self::Inconclusive { .. }
+            Self::Refused { .. }
+                | Self::NoLocation { .. }
+                | Self::Inconclusive { .. }
+                | Self::TooLarge { .. }
         )
     }
 
@@ -2175,6 +2303,26 @@ impl LegOutcome {
                 format!("named no location ({detail}) — not evidence that the work is unavailable")
             }
             Self::Inconclusive { detail } => format!("could not be resolved: {detail}"),
+            Self::TooLarge {
+                cap,
+                observed,
+                from_content_length,
+            } => {
+                let shape = if *from_content_length {
+                    format!(
+                        "declared {observed} bytes, over the {cap}-byte cap ADR-007 §1 \
+                         \"Storage\" sets for a full-text artefact; nothing was pulled from the \
+                         wire"
+                    )
+                } else {
+                    format!(
+                        "the streamed body passed the {cap}-byte cap ADR-007 §1 \"Storage\" sets \
+                         for a full-text artefact after {observed}+ bytes; the read was aborted \
+                         and no file was staged"
+                    )
+                };
+                format!("refused to file what came back: {shape}")
+            }
             Self::Ranked {
                 candidates,
                 position,
@@ -2253,6 +2401,36 @@ impl LegError {
             outcome: LegOutcome::Skipped {
                 why: why.to_string(),
             },
+        }
+    }
+
+    /// The body exceeded the cap (ADR-007 §1 "Storage"; #288).
+    ///
+    /// Both the error and the outcome come from the one `FetchError::BodyTooLarge`:
+    /// the error carries the message the walk has always surfaced, and the outcome
+    /// carries the structured fields the ladder record and the `too_large`
+    /// `acquisition_attempts` row read.
+    fn too_large(error: FetchError) -> Self {
+        let outcome = if let FetchError::BodyTooLarge {
+            cap,
+            observed,
+            from_content_length,
+            ..
+        } = &error
+        {
+            LegOutcome::TooLarge {
+                cap: *cap,
+                observed: *observed,
+                from_content_length: *from_content_length,
+            }
+        } else {
+            // Unreachable at the one call site, but the panic message would be a
+            // better signal than a silent mis-classification.
+            unreachable!("LegError::too_large on a non-BodyTooLarge FetchError: {error:?}")
+        };
+        Self {
+            error: AdapterError::Paced(error),
+            outcome,
         }
     }
 
@@ -2658,6 +2836,11 @@ fn fetch_failure(what: &str, error: FetchError) -> LegError {
                 "{what} returned status {code}"
             )))
         }
+        // The body was over the per-kind cap (#288). Classified in its own
+        // bucket because it is **our** refusal, not the publisher's: the route
+        // answered and the bytes started arriving, and the cap is what refused
+        // to file them.
+        FetchError::BodyTooLarge { .. } => LegError::too_large(error),
         // A login redirect says a route exists that needs a human's session,
         // not that the work is unobtainable, so it is inconclusive here: the
         // tier-4 leg has not been taken. Same for a pacing refusal, which is
@@ -3094,6 +3277,38 @@ mod tests {
                 .await;
         }
 
+        /// Mount a PDF route with a caller-supplied body. The seam the #288
+        /// tests use to drive a body of exactly the shape and size the cap is
+        /// being asked about.
+        async fn serve_pdf_body(&self, route: &str, body: Vec<u8>) {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/pdf")
+                        .set_body_bytes(body),
+                )
+                .mount(&self.server)
+                .await;
+        }
+
+        /// Mount a chunked PDF route: the body is served with
+        /// `Transfer-Encoding: chunked` so `Content-Length` is not advertised,
+        /// which is the publisher shape #288's acceptance criterion needs —
+        /// "a chunked response with no `Content-Length` is bounded".
+        async fn serve_pdf_chunked(&self, route: &str, body: Vec<u8>) {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/pdf")
+                        .insert_header("transfer-encoding", "chunked")
+                        .set_body_bytes(body),
+                )
+                .mount(&self.server)
+                .await;
+        }
+
         /// The `acquisition_state` rows for a work, as
         /// `(status, reason, hint_url, drop_path)`.
         fn states(&self, paper_id: &str) -> Vec<StateRow> {
@@ -3187,6 +3402,78 @@ mod tests {
             let conn = self.db.conn().expect("conn");
             conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
                 .expect("count")
+        }
+
+        /// The audit rows migration 013 writes for a work, as
+        /// `(kind, route, outcome, detail)` in insert order. Used by the #288
+        /// fetch-cap tests, where the one assertion the acceptance criterion
+        /// pins is that `too_large` landed in the same table scan writes to.
+        fn attempts(&self, paper_id: &str) -> Vec<(String, String, String, String)> {
+            let conn = self.db.conn().expect("conn");
+            let mut stmt = conn
+                .prepare(
+                    "SELECT kind, route, outcome, COALESCE(detail, '')
+                       FROM acquisition_attempts
+                      WHERE paper_id = ?1
+                      ORDER BY id",
+                )
+                .expect("prepare");
+            stmt.query_map([paper_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("rows")
+        }
+
+        /// Paths on disk under the library root, with `blobs/.tmp/` (the
+        /// staging directory) listed separately so a test can prove that a
+        /// refused fetch left nothing behind. The acceptance criterion the
+        /// #288 tests pin: never write more than the cap, and leave no partial
+        /// file.
+        fn stored_blobs(&self) -> Vec<PathBuf> {
+            let blobs = self.root().join("blobs");
+            if !blobs.exists() {
+                return Vec::new();
+            }
+            let mut out = Vec::new();
+            let mut stack = vec![blobs];
+            while let Some(dir) = stack.pop() {
+                for entry in std::fs::read_dir(&dir).expect("read_dir") {
+                    let entry = entry.expect("entry");
+                    let path = entry.path();
+                    // The staging directory lives under blobs/ but is not a
+                    // placed blob — list it under its own helper instead.
+                    if path.ends_with(".tmp") {
+                        continue;
+                    }
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else {
+                        out.push(path);
+                    }
+                }
+            }
+            out.sort();
+            out
+        }
+
+        fn staged_files(&self) -> Vec<PathBuf> {
+            let staging = self.root().join("blobs").join(".tmp");
+            if !staging.exists() {
+                return Vec::new();
+            }
+            let mut out: Vec<PathBuf> = std::fs::read_dir(&staging)
+                .expect("read_dir")
+                .map(|e| e.expect("entry").path())
+                .collect();
+            out.sort();
+            out
         }
     }
 
@@ -4672,6 +4959,297 @@ mod tests {
             reason.contains("ranked") || reason.contains("derived"),
             "and it says the routes were *ranked* rather than walked: {reason}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // #288: the fetch body cap, end to end.
+    //
+    // The http layer owns the mechanics — four shapes of body under one cap,
+    // tested in `scitadel_http::client::tests::bytes_capped`. These tests pin
+    // the *integration*: a cap-refused fetch records `too_large` in the same
+    // audit table that `scan` writes to (#286), nothing is staged, and no
+    // artefact row is written. The cap is injected through
+    // `PaperDownloader::with_body_cap`, which keeps the test's bodies small
+    // and the one constant that encodes the production value — `FETCH_BODY_CAP_BYTES`,
+    // itself a re-export of `cap_for_kind("fulltext_pdf")` — unchanged.
+    //
+    // All four of #288's shapes are exercised here, mirroring the http-layer
+    // suite. The "lying Content-Length" shape runs through `wiremock` with the
+    // publisher declaring **more** bytes than the cap, because reqwest's
+    // transport truncates a lying-small declaration before the stream check
+    // ever sees it; the attack we must bound in-process is the one where the
+    // declared length is under the cap and the real body is chunked — which is
+    // the "chunked body over the cap" test below.
+    // -----------------------------------------------------------------
+
+    /// A fixture that steers a work through the arXiv preprint transform —
+    /// the simplest route to drive, because `arxiv_id` on the paper names the
+    /// one URL the metadata pass's ranking has to pick.
+    fn save_arxiv_work(fx: &Fixture, id: &str, arxiv_id: &str) -> Paper {
+        save(
+            fx,
+            id,
+            Some(&format!("10.48550/arxiv.{arxiv_id}")),
+            Some(arxiv_id),
+            None,
+            None,
+        )
+    }
+
+    /// Acceptance criterion: a fetched body above the cap is never written to
+    /// the blob store, and records `too_large`.
+    ///
+    /// Shape 1 — chunked body over the cap, no honest `Content-Length`. This
+    /// is the worst case: the server promises nothing about size up front, so
+    /// the stream check is the only line between the cap and a 2 GB blob.
+    #[tokio::test]
+    async fn a_chunked_body_over_the_cap_is_bounded_and_records_too_large() {
+        let fx = Fixture::new().await;
+        let arxiv_id = "2401.00001";
+        let body = vec![b'P'; 4 * 1024]; // 4 KiB, exceeds the 1 KiB test cap
+        fx.serve_pdf_chunked(&format!("/pdf/{arxiv_id}.pdf"), body.clone())
+            .await;
+        let paper = save_arxiv_work(&fx, "p-too-large-chunked", arxiv_id);
+
+        let err = fx
+            .downloader()
+            .with_body_cap(1024)
+            .download_paper(&paper, &fx.papers_dir())
+            .await
+            .expect_err("a body over the cap is a refused fetch");
+        match &err {
+            AdapterError::Paced(FetchError::BodyTooLarge {
+                cap,
+                observed,
+                from_content_length,
+                ..
+            }) => {
+                assert_eq!(*cap, 1024);
+                assert!(
+                    !*from_content_length,
+                    "no honest Content-Length — the stream caught this"
+                );
+                assert!(observed > cap, "observed {observed} > cap {cap}");
+            }
+            other => panic!("expected BodyTooLarge, got {other:?}"),
+        }
+
+        // No artefact was written.
+        assert!(
+            fx.artefact("p-too-large-chunked").is_none(),
+            "a body over the cap must never be filed"
+        );
+        // And no blob reached the store — not even in staging, because the
+        // `too_large` error short-circuits before `store_bytes` is called.
+        assert!(
+            fx.stored_blobs().is_empty(),
+            "nothing is placed in blobs/: {:?}",
+            fx.stored_blobs()
+        );
+        assert!(
+            fx.staged_files().is_empty(),
+            "nothing is left in blobs/.tmp/: {:?}",
+            fx.staged_files()
+        );
+        assert_eq!(fx.count("blobs"), 0, "no `blobs` row was written");
+
+        // The audit row is `too_large`, in the same table and with the same
+        // outcome spelling `scan` uses (`crates/scitadel-adapters/src/scan.rs`
+        // writes this one for a dropped-in file; #288 adds this call site).
+        let attempts = fx.attempts("p-too-large-chunked");
+        let too_large: Vec<_> = attempts
+            .iter()
+            .filter(|(_, _, outcome, _)| outcome == "too_large")
+            .collect();
+        assert_eq!(
+            too_large.len(),
+            1,
+            "exactly one too_large row: {attempts:?}"
+        );
+        let (kind, route, _, detail) = too_large[0];
+        assert_eq!(kind, "fulltext", "the gap kind this fetch was for");
+        assert_eq!(route, "arxiv", "the route that served the oversized body");
+        assert!(
+            detail.contains("1024"),
+            "the cap is in the detail: {detail}"
+        );
+        assert!(
+            detail.contains("stream"),
+            "the detail says the stream check was what refused: {detail}"
+        );
+    }
+
+    /// Acceptance criterion: a declared `Content-Length` over the cap is
+    /// refused early. The pre-flight may use the header to refuse; it never
+    /// uses it to raise the limit.
+    ///
+    /// Shape 2 of #288's tests — a lying-upward `Content-Length`: the server
+    /// declares a length that happens to equal the body it then sends, but
+    /// that length is already over the per-kind cap. The cap refuses without
+    /// reading the body, and the audit row says so.
+    #[tokio::test]
+    async fn a_declared_length_over_the_cap_refuses_before_reading() {
+        let fx = Fixture::new().await;
+        let arxiv_id = "2401.00002";
+        let body = vec![b'Q'; 4 * 1024]; // 4 KiB body with honest Content-Length
+        fx.serve_pdf_body(&format!("/pdf/{arxiv_id}.pdf"), body)
+            .await;
+        let paper = save_arxiv_work(&fx, "p-too-large-declared", arxiv_id);
+
+        let err = fx
+            .downloader()
+            .with_body_cap(1024)
+            .download_paper(&paper, &fx.papers_dir())
+            .await
+            .expect_err("a declared length over the cap is a refused fetch");
+        match &err {
+            AdapterError::Paced(FetchError::BodyTooLarge {
+                cap,
+                observed,
+                from_content_length,
+                ..
+            }) => {
+                assert_eq!(*cap, 1024);
+                assert!(
+                    *from_content_length,
+                    "the declared length is what refused: nothing was pulled"
+                );
+                assert_eq!(*observed, 4 * 1024, "the declared length verbatim");
+            }
+            other => panic!("expected BodyTooLarge, got {other:?}"),
+        }
+        assert!(fx.artefact("p-too-large-declared").is_none());
+        assert!(fx.stored_blobs().is_empty());
+        assert!(fx.staged_files().is_empty());
+
+        let too_large: Vec<_> = fx
+            .attempts("p-too-large-declared")
+            .into_iter()
+            .filter(|(_, _, outcome, _)| outcome == "too_large")
+            .collect();
+        assert_eq!(too_large.len(), 1);
+        let detail = &too_large[0].3;
+        assert!(
+            detail.contains("Content-Length declared"),
+            "the detail distinguishes the pre-flight case: {detail}"
+        );
+    }
+
+    /// Acceptance criterion: `scan` and the fetch path share one implementation
+    /// of the rule.
+    ///
+    /// Shape 3 — a body **exactly at** the cap lands. The cap is the first
+    /// size that is refused, not the last that is accepted, which is also what
+    /// `scan` enforces on a dropped-in file (`crates/scitadel-db/src/sqlite/blobs.rs`
+    /// is `cap_for_kind`'s one definition, and both paths read it).
+    #[tokio::test]
+    async fn a_body_exactly_at_the_cap_is_filed() {
+        // A 1024-byte PDF-shaped body: the `%PDF` prefix is enough for the
+        // `looks_like_pdf` classification to read as a PDF, and the rest is
+        // padding so that `body.len() == cap`.
+        const CAP: u64 = 1024;
+        let fx = Fixture::new().await;
+        let arxiv_id = "2401.00003";
+        let mut body = b"%PDF-1.7\n".to_vec();
+        body.resize(CAP as usize, b'x');
+        fx.serve_pdf_body(&format!("/pdf/{arxiv_id}.pdf"), body.clone())
+            .await;
+        let paper = save_arxiv_work(&fx, "p-at-cap", arxiv_id);
+
+        let result = fx
+            .downloader()
+            .with_body_cap(CAP)
+            .download_paper(&paper, &fx.papers_dir())
+            .await
+            .expect("a body exactly at the cap is accepted");
+        assert_eq!(result.bytes, CAP as usize);
+        assert_eq!(result.format, DownloadFormat::Pdf);
+        assert_eq!(result.route, RouteId::Arxiv);
+
+        // The artefact and its blob are both written — the cap did not get in
+        // the way.
+        let artefact = fx
+            .artefact("p-at-cap")
+            .expect("an artefact for a body at the cap");
+        assert_eq!(artefact.kind, "fulltext_pdf");
+        assert!(artefact.sha256.is_some(), "a blob was hashed and filed");
+        assert_eq!(
+            fx.stored_blobs().len(),
+            1,
+            "exactly one blob file placed: {:?}",
+            fx.stored_blobs()
+        );
+        assert!(
+            fx.staged_files().is_empty(),
+            "the staging file was renamed into place, not left behind"
+        );
+        assert!(
+            fx.attempts("p-at-cap")
+                .iter()
+                .all(|(_, _, outcome, _)| outcome != "too_large"),
+            "and no too_large audit row was written"
+        );
+    }
+
+    /// Shape 4 — a body just under the cap is accepted, with every byte
+    /// intact. The symmetrical case to `a_body_exactly_at_the_cap_is_filed`,
+    /// which proves the boundary itself holds without rounding either way.
+    #[tokio::test]
+    async fn a_body_just_under_the_cap_is_filed() {
+        const CAP: u64 = 1024;
+        let fx = Fixture::new().await;
+        let arxiv_id = "2401.00004";
+        let mut body = b"%PDF-1.7\n".to_vec();
+        body.resize(CAP as usize - 1, b'x');
+        fx.serve_pdf_body(&format!("/pdf/{arxiv_id}.pdf"), body.clone())
+            .await;
+        let paper = save_arxiv_work(&fx, "p-under-cap", arxiv_id);
+
+        let result = fx
+            .downloader()
+            .with_body_cap(CAP)
+            .download_paper(&paper, &fx.papers_dir())
+            .await
+            .expect("a body one byte under the cap is accepted");
+        assert_eq!(result.bytes, CAP as usize - 1);
+        assert_eq!(result.format, DownloadFormat::Pdf);
+
+        let artefact = fx
+            .artefact("p-under-cap")
+            .expect("an artefact for a body under the cap");
+        assert!(artefact.sha256.is_some());
+        assert_eq!(fx.stored_blobs().len(), 1);
+        assert!(fx.staged_files().is_empty());
+        assert!(
+            fx.attempts("p-under-cap")
+                .iter()
+                .all(|(_, _, outcome, _)| outcome != "too_large"),
+        );
+    }
+
+    /// Acceptance criterion: `scan` and the fetch path share **one**
+    /// implementation of the rule.
+    ///
+    /// The one constant that encodes ADR-007 §1's full-text cap is
+    /// [`scitadel_db::sqlite::CAP_FULLTEXT_BYTES`], read by `scan` through
+    /// `cap_for_kind("fulltext_pdf")` and by the fetch path through the
+    /// [`FETCH_BODY_CAP_BYTES`] re-export. If anyone edits one side without
+    /// the other, this test fails — which is the whole mechanical point of
+    /// having one source of truth for the number.
+    #[test]
+    fn the_fetch_cap_is_the_same_rule_scan_enforces() {
+        assert_eq!(
+            FETCH_BODY_CAP_BYTES,
+            scitadel_db::sqlite::CAP_FULLTEXT_BYTES as u64,
+            "the fetch path's cap is cap_for_kind('fulltext_pdf') verbatim"
+        );
+        assert_eq!(
+            Some(FETCH_BODY_CAP_BYTES as i64),
+            scitadel_db::sqlite::cap_for_kind("fulltext_pdf"),
+            "and `scan` reads the same number through `cap_for_kind`"
+        );
+        // 100 MB, pinned so a later change to the ADR has to land here too.
+        assert_eq!(FETCH_BODY_CAP_BYTES, 100 * 1024 * 1024);
     }
 
     /// **"Unreachable" must never be reachable-by-download**, part one: a work

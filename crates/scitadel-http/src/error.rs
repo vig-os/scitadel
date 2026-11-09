@@ -105,6 +105,35 @@ pub enum FetchError {
         #[source]
         source: reqwest::Error,
     },
+
+    /// The body is over the caller-supplied cap (ADR-007 §1 "Storage").
+    ///
+    /// Two shapes under one name because the recording — an
+    /// `acquisition_attempts.outcome = 'too_large'` row, written by the
+    /// adapter — wants the same outcome word for either:
+    ///
+    /// - `from_content_length: true` — the server declared a `Content-Length`
+    ///   over the cap. The number is a *claim* and nothing was pulled, so
+    ///   `observed` is exact and `0` bytes were read. The declared length may
+    ///   refuse early but **never** raise the enforced limit (#288).
+    /// - `from_content_length: false` — no honest `Content-Length`, and the
+    ///   streaming read itself passed the cap. `observed` is a *lower bound*
+    ///   (`> cap`): the read is aborted the moment the running total crosses
+    ///   it, so no partial file is kept.
+    ///
+    /// The stream path is what defeats the lying-Content-Length case: a
+    /// publisher that declares `Content-Length: 1` and sends 2 GB is still
+    /// stopped, because the limit is the byte count actually read.
+    #[error(
+        "body over the {cap}-byte cap for {url} \
+         (observed {observed} bytes, from_content_length: {from_content_length})"
+    )]
+    BodyTooLarge {
+        url: String,
+        cap: u64,
+        observed: u64,
+        from_content_length: bool,
+    },
 }
 
 impl FetchError {
@@ -189,6 +218,12 @@ mod tests {
                 allowed: "elsevier".into(),
             },
             FetchError::Pace(PaceDenied::DailyCap),
+            FetchError::BodyTooLarge {
+                url: "https://example.org/huge.pdf".into(),
+                cap: 100 * 1024 * 1024,
+                observed: 250 * 1024 * 1024,
+                from_content_length: true,
+            },
         ];
         for e in all {
             let msg = e.to_string();
