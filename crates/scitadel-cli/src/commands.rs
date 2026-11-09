@@ -73,6 +73,7 @@ pub fn tui(theme_override: Option<&str>) -> Result<()> {
     scitadel_tui::run(
         &config.db_path,
         openalex,
+        config.acquire.body_cap_bytes,
         papers_dir,
         config.ui.show_institutional_hint,
         reader,
@@ -856,7 +857,8 @@ pub async fn download(doi: &str, output_dir: Option<PathBuf>) -> Result<()> {
         .context("open database for the pacing ledger")?;
     let downloader =
         scitadel_adapters::download::PaperDownloader::new(db, config.openalex.auth(), 60.0)
-            .context("build the downloader")?;
+            .context("build the downloader")?
+            .with_body_cap_override(config.acquire.body_cap_bytes);
 
     println!("Downloading paper: {doi}");
     println!("  Output dir: {}", out_dir.display());
@@ -2310,7 +2312,8 @@ pub async fn acquire(opts: AcquireOptions, json: bool) -> Result<()> {
     // from being a second, subtly different code path.
     let downloader =
         scitadel_adapters::download::PaperDownloader::new(db.clone(), config.openalex.auth(), 60.0)
-            .context("build the downloader")?;
+            .context("build the downloader")?
+            .with_body_cap_override(config.acquire.body_cap_bytes);
 
     // `--from` imports, then drains: two reconciliations of two different things,
     // so they are two calls with one order. A queue import writes

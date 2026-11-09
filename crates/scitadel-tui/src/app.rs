@@ -135,6 +135,9 @@ pub struct App {
     /// OpenAlex polite-pool address + metered API key, used by the
     /// download chain (Unpaywall wants the email; OpenAlex wants both).
     pub openalex: OpenAlexAuth,
+    /// Operator override for the fetch body cap (#288), threaded through
+    /// `config.acquire.body_cap_bytes`. `None` keeps the workspace default.
+    pub body_cap_bytes: Option<u64>,
     pub papers_dir: PathBuf,
     pub show_institutional_hint: bool,
     pub reader: String,
@@ -277,6 +280,7 @@ impl App {
     fn new(
         data: DataStore,
         openalex: OpenAlexAuth,
+        body_cap_bytes: Option<u64>,
         papers_dir: PathBuf,
         show_institutional_hint: bool,
         reader: String,
@@ -304,6 +308,7 @@ impl App {
             tasks: Vec::new(),
             last_published_state: None,
             openalex,
+            body_cap_bytes,
             papers_dir,
             show_institutional_hint,
             reader,
@@ -969,6 +974,7 @@ impl App {
             self.openalex.clone(),
             self.data.db.clone(),
             self.papers_dir.clone(),
+            self.body_cap_bytes,
         );
     }
 
@@ -1446,13 +1452,21 @@ fn tui_state_key(
 pub fn run(
     db_path: &Path,
     openalex: OpenAlexAuth,
+    body_cap_bytes: Option<u64>,
     papers_dir: PathBuf,
     show_institutional_hint: bool,
     reader: String,
     startup_toast: Option<String>,
 ) -> Result<()> {
     let data = DataStore::open(db_path)?;
-    let mut app = App::new(data, openalex, papers_dir, show_institutional_hint, reader);
+    let mut app = App::new(
+        data,
+        openalex,
+        body_cap_bytes,
+        papers_dir,
+        show_institutional_hint,
+        reader,
+    );
     app.startup_toast = startup_toast;
 
     enable_raw_mode()?;
@@ -1827,6 +1841,7 @@ mod tests {
                 email: "demo@example.org".into(),
                 ..OpenAlexAuth::default()
             },
+            None,
             papers_dir.clone(),
             false,
             "lars".into(),

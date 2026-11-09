@@ -499,6 +499,19 @@ impl PaperDownloader {
         self
     }
 
+    /// Apply the operator's body-cap override, when one is set.
+    ///
+    /// `None` keeps the workspace default: the thin wrapper exists so the
+    /// CLI, MCP and TUI call sites spell the config binding the same way
+    /// (one source of truth: `config.acquire.body_cap_bytes`).
+    #[must_use]
+    pub fn with_body_cap_override(self, cap: Option<u64>) -> Self {
+        match cap {
+            Some(cap) => self.with_body_cap(cap),
+            None => self,
+        }
+    }
+
     /// The endpoint set in force, for a test that asserts on it.
     #[must_use]
     pub fn endpoints(&self) -> &Endpoints {
@@ -5595,6 +5608,105 @@ mod tests {
         assert_eq!(
             too_large_after_second, too_large_after_first,
             "no second cap refusal row, because the planner never asked for one"
+        );
+    }
+
+    /// The **named re-acquire** path: after raising the cap, calling
+    /// `acquire` with an explicit `--paper <id>` bypasses the queue filter
+    /// and fetches the work again. This is the one documented way out of
+    /// `too_large` (#288): naming the id declares the inputs changed.
+    #[tokio::test]
+    async fn a_raised_cap_and_a_named_re_acquire_fetches_the_work() {
+        let fx = Fixture::new().await;
+        let arxiv_id = "2401.00043";
+        let body = vec![b'S'; 4 * 1024];
+        // Two mounts: the record-arxiv-id variant (`/pdf/<id>.pdf`, used
+        // when `paper.arxiv_id` is set in-memory — the first walk here
+        // passes the `Paper` object directly) and the preprint-transform
+        // variant (`/pdf/<id>`, used by `acquire::run` which reads the
+        // `papers` row back and finds no `arxiv_id` column in the test
+        // fixture's `save()` — ARXIV transforms the DOI itself to an
+        // arxiv URL in that path). Both resolve to the same 4 KiB body so
+        // the test does not accidentally depend on which URL won.
+        let pdf_path_arxiv = format!("/pdf/{arxiv_id}.pdf");
+        let pdf_path_doi = format!("/pdf/{arxiv_id}");
+        fx.serve_pdf_chunked(&pdf_path_arxiv, body.clone()).await;
+        fx.serve_pdf_chunked(&pdf_path_doi, body).await;
+        let paper = save_arxiv_work(&fx, "p-raised-cap", arxiv_id);
+
+        // First walk via `download_paper` (which records the gap row). The
+        // 4 KiB body is over the 1 KiB cap, so status is `too_large`.
+        let strict = fx.downloader().with_body_cap(1024);
+        let _ = strict
+            .download_paper(&paper, &fx.papers_dir())
+            .await
+            .expect_err("the 4 KiB body is over the strict 1 KiB cap");
+        let states = fx.states("p-raised-cap");
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].status, "too_large");
+        // `fx.ladder_requests()` strips the metadata pass, and the fetch
+        // can route through either arxiv URL shape (see mock setup).
+        let count_fetches = |urls: Vec<String>| -> usize {
+            urls.into_iter()
+                .filter(|u| u.contains(&pdf_path_arxiv) || u.contains(&pdf_path_doi))
+                .count()
+        };
+        let ladder_after_first = count_fetches(fx.ladder_requests().await);
+        assert!(
+            ladder_after_first >= 1,
+            "sanity: the first walk put a byte request on the wire for an \
+             arxiv pdf url"
+        );
+
+        // A plain queue run, now with the raised cap, must skip the work
+        // because `too_large` is terminal — the queue has no way to know
+        // the operator raised the cap.
+        let raised = fx.downloader().with_body_cap(8 * 1024);
+        let _ = crate::acquire::run(
+            &fx.db,
+            &raised,
+            &fx.papers_dir(),
+            &crate::acquire::AcquireRequest::queue(),
+        )
+        .await
+        .expect("acquire run always returns a report");
+        let ladder_after_queue_run = count_fetches(fx.ladder_requests().await);
+        assert_eq!(
+            ladder_after_queue_run, ladder_after_first,
+            "the queue filter still skips `too_large`: the raised cap on its \
+             own is not a signal to re-fetch"
+        );
+
+        // The named re-acquire bypasses the queue filter
+        // (`acquire::plan`'s `explicit` branch — `acquire.rs:~525`). With
+        // the raised cap the 4 KiB body fits, so the walk succeeds — a new
+        // byte request lands on the wire and the status leaves `too_large`.
+        let named = crate::acquire::AcquireRequest::for_papers(["p-raised-cap".to_string()]);
+        let report = crate::acquire::run(&fx.db, &raised, &fx.papers_dir(), &named)
+            .await
+            .expect("acquire run always returns a report");
+        assert_eq!(
+            report.plan.works.len(),
+            1,
+            "the named re-acquire bypassed the queue filter and planned the \
+             one work: {report:?}"
+        );
+        let ladder_after_named = count_fetches(fx.ladder_requests().await);
+        assert!(
+            ladder_after_named > ladder_after_queue_run,
+            "the named re-acquire must have put another byte request on the \
+             wire for an arxiv pdf url (saw {ladder_after_named}, pre-named \
+             {ladder_after_queue_run}): {report:?}"
+        );
+        // The work was fetched. The `acquisition_state` row for `fulltext`
+        // is retracted by `record_download`; its absence is the success
+        // signal.
+        let states_after = fx.states("p-raised-cap");
+        assert!(
+            states_after
+                .iter()
+                .all(|s| !(s.kind == "fulltext" && s.locator.is_empty())),
+            "the gap row was retracted by the successful fetch: {states_after:?}"
         );
     }
 

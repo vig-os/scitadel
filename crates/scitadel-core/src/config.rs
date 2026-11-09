@@ -178,6 +178,31 @@ fn default_scoring_concurrency() -> u32 {
     5
 }
 
+/// Per-run tuning for `acquire` and the DOI-only `download` path — the two
+/// knobs a library operator can turn without a rebuild.
+///
+/// Today one knob: the fetch-body cap (#288). Future knobs for the acquire
+/// slice land here rather than growing their own top-level sections, so the
+/// TOML `[acquire]` table stays the one place to look.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AcquireConfig {
+    /// Override for the per-fetch body cap (ADR-007 §1 "Storage"; #288),
+    /// in bytes.
+    ///
+    /// `None` — the serde default — keeps the workspace-wide constant
+    /// `scitadel_adapters::download::FETCH_BODY_CAP_BYTES` (which is the
+    /// one re-export of `cap_for_kind("fulltext_pdf")`, so the fetch path
+    /// and `scan` can never drift). Setting a value **raises or lowers**
+    /// the cap — raising it is how an operator unlocks a cap-refused work
+    /// for a named re-acquire (`scitadel acquire --paper <id>`), which is
+    /// the one way out of `too_large` (ADR-007 §2 doc / migration 015).
+    ///
+    /// Env override: `SCITADEL_ACQUIRE_BODY_CAP_BYTES` (parsed as `u64`).
+    /// Precedence: env > TOML > unset (keep the default).
+    #[serde(default)]
+    pub body_cap_bytes: Option<u64>,
+}
+
 /// UI/UX preferences (TUI-only today; extensible for future surfaces).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiConfig {
@@ -232,6 +257,8 @@ pub struct Config {
     pub chat: ChatConfig,
     #[serde(default)]
     pub ui: UiConfig,
+    #[serde(default)]
+    pub acquire: AcquireConfig,
 }
 
 fn default_sources() -> Vec<String> {
@@ -268,6 +295,7 @@ impl Default for Config {
             epo: EpoConfig::default(),
             chat: ChatConfig::default(),
             ui: UiConfig::default(),
+            acquire: AcquireConfig::default(),
         }
     }
 }
@@ -399,6 +427,20 @@ pub fn load_config() -> Config {
         config.chat.scoring_concurrency = v;
     }
 
+    // Acquire knobs (#288). `None` in the TOML keeps the workspace-wide
+    // default; a parse failure is ignored rather than surfaced so a typo
+    // never stops the CLI starting — the warning goes through `tracing`.
+    if let Ok(bytes) = std::env::var("SCITADEL_ACQUIRE_BODY_CAP_BYTES") {
+        match bytes.parse::<u64>() {
+            Ok(v) => config.acquire.body_cap_bytes = Some(v),
+            Err(e) => tracing::warn!(
+                value = %bytes,
+                error = %e,
+                "SCITADEL_ACQUIRE_BODY_CAP_BYTES is not a u64; keeping the default"
+            ),
+        }
+    }
+
     config
 }
 
@@ -510,5 +552,33 @@ mod tests {
         assert!(config.openalex.auth().is_anonymous());
         assert!(config.openalex.enabled);
         assert!((config.openalex.timeout - 30.0).abs() < f64::EPSILON);
+    }
+
+    /// #288: `[acquire] body_cap_bytes` flows through the TOML loader.
+    /// A missing section keeps the workspace default (`None`); an explicit
+    /// value is honoured as-is, so `PaperDownloader::with_body_cap_override`
+    /// sees exactly what the operator asked for.
+    #[test]
+    fn body_cap_bytes_loads_from_toml_when_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "db_path = \"/tmp/x.db\"\n\n[acquire]\nbody_cap_bytes = 536870912\n",
+        )
+        .unwrap();
+
+        let config = load_config_from(&path).unwrap();
+        assert_eq!(config.acquire.body_cap_bytes, Some(536870912));
+    }
+
+    #[test]
+    fn body_cap_bytes_is_none_when_the_section_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "db_path = \"/tmp/x.db\"\n").unwrap();
+
+        let config = load_config_from(&path).unwrap();
+        assert_eq!(config.acquire.body_cap_bytes, None);
     }
 }
