@@ -2330,16 +2330,13 @@ impl LegOutcome {
         )
     }
 
-    /// Did the place itself say no?
-    fn was_refused(&self) -> bool {
-        matches!(self, Self::Refused { .. })
-    }
-
     /// Is this outcome a **terminal no** — a refusal that trying again cannot
     /// change? Two shapes under one predicate:
     ///
     /// - [`Self::Refused`] — the place itself said no (403, 404, …): the
-    ///   refusal is theirs, and retrying will see the same answer.
+    ///   refusal is theirs, and retrying will see the same answer. This is
+    ///   the one case in which "there is no such full text here" is supported
+    ///   by evidence rather than by exhaustion.
     /// - [`Self::TooLarge`] — the cap refused what came back (#288): the
     ///   refusal is **ours**, but a publisher that serves an oversized body
     ///   today will serve the same oversized body tomorrow, so the gap is
@@ -2351,6 +2348,10 @@ impl LegOutcome {
     /// `acquisition_attempts` (`identity_mismatch`, `too_large`, …) is what
     /// tells a human *why*, and `scitadel action_list` reads that detail when
     /// the status alone is not enough.
+    ///
+    /// Replaces the narrower `was_refused` predicate, which only read the
+    /// publisher's side of the refusal and let a cap-refused route fall
+    /// through to the retryable `error` status (#288).
     fn is_terminal_no(&self) -> bool {
         matches!(self, Self::Refused { .. } | Self::TooLarge { .. })
     }
@@ -2540,9 +2541,9 @@ impl std::fmt::Display for LegError {
 ///   `acquire` would redownload up to the cap on every run; the `too_large`
 ///   row in `acquisition_attempts` is what tells a human *why* the verdict
 ///   is `unavailable`, in the same table `scan` writes its own refusals to
-///   (#286). The two `was_refused`/`is_terminal_no` distinction is why this
-///   predicate is spelled out rather than reusing the former: the verdict
-///   reads a superset of refusals, both theirs and ours.
+///   (#286). The [`LegOutcome::is_terminal_no`] predicate carries both
+///   shapes under one name so the verdict reads a superset of refusals —
+///   both theirs and ours.
 /// - **`error`** ("transient failure", retry with backoff) when legs were
 ///   attempted but at least one of them could not give a yes or a no — a
 ///   transport failure, a 5xx, a pacing refusal, or an index that named no
