@@ -403,7 +403,8 @@ Other knobs:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SCITADEL_DB` | `./.scitadel/scitadel.db` | Database path |
+| `SCITADEL_WORKSPACE` | git toplevel from cwd → cwd | Project root the MCP server confines file reads to. Explicit override for when the server runs outside a git repo, or when the project's `.scitadel/` sits somewhere other than the git toplevel. A leading `~` is expanded, relative paths resolve against the server's cwd. Must not be `/`, `$HOME`, or an ancestor of `$HOME`. |
+| `SCITADEL_DB` | `<workspace>/.scitadel/scitadel.db` | Database path. Independent of `SCITADEL_WORKSPACE`: the DB may live outside the project (`/tmp/x.db`, `~/scitadel.db`), the workspace stays wherever the project is. |
 | `SCITADEL_CREDENTIAL_BACKEND` | auto-detected | `macos-keychain`, `secret-service` or `file` |
 | `SCITADEL_CHAT_MODEL` | `claude-sonnet-4-6` | Model used for scoring |
 | `SCITADEL_CHAT_MAX_TOKENS` | `4096` | Max completion tokens |

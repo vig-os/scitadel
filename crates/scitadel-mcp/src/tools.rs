@@ -2188,8 +2188,8 @@ pub fn bib_snapshot_tool(
     // the inputs, pin the directory to a configured location under the
     // workspace. `sanitize_filename_component` strips `/` and `.` so
     // the sanitised question id cannot carry any path semantics.
-    let config = load_config();
-    let export_dir = crate::paths::mcp_export_dir(&config).map_err(|e| e.to_string())?;
+    let root = crate::paths::workspace_root().map_err(|e| e.to_string())?;
+    let export_dir = crate::paths::mcp_export_dir().map_err(|e| e.to_string())?;
     let ext = if is_csl { "json" } else { "bib" };
     let fname = format!(
         "{}.{ext}",
@@ -2198,7 +2198,12 @@ pub fn bib_snapshot_tool(
     let output_path = export_dir.join(&fname);
     let output = output_path.to_string_lossy().into_owned();
 
-    std::fs::write(&output_path, &content).map_err(|e| e.to_string())?;
+    // `safe_write_in_root` refuses to follow a symlink at the target
+    // or in the parent (#266 adversarial review): a prior symlink
+    // under `.scitadel/bib/<qid>.bib` is replaced by an atomic rename,
+    // not written through to whatever it pointed at.
+    crate::paths::safe_write_in_root(&root, &output_path, content.as_bytes())
+        .map_err(|e| e.to_string())?;
 
     let sidecar = sidecar_path_for(&output_path);
     let mut response = serde_json::Map::new();
@@ -2223,7 +2228,11 @@ pub fn bib_snapshot_tool(
                 &content,
             )
         };
-        std::fs::write(&sidecar, lock.to_json().map_err(|e| e.to_string())?)
+        // Same symlink-safety guarantees as the bib write above:
+        // a dangling or planted sidecar symlink is replaced, not
+        // followed.
+        let sidecar_bytes = lock.to_json().map_err(|e| e.to_string())?;
+        crate::paths::safe_write_in_root(&root, &sidecar, sidecar_bytes.as_bytes())
             .map_err(|e| e.to_string())?;
         response.insert(
             "sidecar".into(),
@@ -2245,19 +2254,36 @@ pub fn bib_snapshot_tool(
 /// `bib_verify` MCP tool — confirm a `.bib` matches its sidecar
 /// lockfile. `file` is caller-supplied and read, so it is confined to
 /// the workspace root first (#266).
+///
+/// The sidecar `<file>.scitadel-bib.lock` is also routed through the
+/// confinement helper (adversarial-review follow-up): without this,
+/// a symlink at the derived sidecar path pointed `fs::read_to_string`
+/// at an outside victim file. The message for a missing sidecar
+/// echoes the caller's input + the sidecar suffix rather than the
+/// resolved path, so no outside-root path is leaked even by accident.
 pub fn bib_verify_tool(file: &str, question_override: Option<&str>) -> Result<String, String> {
     let bib_path = crate::paths::confine_read_path(file).map_err(|e| e.to_string())?;
     let bib_bytes = std::fs::read_to_string(&bib_path).map_err(|e| e.to_string())?;
 
-    let sidecar = sidecar_path_for(&bib_path);
-    if !sidecar.exists() {
-        return Ok(serde_json::json!({
-            "status": "stale",
-            "exit_code": 2,
-            "message": format!("no lockfile at {} — run bib_snapshot first", sidecar.display()),
-        })
-        .to_string());
-    }
+    // `sidecar_path_for(bib_path)` names a file next to a path that
+    // has already been confined, so the lexical check normally
+    // passes; `confine_read_path` then follows symlinks and catches
+    // the attack where the sidecar itself is a symlink to outside.
+    let sidecar_input = format!("{file}{}", SIDECAR_SUFFIX);
+    let sidecar = match crate::paths::confine_read_path(&sidecar_input) {
+        Ok(p) => p,
+        Err(crate::paths::PathScopeError::NotAccessible { .. }) => {
+            return Ok(serde_json::json!({
+                "status": "stale",
+                "exit_code": 2,
+                "message": format!(
+                    "no lockfile at {sidecar_input} — run bib_snapshot first",
+                ),
+            })
+            .to_string());
+        }
+        Err(e) => return Err(e.to_string()),
+    };
     let lock_bytes = std::fs::read_to_string(&sidecar).map_err(|e| e.to_string())?;
     let lock = scitadel_export::BibLockfile::from_json(&lock_bytes).map_err(|e| e.to_string())?;
 

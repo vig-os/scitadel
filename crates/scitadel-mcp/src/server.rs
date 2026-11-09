@@ -1483,7 +1483,7 @@ mod tests {
     /// is opened from the env var inside the same lock, so the
     /// effective DB path is stable per test even though
     /// `cargo test` launches them concurrently.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::TEST_ENV_LOCK as ENV_LOCK;
 
     /// End-to-end: a real `create_annotation` call goes through the
     /// tool surface and emits a `Created` event on the broadcast
@@ -2010,7 +2010,7 @@ mod tests {
     /// the tempdir root. We never cross into real filesystem paths;
     /// every "outside root" file sits in a sibling tempdir.
     mod mcp_path_scoping_tests {
-        use super::ENV_LOCK;
+        use crate::TEST_ENV_LOCK as ENV_LOCK;
         use std::fs;
         use std::path::PathBuf;
 
@@ -2026,6 +2026,14 @@ mod tests {
             fs::create_dir_all(&scitadel_dir).unwrap();
             let db_path = scitadel_dir.join("scitadel.db");
             unsafe {
+                // #266 follow-up: the workspace is no longer derived
+                // from `db_path.parent().parent()`, so tests have to
+                // point `SCITADEL_WORKSPACE` at the tempdir explicitly
+                // (otherwise `workspace_root` falls through to `git
+                // rev-parse` from cwd, which lands in the project
+                // repo and refuses the host's own `.scitadel/` on a
+                // fresh workspace).
+                std::env::set_var("SCITADEL_WORKSPACE", &root);
                 std::env::set_var("SCITADEL_DB", &db_path);
             }
             let db = scitadel_db::sqlite::Database::open(&db_path).unwrap();
@@ -2254,6 +2262,205 @@ mod tests {
                 "snapshot file not written: {}",
                 out_path.display()
             );
+        }
+
+        // ---- #266 adversarial-review follow-ups ----
+
+        /// Seed a question through the tools surface and return its
+        /// id. `question_prefix` on the snapshot call resolves to
+        /// this.
+        fn seed_question() -> String {
+            let printed =
+                super::super::tools::create_question_tool("Q?", "ctx").expect("create question");
+            let first = printed.lines().next().unwrap();
+            first
+                .strip_prefix("Question created: ")
+                .expect("expected `Question created: <id>` prefix")
+                .to_string()
+        }
+
+        /// A `.bib` file pre-existing at the snapshot target as a
+        /// symlink to an outside file must NOT be followed by the
+        /// write. The outside victim stays unchanged; the target is
+        /// a regular file with the fresh snapshot content.
+        #[test]
+        #[cfg(unix)]
+        fn bib_snapshot_replaces_a_target_symlink_instead_of_following_it() {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let (_tmp, root, _db) = seed_workspace();
+            let qid = seed_question();
+
+            let bib_dir = root.join(".scitadel").join("bib");
+            fs::create_dir_all(&bib_dir).unwrap();
+            let outside_dir = tempfile::tempdir().unwrap();
+            let victim = outside_dir.path().canonicalize().unwrap().join("victim");
+            fs::write(&victim, b"untouched").unwrap();
+            let target = bib_dir.join(format!("{qid}.bib"));
+            std::os::unix::fs::symlink(&victim, &target).unwrap();
+
+            super::super::tools::bib_snapshot_tool(&qid, "alice", false, "bibtex")
+                .expect("snapshot succeeds");
+
+            let victim_after = fs::read(&victim).unwrap();
+            assert_eq!(victim_after, b"untouched", "outside file was overwritten");
+            let meta = fs::symlink_metadata(&target).unwrap();
+            assert!(
+                !meta.file_type().is_symlink(),
+                "target is still a symlink after snapshot"
+            );
+        }
+
+        /// Same, for the sidecar `<target>.scitadel-bib.lock`. The
+        /// reviewer caught this specifically because the bib write
+        /// was the first `fs::write` call site but not the only one.
+        #[test]
+        #[cfg(unix)]
+        fn bib_snapshot_replaces_a_sidecar_symlink_instead_of_following_it() {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let (_tmp, root, _db) = seed_workspace();
+            let qid = seed_question();
+
+            let bib_dir = root.join(".scitadel").join("bib");
+            fs::create_dir_all(&bib_dir).unwrap();
+            let outside_dir = tempfile::tempdir().unwrap();
+            let victim = outside_dir
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join("victim.lock");
+            fs::write(&victim, b"untouched-sidecar").unwrap();
+            let sidecar_target = bib_dir.join(format!("{qid}.bib.scitadel-bib.lock"));
+            std::os::unix::fs::symlink(&victim, &sidecar_target).unwrap();
+
+            super::super::tools::bib_snapshot_tool(&qid, "alice", false, "bibtex")
+                .expect("snapshot succeeds");
+
+            let victim_after = fs::read(&victim).unwrap();
+            assert_eq!(
+                victim_after, b"untouched-sidecar",
+                "outside sidecar was overwritten"
+            );
+            let meta = fs::symlink_metadata(&sidecar_target).unwrap();
+            assert!(
+                !meta.file_type().is_symlink(),
+                "sidecar is still a symlink after snapshot"
+            );
+        }
+
+        /// If `.scitadel/bib/` itself is a symlink, `bib_snapshot`
+        /// refuses — not falls through and writes to the target dir.
+        /// Exposed via the shared `mcp_export_dir` helper.
+        #[test]
+        #[cfg(unix)]
+        fn bib_snapshot_refuses_when_bib_dir_is_a_symlink() {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let (_tmp, root, _db) = seed_workspace();
+            let qid = seed_question();
+
+            let scitadel = root.join(".scitadel");
+            fs::create_dir_all(&scitadel).unwrap();
+            let outside_dir = tempfile::tempdir().unwrap();
+            let victim_dir = outside_dir.path().canonicalize().unwrap().join("outside");
+            fs::create_dir(&victim_dir).unwrap();
+            std::os::unix::fs::symlink(&victim_dir, scitadel.join("bib")).unwrap();
+
+            let err = super::super::tools::bib_snapshot_tool(&qid, "alice", false, "bibtex")
+                .expect_err("snapshot must refuse a symlinked bib dir");
+            assert!(
+                err.contains("workspace root is not accessible") || err.contains("is a symlink"),
+                "unexpected error: {err}"
+            );
+            // Victim dir still empty — nothing landed there.
+            let entries: Vec<_> = fs::read_dir(&victim_dir).unwrap().collect();
+            assert!(entries.is_empty(), "victim dir received a write");
+        }
+
+        /// A sidecar lockfile at `<bib>.scitadel-bib.lock` that is a
+        /// symlink outside the workspace must be refused by
+        /// `bib_verify` — the reviewer found an unconfined
+        /// `fs::read_to_string(sidecar)` that would open and parse
+        /// an outside file.
+        #[test]
+        #[cfg(unix)]
+        fn bib_verify_refuses_a_sidecar_symlinked_outside_the_workspace() {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let (_tmp, root, _db) = seed_workspace();
+
+            // A valid bib file inside the workspace.
+            let bib = root.join("refs.bib");
+            fs::write(&bib, "@article{x,title={X},year={2024}}\n").unwrap();
+
+            // Sidecar is a symlink to an outside file. The target
+            // content shape does not matter — the test is about the
+            // refusal before the read.
+            let outside_dir = tempfile::tempdir().unwrap();
+            let victim = outside_dir.path().canonicalize().unwrap().join("evil.lock");
+            fs::write(&victim, b"{\"not\":\"ours\"}").unwrap();
+            let sidecar = root.join("refs.bib.scitadel-bib.lock");
+            std::os::unix::fs::symlink(&victim, &sidecar).unwrap();
+
+            let err = super::super::tools::bib_verify_tool("refs.bib", None)
+                .expect_err("sidecar symlink-out must be refused");
+            assert!(
+                err.contains("escapes the workspace root"),
+                "unexpected error: {err}"
+            );
+        }
+
+        /// `bib_verify`'s "no lockfile" message echoes the caller's
+        /// input (plus the known suffix), not a resolved path. If a
+        /// future refactor goes back to `sidecar.display()` and the
+        /// resolved path happens to sit outside the root, this test
+        /// fails loud. The refactor-prevention value is the point.
+        #[test]
+        fn bib_verify_missing_sidecar_message_does_not_leak_a_resolved_path() {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let (_tmp, root, _db) = seed_workspace();
+
+            let bib = root.join("refs.bib");
+            fs::write(&bib, "@article{x,title={X},year={2024}}\n").unwrap();
+            // No sidecar on disk.
+
+            let out =
+                super::super::tools::bib_verify_tool("refs.bib", None).expect("verify returns");
+            let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(v.get("status").and_then(|s| s.as_str()), Some("stale"));
+            let msg = v.get("message").and_then(|s| s.as_str()).unwrap_or("");
+            assert!(
+                !msg.contains(root.to_str().unwrap()),
+                "message leaks the resolved workspace path: {msg}"
+            );
+            assert!(
+                msg.contains("refs.bib.scitadel-bib.lock"),
+                "message should echo the caller's input: {msg}"
+            );
+        }
+
+        /// #266 follow-up: the reviewer's `SCITADEL_DB=scitadel.db`
+        /// case used to fail with `WorkspaceInaccessible` because
+        /// `db_path.parent().parent()` of a relative path has no
+        /// parent. The fix derives the root from `SCITADEL_WORKSPACE`
+        /// / git / cwd instead, so a relative DB path no longer
+        /// breaks path scoping. The DB layer handles its own failure
+        /// separately — this test drives confinement, not the open.
+        ///
+        /// A matching tilde-expansion test sits in paths.rs; the two
+        /// live apart because the DB open during `import_bibtex`
+        /// would try to open the relative path in the test process's
+        /// cwd (the crate dir) and leave a `scitadel.db` artifact.
+        #[test]
+        fn confine_read_path_tolerates_a_relative_scitadel_db() {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let (_tmp, root, _db) = seed_workspace();
+            unsafe {
+                std::env::set_var("SCITADEL_DB", "scitadel.db");
+            }
+            let bib = root.join("good.bib");
+            fs::write(&bib, "x").unwrap();
+
+            let got = crate::paths::confine_read_path("good.bib")
+                .expect("inside-root path accepted even with a relative SCITADEL_DB");
+            assert_eq!(got, bib.canonicalize().unwrap());
         }
     }
 }

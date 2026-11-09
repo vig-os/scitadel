@@ -3017,6 +3017,7 @@ version = "0.8.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "libc",
  "pdf-extract",
  "rmcp",
  "schemars",

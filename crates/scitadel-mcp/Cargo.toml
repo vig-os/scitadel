@@ -30,6 +30,13 @@ pdf-extract = { workspace = true }
 scraper = { workspace = true }
 sha2 = { workspace = true }
 
+# `O_NOFOLLOW` on the atomic-write helper (#266): the constant is
+# platform-specific, so we route it through `libc` rather than
+# hard-code it per target. Unix-only; the `cfg(unix)` gate means
+# Windows builds don't pull libc for this crate.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = { workspace = true }
