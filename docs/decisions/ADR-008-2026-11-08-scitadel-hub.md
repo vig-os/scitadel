@@ -3,7 +3,7 @@
 **Status**: Proposed.
 **Date**: 2026-11-08
 **Supersedes**: —
-**Context**: #311 (epic), #313–#316 (H0–H3), #318–#321 (H4–H7), #268 (PatentsView retirement), #246 (System One ranking), vig-os/tessera#778, gerchowl/g-fleet#1121, gerchowl/g-fleet#1363
+**Context**: #311 (epic), #313–#316 (H0–H3), #318–#333 (H4–H20), #268 (PatentsView retirement), #246 (System One ranking), vig-os/tessera#778, gerchowl/g-fleet#1121, gerchowl/g-fleet#1363
 
 Figures marked *(estimate)* are back-of-envelope numbers, not measurements.
 Prices and limits for third-party services are as published on 2026-11-08.
@@ -33,7 +33,7 @@ ADR-007. Four things changed:
 2. **OpenAlex prices freshness, not data.** Since February 2026 a free
    key carries a $1/day budget: a filtered list call costs $0.0001, a
    search call $0.001, and a single-entity GET is free. `per_page` is
-   capped at 100. The filters that return "everything changed since a
+   capped at 200 (the docs say 100; 200 measured on 2026-11-08). The filters that return "everything changed since a
    date" (`from_updated_date`, `from_created_date` and their `to_`
    pairs) and the daily snapshot are **Member+** ($10k/year). The
    quarterly snapshot is free: CC0, on a public S3 bucket, in JSONL and
@@ -345,7 +345,7 @@ GB per subset *(estimate)*.
 1. **Subscriptions.** For each subscribed topic, author, institution or
    source, a list query with
    `from_publication_date = last_run − lookback` (default 90 days),
-   `per_page=100`, cursor paging. Every new work in all of OpenAlex
+   `per_page=200`, cursor paging. Every new work in all of OpenAlex
    would cost a few hundred calls, about $0.05/day *(estimate)*; a
    realistic lab set costs under $0.01.
 2. **Rolling refresh.** Re-fetch known works 100 IDs per call
@@ -1255,13 +1255,18 @@ what.
 | H5 — document model + tiered extraction pipeline | #319 | hub | H0, H4, H7; tessera W0–W2, tessera#779, #780, #782 |
 | H6 — base + delta lifecycle, compaction, retention | #320 | hub | H0, H5; tessera#781; g-fleet#1363 |
 | H7 — golden set, red/green loop, random-sample QC | #321 | hub | H0; runs alongside H1, H2 and H5 from their first batch |
-| H8 — client app (Tauri 2 desktop + mobile; web dual build) | sub-issue under #311 | scitadel | H0, H3 |
-| H9 — accounts, tiers and metering | sub-issue under #311 | scitadel-cloud | H8; extraction trigger of §1 met |
-| H10 — tenant simulation on microVMs | sub-issue under #311 | scitadel-hub-deploy | H0; `microvm.nix` on anvil |
-| H11 — on-prem packaging (NixOS module + OCI + Helm) | sub-issue under #311 | scitadel-hub-deploy | H0; stage 0 hub running |
-| H12 — standalone `scitadel-mcp` (crates.io + PyPI wheel + npm) | sub-issue under #311 | scitadel | H3 |
-| H13 — TDM opt-out pipeline (robots.txt + TDMRep + `noai` + ai.txt, re-checked on every re-ingest) | sub-issue under #311 | hub | §12; before any commercial hosted tier |
-| H14 — `scitadel-hub-fixtures` CC0 slice (if open question 2 confirms) | sub-issue under #311 | scitadel | H0, H5 |
+| H8 — worldwide patent corpus: DOCDB/INPADOC families, multilingual full text, patent↔paper bridge | #322 | hub | H1, H5 |
+| H9–H11 — phase-1 sibling sources (PMC OA `oa_comm`, SureChEMBL, DataCite + Crossref; §15) | to file from #323 | hub | H0, H5 |
+| H12 — extraction-issue reporting via squelch | #324 | both | H5, H7 |
+| H13 — client app (Tauri 2 desktop + mobile; web dual build) | #325 | scitadel | H0, H3 |
+| H14 — accounts, tiers and metering | #326 | scitadel-cloud | H13; extraction trigger of §1 met |
+| H15 — tenant simulation on microVMs | #327 | scitadel-hub-deploy | H0; `microvm.nix` on anvil |
+| H16 — on-prem packaging (NixOS module + OCI + Helm) | #328 | scitadel-hub-deploy | H0; stage 0 hub running |
+| H17 — standalone `scitadel-mcp` with grounded, licence-tagged responses | #329 | scitadel | H3 |
+| H18 — TDM opt-out pipeline (robots.txt + TDMRep + `noai` + ai.txt, re-checked on every re-ingest) | #330 | hub | §12; before any commercial hosted tier |
+| H19 — `scitadel-hub-fixtures` CC0 slice + conformance kit (scope per open question 2) | #331 | scitadel | H0, H5 |
+| H20 — grounding benchmark (citation existence, support, licence correctness) | #332 | hub | H17, H5, H7 |
+| — licensing and trademark hygiene (§16) | #333 | both | — |
 
 Upstream: vig-os/tessera#778 waves:
 - W0: #758, #628;
@@ -1371,7 +1376,7 @@ product. The only use that remains is the CC0
   (§12). Embeddings are treated as adapted material to be safe; the
   per-row licence column is the enforcement surface, not a convention.
 - **A TDM opt-out pipeline is on the critical path for the hosted
-  tier** (§12, H13). robots.txt / TDMRep / `noai` / ai.txt must be
+  tier** (§12, H18). robots.txt / TDMRep / `noai` / ai.txt must be
   re-checked on every re-ingest; a hosted tier that skips this cannot
   rely on EU DSM Art. 4.
 - **A DPIA plus an Art. 14 notice are pre-launch gates** for the
