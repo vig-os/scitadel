@@ -2827,9 +2827,19 @@ enum VerifiedOpen {
 /// Open `canon` with `O_NOFOLLOW` on Unix, `fstat` to confirm a
 /// regular file, and verify the FD's current real path still sits
 /// under `root` (Linux: `/proc/self/fd/<fd>`, macOS:
-/// `fcntl(F_GETPATH)`). On non-Unix (not currently a scitadel build
-/// target) the check degrades to `is_file()` — the DB-level
-/// containment check in the caller is still enforced there.
+/// `fcntl(F_GETPATH)`, via the shared `scitadel_core::fd` helper).
+/// If the real path cannot be determined on a platform where the
+/// read may still race — including the macOS `F_GETPATH` branch,
+/// which the previous revision silently skipped — the open is
+/// treated as an escape and the caller refuses the row. The
+/// alternative, trusting the opened path, is a hole the round-6
+/// brief flagged: the check-then-open window between the DB-supplied
+/// `blob_rel_path` and the use could target different inodes.
+///
+/// On non-Unix (not currently a scitadel build target) the check
+/// degrades to `is_file()` — the DB-level containment check in the
+/// caller is still enforced, and there is no attacker model where
+/// the FD-realpath check would help without one.
 ///
 /// The FD is dropped on return. The caller reopens by path for the
 /// actual read; the remaining race is bounded by local-filesystem
@@ -2837,7 +2847,6 @@ enum VerifiedOpen {
 fn verified_open_under_root(canon: &Path, root: &Path) -> VerifiedOpen {
     #[cfg(unix)]
     {
-        use std::os::fd::AsRawFd as _;
         use std::os::unix::fs::OpenOptionsExt as _;
 
         // `O_NOFOLLOW` refuses a last-moment symlink at the leaf;
@@ -2857,39 +2866,19 @@ fn verified_open_under_root(canon: &Path, root: &Path) -> VerifiedOpen {
         if !meta.file_type().is_file() {
             return VerifiedOpen::NotFile;
         }
-        let fd = file.as_raw_fd();
-        let real: Option<PathBuf> = {
-            #[cfg(target_os = "linux")]
-            {
-                std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                // On macOS and other unix the FD→realpath call lives
-                // in libc (`fcntl(F_GETPATH)`), which this crate does
-                // not depend on. The round-5 path-level containment
-                // check above (`path.starts_with(&root)` on the
-                // canonical form) is still enforced, and the local
-                // dir-swap race that an FD realpath check would close
-                // is explicitly out of scope per the threat model in
-                // `scitadel_mcp::paths`.
-                let _ = fd;
-                None
-            }
+        // Fail CLOSED when the platform does not expose an FD-real-path
+        // call we can trust. Previously macOS fell through to `Ok` —
+        // the macOS branch now uses `fcntl(F_GETPATH)` through
+        // `scitadel_core::fd::fd_real_path`; any lookup failure is
+        // treated as "could not verify" and refused.
+        let Some(real) = scitadel_core::fd::fd_real_path(&file) else {
+            return VerifiedOpen::Escapes;
         };
-        match real {
-            Some(p) => {
-                let got = resolve_best_effort(&p);
-                if got.starts_with(root) {
-                    VerifiedOpen::Ok
-                } else {
-                    VerifiedOpen::Escapes
-                }
-            }
-            // No FD→realpath lookup available on this platform — the
-            // O_NOFOLLOW + regular-file gates above are what we have;
-            // the leaf symlink and FIFO/device cases are still caught.
-            None => VerifiedOpen::Ok,
+        let got = resolve_best_effort(&real);
+        if got.starts_with(root) {
+            VerifiedOpen::Ok
+        } else {
+            VerifiedOpen::Escapes
         }
     }
     #[cfg(not(unix))]
@@ -4106,6 +4095,97 @@ mod tests {
             None,
             "`missing_on_disk` is the same refusal: the row is there and the file \
              is not, and handing a reader a path that opens nothing is worse"
+        );
+    }
+
+    /// Round-7 nit: a DB-supplied `blob_rel_path` containing `..`
+    /// must not reach the reader, however the bytes happen to be
+    /// laid out on disk. The row's path-level containment check in
+    /// `find_cached_file` catches it; we assert the warn-and-skip
+    /// behaviour (`None` on this row).
+    #[test]
+    fn find_cached_file_refuses_a_row_with_parent_dir_traversal() {
+        let (_dir, db) = library();
+        let mut paper = Paper::new("A paper");
+        paper.id = scitadel_core::models::PaperId::from("p-traversal");
+        let root = db
+            .library_root()
+            .expect("root")
+            .expect("a file-backed library");
+        // The attacker's target: a real PDF one directory above the
+        // library root. A reader that opens `root/../pwn.pdf` would
+        // happily read it.
+        let outside = root.parent().expect("a parent").join("pwn.pdf");
+        std::fs::write(&outside, PDF_BYTES).expect("plant a victim file");
+
+        let sha = "aa".repeat(32);
+        write_artefact(
+            &db,
+            &paper,
+            ArtefactWrite {
+                sha256: Some(sha.clone()),
+                blob: Some(BlobWrite {
+                    sha256: sha.clone(),
+                    bytes: PDF_BYTES.len() as i64,
+                    mime: "application/pdf".into(),
+                    // The injected row — '..' crosses the library boundary.
+                    rel_path: "../pwn.pdf".into(),
+                    created_at: NOW.into(),
+                }),
+                ..fulltext_row(&paper, &sha)
+            },
+        );
+        assert_eq!(
+            find_cached_file(&db, &paper).expect("a root"),
+            None,
+            "a DB row with `..` in its blob_rel_path must not escape the library"
+        );
+    }
+
+    /// Round-7 nit: a `blob_rel_path` that sits under the library
+    /// root *in writing* but resolves (via a symlink at the leaf)
+    /// to a target outside must not reach the reader either. The
+    /// `O_NOFOLLOW` + FD-realpath verify in `verified_open_under_root`
+    /// catches it: the open refuses the symlink (`NotFile`), so the
+    /// row is skipped.
+    #[test]
+    #[cfg(unix)]
+    fn find_cached_file_refuses_a_row_whose_blob_is_a_symlink_outside() {
+        let (_dir, db) = library();
+        let mut paper = Paper::new("A paper");
+        paper.id = scitadel_core::models::PaperId::from("p-symlink");
+        let root = db
+            .library_root()
+            .expect("root")
+            .expect("a file-backed library");
+        let outside = root.parent().expect("a parent").join("victim.pdf");
+        std::fs::write(&outside, PDF_BYTES).expect("plant a victim file");
+
+        let sha = "bb".repeat(32);
+        let rel = blob_rel_path(&sha, "pdf");
+        let link_at = root.join(&rel);
+        std::fs::create_dir_all(link_at.parent().expect("a shard")).expect("shard dir");
+        std::os::unix::fs::symlink(&outside, &link_at).expect("plant a symlink");
+
+        write_artefact(
+            &db,
+            &paper,
+            ArtefactWrite {
+                sha256: Some(sha.clone()),
+                blob: Some(BlobWrite {
+                    sha256: sha.clone(),
+                    bytes: PDF_BYTES.len() as i64,
+                    mime: "application/pdf".into(),
+                    rel_path: rel.clone(),
+                    created_at: NOW.into(),
+                }),
+                ..fulltext_row(&paper, &sha)
+            },
+        );
+        assert_eq!(
+            find_cached_file(&db, &paper).expect("a root"),
+            None,
+            "a symlinked blob leaving the library must not be offered to a reader"
         );
     }
 

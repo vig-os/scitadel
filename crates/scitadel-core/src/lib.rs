@@ -2,6 +2,7 @@ pub mod bibtex_key;
 pub mod config;
 pub mod credentials;
 pub mod error;
+pub mod fd;
 pub mod models;
 pub mod ports;
 pub mod project;

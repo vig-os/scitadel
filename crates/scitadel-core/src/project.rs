@@ -151,9 +151,7 @@ fn resolve_root_input() -> Result<PathBuf, ProjectRootError> {
 /// fail the same way. `validate_marker` later tightens the MCP
 /// side with a symlink-safety check against the project root.
 fn has_project_marker(dir: &Path) -> bool {
-    std::fs::metadata(dir.join(PROJECT_MARKER))
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
+    std::fs::metadata(dir.join(PROJECT_MARKER)).is_ok_and(|m| m.is_dir())
 }
 
 /// Walk up from `start`, returning the first ancestor (including
@@ -367,7 +365,8 @@ pub fn home_from_passwd() -> Option<PathBuf> {
         // and `result` are out-pointers we own. `getpwuid_r` fills
         // `pwd` with pointers into `buf`; we copy `pw_dir` before
         // either goes out of scope.
-        let rc = unsafe { libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), cap, &mut result) };
+        let rc =
+            unsafe { libc::getpwuid_r(uid, &raw mut pwd, buf.as_mut_ptr(), cap, &raw mut result) };
         if rc == libc::ERANGE {
             cap = cap.saturating_mul(2);
             if cap > 1 << 20 {
