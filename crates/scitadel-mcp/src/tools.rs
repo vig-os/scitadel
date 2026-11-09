@@ -3138,7 +3138,7 @@ mod tests {
              {final_window}"
         );
         assert_eq!(
-            final_window["total_chars"].as_u64().unwrap() as usize,
+            final_window["paper"]["total_chars"].as_u64().unwrap() as usize,
             total,
             "sanity: the final window reaches total_chars"
         );
