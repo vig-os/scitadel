@@ -338,7 +338,8 @@ mod tests {
         // One paper so the FK can be exercised, and one acquisition_state
         // row per v14 status so every status is reconstituted on the rebuild.
         conn.execute(
-            "INSERT INTO papers (id, title) VALUES ('p-cascade', 'Status survival test')",
+            "INSERT INTO papers (id, title, created_at)
+             VALUES ('p-cascade', 'Status survival test', '2026-11-09T00:00:00Z')",
             [],
         )
         .unwrap();
