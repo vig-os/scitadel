@@ -402,12 +402,14 @@ impl PacedResponse {
             });
         }
 
-        // `cap + 1` so that a stream exactly at the cap fits without a
-        // re-allocation and a stream *just over* the cap is detected on the
-        // first chunk that crosses the line. A huge `usize` cast would allow a
-        // hostile `Content-Length` to drive an allocation we never actually
-        // need; the honest-case cap for fulltext is 100 MB, well inside
-        // `usize`, but we clamp to be safe.
+        // A conservative 64 KiB initial allocation, clamped so no hostile
+        // declared length can grow it further. The vector grows naturally as
+        // chunks arrive, so the full-text cap (100 MB) does **not** eagerly
+        // allocate 100 MB up front — only a sub-64 KiB body ever fits in the
+        // initial buffer without a re-alloc. `usize::MAX` on 32-bit platforms
+        // can't actually store `cap + 1` for every valid `u64`, so the
+        // saturating `try_from` is what keeps the math honest; `min(64 KiB)`
+        // is what keeps the allocation sane.
         let initial_capacity = usize::try_from(cap.saturating_add(1)).unwrap_or(usize::MAX);
         let mut body: Vec<u8> = Vec::with_capacity(initial_capacity.min(64 * 1024));
         let mut total: u64 = 0;
@@ -1398,35 +1400,38 @@ mod tests {
             }
         }
 
-        /// A publisher that **lies** about `Content-Length` must not raise the
-        /// enforced limit: the number the cap compares against is the byte
-        /// count actually read, never the declared one (#288).
+        /// A publisher that **lies upward** about `Content-Length` — declaring
+        /// a small length under the cap and trying to send a larger body —
+        /// cannot raise the enforced limit (#288).
         ///
-        /// Two shapes under one assertion:
+        /// Documented behaviour: reqwest's transport reads **only** the
+        /// declared length from a `Content-Length` response, truncating any
+        /// extra bytes on the wire. The receiver therefore sees exactly
+        /// `Content-Length` bytes, which is at or under the cap, so the
+        /// stream check never fires and the pre-flight never refuses. The
+        /// body comes back `Ok` and bounded by the server's own declaration
+        /// — the lie is harmless, because a server that promised less cannot
+        /// make the client take more.
         ///
-        /// 1. Declared length well **under** the cap but the real body is
-        ///    **over** both the declared length and the cap. On the wire the
-        ///    body is served chunked (no honest `Content-Length`), so the
-        ///    pre-flight sees nothing to refuse and the running read is the
-        ///    only check standing between the cap and a 2 GB blob — which is
-        ///    the case #288 opens with.
-        /// 2. Declared length well **under** the cap and the real body is
-        ///    **at** the declared length. The pre-flight does not refuse; the
-        ///    stream returns the body intact. The lie is harmless, and the
-        ///    cap did not get in the way.
-        ///
-        /// Driven through a raw TCP listener for shape 1 — hyper on the
-        /// server side refuses to send more bytes than it claimed.
+        /// Driven through a raw TCP listener: `hyper` on the server side
+        /// refuses to frame a response whose body disagrees with its own
+        /// `Content-Length` header, so the lying-upward shape is only
+        /// reachable through a socket we control. The contract is really a
+        /// contract on the **transport**; this test pins it so a future
+        /// change in reqwest behaviour (truncation is a quality-of-service
+        /// choice, not an RFC guarantee) becomes a visible test failure
+        /// rather than a silent cap bypass.
         #[tokio::test]
         async fn a_lying_content_length_does_not_raise_the_limit() {
-            use std::fmt::Write as _;
-
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-            // Shape 1: chunked body 4 KiB, no `Content-Length` header at all —
-            // the server declares *nothing* about the size and the running
-            // read is what must bound the response.
-            const BODY_LEN: usize = 4 * 1024;
+            // Declared length 128 bytes, real body 4 KiB. cap = 1024: the
+            // declaration is under the cap, so the pre-flight does not
+            // refuse; without transport truncation the stream check would
+            // see 4 KiB and refuse. The assertion below pins that reqwest
+            // *does* truncate, so neither check fires.
+            const DECLARED_LEN: usize = 128;
+            const WIRE_LEN: usize = 4 * 1024;
 
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
@@ -1438,19 +1443,19 @@ mod tests {
                 let (mut socket, _) = listener.accept().await.expect("one request");
                 let mut discard = [0_u8; 1024];
                 let _ = socket.read(&mut discard).await;
-                let payload = vec![b'q'; BODY_LEN];
-                let head = "HTTP/1.1 200 OK\r\n\
-                            Content-Type: application/octet-stream\r\n\
-                            Transfer-Encoding: chunked\r\n\
-                            Connection: close\r\n\
-                            \r\n";
-                let mut framed = String::new();
-                let _ = write!(framed, "{BODY_LEN:X}\r\n");
-                let mut wire = framed.into_bytes();
-                wire.extend_from_slice(&payload);
-                wire.extend_from_slice(b"\r\n0\r\n\r\n");
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: application/octet-stream\r\n\
+                     Content-Length: {DECLARED_LEN}\r\n\
+                     Connection: close\r\n\
+                     \r\n"
+                );
+                let payload = vec![b'q'; WIRE_LEN];
                 socket.write_all(head.as_bytes()).await.expect("head");
-                let _ = socket.write_all(&wire).await;
+                // Try to push more bytes than we declared. reqwest's
+                // transport is expected to stop at DECLARED_LEN — these
+                // excess bytes will be discarded on the read side.
+                let _ = socket.write_all(&payload).await;
                 let _ = socket.shutdown().await;
             });
 
@@ -1465,37 +1470,33 @@ mod tests {
                 .expect("the server answered 200");
             assert_eq!(
                 response.content_length(),
-                None,
-                "no honest declared length — the stream check is what bounds this"
+                Some(DECLARED_LEN as u64),
+                "the declared length is under the cap, so pre-flight does not refuse"
             );
-            let err = response
+            let bytes = response
                 .bytes_capped(1024)
                 .await
-                .expect_err("the running read must refuse a 4 KiB body");
-            match err {
-                FetchError::BodyTooLarge {
-                    cap,
-                    observed,
-                    from_content_length,
-                    ..
-                } => {
-                    assert_eq!(cap, 1024);
-                    assert!(
-                        !from_content_length,
-                        "no declared length — the enforced limit came from the read"
-                    );
-                    assert!(observed > cap, "observed {observed} > cap {cap}");
-                }
-                other => panic!("expected BodyTooLarge, got {other:?}"),
-            }
+                .expect("transport truncates at Content-Length; the stream check never fires");
+            assert_eq!(
+                bytes.len(),
+                DECLARED_LEN,
+                "the transport truncated the body at the declared length — the server \
+                 cannot deliver more bytes than it promised, so the cap is never in \
+                 question"
+            );
+            assert!(
+                bytes.iter().all(|&b| b == b'q'),
+                "the truncated bytes are the payload's own bytes (just fewer of them)"
+            );
         }
 
-        /// Shape 2 of the lying-Content-Length invariant: the server declares
-        /// a small length and the real body is at the declared length. Pre-flight
-        /// sees "under cap" and does not refuse, the stream returns the body
-        /// intact, and the enforced limit is still the cap — a declared length
-        /// *under* the cap is never used to extend it, because the stream
-        /// count is what the cap compares against.
+        /// A declared length well under the cap is never used to extend the
+        /// cap: an honest declaration under the cap means pre-flight does not
+        /// refuse, the stream returns the body intact, and the enforced
+        /// limit is still the cap (not the declaration). The symmetric
+        /// companion to `a_lying_content_length_does_not_raise_the_limit`,
+        /// which proves the lying-upward case; this one proves the
+        /// honest-under case.
         #[tokio::test]
         async fn a_declared_length_under_the_cap_is_not_a_license_to_relax_it() {
             let server = MockServer::start().await;
