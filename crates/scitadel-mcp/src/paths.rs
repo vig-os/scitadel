@@ -231,11 +231,19 @@ mod tests {
     }
 
     /// An absolute path that resolves outside the workspace is
-    /// refused, regardless of how convincing-looking it is.
+    /// refused, regardless of how convincing-looking it is. The
+    /// "outside" file is seeded in a second tempdir so the assertion
+    /// holds on any filesystem layout (macOS has no `/etc/hostname`,
+    /// and `/etc/hosts` is a symlink into `/private/etc` which
+    /// canonicalises stably but is not portable to assume).
     #[test]
     fn confine_rejects_absolute_path_outside_root() {
         let (_tmp, root) = fresh_workspace();
-        let err = confine_to_workspace(&root, "/etc/hostname").unwrap_err();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().canonicalize().unwrap().join("x.bib");
+        fs::write(&outside, "pretend").unwrap();
+
+        let err = confine_to_workspace(&root, outside.to_str().unwrap()).unwrap_err();
         assert!(
             matches!(err, PathScopeError::Escapes { .. }),
             "expected Escapes, got {err:?}"
