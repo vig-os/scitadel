@@ -272,21 +272,28 @@ impl Default for Config {
     }
 }
 
-/// Pick a workspace for the CLI. The strict project resolver in
-/// `crate::project` is the single source of truth — but the CLI
-/// needs to run `scitadel init` *before* the marker exists, so a
-/// marker-less dir falls back to the process cwd here (the MCP
-/// server uses `project::project_root` directly and fails closed
-/// in the same case; see #266).
+/// Pick a workspace for the CLI. Shares the gate's resolver
+/// (`project::find_cli_project_root`) so a visible marker always
+/// settles both the gate decision and the DB location. A
+/// marker-less dir falls back to cwd so `scitadel init` and the
+/// documented auto-creators (`search`, `assess`, `download`,
+/// `acquire`, `snowball`, `scan`, `attach`, `bib import`, `bib
+/// watch`, `question create`, `question add-terms`,
+/// `override-identity`, `resolve-doi` saving, `import-flat`) can
+/// seed a fresh project; every project-aware read-only command
+/// gates on `require_project_marker` first, so cwd fallback never
+/// plants a stray `.scitadel/` on their behalf.
 ///
-/// The pre-fix code shelled out to `git rev-parse --show-toplevel`
-/// here, which let `GIT_WORK_TREE=/etc` steer the workspace. We
-/// never trust git env vars.
+/// Pre-fix: this routed through the strict `project::project_root`,
+/// which refuses `$HOME`, `/` and bad markers. The gate accepted
+/// those (`find_marker_ancestor`), so config silently fell back to
+/// cwd and `Database::open` created a stray `.scitadel/` there
+/// (round-7 blocker). The pre-round-4 code also shelled out to
+/// `git rev-parse --show-toplevel`, which let `GIT_WORK_TREE=/etc`
+/// steer the workspace; we never trust git env vars.
 fn cli_workspace_root() -> PathBuf {
-    match crate::project::project_root() {
-        Ok(p) => p,
-        Err(_) => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    }
+    crate::project::find_cli_project_root()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
 /// Resolve the default database path.

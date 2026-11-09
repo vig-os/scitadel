@@ -141,11 +141,19 @@ fn resolve_root_input() -> Result<PathBuf, ProjectRootError> {
     find_marker_ancestor(&cwd).ok_or(ProjectRootError::MarkerMissing)
 }
 
-/// `true` when `dir` has an immediate child entry named
-/// `PROJECT_MARKER` (any file type — the marker-safety check runs
-/// against the canonicalised root later).
+/// `true` when `dir` has an immediate child named `PROJECT_MARKER`
+/// that is a directory (or a symlink that follows to one). A plain
+/// file named `.scitadel` is not a project — accepting it as a
+/// marker steered the CLI into creating `cwd/.scitadel/` elsewhere
+/// (round-7 blocker: the gate accepted the file, `load_config` then
+/// rejected it, fell back to cwd, and `Database::open` seeded a
+/// fresh marker). Dangling symlinks and other non-directory entries
+/// fail the same way. `validate_marker` later tightens the MCP
+/// side with a symlink-safety check against the project root.
 fn has_project_marker(dir: &Path) -> bool {
-    std::fs::symlink_metadata(dir.join(PROJECT_MARKER)).is_ok()
+    std::fs::metadata(dir.join(PROJECT_MARKER))
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
 }
 
 /// Walk up from `start`, returning the first ancestor (including
@@ -167,6 +175,36 @@ pub fn find_marker_ancestor(start: &Path) -> Option<PathBuf> {
         cur = p.parent();
     }
     None
+}
+
+/// CLI-side project resolution. Honours `SCITADEL_WORKSPACE` (with
+/// `~`/`~/` expansion, same as the MCP resolver), then walks up
+/// from cwd for the first ancestor with a directory marker. Does
+/// NOT apply the MCP's `reject_system_root` rule — a user with a
+/// `.scitadel/` in `$HOME` keeps the full CLI working (round-6
+/// regression). Both `require_project_marker` and
+/// `config::load_config` route through this one function so the
+/// gate and the config resolver agree on where the project is
+/// (round-7 blocker: `cd ~/notes && scitadel history` with
+/// `~/.scitadel/` used to pass the gate, then `project_root`
+/// refused `~`, `load_config` fell back to cwd, and
+/// `Database::open` seeded `~/notes/.scitadel/`).
+#[must_use]
+pub fn find_cli_project_root() -> Option<PathBuf> {
+    if let Ok(v) = std::env::var(WORKSPACE_ENV)
+        && !v.is_empty()
+    {
+        let p = expand_tilde(&v);
+        let p = if p.is_absolute() {
+            p
+        } else {
+            std::env::current_dir().ok()?.join(p)
+        };
+        let p = lexical_normalise(&p);
+        return has_project_marker(&p).then_some(p);
+    }
+    let cwd = std::env::current_dir().ok()?;
+    find_marker_ancestor(&cwd)
 }
 
 /// Marker safety. Canonical `root/.scitadel` must be a real directory
@@ -293,34 +331,64 @@ fn lexical_normalise(p: &Path) -> PathBuf {
     out
 }
 
-/// Resolve the current user's home dir via `getpwuid`. Exposed so
-/// callers that want to compare against the real home (not just
-/// `$HOME`, which can be spoofed) have one function to call. Returns
-/// None on platforms with no passwd entry for the uid.
+/// Resolve the current user's home dir via `getpwuid_r`. Exposed
+/// so callers that want to compare against the real home (not just
+/// `$HOME`, which can be spoofed) have one function to call.
+/// Returns None on platforms with no passwd entry for the uid.
+///
+/// The reentrant `_r` variant is used because the plain `getpwuid`
+/// returns a pointer to a process-wide static buffer that another
+/// thread's `getpwuid` / `getpwent` call can overwrite between the
+/// return and our copy. We own our own buffer and grow it on
+/// `ERANGE`, so there is no shared mutable state to race on.
 #[cfg(unix)]
 #[must_use]
 pub fn home_from_passwd() -> Option<PathBuf> {
     use std::ffi::CStr;
     use std::os::unix::ffi::OsStringExt;
-    // SAFETY: `getpwuid` returns a pointer to a thread-local-ish
-    // static buffer owned by libc. We copy out of `pw_dir` immediately
-    // and never retain the pointer, so the usual "next call may
-    // overwrite" caveat does not apply across this function's return.
-    unsafe {
-        let uid = libc::getuid();
-        let pw = libc::getpwuid(uid);
-        if pw.is_null() {
+
+    // sysconf(_SC_GETPW_R_SIZE_MAX) returns the suggested initial
+    // size, or -1 meaning "indeterminate" — in which case 1024 is
+    // the glibc convention. We grow on ERANGE either way.
+    let mut cap: usize = {
+        // SAFETY: sysconf is always safe to call with a valid key.
+        let n = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+        if n > 0 { n as usize } else { 1024 }
+    };
+    let uid = unsafe { libc::getuid() };
+    loop {
+        let mut buf: Vec<libc::c_char> = vec![0; cap];
+        // MaybeUninit is overkill here — getpwuid_r writes all the
+        // fields it populates, and we only read `pw_dir` after
+        // confirming `result` is non-null.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: `buf` lives for the duration of the call, `pwd`
+        // and `result` are out-pointers we own. `getpwuid_r` fills
+        // `pwd` with pointers into `buf`; we copy `pw_dir` before
+        // either goes out of scope.
+        let rc = unsafe { libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), cap, &mut result) };
+        if rc == libc::ERANGE {
+            cap = cap.saturating_mul(2);
+            if cap > 1 << 20 {
+                return None;
+            }
+            continue;
+        }
+        if rc != 0 || result.is_null() {
             return None;
         }
-        let dir = (*pw).pw_dir;
+        // SAFETY: on success, `pwd.pw_dir` points into `buf`, which
+        // we still own and have not reallocated this iteration.
+        let dir = pwd.pw_dir;
         if dir.is_null() {
             return None;
         }
-        let bytes = CStr::from_ptr(dir).to_bytes().to_vec();
+        let bytes = unsafe { CStr::from_ptr(dir) }.to_bytes().to_vec();
         if bytes.is_empty() {
             return None;
         }
-        Some(PathBuf::from(OsString::from_vec(bytes)))
+        return Some(PathBuf::from(OsString::from_vec(bytes)));
     }
 }
 

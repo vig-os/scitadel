@@ -44,7 +44,7 @@ fn open_db() -> Result<Database> {
 /// does not create a stray `.scitadel/` anywhere, so the risk the
 /// marker check addresses is not present.
 fn require_project_marker() -> Result<()> {
-    use scitadel_core::project::{PROJECT_MARKER, find_marker_ancestor};
+    use scitadel_core::project::find_cli_project_root;
     if let Ok(db) = std::env::var("SCITADEL_DB")
         && !db.is_empty()
     {
@@ -53,22 +53,11 @@ fn require_project_marker() -> Result<()> {
             return Ok(());
         }
     }
-    if let Ok(v) = std::env::var(scitadel_core::project::WORKSPACE_ENV)
-        && !v.is_empty()
-    {
-        let p = std::path::PathBuf::from(&v);
-        let p = if p.is_absolute() {
-            p
-        } else {
-            std::env::current_dir().unwrap_or_default().join(p)
-        };
-        if p.join(PROJECT_MARKER).exists() {
-            return Ok(());
-        }
-    }
-    let cwd = std::env::current_dir()
-        .map_err(|e| anyhow::anyhow!("cannot read current directory: {e}"))?;
-    if find_marker_ancestor(&cwd).is_some() {
+    // One CLI resolver for both the gate and `load_config`. Re-parsing
+    // `SCITADEL_WORKSPACE` here used to skip the `~`/`~/` expansion
+    // the core parser does, and used `find_marker_ancestor` directly
+    // (so a `.scitadel` file was accepted as a marker; round-7 blocker).
+    if find_cli_project_root().is_some() {
         return Ok(());
     }
     bail!("no scitadel project here; run `scitadel init` in your project root")

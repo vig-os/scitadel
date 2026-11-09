@@ -226,3 +226,129 @@ fn question_list_in_a_home_project_succeeds() {
         .assert()
         .success();
 }
+
+/// Round-7 blocker: `cd $HOME/notes && scitadel history` with a
+/// marker at `$HOME`. The gate accepted it (via
+/// `find_marker_ancestor`), but `load_config` routed through
+/// `project_root`, which refuses `$HOME` and silently fell back to
+/// cwd. `Database::open` then created `$HOME/notes/.scitadel/` — a
+/// fresh marker a later MCP start could accept. After the fix both
+/// resolvers share `find_cli_project_root`, so the command reads the
+/// real DB and leaves no stray marker.
+#[test]
+fn history_in_a_subdir_of_a_home_project_leaves_no_stray_marker() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    fs::create_dir_all(home.join(".scitadel")).unwrap();
+    let db_path = home.join(".scitadel").join("scitadel.db");
+    // Seed a usable DB at $HOME/.scitadel/scitadel.db.
+    Command::cargo_bin("scitadel")
+        .unwrap()
+        .arg("init")
+        .arg("--yes")
+        .arg("--email")
+        .arg("foo@example.test")
+        .arg("--db")
+        .arg(&db_path)
+        .env("HOME", home)
+        .env_remove("SCITADEL_WORKSPACE")
+        .env_remove("SCITADEL_DB")
+        .current_dir(home)
+        .assert()
+        .success();
+
+    let notes = home.join("notes");
+    fs::create_dir_all(&notes).unwrap();
+
+    Command::cargo_bin("scitadel")
+        .unwrap()
+        .arg("history")
+        .env("HOME", home)
+        .env_remove("SCITADEL_WORKSPACE")
+        .env_remove("SCITADEL_DB")
+        .current_dir(&notes)
+        .assert()
+        .success();
+
+    assert!(
+        !notes.join(".scitadel").exists(),
+        "history in $HOME/notes must not seed $HOME/notes/.scitadel/"
+    );
+}
+
+/// Round-7 blocker: a FILE at `$HOME/.scitadel` (not a directory)
+/// used to let the gate pass — `has_project_marker` only checked
+/// `symlink_metadata`. `load_config`'s `project_root` then refused
+/// the file marker and fell back to cwd, so `Database::open`
+/// created `cwd/.scitadel/`. The gate now requires the marker be a
+/// directory, so the command refuses with the init hint and leaves
+/// no stray marker.
+#[test]
+fn history_with_a_file_marker_refuses_and_leaves_no_stray_marker() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    fs::write(home.join(".scitadel"), b"not a dir").unwrap();
+    let notes = home.join("notes");
+    fs::create_dir_all(&notes).unwrap();
+
+    Command::cargo_bin("scitadel")
+        .unwrap()
+        .arg("history")
+        .env("HOME", home)
+        .env_remove("SCITADEL_WORKSPACE")
+        .env_remove("SCITADEL_DB")
+        .current_dir(&notes)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("scitadel init"));
+
+    assert!(
+        !notes.join(".scitadel").exists(),
+        "a file marker must not steer cwd/.scitadel/ into being seeded"
+    );
+}
+
+/// Round-7 blocker: a subdirectory of a normal (non-`$HOME`)
+/// project. `history` must walk up from the subdir to the parent
+/// marker, open the parent's DB, and leave no new `.scitadel/`
+/// under the subdir.
+#[test]
+fn history_in_a_subdir_of_a_normal_project_leaves_no_stray_marker() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let db_path = root.join(".scitadel").join("scitadel.db");
+    Command::cargo_bin("scitadel")
+        .unwrap()
+        .arg("init")
+        .arg("--yes")
+        .arg("--email")
+        .arg("foo@example.test")
+        .arg("--db")
+        .arg(&db_path)
+        .env_remove("SCITADEL_WORKSPACE")
+        .env_remove("SCITADEL_DB")
+        .current_dir(root)
+        .assert()
+        .success();
+
+    let sub = root.join("deep").join("sub");
+    fs::create_dir_all(&sub).unwrap();
+
+    Command::cargo_bin("scitadel")
+        .unwrap()
+        .arg("history")
+        .env_remove("SCITADEL_WORKSPACE")
+        .env_remove("SCITADEL_DB")
+        .current_dir(&sub)
+        .assert()
+        .success();
+
+    assert!(
+        !sub.join(".scitadel").exists(),
+        "history in a subdir must not seed a .scitadel/ there"
+    );
+    assert!(
+        !root.join("deep").join(".scitadel").exists(),
+        "and must not seed one at an intermediate dir either"
+    );
+}
