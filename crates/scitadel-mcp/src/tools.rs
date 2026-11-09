@@ -1541,6 +1541,16 @@ fn build_annotated_paper(
     max_chars: usize,
     offset: usize,
 ) -> Result<String, String> {
+    // Reject `max_chars == 0` up front. The paging contract is
+    // `next_offset = offset + max_chars`, so a zero width pins
+    // `next_offset` to `offset` forever — a caller looping on
+    // `next_offset.is_some()` would spin without consuming any body.
+    // Same shape as other typed-argument errors so a caller can route
+    // on the message prefix. (#307 review.)
+    if max_chars == 0 {
+        return Err("max_chars must be at least 1 (0 would loop forever)".into());
+    }
+
     let paper = resolve_paper_id(db, paper_id)?;
 
     let (entries, source_version) = build_annotations_json(db, paper.id.as_str())?;
@@ -1549,48 +1559,85 @@ fn build_annotated_paper(
     // uses, so two tools returning the same document now return the same
     // amount of it (#307). The abstract stays whole — abstracts are short
     // and a truncated abstract is a corrupted citation record, the same
-    // reasoning that kept it out of `read_paper`'s `max_chars` cap. #306's
-    // envelope is intact: the body is `rendered()`, not `as_str()`, so no
-    // escape sequence reaches the response.
-    let rendered_body = paper.full_text.as_ref().map(|b| b.rendered().into_owned());
-    let (body_window, total_chars, was_truncated, next_offset) =
-        rendered_body.as_deref().map_or_else(
-            || (None, 0usize, false, None),
-            |body| window_body(body, offset, max_chars),
-        );
+    // reasoning that kept it out of `read_paper`'s `max_chars` cap.
+    //
+    // `offset`, `window_end`, `next_offset`, `total_chars` AND the
+    // annotation `char_range` positions are all stored-text char
+    // offsets — the coordinate space a `char_range` was recorded in
+    // (over `UntrustedBody::as_str`, before neutralisation). Sliding
+    // the window over `rendered()` would drift these apart when a
+    // zero-width, bidi or BOM character is stripped: the anchor at
+    // "position 500" would move relative to the "position 500" the
+    // window ends at. We therefore slice `as_str()` and render the
+    // slice for output — `UntrustedBody::rendered` is pure
+    // neutralisation, so running it after slicing strips the same
+    // bytes and leaves no escape in the response (#287), while every
+    // position the caller is told about is the position it was
+    // stored at.
+    let stored_body = paper
+        .full_text
+        .as_ref()
+        .map(scitadel_core::untrusted::UntrustedBody::as_str);
+    let (body_window, total_chars, was_truncated, next_offset) = stored_body.map_or_else(
+        || (None, 0usize, false, None),
+        |body| window_body(body, offset, max_chars),
+    );
 
     // Report every annotation whose anchor can be placed in the document
     // but falls outside the returned window — the acceptance criterion
-    // against silently dropping them (#307). Anchors with no `char_range`
-    // are left out of this count (they have no position to compare), as
-    // are anchors inside the window.
-    //
-    // `char_range` positions are char offsets, and `window_body` slices
-    // on a char boundary — so `window_end` also has to count chars, not
-    // bytes, or a multi-byte glyph in the window shifts the boundary.
+    // against silently dropping them (#307). The body window above
+    // slices in stored-text coordinates, so `start`/`end` from the
+    // anchor and `offset`/`window_end` here all refer to the same
+    // text. Zero-length anchors (`start == end`) are a point in the
+    // document rather than a span: we count one as "inside" when it
+    // lands on the inclusive boundary [offset, window_end], which is
+    // what a caller walking a cursor expects. Annotations without a
+    // `char_range` are counted in their own bucket — they have no
+    // position to compare, so counting them alongside positioned
+    // anchors would hide them from a caller that re-fetches outside
+    // the current window.
     let window_end = offset.saturating_add(
         body_window
             .as_deref()
             .map_or(0, |body| body.chars().count()),
     );
-    let out_of_window: Vec<serde_json::Value> = entries
-        .iter()
-        .filter_map(|a| {
-            let cr = a.get("anchor").and_then(|an| an.get("char_range"))?;
-            let arr = cr.as_array()?;
+    let mut out_of_window: Vec<serde_json::Value> = Vec::new();
+    let mut without_range: Vec<serde_json::Value> = Vec::new();
+    for a in &entries {
+        let anchor = a.get("anchor");
+        let cr = anchor.and_then(|an| an.get("char_range"));
+        let arr = cr.and_then(|v| v.as_array());
+        let placed = arr.and_then(|arr| {
             let start = arr.first()?.as_u64()? as usize;
             let end = arr.get(1)?.as_u64()? as usize;
-            // An anchor overlaps the window iff start < window_end AND end > offset.
-            if start < window_end && end > offset {
-                None
-            } else {
-                Some(serde_json::json!({
+            Some((start, end))
+        });
+        match placed {
+            None => {
+                without_range.push(serde_json::json!({
                     "id": a.get("id"),
-                    "char_range": [start, end],
-                }))
+                }));
             }
-        })
-        .collect();
+            Some((start, end)) => {
+                let overlaps = if start == end {
+                    // A zero-length anchor is a cursor-shaped marker
+                    // between two characters, not a span. It is "in"
+                    // the window when the cursor sits on the
+                    // half-open window `[offset, window_end)` — same
+                    // logic as a text editor's caret.
+                    start >= offset && start < window_end
+                } else {
+                    start < window_end && end > offset
+                };
+                if !overlaps {
+                    out_of_window.push(serde_json::json!({
+                        "id": a.get("id"),
+                        "char_range": [start, end],
+                    }));
+                }
+            }
+        }
+    }
 
     let response = serde_json::json!({
         "paper": {
@@ -1601,8 +1648,13 @@ fn build_annotated_paper(
             // paragraph structure survives.
             "abstract": paper.r#abstract.rendered(),
             // Windowed by `max_chars` / `offset`; `truncated` + `next_offset`
-            // tell the caller whether and where to page (#307).
-            "full_text": body_window,
+            // tell the caller whether and where to page (#307). Positions
+            // (`offset`, `next_offset`, `total_chars`, and the `char_range`
+            // of every anchor) are in **stored-text char coordinates** — the
+            // bytes the record carries, before neutralisation and before any
+            // grapheme-cluster reshaping. Same contract as `read_paper`: the
+            // split is on scalar chars, not graphemes.
+            "full_text": body_window.as_deref().map(neutralise_window),
             "truncated": was_truncated,
             "total_chars": total_chars,
             "offset": offset,
@@ -1611,10 +1663,28 @@ fn build_annotated_paper(
         "annotations": entries,
         "annotations_outside_window": out_of_window.len(),
         "annotations_outside_window_anchors": out_of_window,
+        // Annotations with no `char_range` are reported separately so a
+        // caller paging through `next_offset` sees them exactly once
+        // regardless of which window it is on (#307 review).
+        "annotations_without_char_range": without_range.len(),
+        "annotations_without_char_range_ids": without_range,
         "source_version": source_version,
     });
 
     serde_json::to_string_pretty(&response).map_err(|e| e.to_string())
+}
+
+/// Pass a windowed slice of a stored body through
+/// `UntrustedBody::rendered`'s neutraliser so the response can never
+/// carry escape sequences, bidi overrides or control characters —
+/// matching the `#287` contract `rendered()` enforces on the full
+/// body. Keeps the slice's char positions aligned with the stored-text
+/// coordinate space `char_range` was recorded in: this call drops
+/// bytes, never shifts them.
+fn neutralise_window(window: &str) -> String {
+    scitadel_core::untrusted::UntrustedBody::publisher_supplied(window)
+        .rendered()
+        .into_owned()
 }
 
 /// Take a `char_range`-based slice of `body`, starting at `offset` and
@@ -2879,6 +2949,146 @@ mod tests {
             max_chars.unwrap_or(20_000),
             offset.unwrap_or(0),
         )
+    }
+
+    /// `max_chars == 0` would make `next_offset == offset`, an
+    /// infinite paging loop. The tool rejects it with a typed error
+    /// rather than returning a zero-width window. (#307 review.)
+    #[test]
+    fn get_annotated_paper_rejects_zero_max_chars() {
+        let db = fresh_db();
+        save_paper(&db, "p-zero", "Z", Some("some body"));
+        let err = build_annotated_paper(&db, "p-zero", 0, 0).expect_err("rejects zero");
+        assert!(
+            err.contains("max_chars must be at least 1"),
+            "typed message: {err}"
+        );
+    }
+
+    /// `char_range` positions and `offset` / `window_end` must refer
+    /// to the same coordinate space. Before the fix we sliced
+    /// `rendered()` (post-neutralisation) and compared against
+    /// `char_range` positions stored over `as_str()` (pre-
+    /// neutralisation). A zero-width joiner in the stored body
+    /// shifted the rendered coordinates relative to the anchor's,
+    /// so an anchor that *should* have been inside a window at the
+    /// end of the first page looked past it. The fix slices
+    /// `as_str()` and renders the slice. (#307 review.)
+    #[test]
+    fn get_annotated_paper_window_and_char_range_share_a_coordinate_space() {
+        let db = fresh_db();
+        // 10 chars of ASCII, then a zero-width joiner (dropped by
+        // `rendered`), then an anchor at char positions 11..20 in
+        // STORED text. `rendered` returns 19 chars; a slice with
+        // char-coords 0..11 that uses `rendered` would end one char
+        // short of the anchor.
+        let mut body = String::new();
+        body.push_str("prefix1234");
+        body.push('\u{200d}'); // zero-width joiner
+        body.push_str("ANCHORED!");
+        let pid = save_paper(&db, "p-zw", "ZW", Some(&body));
+        // The anchor lives at stored-char positions 11..20 — right
+        // after the zero-width joiner.
+        let repo = SqliteAnnotationRepository::new(db.clone());
+        let ann = Annotation::new_root(
+            pid,
+            "lars".into(),
+            "anchor past the ZWJ".into(),
+            Anchor {
+                char_range: Some((11, 20)),
+                quote: Some("ANCHORED!".into()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&ann).unwrap();
+
+        // Window `[0, 20)` in stored coords includes the anchor's
+        // whole span — it must not be reported as outside.
+        let v: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-zw", 20, 0).unwrap()).unwrap();
+        assert_eq!(
+            v["annotations_outside_window"], 0,
+            "the anchor at [11, 20) is inside window `[0, 20)`: {v}",
+        );
+        // And the window really does cover 20 stored chars.
+        assert_eq!(v["paper"]["total_chars"], body.chars().count());
+        assert_eq!(
+            v["paper"]["full_text"].as_str().unwrap().chars().count(),
+            20 - 1, // one ZWJ in that range was neutralised
+            "the ZWJ is stripped by `rendered`, but the position \
+             coordinates still refer to the stored-text char index",
+        );
+    }
+
+    /// A zero-length anchor at exactly `offset` must be reported as
+    /// inside the window — it is a cursor-shaped marker on the
+    /// first character of the window, not a span past it. The
+    /// pre-fix overlap check `end > offset` wrongly rejected it.
+    /// (#307 review.)
+    #[test]
+    fn get_annotated_paper_zero_length_anchor_at_offset_is_inside() {
+        let db = fresh_db();
+        let pid = save_paper(&db, "p-zl", "ZL", Some(&"x".repeat(100)));
+        let repo = SqliteAnnotationRepository::new(db.clone());
+        // Zero-length anchor on char 40 — the start of the window
+        // for the second page.
+        let ann = Annotation::new_root(
+            pid,
+            "lars".into(),
+            "point-shaped anchor".into(),
+            Anchor {
+                char_range: Some((40, 40)),
+                quote: Some(String::new()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&ann).unwrap();
+
+        // Window `[40, 80)`: a point anchor at 40 is at the start.
+        let v: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-zl", 40, 40).unwrap()).unwrap();
+        assert_eq!(
+            v["annotations_outside_window"], 0,
+            "zero-length anchor at offset is inside the window: {v}"
+        );
+    }
+
+    /// Annotations with no `char_range` are counted in a separate
+    /// bucket. Pre-fix code dropped them from the outside-window
+    /// count silently, hiding paper-level notes from a caller that
+    /// expected the response to surface every annotation it was not
+    /// serving in the current window. (#307 review.)
+    #[test]
+    fn get_annotated_paper_annotations_without_char_range_report_separately() {
+        let db = fresh_db();
+        let pid = save_paper(&db, "p-nr", "No range", Some(&"x".repeat(100)));
+        let repo = SqliteAnnotationRepository::new(db.clone());
+        // An anchor-less paper note (`char_range = None`).
+        let note = Annotation::new_root(
+            pid,
+            "lars".into(),
+            "paper-level comment".into(),
+            Anchor {
+                char_range: None,
+                quote: None,
+                ..Anchor::default()
+            },
+        );
+        repo.create(&note).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-nr", 40, 0).unwrap()).unwrap();
+        assert_eq!(
+            v["annotations_outside_window"], 0,
+            "anchor-less annotations are not counted as outside: {v}"
+        );
+        assert_eq!(
+            v["annotations_without_char_range"], 1,
+            "they are counted in their own bucket: {v}"
+        );
+        let ids = v["annotations_without_char_range_ids"]
+            .as_array()
+            .expect("ids array");
+        assert_eq!(ids.len(), 1);
     }
 
     /// `max_chars` is a *character* budget, so a body of 3-byte glyphs
