@@ -777,6 +777,13 @@ to be confirmed with ETH Library (open question 7).
 - **`scitadel detach` / `export`** pulls full copies of tracked papers
   into local storage, checking the licence per artefact. It can emit a
   per-paper `.tsra` whose provenance points at the hub shard's seal.
+  A "full copy" is the **structured document**: elements, tables,
+  figures as JPEG XL, references, the provenance, and the user's
+  annotations, all rendered locally by the reader. **The hub never
+  serves PDF bytes**, on `open`, `detach` or anything else (owner
+  decision, 2026-11-08). PDFs are ingest inputs only. A PDF the user's
+  own client acquired under ADR-007 stays wherever that client stored
+  it; `detach` doesn't hand it out again.
 - **Guardrails:**
   - never a bulk proxy for paywalled content: the hub caches only what
     members fetched individually, and the ADR-007 pacer still applies
@@ -1213,7 +1220,8 @@ MCP server are the same engine with different front-ends.
 
 - `scitadel detach` pulls **full copies of a user's own tracked works**
   into local storage (§12), checking the licence per artefact. This is
-  the offline-first affordance.
+  the offline-first affordance. A full copy is the structured document
+  plus annotations, never PDF bytes (§12).
 - **Bulk export of the processed corpus is not offered** — the walled
   corpus (decision 19) is the hub's running service, not a dataset
   download. The two statements are consistent: individuals take their
