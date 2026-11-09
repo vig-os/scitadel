@@ -26,6 +26,18 @@ use scitadel_core::models::Annotation;
 // annotation-background tints swappable alongside the rest of the UI
 // when light-mode / auto-detect ships in #137.
 
+/// Draw the two-pane reader.
+///
+/// `scroll` is `&mut` so the draw can **clamp in state**: a stale
+/// `u16::MAX` sentinel from a prior `G`, or a scroll offset the viewport
+/// outgrew on resize, is re-written to the current wrapped maximum here.
+/// This is the "clamp in state on every scroll action and on resize"
+/// half of #307 — `terminal.draw` runs between every key press and on
+/// every terminal resize, so a `k` after `G` moves immediately rather
+/// than walking down from the saturated sentinel for thousands of
+/// presses. `text_pane_width` is written back so `line_of_highlight`
+/// can map a highlight to its wrapped row when the next `J`/`K` fires.
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     frame: &mut Frame,
     area: Rect,
@@ -33,7 +45,8 @@ pub fn draw(
     paper_id: &str,
     focus: Option<usize>,
     reader: &str,
-    scroll: u16,
+    scroll: &mut u16,
+    text_pane_width: &mut u16,
 ) {
     let Ok(Some(paper)) = data.load_paper(paper_id) else {
         let block = Block::default().title(" Reader ").borders(Borders::ALL);
@@ -97,6 +110,10 @@ pub fn draw(
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(area);
 
+    // Expose the text pane's inner width so a later `J`/`K` can map the
+    // hopped highlight to the matching wrapped row. Width is written
+    // back every frame so a resize is picked up on the next keystroke.
+    *text_pane_width = chunks[0].width;
     draw_text_pane(
         frame,
         chunks[0],
@@ -124,29 +141,54 @@ fn draw_text_pane(
     body: &str,
     roots: &[&Annotation],
     focus: Option<usize>,
-    scroll: u16,
+    scroll: &mut u16,
 ) {
     let highlights = build_highlights(body, roots);
     let lines = render_with_highlights(body, &highlights, focus);
-    // Clamp the offset against the body's own line count so `G` (and a
-    // stale `reader_scroll` after the paper changes) can't skip past the
-    // end and show an empty pane. The scroll stays *below* the last line
-    // so at least one row of body is always visible. Highlights ride
-    // along: `render_with_highlights` returns the full set of styled
-    // lines and `Paragraph::scroll` is a pure view offset, so a
-    // highlight that lives on line 400 still lands on line 400 — the
-    // acceptance criterion against scroll/highlight desync (#307).
-    let total_lines = u16::try_from(lines.len().saturating_sub(1)).unwrap_or(u16::MAX);
-    let clamped = scroll.min(total_lines);
     let para = Paragraph::new(lines)
         .block(
             Block::default()
                 .title(format!(" Reader — {title} "))
                 .borders(Borders::ALL),
         )
-        .wrap(Wrap { trim: false })
-        .scroll((clamped, 0));
+        .wrap(Wrap { trim: false });
+    // Clamp the offset against the **wrapped** row count of the whole
+    // body at the current viewport width. Counting source lines (the
+    // pre-fix shape of this clamp) made `G` stop early on a long
+    // single-paragraph body — the 40 kB case from #307 wraps to
+    // hundreds of rows but has zero `\n`, so a source-line count gave
+    // zero max-scroll and the reader got stuck at the top. The
+    // `unstable-rendered-line-info` feature on the `ratatui` dep gives
+    // us `line_count`, which runs ratatui's own word-wrapper — same
+    // code the renderer uses — so the clamp lines up with what the
+    // paragraph actually paints. The clamp is also written back to
+    // `*scroll` so a key handler that saw the sentinel `u16::MAX`
+    // after `G` isn't still subtracting from it on the next `k` /
+    // `u`; the stored offset is always in range of the current
+    // viewport. Resize is covered by the same write: `terminal.draw`
+    // re-runs with the new area dimensions.
+    *scroll = (*scroll).min(max_scroll(&para, area));
+    let para = para.scroll((*scroll, 0));
     frame.render_widget(para, area);
+}
+
+/// Largest in-range scroll offset for `para` rendered at `area`.
+///
+/// `Paragraph::line_count(width)` returns the number of wrapped **content**
+/// rows plus the paragraph's block vertical padding (two for a bordered
+/// block). The max offset leaves the last content row on the last
+/// visible content row of the viewport: `total_rows - area.height`
+/// (saturating at 0), using the outer `area.height` to match the +2
+/// included in `line_count`. Width passed is the inner width
+/// (`area.width - 2`), which is what the word-wrapper wraps against.
+fn max_scroll(para: &Paragraph<'_>, area: Rect) -> u16 {
+    let inner_width = area.width.saturating_sub(2);
+    if inner_width == 0 {
+        return 0;
+    }
+    let total_rows = para.line_count(inner_width);
+    let max = total_rows.saturating_sub(usize::from(area.height));
+    u16::try_from(max).unwrap_or(u16::MAX)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -419,19 +461,28 @@ pub fn highlight_count(data: &DataStore, paper_id: &str) -> usize {
         .map_or(0, |anns| anns.iter().filter(|a| !a.is_reply()).count())
 }
 
-/// Pre-wrap line number of the `idx`-th root highlight in the paper
-/// body, or `None` when the paper is missing, has no body, or the
-/// index does not resolve to a placed highlight. The app layer uses
-/// this to auto-scroll the reader to a highlight below the fold when
-/// the user hops onto it with `J`/`K` (#307).
+/// Post-wrap row of the `idx`-th root highlight in the paper body at
+/// the current `text_pane_width`, or `None` when the paper is missing,
+/// has no body, or the index does not resolve to a placed highlight.
 ///
-/// Counts `\n` boundaries rather than post-wrap rows: wrap width is a
-/// draw-time concern and the paragraph's own `Wrap { trim: false }` is
-/// what lands a highlight on the exact visible row. Placing the scroll
-/// at the pre-wrap line lands the highlight within one wrap of the top,
-/// which is enough for the acceptance "a match below the fold is
-/// reachable."
-pub fn line_of_highlight(data: &DataStore, paper_id: &str, idx: usize) -> Option<u16> {
+/// The app layer uses this to auto-scroll the reader to a highlight
+/// below the fold when the user hops onto it with `J`/`K` (#307).
+/// `text_pane_width` is the reader's text-pane outer width (what
+/// `draw` writes back); we wrap against its inner width (`width - 2`
+/// for the block's left+right borders), matching `draw_text_pane`.
+///
+/// Counts **wrapped** rows rather than `\n` boundaries so a highlight
+/// that lives past a long wrapped paragraph lands inside the viewport
+/// — a source-line count puts the highlight below the fold on a 40 kB
+/// paragraph with zero `\n` (the #307 case). Builds a prefix
+/// paragraph with the same `Wrap { trim: false }` the renderer uses,
+/// so the two agree on where the highlight falls.
+pub fn line_of_highlight(
+    data: &DataStore,
+    paper_id: &str,
+    idx: usize,
+    text_pane_width: u16,
+) -> Option<u16> {
     let paper = data.load_paper(paper_id).ok().flatten()?;
     let body = paper
         .full_text
@@ -453,9 +504,49 @@ pub fn line_of_highlight(data: &DataStore, paper_id: &str, idx: usize) -> Option
     // list in its original order — match by `root_index` so the hop
     // lands on the same highlight J/K selected.
     let target = highlights.iter().find(|h| h.root_index == idx)?;
-    let prefix: String = body.chars().take(target.char_start).collect();
-    let line = prefix.matches('\n').count();
-    u16::try_from(line).ok()
+    // Take `char_start + 1` so the quote's first char sits in the
+    // prefix — `ratatui::Text::raw` uses `str::lines()` and so drops
+    // a trailing empty line, which otherwise puts a quote that sits
+    // right after a `\n` one row short. Including the next char
+    // forces `line_count` to open a fresh row for it, and
+    // `saturating_sub(1)` turns the resulting count into the row
+    // index the hop should land on. A `line_count` of 0 (empty
+    // document) folds to row 0.
+    let prefix_incl_next: String = body.chars().take(target.char_start + 1).collect();
+    // A key handler running before the first draw sees `text_pane_width
+    // = 0`. Fall back to the source-line count in that case so the hop
+    // still moves the viewport toward the quote — a close-enough start
+    // that the first wrap puts it on screen — rather than snapping to
+    // row 0 and losing the signal.
+    let row = if text_pane_width <= 2 {
+        body.chars()
+            .take(target.char_start)
+            .filter(|c| *c == '\n')
+            .count()
+    } else {
+        wrapped_row_count(&prefix_incl_next, text_pane_width).saturating_sub(1)
+    };
+    u16::try_from(row).ok()
+}
+
+/// Number of wrapped rows `text` occupies when rendered as a
+/// `Paragraph` with `Wrap { trim: false }` at the given
+/// `text_pane_width` (the reader's **outer** text-pane width, same
+/// value `line_of_highlight` takes). Returns 0 when the pane is too
+/// narrow to hold any content.
+///
+/// Delegates to `ratatui`'s own wrapper via `Paragraph::line_count` so
+/// the clamp in `draw_text_pane` and the hop target here can never
+/// disagree about where a row falls. The empty-body row (no `\n`,
+/// still one visible row) is accounted for by `line_count` itself.
+fn wrapped_row_count(text: &str, text_pane_width: u16) -> usize {
+    let inner_width = text_pane_width.saturating_sub(2);
+    if inner_width == 0 {
+        return 0;
+    }
+    Paragraph::new(text.to_string())
+        .wrap(Wrap { trim: false })
+        .line_count(inner_width)
 }
 
 #[cfg(test)]
@@ -591,6 +682,8 @@ mod tests {
     fn rendered_rows_with(paper: &Paper, scroll: u16, annotations: &[Annotation]) -> Vec<String> {
         let (_dir, data) = seed_paper(paper, annotations);
         let mut terminal = Terminal::new(TestBackend::new(100, 12)).expect("terminal");
+        let mut scroll = scroll;
+        let mut pane_width = 0u16;
         terminal
             .draw(|frame| {
                 draw(
@@ -600,7 +693,8 @@ mod tests {
                     paper.id.as_str(),
                     None,
                     "lars",
-                    scroll,
+                    &mut scroll,
+                    &mut pane_width,
                 );
             })
             .expect("draw");
@@ -861,6 +955,8 @@ mod tests {
         // painted a highlight on the unscrolled view.
         let (_dir, data) = seed_paper(&paper, std::slice::from_ref(&ann));
         let mut term = Terminal::new(TestBackend::new(100, 12)).expect("terminal");
+        let mut scroll_top = 0u16;
+        let mut pane_width = 0u16;
         term.draw(|frame| {
             draw(
                 frame,
@@ -869,7 +965,8 @@ mod tests {
                 paper.id.as_str(),
                 None,
                 "lars",
-                0,
+                &mut scroll_top,
+                &mut pane_width,
             );
         })
         .expect("draw");
@@ -890,6 +987,7 @@ mod tests {
         // screen AND lands on a row whose cells carry the highlight's
         // background color — the "root_at offsets stay correct" check.
         let mut term = Terminal::new(TestBackend::new(100, 12)).expect("terminal");
+        let mut scroll_at = expected_line;
         term.draw(|frame| {
             draw(
                 frame,
@@ -898,7 +996,8 @@ mod tests {
                 paper.id.as_str(),
                 None,
                 "lars",
-                expected_line,
+                &mut scroll_at,
+                &mut pane_width,
             );
         })
         .expect("draw");
@@ -930,9 +1029,10 @@ mod tests {
 
         // `line_of_highlight` must agree with the scroll offset the
         // test derived, so the app layer's auto-scroll (J/K) lands on
-        // the same line.
+        // the same line. Short source lines never wrap at the 60-col
+        // pane width, so the wrapped row and the pre-wrap line match.
         assert_eq!(
-            line_of_highlight(&data, paper.id.as_str(), 0),
+            line_of_highlight(&data, paper.id.as_str(), 0, 60),
             Some(expected_line),
             "line_of_highlight agrees with the pre-wrap line, so J/K \
              scroll lands on the quote",
@@ -954,6 +1054,204 @@ mod tests {
         assert!(
             rows.iter().any(|r| r.contains("one line only")),
             "scroll clamped to the last line, so the sole row stays on screen: {rows:?}"
+        );
+    }
+
+    // ---- #307 review: wrapped-row clamping ----
+
+    /// A long single-paragraph body (the 40 kB case from #307) must
+    /// still let `G` reach text past the first wrap. Before the fix
+    /// the clamp counted source lines (`lines.len()`), so a body
+    /// with no `\n` got `max_scroll == 0` and `G` stuck at the top.
+    /// The paragraph ends with a tail token that only reaches the
+    /// screen after a `u16::MAX` scroll is clamped to the real last
+    /// wrapped row — the assertion the source-line clamp fails.
+    #[test]
+    fn g_reaches_the_end_of_a_long_wrapped_single_paragraph() {
+        use std::fmt::Write as _;
+        let mut body = String::new();
+        // ~40 kB of text, no newlines. Roughly 300 words so word-wrap
+        // actually breaks the paragraph, matching the #307 shape.
+        for i in 0..4_000 {
+            write!(body, "word{i} ").unwrap();
+        }
+        body.push_str("END_OF_PAPER");
+        assert!(
+            !body.contains('\n'),
+            "fixture has no hard breaks, so the clamp has to wrap",
+        );
+        let mut p = Paper::new("Wrapped");
+        p.id = PaperId::from("p-wrap");
+        p.r#abstract = UntrustedBody::publisher_supplied("abs");
+        p.full_text = Some(UntrustedBody::publisher_supplied(body));
+
+        let rows = body_rows(&rendered_rows_scrolled(&p, u16::MAX));
+        assert!(
+            rows.iter().any(|r| r.contains("END_OF_PAPER")),
+            "`G` past the end must land on the last wrapped row: {rows:?}",
+        );
+    }
+
+    /// `line_of_highlight` maps a quote **past wrapped text** to the
+    /// post-wrap row the highlight actually falls on, so a J/K hop
+    /// lands inside the viewport. The source-line version (pre-fix)
+    /// put the highlight below the fold when the paragraph above it
+    /// wrapped.
+    #[test]
+    fn line_of_highlight_maps_past_a_wrapped_paragraph() {
+        use std::fmt::Write as _;
+        let pane_width: u16 = 60;
+        // Inner width is pane_width - 2 borders.
+        let inner_width = usize::from(pane_width - 2);
+        // A wrap-worthy preamble of ~5 inner-width rows, then the
+        // highlight target. The target's byte offset gives the row it
+        // falls on so the test can assert on an exact wrapped row.
+        let mut body = String::new();
+        for i in 0..(inner_width * 5 / 6) {
+            write!(body, "w{i} ").unwrap();
+        }
+        let prefix_len_before_newline = body.chars().count();
+        body.push_str("\nTARGET_QUOTE after the wraps");
+
+        let mut p = Paper::new("Wrapped highlight");
+        p.id = PaperId::from("p-wrap-h");
+        p.r#abstract = UntrustedBody::publisher_supplied("abs");
+        p.full_text = Some(UntrustedBody::publisher_supplied(body.clone()));
+
+        let target_start = body.find("TARGET_QUOTE").expect("target in body");
+        let target_char_start = body[..target_start].chars().count();
+        let target_char_end = target_char_start + "TARGET_QUOTE".chars().count();
+        let ann = {
+            let mut a = Annotation::new_root(
+                p.id.clone(),
+                "lars".into(),
+                "note".into(),
+                Anchor {
+                    char_range: Some((target_char_start, target_char_end)),
+                    quote: Some("TARGET_QUOTE".into()),
+                    status: AnchorStatus::Ok,
+                    ..Anchor::default()
+                },
+            );
+            a.id = scitadel_core::models::AnnotationId::from("ann-wrap");
+            a
+        };
+
+        let (_dir, data) = seed_paper(&p, std::slice::from_ref(&ann));
+        let line = line_of_highlight(&data, p.id.as_str(), 0, pane_width).expect("mapped");
+        // The preamble takes multiple wrapped rows (strictly more than
+        // one, which is the whole point); a source-line count would
+        // return 1 here. The fix returns the wrapped row count of
+        // the preamble + newline.
+        assert!(
+            line >= 2,
+            "line must be past the wrapped preamble, not the pre-wrap \
+             `\\n` count (1): got {line}, preamble chars {prefix_len_before_newline}, pane_width {pane_width}",
+        );
+
+        // And the quote actually lands in the viewport when we scroll
+        // the reader to that line — the J/K acceptance.
+        let mut terminal = Terminal::new(TestBackend::new(pane_width + 40, 12)).expect("terminal");
+        let mut scroll = line;
+        let mut width_back = 0u16;
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+                    .split(area);
+                let _ = chunks;
+                draw(
+                    frame,
+                    area,
+                    &data,
+                    p.id.as_str(),
+                    None,
+                    "lars",
+                    &mut scroll,
+                    &mut width_back,
+                );
+            })
+            .expect("draw");
+        let rows: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(usize::from(pane_width + 40))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        assert!(
+            rows.iter().any(|r| r.contains("TARGET_QUOTE")),
+            "J-hop lands the highlight in view past the wrapped preamble: {rows:?}",
+        );
+    }
+
+    /// Resize re-clamps the stored scroll: a user who scrolled to the
+    /// bottom at narrow width, then widened the terminal, must not be
+    /// left with a stale offset that stays saturated past the new
+    /// wrapped last row. The clamp is in `draw`, so a second draw at
+    /// the wider size writes the clamped value back.
+    #[test]
+    fn resize_reclamps_the_stored_scroll_offset() {
+        use std::fmt::Write as _;
+        let mut body = String::new();
+        for i in 0..500 {
+            writeln!(body, "line {i}").unwrap();
+        }
+        let mut p = Paper::new("Resize");
+        p.id = PaperId::from("p-resize");
+        p.r#abstract = UntrustedBody::publisher_supplied("abs");
+        p.full_text = Some(UntrustedBody::publisher_supplied(body));
+
+        let (_dir, data) = seed_paper(&p, &[]);
+
+        // Narrow draw — many wrapped rows; `G` sentinel clamps high.
+        let mut scroll = u16::MAX;
+        let mut pane_width = 0u16;
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("narrow terminal");
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    frame.area(),
+                    &data,
+                    p.id.as_str(),
+                    None,
+                    "lars",
+                    &mut scroll,
+                    &mut pane_width,
+                );
+            })
+            .expect("narrow draw");
+        let narrow_max = scroll;
+        assert!(
+            narrow_max > 0 && narrow_max < u16::MAX,
+            "narrow draw clamps the stored scroll to a real max: {narrow_max}",
+        );
+
+        // Wider terminal: the max drops, and the second draw rewrites
+        // the stored offset to the new (smaller) max — not just at
+        // render time, but in `scroll` itself.
+        let mut terminal = Terminal::new(TestBackend::new(200, 24)).expect("wide terminal");
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    frame.area(),
+                    &data,
+                    p.id.as_str(),
+                    None,
+                    "lars",
+                    &mut scroll,
+                    &mut pane_width,
+                );
+            })
+            .expect("wide draw");
+        assert!(
+            scroll < narrow_max,
+            "resize to a bigger pane re-clamps the stored scroll to the \
+             new wrapped max: was {narrow_max}, now {scroll}",
         );
     }
 }
