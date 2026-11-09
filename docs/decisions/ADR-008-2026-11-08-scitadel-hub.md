@@ -69,11 +69,11 @@ a permissive licence — fall out of that target.
 1. **Four repos** (§1). `vig-os/scitadel` stays open (`MIT OR
    Apache-2.0`) as the client: CLI, MCP, TUI, GUI, Tauri + web + mobile
    app, source adapters, acquisition (ADR-007), review workflow,
-   local SQLite, and `scitadel-hub-proto`. `vig-os/scitadel-hub` is
-   public and dual-licensed (§16). `vig-os/scitadel-hub-deploy` is
+   local SQLite, and `scitadel-hub-proto`. `nerdmachines/scitadel-hub` is
+   public and dual-licensed (§16). `nerdmachines/scitadel-hub-deploy` is
    **PRIVATE** and carries the NixOS module, the OCI image build and
    the Helm chart; on-prem comes via the commercial grant or a support
-   contract. `vig-os/scitadel-cloud` is private and comes later. The
+   contract. `nerdmachines/scitadel-cloud` is private and comes later. The
    fleet (`gerchowl/g-fleet`) consumes the module from the private
    deploy repo pinned by tag and never patches it locally.
 2. **The seam is a source adapter.** scitadel gains a `hub` source
@@ -203,16 +203,20 @@ a permissive licence — fall out of that target.
 - Repo settings come from vig-os/org-config (otterdog), as for this
   repo.
 
-The repo is created only after this ADR is Accepted (#313).
+The three repos were created on 2026-11-09 under the owner's
+`nerdmachines` org, as scaffolds only (licence, README, contribution
+policy). The owner chose a separate org from `vig-os` for a clean
+ownership line under the dual licence. Hub code lands only after this
+ADR is Accepted (#313).
 
 **Four repos in total:**
 
 | Repo | Visibility | Licence | Contents |
 |---|---|---|---|
 | `vig-os/scitadel` | public | `MIT OR Apache-2.0` | Client (CLI, MCP, TUI, GUI, Tauri + web + mobile); `scitadel-core`, `scitadel-http`, `scitadel-adapters`, `scitadel-scoring`, `scitadel-hub-proto`, `scitadel-hub-fixtures`; spec docs |
-| `vig-os/scitadel-hub` | public | `AGPL-3.0-only OR LicenseRef-scitadel-Commercial` | Hub server and hub-internal crates |
-| `vig-os/scitadel-hub-deploy` | **PRIVATE** | internal | NixOS module (`services.scitadel-hub`), OCI image build, Helm chart |
-| `vig-os/scitadel-cloud` | private, later | proprietary | Hosted-tier control plane: tenants, billing, metering, admin console |
+| `nerdmachines/scitadel-hub` | public | `AGPL-3.0-only OR LicenseRef-scitadel-Commercial` | Hub server and hub-internal crates |
+| `nerdmachines/scitadel-hub-deploy` | **PRIVATE** | internal | NixOS module (`services.scitadel-hub`), OCI image build, Helm chart |
+| `nerdmachines/scitadel-cloud` | private (business docs now, control plane later) | proprietary | Hosted-tier control plane: tenants, billing, metering, admin console |
 
 **On-prem comes via the commercial grant.** Keeping the deploy repo
 private is **deliberate friction** for other admins: a university or
@@ -1259,9 +1263,9 @@ what.
 | H9–H11 — phase-1 sibling sources (PMC OA `oa_comm`, SureChEMBL, DataCite + Crossref; §15) | to file from #323 | hub | H0, H5 |
 | H12 — extraction-issue reporting via squelch | #324 | both | H5, H7 |
 | H13 — client app (Tauri 2 desktop + mobile; web dual build) | #325 | scitadel | H0, H3 |
-| H14 — accounts, tiers and metering | #326 | scitadel-cloud | H13; extraction trigger of §1 met |
-| H15 — tenant simulation on microVMs | #327 | scitadel-hub-deploy | H0; `microvm.nix` on anvil |
-| H16 — on-prem packaging (NixOS module + OCI + Helm) | #328 | scitadel-hub-deploy | H0; stage 0 hub running |
+| H14 — accounts, tiers and metering | nerdmachines/scitadel-cloud#1 | scitadel-cloud | H13; extraction trigger of §1 met |
+| H15 — tenant simulation on microVMs | nerdmachines/scitadel-hub-deploy#1 | scitadel-hub-deploy | H0; `microvm.nix` on anvil |
+| H16 — on-prem packaging (NixOS module + OCI + Helm) | nerdmachines/scitadel-hub-deploy#2 | scitadel-hub-deploy | H0; stage 0 hub running |
 | H17 — standalone `scitadel-mcp` with grounded, licence-tagged responses | #329 | scitadel | H3 |
 | H18 — TDM opt-out pipeline (robots.txt + TDMRep + `noai` + ai.txt, re-checked on every re-ingest) | #330 | hub | §12; before any commercial hosted tier |
 | H19 — `scitadel-hub-fixtures` CC0 slice + conformance kit (scope per open question 2) | #331 | scitadel | H0, H5 |
