@@ -3,7 +3,7 @@
 **Status**: Proposed.
 **Date**: 2026-11-08
 **Supersedes**: —
-**Context**: #311 (epic), #313–#316 (H0–H3), #318–#321 (H4–H7), #268 (PatentsView retirement), #246 (System One ranking), vig-os/tessera#778, gerchowl/g-fleet#1121
+**Context**: #311 (epic), #313–#316 (H0–H3), #318–#321 (H4–H7), #268 (PatentsView retirement), #246 (System One ranking), vig-os/tessera#778, gerchowl/g-fleet#1121, gerchowl/g-fleet#1363
 
 Figures marked *(estimate)* are back-of-envelope numbers, not measurements.
 Prices and limits for third-party services are as published on 2026-11-08.
@@ -55,11 +55,27 @@ derived indexes, and the full text that **clients acquire** through
 ADR-007 (§12), stored once per lab instead of once per laptop and
 gated by licence.
 
+**Positioning.** The hub is a stepping stone toward a scitadel MCP
+that grounds AI agents against hallucination, with per-row provenance
+and licence class first-class in every protocol response. The target
+is institutional knowledge in the database and graph, exposed through
+a wire protocol a third party can implement. The architectural
+decisions below — the walled corpus, per-row licence columns, the
+`capabilities` and `coverage` advertisements, the protocol crate under
+a permissive licence — fall out of that target.
+
 ## Decision
 
-1. **A separate repo, `vig-os/scitadel-hub`**, holds the corpus
-   server. scitadel stays the client: CLI, MCP, TUI, GUI, source
-   adapters, acquisition (ADR-007), review workflow and local SQLite.
+1. **Four repos** (§1). `vig-os/scitadel` stays open (`MIT OR
+   Apache-2.0`) as the client: CLI, MCP, TUI, GUI, Tauri + web + mobile
+   app, source adapters, acquisition (ADR-007), review workflow,
+   local SQLite, and `scitadel-hub-proto`. `vig-os/scitadel-hub` is
+   public and dual-licensed (§16). `vig-os/scitadel-hub-deploy` is
+   **PRIVATE** and carries the NixOS module, the OCI image build and
+   the Helm chart; on-prem comes via the commercial grant or a support
+   contract. `vig-os/scitadel-cloud` is private and comes later. The
+   fleet (`gerchowl/g-fleet`) consumes the module from the private
+   deploy repo pinned by tag and never patches it locally.
 2. **The seam is a source adapter.** scitadel gains a `hub` source
    that is tried before the live APIs for the sources a hub declares it
    covers, and falls through when it does not. The wire types live in
@@ -79,12 +95,17 @@ gated by licence.
    refresh. The Member+ sync path is optional, for institutions that
    have it.
 7. **Patents are built from USPTO bulk data**, embedded on anvil's GPU,
-   and published on Hugging Face as `.tsra` only. PatentRef remains a stopgap in the
-   client adapter, not a dependency of the hub.
-8. **The hub runs on fleet infrastructure:** the S3-compatible
-   research-data store (versitygw, g-fleet#1121), a POSIX working copy
-   under `/srv/anvil/projects/<project>/`, and GPU work only as queued
-   batch jobs.
+   and **served by the hub as walled corpus** (§6). They are **not
+   published on Hugging Face** — the corpus is walled; the tools are
+   published. PatentRef remains a stopgap in the client adapter, not
+   a dependency of the hub.
+8. **The hub runs on staged infrastructure** (§8). Stage 0 is anvil
+   (versitygw + Hetzner Storage Box cold tier via restic; GPU through
+   `gpu_submit`; tenant simulation on microVMs via `microvm.nix`).
+   Stage 1 moves serving to a Hetzner AX box plus Hetzner Object
+   Storage. Stage 2 adds NixOS k3s/microVMs for hosted org and
+   personal spaces, plus hourly-rented Hetzner GPU for backfill. On-prem
+   runs the NixOS module / OCI / Helm from the private deploy repo.
 9. **Full text is stored as a document model, not as documents** (§9).
    Papers become Arrow-shaped tables in tessera/Vortex shard products,
    one block per element type, linked by keys. JATS, TEI, HTML and
@@ -112,13 +133,12 @@ gated by licence.
     mismatched query vectors.
 15. **Build first on a strictly licence-clean corpus** (§15). Phase 1
     ingests only content that is CC0, CC-BY or public-domain per
-    item, and whose access terms allow bulk harvest. The whole
-    phase-1 corpus is therefore also publishable on Hugging Face as
-    `.tsra`, giving us one audience — internal and external — on one
-    licence surface. Within that envelope phase 1 goes for **maximum
-    depth** (full text, figures, tables, cross-links, embeddings for
-    as much of the corpus as we can fit), not minimum viable. The
-    sources are listed in §15.
+    item, and whose access terms allow bulk harvest. The corpus is
+    **walled** — ingested, embedded, indexed and served by the hub;
+    not published on Hugging Face. Within the licence-clean envelope
+    phase 1 goes for **maximum depth** (full text, figures, tables,
+    cross-links, embeddings for as much of the corpus as we can fit),
+    not minimum viable. The sources are listed in §15.
 16. **Licence-gated features are designed but disabled in phase 1.**
     The entitlement classes and per-class gating of H4 (#318), local
     display of licensed content for entitled lab users, and COUNTER
@@ -135,8 +155,33 @@ gated by licence.
     Consortium of Swiss Academic Libraries, and COUNTER 5.1 / SUSHI
     reporting are deferred until a working phase-1 demo exists. We
     approach ETH Library with a running hub, not a slide deck.
+18. **Licensing** (§16; not legal advice). The scitadel client stays
+    `MIT OR Apache-2.0`. The hub is dual-licensed
+    `AGPL-3.0-only OR LicenseRef-scitadel-Commercial`, with written
+    AGPL §7 additional permissions for client/cloud interop. The
+    protocol crate `scitadel-hub-proto` stays in the scitadel repo
+    under `MIT OR Apache-2.0` (an AGPL proto crate would contaminate
+    clients and integrators; this resolves the old open question 1).
+    The protocol spec is Community Specification License 1.0;
+    conformance vectors are CC0-1.0.
+19. **The corpus is walled; the tools are published.** The processed
+    corpus and the GPU hours that produce it are not given away: a
+    curated public dataset is no longer a moat, and bulk copies would
+    only dilute the running service. The one possible exception is a
+    tiny CC0 conformance/fixtures slice (`scitadel-hub-fixtures`),
+    held open as an open question. tessera#777 (tsra on HF) is
+    reframed to optional/selective rather than the main publication
+    path.
+20. **The client app is Tauri 2 desktop and mobile plus a web dual
+    build** (§17), sharing a Rust backend through typed transport
+    (`specta` / `tauri-specta`). Offline-first on a personal
+    machine is free and local; hosted personal, lab and organisation
+    spaces are paid tiers reached over the web.
+21. **A user may detach full copies of THEIR tracked works**
+    (ADR-007 + §12). Bulk export of the processed corpus isn't
+    offered — it is the wall.
 
-## 1 · Repo split
+## 1 · Repo split and deploy topology
 
 | | scitadel (client) | scitadel-hub (server) |
 |---|---|---|
@@ -149,14 +194,39 @@ gated by licence.
 
 - `scitadel-core` (published) supplies domain types: `Paper`,
   identifiers, `UntrustedText`.
-- A protocol crate (working name `scitadel-hub-proto`) holds the
-  request and response types (§7). **Default: it lives in this repo**
-  and ships with the release train, so the client never depends on the
-  hub repo. Open question 1 asks whether it should move to the hub.
+- A protocol crate (`scitadel-hub-proto`) holds the request and
+  response types (§7). It **lives in this repo** under
+  `MIT OR Apache-2.0` and ships with the release train, so the
+  client never depends on the hub repo and no third-party integrator
+  inherits AGPL by `cargo add`-ing it. An AGPL proto crate would
+  contaminate clients; this is the licence split, not a preference.
 - Repo settings come from vig-os/org-config (otterdog), as for this
   repo.
 
 The repo is created only after this ADR is Accepted (#313).
+
+**Four repos in total:**
+
+| Repo | Visibility | Licence | Contents |
+|---|---|---|---|
+| `vig-os/scitadel` | public | `MIT OR Apache-2.0` | Client (CLI, MCP, TUI, GUI, Tauri + web + mobile); `scitadel-core`, `scitadel-http`, `scitadel-adapters`, `scitadel-scoring`, `scitadel-hub-proto`, `scitadel-hub-fixtures`; spec docs |
+| `vig-os/scitadel-hub` | public | `AGPL-3.0-only OR LicenseRef-scitadel-Commercial` | Hub server and hub-internal crates |
+| `vig-os/scitadel-hub-deploy` | **PRIVATE** | internal | NixOS module (`services.scitadel-hub`), OCI image build, Helm chart |
+| `vig-os/scitadel-cloud` | private, later | proprietary | Hosted-tier control plane: tenants, billing, metering, admin console |
+
+**On-prem comes via the commercial grant.** Keeping the deploy repo
+private is **deliberate friction** for other admins: a university or
+lab installs the hub through the commercial licence or a support
+contract, not by cloning a public module. The AGPL hub source stays
+public. The product-angle review and the license-spike both
+recommended a public `Apache-2.0` deploy repo; the owner overrode them
+on the deployment-friction axis.
+
+`gerchowl/g-fleet` consumes `services.scitadel-hub` from the private
+deploy repo **pinned by tag**, never patching it locally. Hub secrets
+live in their own `sops` file. `scitadel-cloud` is extracted at the
+**first external tenant**, the **first billing code**, or when
+**serving moves to Hetzner** — whichever comes first.
 
 ## 2 · Data model on tessera: layout and lifecycle
 
@@ -195,12 +265,13 @@ The repo is created only after this ADR is Accepted (#313).
   `current` moves atomically. Deltas may also be merged monthly along
   the way. Nothing is rewritten in place.
 - **Retention is an explicit policy.** Hub data lives in its own
-  versitygw bucket (g-fleet#1121), with a retention policy (default:
-  keep the last 2 bases and their deltas). The fleet's add-only rule
-  for `/srv/anvil` covers research data written by GPU jobs. The hub's
-  working copy is a rebuildable mirror of the bucket, and a generation
-  expires by that policy, never by an ad-hoc delete. How the two rules
-  meet is settled in g-fleet#1121 (H6).
+  versitygw bucket on the dedicated NixOS ZFS + versitygw box
+  (g-fleet#1363, replacing the shared path of g-fleet#1121), with a
+  retention policy (default: keep the last 2 bases and their deltas).
+  The fleet's add-only rule for `/srv/anvil` covers research data
+  written by GPU jobs. The hub's working copy is a rebuildable mirror
+  of the bucket, and a generation expires by that policy, never by an
+  ad-hoc delete. How the two rules meet is settled in g-fleet#1363 (H6).
 - **Derived means rebuildable.** Every product can be rebuilt from
   upstream or from the artefact store (§12). That is why tessera's
   pre-1.0 format is acceptable here: a format change costs a rebuild,
@@ -337,18 +408,20 @@ verified). The hub computes embeddings only for works they miss.
   - **Out of scope:** pre-1976 patents, which are images only and would
     need OCR.
   - **The golden set has a patent stratum** (§13).
-- **Publication.** A Hugging Face dataset under a `vig-os` org,
-  shipped as **`.tsra` only**, with a dataset card (tessera#777).
-  Consumers read columns straight from HF over HTTP range reads through
-  tessera's object-store reader (tessera ADR-0034); Vortex gives
-  better column access than Parquet. The card states the licences (PatentsView tables
-  CC-BY-4.0 with attribution; USPTO text public domain in the US),
-  the provenance (USPTO release, embedding model and version) and the
-  build recipe. Size: 100–150 GB in total *(estimate)*, inside HF's
-  free public storage.
-- **Novelty:** nothing on Hugging Face combines US full text from 1976
-  to now with embeddings and a search index. HUPD stops at 2018 and
-  has no embeddings. This makes the dataset useful beyond the lab.
+- **Serving.** The patent `.tsra` is **walled**: the hub ingests it,
+  embeds it, indexes it and serves it over the `search` / `get` /
+  `neighbours` protocol (§7). It is **not published on Hugging Face**
+  — the corpus is the running service, not a public dataset, and
+  shipping it in bulk would dilute the product the hub sells
+  (freshness, licence-class gating, extraction-cascade curation,
+  System One ranking). Attribution is kept on `search` and `get`
+  responses per row (PatentsView tables CC-BY-4.0 with attribution;
+  USPTO text public domain in the US). Size: 100–150 GB in total
+  *(estimate)*, held in the hub's warm tier (§8).
+- **The hub answers what HUPD and HF don't.** No public dataset
+  combines US patent full text from 1976 to now with embeddings and a
+  search index (HUPD stops at 2018 and has no embeddings). The hub
+  closes that gap as a *service*, not as a dataset.
 - **PatentRef stopgap.** scitadel's PatentsView adapter points at a
   configurable PatentSearch-compatible endpoint, defaulting to
   PatentRef (#268 thread). It is a third-party free beta with no
@@ -385,36 +458,81 @@ verified). The hub computes embeddings only for works they miss.
   wrong model (§14).
 - **Transport:** HTTP+JSON first. The types do not assume it.
 
-## 8 · Infrastructure
+## 8 · Infrastructure — staged
 
-- **Store.** The S3-compatible research-data store on anvil (versitygw,
-  gerchowl/g-fleet#1121) is the canonical store and the distribution
-  point. A POSIX working copy under `/srv/anvil/projects/<project>/`
-  serves DataFusion, tantivy and GPU jobs, which read local files much
-  faster than ranged S3 reads.
-- **Disk.** anvil's only documented drive is one 2 TB 990 PRO. Budget
-  *(estimate)*:
-  - patents: 100–150 GB;
-  - OpenAlex subsets: 5–50 GB each;
-  - indexes: ~1.5× the text they cover;
-  - artefact store (§12): kept TEI for a 2M-paper subset ~8–10 GB
-    zstd; paywalled PDFs at ~1.5 MB each, growing with what the lab
-    acquires;
-  - initial total: about 1 TB including working copies.
+Serving and ingest move through three stages. Each stage's host
+mix is set; the data model, protocol and licence gating are
+unchanged across stages.
 
-  A full OpenAlex mirror is ~770 GB as Parquet and an estimated ~2.5 TB
-  sealed in tessera until tessera#628 is fixed, so it **does not fit**
-  and is not a goal.
-- **GPU.** The 5090 is shared and usually busy with inference. The hub
-  uses it only for batch embedding through `gpu_submit`:
-  - declared `vram` and `priority=low`;
-  - chunked to the 30-minute default runtime, with checkpoints;
-  - outputs written to new directories only.
+### Stage 0 — anvil (phase 1 demo)
 
-  No index stays resident in VRAM; queries are served from CPU and
-  NVMe.
-- **Scoring.** System One scoring follows #246 (hosted Clef or local
-  Kev). Where Kev runs is a deployment detail of #246, not of this ADR.
+- **Hot tier.** anvil's KC3000 NVMe holds the POSIX working copy under
+  `/srv/anvil/projects/<project>/`. DataFusion, tantivy and GPU jobs
+  read local files much faster than ranged S3 reads.
+- **Warm tier.** A dedicated **NixOS ZFS + versitygw S3 box**
+  (gerchowl/g-fleet#1363), replacing the shared research-data store
+  path of g-fleet#1121, is the canonical S3-compatible store and the
+  distribution point inside the fleet.
+- **Cold tier.** A **Hetzner Storage Box** (encrypted, via `restic`)
+  holds the backups and the derived products that fall out of the
+  warm working set.
+- **Ingest.** GPU work only through `gpu_submit`: declared `vram`,
+  `priority=low`, chunked to the default runtime with checkpoints,
+  outputs written to new directories only. No index stays resident in
+  VRAM; queries are served from CPU and NVMe.
+- **Tenant simulation.** Per-tenant hub instances for development and
+  acceptance tests run on **microVMs** (`microvm.nix`) on anvil, one
+  per simulated tenant, so isolation and metering code paths are
+  exercised against the same packaging the hosted tier will use.
+
+### Stage 1 — Hetzner (first hosted users)
+
+- **Serving.** A **Hetzner AX** dedicated box runs the hub binary on
+  CPU.
+- **Warm store.** **Hetzner Object Storage** replaces the fleet's
+  versitygw as the distribution point for `.tsra` products.
+- **Cold.** The Storage Box of stage 0 stays in the cold tier.
+- **GPU.** anvil remains the steady-state ingest GPU; **hourly-rented
+  Hetzner GPU** covers backfills, re-embedding after a model upgrade
+  and spikes.
+
+### Stage 2 — hosted spaces
+
+- NixOS **k3s + microVMs** host org and personal spaces with per-tenant
+  isolation, metering and billing (behind `scitadel-cloud`, §17).
+- Backfill and re-embedding continue on **hourly-rented Hetzner GPU**.
+
+### On-prem
+
+- The NixOS module, OCI image and Helm chart from the private
+  `scitadel-hub-deploy` repo (§1). An on-prem hub runs the same
+  binary and the same `.tsra` shards as any stage above, and
+  interoperates with the same protocol.
+
+### GPU policy (all stages)
+
+- **Steady state:** anvil's 5090 via `gpu_submit`.
+- **Backfill and re-embedding:** hourly-rented Hetzner GPU, not anvil
+  (anvil is shared with inference and must not be monopolised by a
+  one-off re-embedding sweep).
+
+### Disk budget (stage 0, *estimate*)
+
+anvil's canonical drive is one 2 TB 990 PRO plus the KC3000 tier:
+- patents: 100–150 GB;
+- OpenAlex subsets: 5–50 GB each;
+- indexes: ~1.5× the text they cover;
+- artefact store (§12): kept TEI for a 2M-paper subset ~8–10 GB
+  zstd; paywalled PDFs at ~1.5 MB each, growing with what the lab
+  acquires;
+- initial total: about 1 TB including working copies.
+
+A full OpenAlex mirror is ~770 GB as Parquet and an estimated ~2.5 TB
+sealed in tessera until tessera#628 is fixed, so it **does not fit on
+anvil** and is not a goal; the sized-up Hetzner stages absorb it.
+
+**Scoring.** System One scoring follows #246 (hosted Clef or local
+Kev). Where Kev runs is a deployment detail of #246, not of this ADR.
 
 ## 9 · Document model
 
@@ -591,7 +709,7 @@ Patents run the same cascade with a USPTO-specific T0 (§6).
 **Heavy originals stay out of the corpus database** (H4, #318). PDFs
 and raw JATS/TEI/HTML live in a content-addressed artefact store:
 - keys are blake3 hashes, the identity tessera and ADR-007 already use;
-- it is a cold bucket on versitygw (g-fleet#1121);
+- it is a cold bucket on the dedicated versitygw box (g-fleet#1363);
 - `works` rows reference it by hash and source URL;
 - raw XML never goes into tessera products.
 
@@ -607,17 +725,40 @@ and raw JATS/TEI/HTML live in a content-addressed artefact store:
 Keeping the XML lets us re-derive after extractor upgrades without
 paying again, and protects against upstream link rot and retractions.
 
-**Licence classes, recorded per artefact:**
+**Licence classes, recorded per artefact (per-row column on every
+product):**
 
-| Class | Hub cache | Embed / index | Cascade up to | Publish on HF |
+| Class | Hub cache | Embed / index | Cascade up to | Served to |
 |---|---|---|---|---|
-| CC-BY / CC0 / public domain | yes | yes | T4 | yes, with attribution |
-| Free to read, no licence (bronze/green) | lab-internal only | internal only | T3 | no |
-| Paywalled, obtained with a member's access rights | entitled users only (same licence, e.g. ETH members) | internal only | T3 | never |
+| CC-BY / CC0 / public domain | yes | yes | T4 | every tier (free local, lab, org, hosted paid, on-prem); attribution kept on `search` and `get` |
+| CC-BY-NC | not in any paid hosted tier | — | — | **excluded** from every paid hosted tier (CC-BY-NC 4.0 §2(b)(1); a 2048-d embedding counts as adapted material) |
+| CC-BY-ND | not in redistributed indexes | — | — | **excluded** from paid hosted tiers until EU case law resolves whether a lossy embedding is "adapted material"; treat as derivative to be safe |
+| Free to read, no licence (bronze/green) | lab-internal only | internal only | T3 | lab / research-org on-prem only |
+| Paywalled, obtained with a member's access rights | entitled users only (same licence, e.g. ETH members) | internal only | T3 | entitled users only |
 
-The free-to-read row relies on the Swiss Copyright Act's
-text-and-data-mining exception for research (CopA Art. 24d). That is
-our reading, to be confirmed with ETH Library (open question 7).
+**Legal basis for the mining, by tier (not legal advice).**
+
+- **Research organisations (ETH, lab on-prem).** EU DSM Directive
+  (EU) 2019/790 **Art. 3** (scientific TDM, no opt-out, reserved for
+  research organisations and cultural-heritage institutions) plus
+  Swiss CopA **Art. 24d** (scientific TDM on lawfully-accessed works)
+  cover ingest and internal indexing. Art. 24d does **not** permit
+  **commercial redistribution** of mining results beyond verification.
+- **Commercial hosted tier (`scitadel-cloud`).** Relies on EU DSM
+  **Art. 4** only (Art. 3 is reserved for research organisations), so
+  it must honour every machine-readable **opt-out** (robots.txt,
+  TDMRep, `noai`, ai.txt), **re-checked on every re-ingest**. This is
+  a separate issue under #311.
+- **Database sui generis right.** OpenAlex's CC0 declaration waives it
+  for its subsets, so republishing a subset is permitted; every
+  `.tsra` pins the upstream snapshot date for audit.
+- **GDPR.** A **DPIA** is written and reviewed, and an **Art. 14
+  notice** published, before the first hosted user. ORCID / author
+  data re-use under Art. 6(1)(f) legitimate interests; erasure
+  requests honoured (soft-delete from index, retain hash for dedup).
+
+The free-to-read row relies on the lab's reading of CopA Art. 24d,
+to be confirmed with ETH Library (open question 7).
 
 **The client store model:**
 - **The client keeps references.** A local scitadel stores identity
@@ -654,8 +795,9 @@ our reading, to be confirmed with ETH Library (open question 7).
   Each fixture is the raw input plus the expected tessera output, as
   `insta` snapshot tests.
 - **Split by licence.** CC-BY/CC0 and public-domain fixtures live in
-  the repo or on HF and run in public CI. All others live in a private
-  fixture bucket and run on fleet runners only.
+  the `scitadel-hub-fixtures` crate (§16, open question 2) and run in
+  public CI. All others live in a private fixture bucket and run on
+  fleet runners only.
 - **The red/green loop.** Every extraction failure or QC flag goes
   through the same steps:
   1. quarantine the raw input;
@@ -761,9 +903,10 @@ demo. No licensed/paywalled caches, no grey-area sources, no
 scraping, in phase 1. Within that envelope phase 1 goes for
 **maximum depth** (full text, figures, tables, cross-links,
 embeddings for as much as we can fit), not minimum viable. The
-whole phase-1 corpus is therefore also publishable on Hugging Face
-as `.tsra`, giving us one audience — internal and external — on
-one licence surface.
+corpus is **walled**: served by the hub, not published in bulk on
+Hugging Face. What is published is the toolchain — the client, the
+protocol, the conformance kit, and the `scitadel-hub-fixtures` CC0
+slice (open question 2 in §16).
 
 ### Phase 1 — licence-clean sources
 
@@ -859,15 +1002,18 @@ Within the licence-clean envelope phase 1 goes deep, not shallow:
   IOP, APS (PRX etc.), Springer Nature OA, IEEE Access, ACS
   AuthorChoice CC-BY. Open question 12 checks that Crossref still
   exposes both fields and notes per-publisher terms.
-- **Hugging Face as the cold store for the licence-clean public
-  corpus** — the full corpus (especially figure and patent-drawing
-  products) lives on HF and is read by HTTP range (tessera#777);
-  anvil keeps the indexes (BM25 / ANN / graph), the metadata, the
-  text blocks and the hot set. Sizing *(estimates)*: ~5–10 M
-  licence-clean papers × (text ~8 KB + tables ~5 KB + figures
-  ~200 KB JXL + vectors ~30 KB) ≈ 1–2.5 TB; US patent drawings
-  ≈ 0.5–1.5 TB. This exceeds anvil's 2 TB 990 PRO, which is why
-  "HF cold + anvil hot" is the layout, not "everything on anvil".
+- **Staged storage, not HF.** The corpus is walled (decision 19):
+  it is held and served by the hub, not shipped to Hugging Face.
+  Stage 0 (§8) keeps the full set across tiers inside the fleet: a
+  **Hetzner Storage Box** is the cold tier via `restic`, the
+  versitygw box (g-fleet#1363) is warm, and anvil's KC3000 is the hot
+  working set. Stage 1 moves the warm tier to **Hetzner Object
+  Storage** and serving to a Hetzner AX box. Sizing *(estimates)*:
+  ~5–10 M licence-clean papers × (text ~8 KB + tables ~5 KB +
+  figures ~200 KB JXL + vectors ~30 KB) ≈ 1–2.5 TB; US patent
+  drawings ≈ 0.5–1.5 TB. This exceeds anvil's 2 TB 990 PRO, which is
+  why the Storage Box / Object Storage tiers exist, not a public HF
+  cold tier.
 - **Embedding levels** — work, section, chunk, figure (Qwen3-VL),
   table (serialised + caption → text embedder), independent claim,
   graph node. GPU budget *(estimates)*: ~250 M text chunks ≈ 1–2
@@ -879,7 +1025,8 @@ Within the licence-clean envelope phase 1 goes deep, not shallow:
   DOI or PMID) is surfaced with its retraction status and date on
   `search` and `get` responses; search result rendering says so.
   Flags are joined at index-build time (§5, §6), not at query
-  time, and travel with the published `.tsra` on HF.
+  time, and are first-class columns on the `.tsra` shards the hub
+  serves.
 
 ### Phase 1 — gated features designed but disabled
 
@@ -951,28 +1098,175 @@ phase-1 demo:
 - **COUNTER 5.1 / SUSHI** reporting plumbing — the recording path
   designed in H4 switches from no-op to live.
 
-Nothing in phase 2 reopens the phase-1 licence surface: the
-HF-publishable `.tsra` corpus stays CC0/CC-BY/PD by definition,
-and phase-2 licensed content goes into a separate licence class
-that is lab-internal only.
+Nothing in phase 2 reopens the phase-1 licence surface: the walled
+phase-1 corpus stays CC0/CC-BY/PD by definition, and phase-2 licensed
+content goes into a separate licence class that is lab-internal only.
+
+## 16 · Licensing
+
+**Not legal advice.** Every reading below is to be verified with
+counsel before the first external hosted user. The full consolidated
+reviewer notes live in `license/licensing.md` (three parallel fresh
+reviewers under the `license-spike` skill, 2026-11-08); this section
+is a decision record, not the review.
+
+### Per-part decisions
+
+| Part | Licence |
+|---|---|
+| scitadel client (CLI, TUI, MCP, Tauri, libs) | `MIT OR Apache-2.0` (unchanged) |
+| scitadel-hub server | **Dual: `AGPL-3.0-only OR LicenseRef-scitadel-Commercial`**, with written AGPL §7 additional permissions for client / cloud interop |
+| `scitadel-hub-proto` crate | `MIT OR Apache-2.0`, in the scitadel repo (resolves the old open question 1) |
+| Protocol prose spec | Community Specification License 1.0 (CC-BY carries no patent or trademark grant and is wrong for a wire-protocol spec a competitor may implement) |
+| Conformance test vectors + verifier | CC0-1.0, in a sibling repo so re-licensing the hub cannot drag the vectors with it |
+| NixOS module, OCI image, Helm chart | Proprietary / internal, in the **PRIVATE** `scitadel-hub-deploy` repo (§1) |
+| `scitadel-cloud` control plane | Proprietary, extracted at the trigger in §1 |
+
+### Rationale on the hub dual
+
+AGPL alone does not stop a cloud provider from re-hosting the hub as
+a service (the Elasticsearch fork proved this), and AGPL blanket-bans
+in enterprise procurement would close the first-customer door. The
+dual preserves the AGPL deterrent for self-hosters while giving
+procurement-constrained customers a commercial grant without
+re-opening the licence debate per deal.
+
+### Contribution model
+
+Solo author for now (≤24 months is legitimate for a one-person
+project); `CONTRIBUTING.md` says "no external contributions
+accepted; please open an issue instead". **At the first external
+PR, switch to the Apache ICLA** — the hub dual-licence relicensing
+path needs an ICLA's copyright and patent grant, so DCO alone is
+insufficient.
+
+### Trademark
+
+Register `scitadel` as a word mark at **IGE Switzerland** in **Nice
+classes 9 and 42** (approx. CHF 550), after a TMview + IGE + USPTO +
+WIPO clearance search (`Citadel` is heavily used in finance and
+gaming; class specificity matters). Extend via Madrid Protocol to
+EUIPO when revenue arrives.
+
+### Release-train obligations
+
+- **`cargo-about`** NOTICE file wired into the release train.
+- **`cargo-cyclonedx --format json`** SBOM published with every
+  release.
+- **`cargo-deny`** on the client tree with an allowlist and an
+  **explicit copyleft deny** (`GPL-*`, `AGPL-*`, `LGPL-*`, `SSPL-*`,
+  `BUSL-*`) — the client must not accidentally pull in copyleft and
+  break App Store or Homebrew distribution.
+
+### Model-weight policy
+
+- **Qwen3-VL 2B / 8B**: Apache-2.0 on the HF model cards as of
+  2026-11-08. Commercial OK.
+- **Grobid**: Apache-2.0 code; DeLFT model files pinned per release
+  pending audit.
+- **Docling**: MIT. Commercial OK.
+- **Marker**: Apache-2.0 code since v2.0.0 (2026-07); weights carry a
+  revenue / funding threshold. Fine today; weights are **fetched at
+  first run via a signed manifest**, **never baked into the OCI
+  image**. Budget a commercial Marker key before scaling.
+
+### Open-question resolutions referenced here
+
+- Open question 1 (protocol crate home) resolved to this repo under
+  `MIT OR Apache-2.0` by decision 18.
+- Open question 2 (old "HF org") replaced by the `scitadel-hub-fixtures`
+  CC0 slice question, superseded by decision 19.
+
+### Not covered by this section
+
+Operational legal items (trademark clearance search, BIS export
+notification for encryption source, DPIA, Art. 14 notice drafting,
+publisher TDM-term audits) are owner actions, written up next to
+this ADR in `license/`, not in the ADR.
+
+## 17 · Client app and tiers
+
+The client is one product in three builds:
+
+- **Tauri 2 desktop** (macOS, Linux, Windows).
+- **Tauri 2 mobile** (iOS, Android).
+- **Web dual build**, from the same Rust backend, via typed
+  transport (`specta` / `tauri-specta`). The web shell is the
+  entry point for hosted tiers.
+
+All three builds share one Rust backend. The CLI, the TUI and the
+MCP server are the same engine with different front-ends.
+
+### Tiers
+
+| Tier | Where it runs | Scope |
+|---|---|---|
+| **Free, local** | A personal machine | Offline-first; local SQLite; the hub source adapter points at live APIs or at any hub the user is entitled to. No prices in this ADR. |
+| **Personal / Lab / Org — hosted** | Web (and the web dual build of the client) | Per-tenant space on `scitadel-cloud` (§1). Billing and metering out of scope here; see H9 and the business docs. |
+| **On-prem** | Customer hardware | The NixOS module / OCI / Helm from the private `scitadel-hub-deploy` repo (§1), under the commercial grant or a support contract. |
+
+### `detach` vs bulk export
+
+- `scitadel detach` pulls **full copies of a user's own tracked works**
+  into local storage (§12), checking the licence per artefact. This is
+  the offline-first affordance.
+- **Bulk export of the processed corpus is not offered** — the walled
+  corpus (decision 19) is the hub's running service, not a dataset
+  download. The two statements are consistent: individuals take their
+  own workspace with them; the corpus stays behind the wall.
+
+No tier prices and no tier-specific price ranges are recorded in this
+ADR; see the owner's business docs for that.
+
+## 18 · Research analytics (later)
+
+A later expansion layer: **DataFusion over works, authorships
+(ORCID), institutions (ROR), funders, and citations**, as a
+WoS-Research-Intelligence-equivalent surface for research offices
+(funding matching, collaborator graphs, benchmarking). No design
+is proposed here; only the shape, so the ADR is complete across
+the owner's decisions.
+
+### GDPR guardrails (not legal advice)
+
+Benchmarking **named individuals** is profiling under GDPR
+Art. 4(4), so this layer defaults to **aggregates**. Individual
+views are available **only to the researcher themselves or with
+consent**. If outputs could feed hiring or funding decisions,
+Art. 22 applies. Any public ranking surface follows
+**DORA / CoARA** responsible-metrics principles.
+
+### Funding-call matching (shape only)
+
+Embeddings over call-text corpora from NIH RePORTER, NSF, CORDIS
+and SNSF (each with its own licence check before caching). The
+owner's business docs carry the when; this section carries the
+what.
 
 ## Slices
 
 | Slice | Issue | Where | Depends on |
 |---|---|---|---|
 | H0 — repo split + protocol crate home | #313 | both | This ADR Accepted |
-| H1 — patent corpus + HF publication | #314 | hub | H0; tessera W0/W1 (internal Parquet staging first is fine), W2 for indexes, #777 for publication; g-fleet#1121 |
-| H2 — OpenAlex lab mirror | #315 | hub | H0; tessera W0 (#628) and W1; g-fleet#1121 |
+| H1 — patent corpus (walled, served from the hub) | #314 | hub | H0; tessera W0/W1 (internal Parquet staging first is fine), W2 for indexes; g-fleet#1363 |
+| H2 — OpenAlex lab mirror | #315 | hub | H0; tessera W0 (#628) and W1; g-fleet#1363 |
 | H3 — `hub` source adapter + protocol | #316 | scitadel | H0; a mock hub for tests, H1/H2 for end-to-end |
-| H4 — artefact store, raw retention, licence gating, upload-on-acquire, `detach` | #318 | both | H0, H5; ADR-007 acquisition; g-fleet#1121 |
+| H4 — artefact store, raw retention, licence gating, upload-on-acquire, `detach` | #318 | both | H0, H5; ADR-007 acquisition; g-fleet#1363 |
 | H5 — document model + tiered extraction pipeline | #319 | hub | H0, H4, H7; tessera W0–W2, tessera#779, #780, #782 |
-| H6 — base + delta lifecycle, compaction, retention | #320 | hub | H0, H5; tessera#781; g-fleet#1121 |
+| H6 — base + delta lifecycle, compaction, retention | #320 | hub | H0, H5; tessera#781; g-fleet#1363 |
 | H7 — golden set, red/green loop, random-sample QC | #321 | hub | H0; runs alongside H1, H2 and H5 from their first batch |
+| H8 — client app (Tauri 2 desktop + mobile; web dual build) | sub-issue under #311 | scitadel | H0, H3 |
+| H9 — accounts, tiers and metering | sub-issue under #311 | scitadel-cloud | H8; extraction trigger of §1 met |
+| H10 — tenant simulation on microVMs | sub-issue under #311 | scitadel-hub-deploy | H0; `microvm.nix` on anvil |
+| H11 — on-prem packaging (NixOS module + OCI + Helm) | sub-issue under #311 | scitadel-hub-deploy | H0; stage 0 hub running |
+| H12 — standalone `scitadel-mcp` (crates.io + PyPI wheel + npm) | sub-issue under #311 | scitadel | H3 |
+| H13 — TDM opt-out pipeline (robots.txt + TDMRep + `noai` + ai.txt, re-checked on every re-ingest) | sub-issue under #311 | hub | §12; before any commercial hosted tier |
+| H14 — `scitadel-hub-fixtures` CC0 slice (if open question 2 confirms) | sub-issue under #311 | scitadel | H0, H5 |
 
 Upstream: vig-os/tessera#778 waves:
 - W0: #758, #628;
 - W1: #654, #666, #668;
-- W2: #768 → #769, #775, #777;
+- W2: #768 → #769, #775;
 - W3: #776;
 - the gap issues filed for the hub:
   - W1: tessera#780 (declared keys and keyed references, work_id →
@@ -980,6 +1274,11 @@ Upstream: vig-os/tessera#778 waves:
     external inputs not held);
   - W2: tessera#781 (keyed delta products);
   - tessera#779 (media-typed binary columns for figure bytes).
+
+tessera#777 (publish `.tsra` on Hugging Face) is **reframed to
+optional / selective** by decision 19: the walled corpus is the
+product. The only use that remains is the CC0
+`scitadel-hub-fixtures` slice, if open question 2 confirms it.
 
 ## Alternatives considered
 
@@ -1008,11 +1307,19 @@ Upstream: vig-os/tessera#778 waves:
   from an undisclosed operator, with no service commitment, a 1,000
   requests/month free tier and no pre-grant publications. It is the
   stopgap.
+- **Publish the processed corpus on Hugging Face.** Rejected. The
+  processed corpus and the GPU hours that produced it are not given
+  away: a curated public dataset is no longer a moat (anyone with a
+  weekend and a budget can rebuild one from CC0/CC-BY/PD sources), and
+  bulk copies only dilute the running service the hub sells —
+  freshness, licence-class gating, extraction-cascade curation, System
+  One ranking, per-row provenance. The one possible exception is a
+  tiny CC0 conformance/fixtures slice (`scitadel-hub-fixtures`),
+  carried as open question 2 in §16.
 - **A Parquet projection for the HF viewer and the `datasets`
-  library.** Deferred. Publishing `.tsra` only gives up the Hugging
-  Face dataset viewer and `load_dataset()` compatibility. A Parquet
-  projection can be added later if consumers ask for it, as a derived
-  export of the sealed products.
+  library.** Rejected as a corollary of the walled corpus: there is
+  no public HF dataset to project to. A client that wants Parquet runs
+  `scitadel detach` against the hub (§12) and re-exports locally.
 - **TEI, JATS or Typst as the storage format.** Rejected: XML trees and
   typesetting source are not queryable at corpus scale, compress
   worse than typed columns, and Typst conversion is lossy. They are
@@ -1047,13 +1354,32 @@ Upstream: vig-os/tessera#778 waves:
     corpus scale;
   - tessera#758 (fork pin) silently drops determinism fixes for
     downstream dependents.
-- anvil's 2 TB drive caps the hub's scope at subsets plus patents.
-- A public Hugging Face dataset under `vig-os` brings a maintenance
-  promise: a dataset card, a weekly or quarterly cadence, and licence
-  attribution.
+- anvil's 2 TB drive caps the hub's stage-0 scope at subsets plus
+  patents; the warm and cold tiers of §8 absorb the overflow.
+- The walled corpus means `scitadel-hub-deploy` is the only on-prem
+  distribution path (§1). An admin can't skip the commercial grant by
+  cloning a public NixOS module; the owner accepts the friction as a
+  licensing / support signal, over the product-angle and license-spike
+  reviewers' preference for a public `Apache-2.0` deploy repo.
+- Keeping the corpus walled forecloses the "give the data away to earn
+  citations" distribution path. Downstream adoption now depends on
+  the client, the protocol and the hosted tiers earning it.
 - The hub holds licensed content. Licence classes, entitlement checks
   and the T4 gate are security-relevant code and need tests, not
   conventions.
+- **CC-BY-NC and CC-BY-ND are excluded from every paid hosted tier**
+  (§12). Embeddings are treated as adapted material to be safe; the
+  per-row licence column is the enforcement surface, not a convention.
+- **A TDM opt-out pipeline is on the critical path for the hosted
+  tier** (§12, H13). robots.txt / TDMRep / `noai` / ai.txt must be
+  re-checked on every re-ingest; a hosted tier that skips this cannot
+  rely on EU DSM Art. 4.
+- **A DPIA plus an Art. 14 notice are pre-launch gates** for the
+  first hosted user.
+- **Trademark clearance is on the critical path** before any public
+  branded release: `scitadel` registered at IGE Switzerland in
+  Nice classes 9 + 42 after a TMview + IGE + USPTO + WIPO search
+  ("Citadel" is crowded).
 - T3 (sage) and T4 (the Opus API) cost GPU time and money. Budget caps
   and queueing bound them; the random-sample QC sets a floor on that
   spend.
@@ -1073,15 +1399,23 @@ Upstream: vig-os/tessera#778 waves:
 
 ## Open questions for the owner
 
-1. **Protocol crate home:** this repo (default) or the hub repo?
-2. **Hugging Face org:** `vig-os`, or a lab or ETH organisation?
+1. **Protocol crate home:** ~~this repo (default) or the hub repo?~~
+   **Resolved (2026-11-08): this repo, under `MIT OR Apache-2.0`**
+   (decision 18, §1, §16). Rationale: an AGPL proto crate would
+   contaminate clients and third-party integrators.
+2. **`scitadel-hub-fixtures` CC0 slice:** publish a tiny CC0
+   conformance / fixtures slice (`scitadel-hub-fixtures`) as the one
+   exception to the walled-corpus rule, so external CI, bug reports
+   and conformance tests are reproducible? (Replaces the old "HF
+   org" question, superseded by decision 19.) If yes, size and host
+   (crate-embedded, or a small CC0 HF dataset owned by `vig-os`)?
 3. **Patent scope:** grants only (default), or add pre-grant
    publications (more data, more disk)?
 4. **OpenAlex membership:** does ETH (or the lab) hold an OpenAlex
    Member or Member+ plan? If so, §5's paid path applies.
 5. **Disk:** if a larger OpenAlex subset is wanted, more storage on
    anvil (or another host) is needed. Is that in scope for
-   g-fleet#1121?
+   g-fleet#1363?
 6. **Default subset:** which subscriptions should the first lab mirror
    carry (topics, the lab's institution, members' libraries)?
 7. **Licence reading:** does ETH Library confirm that free-to-read
@@ -1105,3 +1439,8 @@ Upstream: vig-os/tessera#778 waves:
     IEEE Access, ACS AuthorChoice CC-BY)? And which of those
     publishers add TDM-specific terms on top of the CC licence
     that we must honour per-publisher in the paced buckets?
+13. **Research-analytics layer (§18):** when does the
+    DataFusion-over-works-authorships-institutions-funders-citations
+    tier (a WoS Research-Intelligence equivalent for research
+    offices) move from "designed later" to "scheduled"? No design
+    is proposed here; only the shape.
