@@ -1809,8 +1809,9 @@ mod tests {
     /// what the cap is in every configuration — the one source of truth the
     /// config doc claims.
     ///
-    /// The scenario mirrors the action-list guidance "fetch manually and
-    /// import, or raise the body cap and re-acquire by id": an operator raises
+    /// The scenario mirrors the action-list guidance "raise
+    /// acquire.body_cap_bytes, then re-acquire by id or fetch manually and
+    /// import": an operator raises
     /// the cap, the ladder would admit the body, and the manual-import path
     /// must admit the same bytes for `attach`'s advice to be honest.
     #[test]

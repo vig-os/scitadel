@@ -229,8 +229,9 @@ impl AcquireConfig {
     ///
     /// Today one check — `body_cap_bytes >= BODY_CAP_MIN_BYTES` when set. The
     /// error names the key, its unit (bytes), the valid range, and the common
-    /// "I meant megabytes" mistake, because the error message is the one the
-    /// operator sees when the CLI refuses to start.
+    /// "I meant megabytes" mistake, because this message is the one the
+    /// operator sees: on stderr when [`load_config`] warns and falls back to
+    /// the default, or as the error from [`load_config_from`].
     pub fn validate(&self) -> Result<(), String> {
         if let Some(bytes) = self.body_cap_bytes
             && bytes < BODY_CAP_MIN_BYTES
@@ -395,12 +396,15 @@ pub fn load_config() -> Config {
         .and_then(|contents| toml::from_str(&contents).ok())
         .unwrap_or_default();
 
+    let mut warn = warn_on_stderr;
     // Enforce the acquire-knob floor from the TOML side (#288). The infallible
     // loader can't return `Err`, but a sub-floor value would otherwise land
     // every fetch in terminal `too_large`; warn and discard the override so the
     // CLI starts on the safe default instead.
     if let Err(msg) = config.acquire.validate() {
-        tracing::warn!(error = %msg, "acquire config invalid; keeping the default");
+        warn(&format!(
+            "config.toml: {msg} Ignoring it and using the default {DEFAULT_BODY_CAP_DESC}."
+        ));
         config.acquire.body_cap_bytes = None;
     }
 
@@ -482,35 +486,65 @@ pub fn load_config() -> Config {
         config.chat.scoring_concurrency = v;
     }
 
-    // Acquire knobs (#288). `None` in the TOML keeps the workspace-wide
-    // default; a parse failure *or* a sub-floor value is ignored rather than
-    // surfaced so a typo never stops the CLI starting — the warning goes
-    // through `tracing` and the override stays whatever the TOML resolved to.
-    if let Ok(bytes) = std::env::var("SCITADEL_ACQUIRE_BODY_CAP_BYTES") {
-        match bytes.parse::<u64>() {
-            Ok(v) => {
-                let candidate = AcquireConfig {
-                    body_cap_bytes: Some(v),
-                };
-                if let Err(msg) = candidate.validate() {
-                    tracing::warn!(
-                        env = "SCITADEL_ACQUIRE_BODY_CAP_BYTES",
-                        error = %msg,
-                        "env override rejected; keeping the TOML/default value"
-                    );
-                } else {
-                    config.acquire.body_cap_bytes = Some(v);
-                }
-            }
-            Err(e) => tracing::warn!(
-                value = %bytes,
-                error = %e,
-                "SCITADEL_ACQUIRE_BODY_CAP_BYTES is not a u64; keeping the default"
-            ),
-        }
-    }
+    apply_acquire_env_override(
+        &mut config.acquire,
+        std::env::var("SCITADEL_ACQUIRE_BODY_CAP_BYTES")
+            .ok()
+            .as_deref(),
+        &mut warn,
+    );
 
     config
+}
+
+/// The built-in fetch-body cap the warnings name as the fallback (#288):
+/// ADR-007 §1's fulltext row, `scitadel_db::sqlite::CAP_FULLTEXT_BYTES`.
+const DEFAULT_BODY_CAP_DESC: &str = "built-in fulltext cap of 104857600 bytes (100 MiB)";
+
+/// Surface a user-facing config warning on stderr (#288).
+///
+/// `load_config` is infallible, and the `tracing` subscriber filters WARN out
+/// when `RUST_LOG` is unset, so a `tracing::warn!` alone is invisible. stderr
+/// is safe for the MCP server (its protocol owns stdout) and the TUI start-up
+/// path; the `tracing` event is kept for log capture.
+fn warn_on_stderr(msg: &str) {
+    tracing::warn!("{msg}");
+    eprintln!("scitadel: warning: {msg}");
+}
+
+/// Apply `SCITADEL_ACQUIRE_BODY_CAP_BYTES` (`raw`) over the TOML-resolved
+/// value (#288). A parse failure or a sub-floor value is ignored rather than
+/// fatal, so a typo never stops the CLI starting, but each is reported through
+/// `warn` naming the key, the given value, its unit, the floor and the default.
+fn apply_acquire_env_override(
+    acquire: &mut AcquireConfig,
+    raw: Option<&str>,
+    warn: &mut dyn FnMut(&str),
+) {
+    const KEY: &str = "SCITADEL_ACQUIRE_BODY_CAP_BYTES";
+    let Some(raw) = raw else { return };
+    let kept = acquire.body_cap_bytes.map_or_else(
+        || format!("the default {DEFAULT_BODY_CAP_DESC}"),
+        |b| format!("the config.toml value of {b} bytes"),
+    );
+    match raw.trim().parse::<u64>() {
+        Ok(v) => {
+            let candidate = AcquireConfig {
+                body_cap_bytes: Some(v),
+            };
+            match candidate.validate() {
+                Ok(()) => acquire.body_cap_bytes = Some(v),
+                Err(_) => warn(&format!(
+                    "{KEY} = {v} is below the {BODY_CAP_MIN_BYTES}-byte (1 MiB) floor; \
+                     the value is measured in bytes, not MB. Ignoring it and using {kept}."
+                )),
+            }
+        }
+        Err(e) => warn(&format!(
+            "{KEY} = {raw:?} is not a whole number of bytes ({e}); the floor is \
+             {BODY_CAP_MIN_BYTES} bytes (1 MiB). Ignoring it and using {kept}."
+        )),
+    }
 }
 
 /// Load config from a specific TOML file path.
@@ -534,6 +568,43 @@ pub fn load_config_from(path: &Path) -> Result<Config, crate::error::CoreError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run the env override with a collecting sink: the warning seam.
+    fn env_override(acquire: &mut AcquireConfig, raw: Option<&str>) -> Vec<String> {
+        let mut out = Vec::new();
+        apply_acquire_env_override(acquire, raw, &mut |m| out.push(m.to_string()));
+        out
+    }
+
+    #[test]
+    fn sub_floor_env_cap_warns_with_key_value_unit_floor_and_default() {
+        let mut a = AcquireConfig::default();
+        let w = env_override(&mut a, Some("100"));
+        assert_eq!(a.body_cap_bytes, None);
+        assert_eq!(w.len(), 1);
+        for needle in [
+            "SCITADEL_ACQUIRE_BODY_CAP_BYTES",
+            "100",
+            "bytes",
+            "1048576",
+            "104857600",
+        ] {
+            assert!(w[0].contains(needle), "{needle:?} missing from {:?}", w[0]);
+        }
+    }
+
+    #[test]
+    fn non_numeric_env_cap_warns_and_valid_one_is_silent() {
+        let mut a = AcquireConfig::default();
+        let w = env_override(&mut a, Some("100MB"));
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("100MB") && w[0].contains("1048576"));
+        assert_eq!(a.body_cap_bytes, None);
+
+        assert!(env_override(&mut a, Some("2097152")).is_empty());
+        assert_eq!(a.body_cap_bytes, Some(2_097_152));
+        assert!(env_override(&mut a, None).is_empty());
+    }
 
     fn openalex_from_toml(body: &str) -> OpenAlexConfig {
         let mut cfg: OpenAlexConfig = toml::from_str(body).unwrap();
