@@ -242,6 +242,22 @@ pub struct PaperIdRequest {
     pub paper_id: String,
 }
 
+/// Request shape for `get_annotated_paper`, which honours the same
+/// `max_chars` cap as `read_paper` (default 20000) and takes an `offset`
+/// so an agent can page through long bodies deterministically (#307).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetAnnotatedPaperRequest {
+    /// Paper ID
+    pub paper_id: String,
+    /// Max characters of `full_text` to return (default 20000, same as
+    /// `read_paper`). The response carries `truncated`, `total_chars`,
+    /// `offset` and `next_offset` so the caller can resume.
+    pub max_chars: Option<usize>,
+    /// Character offset into `full_text` to start the window (default 0).
+    /// Pass the previous response's `next_offset` to read the next window.
+    pub offset: Option<usize>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetCitationsRequest {
     /// Source paper ID (must have openalex_id)
@@ -932,13 +948,13 @@ impl ScitadelServer {
     }
 
     #[tool(
-        description = "Returns: JSON {paper {id,title,abstract,full_text}, annotations[] (live only, with parent_id/root_id and full anchor incl. char_range/quote/prefix/suffix/sentence_id/source_version/status), source_version}. One call replaces get_paper + list_annotations when an agent needs to reason over offsets. NOTE: `read_paper` (with default `with_annotations: true`) returns the same envelope plus extractor metadata and PDF/HTML extraction; prefer it when you need the full text. (#185)"
+        description = "Returns: JSON {paper {id,title,abstract,full_text,truncated,total_chars,offset,next_offset}, annotations[] (live only, with parent_id/root_id and full anchor incl. char_range/quote/prefix/suffix/sentence_id/source_version/status), annotations_outside_window(_anchors), source_version}. `full_text` is windowed with the same default cap (20000 chars) as `read_paper` (#307); pass `max_chars` / `offset` to page through, and `annotations_outside_window(_anchors)` reports anchors that fall outside the returned window. One call replaces get_paper + list_annotations when an agent needs to reason over offsets. NOTE: `read_paper` (with default `with_annotations: true`) returns the same envelope plus extractor metadata and PDF/HTML extraction; prefer it when you need the full text. (#185)"
     )]
     fn get_annotated_paper(
         &self,
-        Parameters(req): Parameters<PaperIdRequest>,
+        Parameters(req): Parameters<GetAnnotatedPaperRequest>,
     ) -> Result<String, String> {
-        tools::get_annotated_paper_tool(&req.paper_id)
+        tools::get_annotated_paper_tool(&req.paper_id, req.max_chars, req.offset)
     }
 
     #[tool(

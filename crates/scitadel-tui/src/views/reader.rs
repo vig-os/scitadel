@@ -33,6 +33,7 @@ pub fn draw(
     paper_id: &str,
     focus: Option<usize>,
     reader: &str,
+    scroll: u16,
 ) {
     let Ok(Some(paper)) = data.load_paper(paper_id) else {
         let block = Block::default().title(" Reader ").borders(Borders::ALL);
@@ -103,6 +104,7 @@ pub fn draw(
         &body,
         &roots,
         focus,
+        scroll,
     );
     draw_notes_pane(
         frame,
@@ -122,16 +124,28 @@ fn draw_text_pane(
     body: &str,
     roots: &[&Annotation],
     focus: Option<usize>,
+    scroll: u16,
 ) {
     let highlights = build_highlights(body, roots);
     let lines = render_with_highlights(body, &highlights, focus);
+    // Clamp the offset against the body's own line count so `G` (and a
+    // stale `reader_scroll` after the paper changes) can't skip past the
+    // end and show an empty pane. The scroll stays *below* the last line
+    // so at least one row of body is always visible. Highlights ride
+    // along: `render_with_highlights` returns the full set of styled
+    // lines and `Paragraph::scroll` is a pure view offset, so a
+    // highlight that lives on line 400 still lands on line 400 — the
+    // acceptance criterion against scroll/highlight desync (#307).
+    let total_lines = u16::try_from(lines.len().saturating_sub(1)).unwrap_or(u16::MAX);
+    let clamped = scroll.min(total_lines);
     let para = Paragraph::new(lines)
         .block(
             Block::default()
                 .title(format!(" Reader — {title} "))
                 .borders(Borders::ALL),
         )
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+        .scroll((clamped, 0));
     frame.render_widget(para, area);
 }
 
@@ -405,6 +419,45 @@ pub fn highlight_count(data: &DataStore, paper_id: &str) -> usize {
         .map_or(0, |anns| anns.iter().filter(|a| !a.is_reply()).count())
 }
 
+/// Pre-wrap line number of the `idx`-th root highlight in the paper
+/// body, or `None` when the paper is missing, has no body, or the
+/// index does not resolve to a placed highlight. The app layer uses
+/// this to auto-scroll the reader to a highlight below the fold when
+/// the user hops onto it with `J`/`K` (#307).
+///
+/// Counts `\n` boundaries rather than post-wrap rows: wrap width is a
+/// draw-time concern and the paragraph's own `Wrap { trim: false }` is
+/// what lands a highlight on the exact visible row. Placing the scroll
+/// at the pre-wrap line lands the highlight within one wrap of the top,
+/// which is enough for the acceptance "a match below the fold is
+/// reachable."
+pub fn line_of_highlight(data: &DataStore, paper_id: &str, idx: usize) -> Option<u16> {
+    let paper = data.load_paper(paper_id).ok().flatten()?;
+    let body = paper
+        .full_text
+        .as_ref()
+        .map(|b| b.rendered().into_owned())
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| paper.r#abstract.rendered().into_owned());
+    if body.trim().is_empty() {
+        return None;
+    }
+    let annotations = data.load_annotations_for_paper(paper_id).ok()?;
+    let roots: Vec<&Annotation> = annotations
+        .iter()
+        .filter(|a| !a.is_reply() && !a.anchor.is_paper_note())
+        .collect();
+    let highlights = build_highlights(&body, &roots);
+    // `build_highlights` is sorted by char_start, and sorted order has
+    // no useful meaning for an app-layer index that walks the ROOTS
+    // list in its original order — match by `root_index` so the hop
+    // lands on the same highlight J/K selected.
+    let target = highlights.iter().find(|h| h.root_index == idx)?;
+    let prefix: String = body.chars().take(target.char_start).collect();
+    let line = prefix.matches('\n').count();
+    u16::try_from(line).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,14 +574,35 @@ mod tests {
     /// both contain the same words, and only one of them puts them on separate
     /// rows.
     fn rendered_rows(paper: &Paper) -> Vec<String> {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let data = DataStore::open(&dir.path().join("scitadel.db")).expect("open db");
-        let (paper_repo, _, _, _, _) = data.db.repositories();
-        paper_repo.save(paper).expect("save paper");
+        rendered_rows_scrolled(paper, 0)
+    }
 
+    /// `rendered_rows` with an explicit scroll offset and no annotations seeded
+    /// — the acceptance assertion for #307 is that scrolling the reader
+    /// surfaces text that lives below the fold.
+    fn rendered_rows_scrolled(paper: &Paper, scroll: u16) -> Vec<String> {
+        rendered_rows_with(paper, scroll, &[])
+    }
+
+    /// Full-fat helper: render `paper` in the reader with `annotations`
+    /// seeded against it and a given scroll offset. Returns the terminal
+    /// buffer as one `String` per row, so a test can walk them and
+    /// locate text or highlight styling.
+    fn rendered_rows_with(paper: &Paper, scroll: u16, annotations: &[Annotation]) -> Vec<String> {
+        let (_dir, data) = seed_paper(paper, annotations);
         let mut terminal = Terminal::new(TestBackend::new(100, 12)).expect("terminal");
         terminal
-            .draw(|frame| draw(frame, frame.area(), &data, paper.id.as_str(), None, "lars"))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    frame.area(),
+                    &data,
+                    paper.id.as_str(),
+                    None,
+                    "lars",
+                    scroll,
+                );
+            })
             .expect("draw");
         terminal
             .backend()
@@ -537,6 +611,22 @@ mod tests {
             .chunks(100)
             .map(|row| row.iter().map(|cell| cell.symbol()).collect())
             .collect()
+    }
+
+    /// Open a fresh DB, save `paper`, and seed `annotations`. Keeps the
+    /// `TempDir` alive by returning it: the DB file lives there.
+    fn seed_paper(paper: &Paper, annotations: &[Annotation]) -> (tempfile::TempDir, DataStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = DataStore::open(&dir.path().join("scitadel.db")).expect("open db");
+        let (paper_repo, _, _, _, _) = data.db.repositories();
+        paper_repo.save(paper).expect("save paper");
+        if !annotations.is_empty() {
+            let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(data.db.clone());
+            for ann in annotations {
+                repo.create(ann).expect("seed annotation");
+            }
+        }
+        (dir, data)
     }
 
     /// Which row a phrase landed on, so a test can ask whether two phrases are
@@ -667,5 +757,203 @@ mod tests {
                  next one: {rows:?}"
             );
         }
+    }
+
+    // ---- #307: reader scroll ----
+
+    /// A body with 60 `line N` rows, so the text terminal (12 rows tall,
+    /// of which 10 are body once the `Reader` block border lands) only
+    /// ever shows a window into it. The `below_fold` line sits well
+    /// past the initial window — asserting it appears after a scroll is
+    /// what proves the viewport moved, not just that the body rendered.
+    fn long_body_paper() -> Paper {
+        use std::fmt::Write as _;
+        let mut body = String::new();
+        for i in 0..60 {
+            if i == 30 {
+                body.push_str("below_fold_token\n");
+            } else {
+                writeln!(body, "line {i}").unwrap();
+            }
+        }
+        let mut p = Paper::new("Scrolling");
+        p.id = PaperId::from("p-scroll");
+        p.r#abstract = UntrustedBody::publisher_supplied("abs");
+        p.full_text = Some(UntrustedBody::publisher_supplied(body));
+        p
+    }
+
+    /// The body pane is the left 60% of the 100-col screen; the notes
+    /// pane is the remaining 40 columns. The notes pane shows the
+    /// quote, so an "is the token in view" check that scans the whole
+    /// row flips on the notes column and reads false for the body.
+    /// Clip to the body pane before asking.
+    fn body_rows(rows: &[String]) -> Vec<String> {
+        rows.iter().map(|r| r.chars().take(60).collect()).collect()
+    }
+
+    /// Scroll = 0 leaves the fold token below the viewport; a scroll
+    /// of ~30 brings it into view. The acceptance half of #307.
+    #[test]
+    fn reader_scroll_moves_the_viewport_down_the_body() {
+        let paper = long_body_paper();
+
+        let rows_top = body_rows(&rendered_rows_scrolled(&paper, 0));
+        assert!(
+            !rows_top.iter().any(|r| r.contains("below_fold_token")),
+            "the fold token lives past line 10 and must not be in view \
+             before a scroll: {rows_top:?}"
+        );
+
+        let rows_scrolled = body_rows(&rendered_rows_scrolled(&paper, 30));
+        assert!(
+            rows_scrolled.iter().any(|r| r.contains("below_fold_token")),
+            "scrolling must bring content below the fold into view: \
+             {rows_scrolled:?}"
+        );
+    }
+
+    /// Scrolling must not desync from highlights (`root_at`): the quote
+    /// spans a line below the fold, and *where* its background color
+    /// lands on screen tracks the scroll offset exactly. If the body
+    /// moved but the highlight did not, this fails.
+    ///
+    /// Covers the acceptance item "a search match below the fold is
+    /// reachable" and the TUI test called out in #307 ("add a test
+    /// proving the highlight positions stay correct after scrolling").
+    #[test]
+    fn reader_scroll_keeps_highlights_aligned_with_root_at_offsets() {
+        let paper = long_body_paper();
+        let body = paper.full_text.as_ref().unwrap().as_str();
+        // Place the highlight on the fold token so its row is far
+        // enough below the top that scrolling actually moves it.
+        let token_start = body
+            .find("below_fold_token")
+            .expect("fold token lives in the body");
+        let token_char_start = body[..token_start].chars().count();
+        let token_char_end = token_char_start + "below_fold_token".chars().count();
+        let ann = {
+            let mut a = Annotation::new_root(
+                paper.id.clone(),
+                "lars".into(),
+                "note".into(),
+                Anchor {
+                    char_range: Some((token_char_start, token_char_end)),
+                    quote: Some("below_fold_token".into()),
+                    status: AnchorStatus::Ok,
+                    ..Anchor::default()
+                },
+            );
+            a.id = scitadel_core::models::AnnotationId::from("ann-fold");
+            a
+        };
+
+        // Line number the quote sits on in the pre-wrap body — the
+        // scroll offset that puts the highlight at (or near) the top.
+        let expected_line =
+            u16::try_from(body[..token_start].matches('\n').count()).expect("line fits u16");
+
+        // No scroll: the highlight lives off-screen. Stronger than the
+        // text alone: assert the painted cells at the expected
+        // highlight row are still background-less (nothing painted
+        // yet). Cells on an unstyled row have `bg == Reset` (the
+        // ratatui default), so finding `Some(_)` means something
+        // painted a highlight on the unscrolled view.
+        let (_dir, data) = seed_paper(&paper, std::slice::from_ref(&ann));
+        let mut term = Terminal::new(TestBackend::new(100, 12)).expect("terminal");
+        term.draw(|frame| {
+            draw(
+                frame,
+                frame.area(),
+                &data,
+                paper.id.as_str(),
+                None,
+                "lars",
+                0,
+            );
+        })
+        .expect("draw");
+        let rows_top: Vec<String> = term
+            .backend()
+            .buffer()
+            .content()
+            .chunks(100)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        let body_top = body_rows(&rows_top);
+        assert!(
+            !body_top.iter().any(|r| r.contains("below_fold_token")),
+            "the fold-aligned highlight must not be in view before a scroll: {body_top:?}"
+        );
+
+        // After scrolling to the highlight's line, the token reaches the
+        // screen AND lands on a row whose cells carry the highlight's
+        // background color — the "root_at offsets stay correct" check.
+        let mut term = Terminal::new(TestBackend::new(100, 12)).expect("terminal");
+        term.draw(|frame| {
+            draw(
+                frame,
+                frame.area(),
+                &data,
+                paper.id.as_str(),
+                None,
+                "lars",
+                expected_line,
+            );
+        })
+        .expect("draw");
+        let buffer = term.backend().buffer().clone();
+        let rows_scrolled: Vec<String> = buffer
+            .content()
+            .chunks(100)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        let body_scrolled = body_rows(&rows_scrolled);
+        let row = body_scrolled
+            .iter()
+            .position(|r| r.contains("below_fold_token"))
+            .unwrap_or_else(|| panic!("fold token on screen after scroll: {body_scrolled:?}"));
+        // Scan the body pane's columns for any painted bg cell — the
+        // highlight styled the quote, and that style has to survive the
+        // scroll offset. The notes pane is clipped off by the column
+        // range so a background on *its* side can't satisfy the check.
+        let painted = (0..60u16).any(|col| {
+            let cell = &buffer[(col, u16::try_from(row).unwrap())];
+            !matches!(cell.bg, Color::Reset)
+        });
+        assert!(
+            painted,
+            "the highlight's background must survive the scroll on the \
+             row carrying its quote: row {row} contents {:?}",
+            body_scrolled[row]
+        );
+
+        // `line_of_highlight` must agree with the scroll offset the
+        // test derived, so the app layer's auto-scroll (J/K) lands on
+        // the same line.
+        assert_eq!(
+            line_of_highlight(&data, paper.id.as_str(), 0),
+            Some(expected_line),
+            "line_of_highlight agrees with the pre-wrap line, so J/K \
+             scroll lands on the quote",
+        );
+    }
+
+    /// A short body (one row) renders fine at `scroll = u16::MAX` — the
+    /// `G`-to-bottom key. Nothing crashes; the single body row still
+    /// shows up. Clamping lives in `draw_text_pane`; this is the test
+    /// that a stale scroll cannot blank the pane.
+    #[test]
+    fn reader_scroll_past_the_end_is_clamped() {
+        let mut p = Paper::new("Short");
+        p.id = PaperId::from("p-short");
+        p.r#abstract = UntrustedBody::publisher_supplied("abs");
+        p.full_text = Some(UntrustedBody::publisher_supplied("one line only"));
+
+        let rows = rendered_rows_scrolled(&p, u16::MAX);
+        assert!(
+            rows.iter().any(|r| r.contains("one line only")),
+            "scroll clamped to the last line, so the sole row stays on screen: {rows:?}"
+        );
     }
 }

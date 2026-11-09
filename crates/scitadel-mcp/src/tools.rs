@@ -1449,9 +1449,24 @@ pub fn list_annotations_tool(
 /// Soft-deleted annotations are excluded. Replies are flat with
 /// `parent_id` and `root_id` so threads can be reconstructed without
 /// extra round-trips.
-pub fn get_annotated_paper_tool(paper_id: &str) -> Result<String, String> {
+///
+/// `max_chars` (default 20_000, same as `read_paper`) windows the
+/// `full_text` so this tool never returns a different amount of the
+/// same document than `read_paper` by accident (#307). `offset`
+/// (default 0) lets a caller page through long bodies deterministically
+/// — the response's `next_offset` is the value to pass next.
+pub fn get_annotated_paper_tool(
+    paper_id: &str,
+    max_chars: Option<usize>,
+    offset: Option<usize>,
+) -> Result<String, String> {
     let db = open_db()?;
-    build_annotated_paper(&db, paper_id)
+    build_annotated_paper(
+        &db,
+        paper_id,
+        max_chars.unwrap_or(20_000),
+        offset.unwrap_or(0),
+    )
 }
 
 /// Build the annotation array + source_version block shared by
@@ -1520,10 +1535,62 @@ fn build_annotations_json(
     Ok((entries, source_version))
 }
 
-fn build_annotated_paper(db: &Database, paper_id: &str) -> Result<String, String> {
+fn build_annotated_paper(
+    db: &Database,
+    paper_id: &str,
+    max_chars: usize,
+    offset: usize,
+) -> Result<String, String> {
     let paper = resolve_paper_id(db, paper_id)?;
 
     let (entries, source_version) = build_annotations_json(db, paper.id.as_str())?;
+
+    // Window the `full_text` with the same default (20_000) `read_paper`
+    // uses, so two tools returning the same document now return the same
+    // amount of it (#307). The abstract stays whole — abstracts are short
+    // and a truncated abstract is a corrupted citation record, the same
+    // reasoning that kept it out of `read_paper`'s `max_chars` cap. #306's
+    // envelope is intact: the body is `rendered()`, not `as_str()`, so no
+    // escape sequence reaches the response.
+    let rendered_body = paper.full_text.as_ref().map(|b| b.rendered().into_owned());
+    let (body_window, total_chars, was_truncated, next_offset) =
+        rendered_body.as_deref().map_or_else(
+            || (None, 0usize, false, None),
+            |body| window_body(body, offset, max_chars),
+        );
+
+    // Report every annotation whose anchor can be placed in the document
+    // but falls outside the returned window — the acceptance criterion
+    // against silently dropping them (#307). Anchors with no `char_range`
+    // are left out of this count (they have no position to compare), as
+    // are anchors inside the window.
+    //
+    // `char_range` positions are char offsets, and `window_body` slices
+    // on a char boundary — so `window_end` also has to count chars, not
+    // bytes, or a multi-byte glyph in the window shifts the boundary.
+    let window_end = offset.saturating_add(
+        body_window
+            .as_deref()
+            .map_or(0, |body| body.chars().count()),
+    );
+    let out_of_window: Vec<serde_json::Value> = entries
+        .iter()
+        .filter_map(|a| {
+            let cr = a.get("anchor").and_then(|an| an.get("char_range"))?;
+            let arr = cr.as_array()?;
+            let start = arr.first()?.as_u64()? as usize;
+            let end = arr.get(1)?.as_u64()? as usize;
+            // An anchor overlaps the window iff start < window_end AND end > offset.
+            if start < window_end && end > offset {
+                None
+            } else {
+                Some(serde_json::json!({
+                    "id": a.get("id"),
+                    "char_range": [start, end],
+                }))
+            }
+        })
+        .collect();
 
     let response = serde_json::json!({
         "paper": {
@@ -1531,19 +1598,49 @@ fn build_annotated_paper(db: &Database, paper_id: &str) -> Result<String, String
             "title": paper.title.rendered(),
             // Rendered, not stored: this return is an agent's context (#287).
             // `UntrustedBody::rendered` is the security half alone — a body's
-            // paragraph structure survives, and nothing here truncates it.
+            // paragraph structure survives.
             "abstract": paper.r#abstract.rendered(),
-            // Already neutralised on the way in: either the `papers.full_text`
-            // cache hit (rendered in `read_paper_tool`) or a fresh extraction,
-            // which is the same bytes the column stores — a data path, and one
-            // whose shape contract a caller depends on.
-            "full_text": paper.full_text.as_ref().map(|b| b.as_str()),
+            // Windowed by `max_chars` / `offset`; `truncated` + `next_offset`
+            // tell the caller whether and where to page (#307).
+            "full_text": body_window,
+            "truncated": was_truncated,
+            "total_chars": total_chars,
+            "offset": offset,
+            "next_offset": next_offset,
         },
         "annotations": entries,
+        "annotations_outside_window": out_of_window.len(),
+        "annotations_outside_window_anchors": out_of_window,
         "source_version": source_version,
     });
 
     serde_json::to_string_pretty(&response).map_err(|e| e.to_string())
+}
+
+/// Take a `char_range`-based slice of `body`, starting at `offset` and
+/// at most `max_chars` wide. Returns `(windowed_text, total_chars,
+/// was_truncated, next_offset)`. `next_offset` is `Some(end)` when
+/// there is more body past the window, `None` at EOF.
+///
+/// Char-based, like `assemble_read_paper_response`'s own slice: this is
+/// a character budget, not a byte budget, so multi-byte scripts cap at
+/// a predictable count.
+fn window_body(
+    body: &str,
+    offset: usize,
+    max_chars: usize,
+) -> (Option<String>, usize, bool, Option<usize>) {
+    let total_chars = body.chars().count();
+    let start = offset.min(total_chars);
+    let end = start.saturating_add(max_chars).min(total_chars);
+    let slice: String = body.chars().skip(start).take(end - start).collect();
+    // `truncated` captures *either* side of the window being cut: a
+    // mid-document offset with no body past it is still a truncation on
+    // the front, and the caller cares that it is not getting the whole
+    // document in one call.
+    let was_truncated = start > 0 || end < total_chars;
+    let next_offset = if end < total_chars { Some(end) } else { None };
+    (Some(slice), total_chars, was_truncated, next_offset)
 }
 
 /// Full-text search over stored search queries. Returns a JSON array of
@@ -2493,7 +2590,7 @@ mod tests {
         ann.tags = vec!["physics".into()];
         repo.create(&ann).expect("create ann");
 
-        let json = build_annotated_paper(&db, "p-1").expect("build");
+        let json = build_annotated_paper(&db, "p-1", 20_000, 0).expect("build");
         let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
         assert_eq!(v["paper"]["id"], "p-1");
         assert_eq!(v["paper"]["full_text"], "Neutron stars are dense.");
@@ -2534,7 +2631,7 @@ mod tests {
         repo.soft_delete(doomed.id.as_str()).unwrap();
 
         let v: serde_json::Value =
-            serde_json::from_str(&build_annotated_paper(&db, "p-2").unwrap()).unwrap();
+            serde_json::from_str(&build_annotated_paper(&db, "p-2", 20_000, 0).unwrap()).unwrap();
         let arr = v["annotations"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["note"], "live");
@@ -2545,7 +2642,7 @@ mod tests {
         let db = fresh_db();
         save_paper(&db, "p-3", "Empty", None);
         let v: serde_json::Value =
-            serde_json::from_str(&build_annotated_paper(&db, "p-3").unwrap()).unwrap();
+            serde_json::from_str(&build_annotated_paper(&db, "p-3", 20_000, 0).unwrap()).unwrap();
         assert_eq!(v["annotations"].as_array().unwrap().len(), 0);
         assert!(v["source_version"].is_null());
     }
@@ -2569,7 +2666,7 @@ mod tests {
         repo.create(&reply).unwrap();
 
         let v: serde_json::Value =
-            serde_json::from_str(&build_annotated_paper(&db, "p-4").unwrap()).unwrap();
+            serde_json::from_str(&build_annotated_paper(&db, "p-4", 20_000, 0).unwrap()).unwrap();
         let arr = v["annotations"].as_array().unwrap();
         assert_eq!(arr.len(), 2);
         let reply_entry = arr
@@ -2582,8 +2679,229 @@ mod tests {
     #[test]
     fn get_annotated_paper_unknown_paper_errors() {
         let db = fresh_db();
-        let err = build_annotated_paper(&db, "nope").unwrap_err();
+        let err = build_annotated_paper(&db, "nope", 20_000, 0).unwrap_err();
         assert!(err.contains("not found"));
+    }
+
+    // -- #307: `build_annotated_paper` honours `max_chars` / `offset`
+    //    with the same semantics as `read_paper`, and surfaces
+    //    continuation + out-of-window anchors so pagination is
+    //    deterministic.
+
+    /// A body shorter than `max_chars` round-trips whole: `truncated`
+    /// is false, `total_chars` is the true length, and `next_offset`
+    /// is null so a paging caller stops here.
+    #[test]
+    fn get_annotated_paper_returns_whole_body_when_under_cap() {
+        let db = fresh_db();
+        save_paper(&db, "p-cap-1", "Short", Some("hello world"));
+
+        let v: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-cap-1", 20_000, 0).unwrap())
+                .unwrap();
+        assert_eq!(v["paper"]["full_text"], "hello world");
+        assert_eq!(v["paper"]["truncated"], false);
+        assert_eq!(v["paper"]["total_chars"], 11);
+        assert_eq!(v["paper"]["offset"], 0);
+        assert!(v["paper"]["next_offset"].is_null());
+        assert_eq!(v["annotations_outside_window"], 0);
+    }
+
+    /// Body length == `max_chars` exactly is not truncated — the
+    /// boundary case that stays off the paging path, mirroring
+    /// `read_paper`'s `>` test.
+    #[test]
+    fn get_annotated_paper_cap_boundary_exact_length_is_not_truncated() {
+        let db = fresh_db();
+        let body: String = "a".repeat(10);
+        save_paper(&db, "p-cap-2", "Edge", Some(&body));
+
+        let v: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-cap-2", 10, 0).unwrap()).unwrap();
+        assert_eq!(v["paper"]["full_text"], body);
+        assert_eq!(v["paper"]["truncated"], false);
+        assert_eq!(v["paper"]["total_chars"], 10);
+        assert!(v["paper"]["next_offset"].is_null());
+    }
+
+    /// Body longer than `max_chars` is capped at a char boundary and
+    /// reports `truncated: true` + a `next_offset` pointing at the
+    /// first un-returned character. The same shape `read_paper` uses.
+    #[test]
+    fn get_annotated_paper_cap_boundary_truncates_and_reports_next_offset() {
+        let db = fresh_db();
+        let body: String = "a".repeat(50);
+        save_paper(&db, "p-cap-3", "Long", Some(&body));
+
+        let v: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-cap-3", 10, 0).unwrap()).unwrap();
+        assert_eq!(
+            v["paper"]["full_text"].as_str().unwrap().chars().count(),
+            10
+        );
+        assert_eq!(v["paper"]["truncated"], true);
+        assert_eq!(v["paper"]["total_chars"], 50);
+        assert_eq!(v["paper"]["offset"], 0);
+        assert_eq!(v["paper"]["next_offset"], 10);
+    }
+
+    /// `max_chars` defaults to 20_000 — the same default as
+    /// `read_paper` — which is #307's invariant: two tools returning
+    /// the same document now return the same amount of it.
+    #[test]
+    fn get_annotated_paper_default_cap_matches_read_paper() {
+        let db = fresh_db();
+        let body: String = "x".repeat(25_000);
+        save_paper(&db, "p-cap-4", "Very long", Some(&body));
+
+        let v: serde_json::Value = serde_json::from_str(
+            &get_annotated_paper_tool_with(&db, "p-cap-4", None, None).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            v["paper"]["full_text"].as_str().unwrap().chars().count(),
+            20_000
+        );
+        assert_eq!(v["paper"]["truncated"], true);
+        assert_eq!(v["paper"]["total_chars"], 25_000);
+        assert_eq!(v["paper"]["next_offset"], 20_000);
+    }
+
+    /// Continuation round-trip: window 1 says `next_offset = N`; feeding
+    /// `offset = N` returns the rest of the body and `next_offset: null`
+    /// at EOF. Concatenating the two windows reconstructs the original.
+    #[test]
+    fn get_annotated_paper_continuation_round_trips_the_body() {
+        let db = fresh_db();
+        let body: String = (b'a'..=b'z').map(char::from).collect::<String>().repeat(4);
+        assert_eq!(body.chars().count(), 104);
+        save_paper(&db, "p-cap-5", "Rolling", Some(&body));
+
+        let page1: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-cap-5", 40, 0).unwrap()).unwrap();
+        assert_eq!(page1["paper"]["truncated"], true);
+        assert_eq!(page1["paper"]["next_offset"], 40);
+
+        let mid = page1["paper"]["next_offset"].as_u64().unwrap() as usize;
+        let page2: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-cap-5", 40, mid).unwrap()).unwrap();
+        assert_eq!(page2["paper"]["truncated"], true);
+        assert_eq!(page2["paper"]["next_offset"], 80);
+
+        let end = page2["paper"]["next_offset"].as_u64().unwrap() as usize;
+        let page3: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-cap-5", 40, end).unwrap()).unwrap();
+        // The tail is a partial window, truncated on the front but not
+        // the back — `next_offset` is null at EOF.
+        assert!(page3["paper"]["next_offset"].is_null());
+        assert_eq!(page3["paper"]["truncated"], true);
+
+        let reassembled = format!(
+            "{}{}{}",
+            page1["paper"]["full_text"].as_str().unwrap(),
+            page2["paper"]["full_text"].as_str().unwrap(),
+            page3["paper"]["full_text"].as_str().unwrap(),
+        );
+        assert_eq!(reassembled, body, "pages re-concatenate to the original");
+    }
+
+    /// Annotations whose `char_range` falls outside the returned window
+    /// are counted (and listed) in the response — the acceptance
+    /// criterion against silently dropping them.
+    #[test]
+    fn get_annotated_paper_reports_annotations_outside_the_window() {
+        let db = fresh_db();
+        let body: String = "a".repeat(100);
+        let pid = save_paper(&db, "p-cap-6", "Spans", Some(&body));
+
+        let repo = SqliteAnnotationRepository::new(db.clone());
+        let in_window = Annotation::new_root(
+            pid.clone(),
+            "lars".into(),
+            "in window".into(),
+            Anchor {
+                char_range: Some((5, 15)),
+                quote: Some("in-win".into()),
+                ..Anchor::default()
+            },
+        );
+        let straddles = Annotation::new_root(
+            pid.clone(),
+            "lars".into(),
+            "straddles the boundary".into(),
+            Anchor {
+                char_range: Some((35, 55)),
+                quote: Some("straddle".into()),
+                ..Anchor::default()
+            },
+        );
+        let after_window = Annotation::new_root(
+            pid,
+            "lars".into(),
+            "well past".into(),
+            Anchor {
+                char_range: Some((70, 90)),
+                quote: Some("after".into()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&in_window).unwrap();
+        repo.create(&straddles).unwrap();
+        repo.create(&after_window).unwrap();
+
+        // Window [0, 40): `in_window` is inside, `straddles` overlaps,
+        // `after_window` is outside. The two that touch the window are
+        // *not* counted as outside; only the fully-past one is.
+        let v: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-cap-6", 40, 0).unwrap()).unwrap();
+        assert_eq!(v["annotations"].as_array().unwrap().len(), 3);
+        assert_eq!(v["annotations_outside_window"], 1);
+        let anchors = v["annotations_outside_window_anchors"]
+            .as_array()
+            .expect("anchors array");
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0]["char_range"][0], 70);
+        assert_eq!(anchors[0]["char_range"][1], 90);
+    }
+
+    /// Thin wrapper so the default-cap test can exercise the
+    /// `get_annotated_paper_tool` entrypoint against an in-memory DB
+    /// without going through `open_db`'s config load.
+    fn get_annotated_paper_tool_with(
+        db: &Database,
+        paper_id: &str,
+        max_chars: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<String, String> {
+        build_annotated_paper(
+            db,
+            paper_id,
+            max_chars.unwrap_or(20_000),
+            offset.unwrap_or(0),
+        )
+    }
+
+    /// `max_chars` is a *character* budget, so a body of 3-byte glyphs
+    /// caps at exactly `max_chars` glyphs — not a byte count that would
+    /// slice a glyph in half. Same invariant as `truncate_abstract`.
+    #[test]
+    fn get_annotated_paper_cap_respects_multibyte_char_boundary() {
+        let db = fresh_db();
+        // U+2019 RIGHT SINGLE QUOTATION MARK is 3 bytes in UTF-8.
+        let body: String = "\u{2019}".repeat(10);
+        save_paper(&db, "p-cap-mb", "Multibyte", Some(&body));
+
+        let v: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-cap-mb", 5, 0).unwrap()).unwrap();
+        let out = v["paper"]["full_text"].as_str().expect("text");
+        assert_eq!(out.chars().count(), 5, "capped at char count, not bytes");
+        assert!(
+            out.chars().all(|c| c == '\u{2019}'),
+            "every slice char is a whole glyph: {out:?}"
+        );
+        assert_eq!(v["paper"]["truncated"], true);
+        assert_eq!(v["paper"]["total_chars"], 10);
+        assert_eq!(v["paper"]["next_offset"], 5);
     }
 
     // -- read_paper #185: with_annotations folds the annotation array

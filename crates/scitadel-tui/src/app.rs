@@ -91,6 +91,13 @@ pub enum Overlay {
         /// Index into the paper's root annotations while the reader
         /// is open; cycles via `J` / `K` to hop between highlights.
         highlight_focus: Option<usize>,
+        /// Vertical scroll offset of the reader's text pane, in
+        /// post-wrap rows. Driven by j/k/Down/Up (1 row), d/u + the
+        /// page keys (10 rows), and g/G (top/bottom). Clamped at draw
+        /// time so a value past the end cannot blank the pane. A J/K
+        /// highlight hop auto-adjusts this so a match below the fold
+        /// is reachable, which is the acceptance criterion in #307.
+        reader_scroll: u16,
     },
     SearchPapers {
         search_id: String,
@@ -676,6 +683,7 @@ impl App {
         self.overlay = Some(Overlay::PaperDetail {
             paper_id: paper_id.to_string(),
             scroll: 0,
+            reader_scroll: 0,
             annotation_focus: None,
             prompt: None,
             reader: true,
@@ -720,6 +728,7 @@ impl App {
                         self.overlay = Some(Overlay::PaperDetail {
                             paper_id: paper.id.as_str().to_string(),
                             scroll: 0,
+                            reader_scroll: 0,
                             annotation_focus: None,
                             prompt: None,
                             reader: false,
@@ -847,6 +856,7 @@ impl App {
                     self.overlay = Some(Overlay::PaperDetail {
                         paper_id: paper.id.as_str().to_string(),
                         scroll: 0,
+                        reader_scroll: 0,
                         annotation_focus: None,
                         prompt: None,
                         reader: false,
@@ -986,6 +996,7 @@ impl App {
             prompt,
             reader,
             highlight_focus,
+            reader_scroll,
         }) = self.overlay.as_mut()
         else {
             return;
@@ -998,6 +1009,7 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('q' | 'R') => {
                     *reader = false;
                     *highlight_focus = None;
+                    *reader_scroll = 0;
                     // Focus left the reader entirely — mark whatever
                     // thread was focused as seen. (#185)
                     focus_thread_by_root_idx(
@@ -1008,9 +1020,20 @@ impl App {
                         None,
                     );
                 }
-                KeyCode::Char('J') | KeyCode::Down if count > 0 => {
+                // `J` / `K` hop between highlights. Keeps the Up/Down
+                // and Shift+J/K ergonomics the reader shipped with
+                // (#97), *and* auto-adjusts `reader_scroll` so a
+                // highlight below the fold lands in view (#307's
+                // "a match below the fold is reachable" acceptance).
+                KeyCode::Char('J') if count > 0 => {
                     let next = Some(highlight_focus.map_or(0, |f| (f + 1).min(count - 1)));
                     *highlight_focus = next;
+                    if let Some(idx) = next
+                        && let Some(line) =
+                            crate::views::reader::line_of_highlight(&self.data, paper_id, idx)
+                    {
+                        *reader_scroll = line;
+                    }
                     focus_thread_by_root_idx(
                         &self.data,
                         &self.reader,
@@ -1019,9 +1042,15 @@ impl App {
                         next,
                     );
                 }
-                KeyCode::Char('K') | KeyCode::Up if count > 0 => {
+                KeyCode::Char('K') if count > 0 => {
                     let next = Some(highlight_focus.map_or(0, |f| f.saturating_sub(1)));
                     *highlight_focus = next;
+                    if let Some(idx) = next
+                        && let Some(line) =
+                            crate::views::reader::line_of_highlight(&self.data, paper_id, idx)
+                    {
+                        *reader_scroll = line;
+                    }
                     focus_thread_by_root_idx(
                         &self.data,
                         &self.reader,
@@ -1030,6 +1059,26 @@ impl App {
                         next,
                     );
                 }
+                // Scroll keys (#307). j/k and arrows walk one row;
+                // d/u and the page keys walk half a page; g/G jump
+                // to the top / bottom. The reader body can be tens of
+                // thousands of rows, so the bottom-sentinel is u16::MAX
+                // and `draw_text_pane` clamps it to the real last line
+                // at render time where the row count is cheap to find.
+                KeyCode::Char('j') | KeyCode::Down => {
+                    *reader_scroll = reader_scroll.saturating_add(1);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    *reader_scroll = reader_scroll.saturating_sub(1);
+                }
+                KeyCode::Char('d') | KeyCode::PageDown => {
+                    *reader_scroll = reader_scroll.saturating_add(10);
+                }
+                KeyCode::Char('u') | KeyCode::PageUp => {
+                    *reader_scroll = reader_scroll.saturating_sub(10);
+                }
+                KeyCode::Char('g') => *reader_scroll = 0,
+                KeyCode::Char('G') => *reader_scroll = u16::MAX,
                 KeyCode::Char('D') => {
                     let pid = paper_id.clone();
                     self.queue_download(&pid);
@@ -1335,6 +1384,7 @@ impl App {
                             self.overlay = Some(Overlay::PaperDetail {
                                 paper_id: paper.id.as_str().to_string(),
                                 scroll: 0,
+                                reader_scroll: 0,
                                 annotation_focus: None,
                                 prompt: None,
                                 reader: false,
@@ -1395,6 +1445,7 @@ impl App {
                             self.overlay = Some(Overlay::PaperDetail {
                                 paper_id: paper.id.as_str().to_string(),
                                 scroll: 0,
+                                reader_scroll: 0,
                                 annotation_focus: None,
                                 prompt: None,
                                 reader: false,
@@ -1546,6 +1597,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             prompt,
             reader,
             highlight_focus,
+            reader_scroll,
         }) => {
             if *reader {
                 crate::views::reader::draw(
@@ -1555,6 +1607,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                     paper_id,
                     *highlight_focus,
                     &app.reader,
+                    *reader_scroll,
                 );
             } else {
                 detail::draw(
@@ -2228,6 +2281,7 @@ mod tests {
         app.overlay = Some(Overlay::PaperDetail {
             paper_id: "p-attn".into(),
             scroll: 0,
+            reader_scroll: 0,
             annotation_focus: None,
             prompt: None,
             reader: false,
@@ -2288,6 +2342,7 @@ mod tests {
         app.overlay = Some(Overlay::PaperDetail {
             paper_id: "p-attn".into(),
             scroll: 0,
+            reader_scroll: 0,
             annotation_focus: None,
             prompt: None,
             reader: true,
@@ -2313,6 +2368,7 @@ mod tests {
         app.overlay = Some(Overlay::PaperDetail {
             paper_id: "p-attn".into(),
             scroll: 0,
+            reader_scroll: 0,
             annotation_focus: None,
             prompt: None,
             reader: true,
@@ -2377,6 +2433,7 @@ mod tests {
             app.overlay = Some(Overlay::PaperDetail {
                 paper_id: "p-attn".into(),
                 scroll: 0,
+                reader_scroll: 0,
                 annotation_focus: None,
                 prompt: None,
                 reader: true,
@@ -2420,6 +2477,7 @@ mod tests {
         app.overlay = Some(Overlay::PaperDetail {
             paper_id: "p-attn".into(),
             scroll: 0,
+            reader_scroll: 0,
             annotation_focus: Some(1),
             prompt: None,
             reader: false,
@@ -2431,5 +2489,175 @@ mod tests {
             Some(reply.id.as_str()),
             "annotation_focus=1 must map to the reply (index over full list, not roots-only)"
         );
+    }
+
+    // ---- #307 reader scroll ----
+
+    /// Pressing `j` / `k` / `d` / `u` / `g` / `G` while the reader is
+    /// open moves `reader_scroll` the way vim does. Covers the key
+    /// convention end of #307 — the `draw` layer's clamping is
+    /// exercised separately in `views::reader::tests`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reader_scroll_keys_walk_and_clamp_the_offset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        app.overlay = Some(Overlay::PaperDetail {
+            paper_id: "p-attn".into(),
+            scroll: 0,
+            reader_scroll: 0,
+            annotation_focus: None,
+            prompt: None,
+            reader: true,
+            highlight_focus: None,
+        });
+
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(reader_scroll_of(&app), 3, "j and Down each walk one row");
+
+        app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(reader_scroll_of(&app), 1, "k and Up each walk one row back");
+
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        assert_eq!(reader_scroll_of(&app), 11, "d jumps a half page");
+
+        app.handle_key(KeyCode::PageUp, KeyModifiers::NONE);
+        assert_eq!(reader_scroll_of(&app), 1, "PageUp mirrors u");
+
+        app.handle_key(KeyCode::PageDown, KeyModifiers::NONE);
+        assert_eq!(reader_scroll_of(&app), 11, "PageDown mirrors d");
+
+        app.handle_key(KeyCode::Char('g'), KeyModifiers::NONE);
+        assert_eq!(reader_scroll_of(&app), 0, "g snaps to the top");
+
+        app.handle_key(KeyCode::Char('G'), KeyModifiers::NONE);
+        assert_eq!(
+            reader_scroll_of(&app),
+            u16::MAX,
+            "G sends the state-value sentinel; the draw layer clamps it"
+        );
+
+        app.handle_key(KeyCode::Char('g'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(
+            reader_scroll_of(&app),
+            0,
+            "k at the top is saturating, not a wrap-around"
+        );
+    }
+
+    /// `R`/`q`/`Esc` resets `reader_scroll` so a reopen starts at the
+    /// top — otherwise a user who scrolled, left, and came back
+    /// would land mid-document for no obvious reason.
+    #[tokio::test(flavor = "current_thread")]
+    async fn leaving_the_reader_resets_its_scroll() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        app.overlay = Some(Overlay::PaperDetail {
+            paper_id: "p-attn".into(),
+            scroll: 0,
+            reader_scroll: 42,
+            annotation_focus: None,
+            prompt: None,
+            reader: true,
+            highlight_focus: None,
+        });
+
+        app.handle_key(KeyCode::Char('R'), KeyModifiers::NONE);
+        match app.overlay {
+            Some(Overlay::PaperDetail {
+                reader,
+                reader_scroll,
+                ..
+            }) => {
+                assert!(!reader, "R toggles the reader back off");
+                assert_eq!(reader_scroll, 0, "closing the reader resets its scroll");
+            }
+            other => panic!("expected PaperDetail after R, got {other:?}"),
+        }
+    }
+
+    /// Shift+J hops to a below-fold highlight AND auto-scrolls to its
+    /// line, so the acceptance criterion "a search match below the
+    /// fold is reachable" is still met after a user presses J.
+    #[tokio::test(flavor = "current_thread")]
+    async fn capital_j_hops_highlight_and_scrolls_to_it() {
+        use scitadel_core::models::{Anchor, Annotation};
+        use scitadel_core::untrusted::UntrustedBody;
+        use std::fmt::Write as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+
+        // Give the seeded paper a long body so a highlight can live
+        // past the viewport, then anchor an annotation on a line
+        // deep in the body.
+        let db = scitadel_db::sqlite::Database::open(&tmp.path().join("scitadel.db")).unwrap();
+        let mut body = String::new();
+        for i in 0..40 {
+            writeln!(body, "line {i}").unwrap();
+        }
+        let target_start = body.find("line 30").expect("line 30 in the body");
+        let target_char_start = body[..target_start].chars().count();
+        let target_char_end = target_char_start + "line 30".chars().count();
+
+        let (paper_repo, _, _, _, _) = db.repositories();
+        let mut paper = paper_repo.get("p-attn").unwrap().unwrap();
+        paper.full_text = Some(UntrustedBody::publisher_supplied(body.clone()));
+        paper_repo.save(&paper).unwrap();
+
+        let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+        let mut root = Annotation::new_root(
+            PaperId::from("p-attn"),
+            "claude".into(),
+            "below the fold".into(),
+            Anchor {
+                char_range: Some((target_char_start, target_char_end)),
+                quote: Some("line 30".into()),
+                ..Anchor::default()
+            },
+        );
+        root.id = scitadel_core::models::AnnotationId::from("ann-below-fold");
+        repo.create(&root).unwrap();
+
+        app.overlay = Some(Overlay::PaperDetail {
+            paper_id: "p-attn".into(),
+            scroll: 0,
+            reader_scroll: 0,
+            annotation_focus: None,
+            prompt: None,
+            reader: true,
+            highlight_focus: None,
+        });
+
+        app.handle_key(KeyCode::Char('J'), KeyModifiers::NONE);
+
+        match app.overlay {
+            Some(Overlay::PaperDetail {
+                highlight_focus,
+                reader_scroll,
+                ..
+            }) => {
+                assert_eq!(highlight_focus, Some(0), "J lands on the first root");
+                // 30 '\n' precede "line 30", so the pre-wrap line is 30.
+                assert_eq!(
+                    reader_scroll, 30,
+                    "J auto-scrolls to the hopped highlight's line so it \
+                     is reachable below the fold"
+                );
+            }
+            other => panic!("expected PaperDetail after J, got {other:?}"),
+        }
+    }
+
+    /// Read the current `reader_scroll`, panicking if the overlay is
+    /// not a `PaperDetail`.
+    fn reader_scroll_of(app: &App) -> u16 {
+        match &app.overlay {
+            Some(Overlay::PaperDetail { reader_scroll, .. }) => *reader_scroll,
+            other => panic!("expected PaperDetail, got {other:?}"),
+        }
     }
 }
