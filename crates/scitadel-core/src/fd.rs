@@ -81,15 +81,9 @@ mod tests {
     #[test]
     fn fd_real_path_of_a_real_file_resolves_back_to_it() {
         let tmp = tempfile::tempdir().unwrap();
-        let p = tmp.path().join("a").canonicalize().unwrap_or_else(|_| {
-            // Create it first, then canonicalise.
-            let a = tmp.path().join("a");
-            std::fs::write(&a, b"x").unwrap();
-            a.canonicalize().unwrap()
-        });
-        if !p.exists() {
-            std::fs::write(&p, b"x").unwrap();
-        }
+        let a = tmp.path().join("a");
+        std::fs::write(&a, b"x").unwrap();
+        let p = a.canonicalize().unwrap();
         let f = std::fs::File::open(&p).unwrap();
         let got = fd_real_path(&f).expect("a real path for the open fd");
         // On Linux and macOS the resolved form should start with our

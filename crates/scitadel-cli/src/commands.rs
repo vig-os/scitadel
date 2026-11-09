@@ -11,7 +11,28 @@ use scitadel_core::ports::{
 };
 use scitadel_db::sqlite::Database;
 
+/// Refuse an explicit `SCITADEL_WORKSPACE` that has no `.scitadel/`
+/// marker instead of letting `load_config` silently fall back to cwd.
+/// `allow_cwd` lets `scitadel init` through when run inside that very
+/// dir, which is exactly the remedy the error suggests.
+fn check_workspace_override(allow_cwd: bool) -> Result<()> {
+    let Some((raw, dir)) = scitadel_core::project::unmarked_workspace_override() else {
+        return Ok(());
+    };
+    if allow_cwd
+        && std::env::current_dir()
+            .is_ok_and(|c| c == dir || c.canonicalize().ok() == dir.canonicalize().ok())
+    {
+        return Ok(());
+    }
+    bail!(
+        "SCITADEL_WORKSPACE={raw} ({}) has no `.scitadel/` marker; run `scitadel init` in that directory (or unset SCITADEL_WORKSPACE)",
+        dir.display()
+    )
+}
+
 fn open_db() -> Result<Database> {
+    check_workspace_override(false)?;
     let config = load_config();
     let db = Database::open(&config.db_path).context("failed to open database")?;
     db.migrate().context("migration failed")?;
@@ -53,6 +74,7 @@ fn require_project_marker() -> Result<()> {
             return Ok(());
         }
     }
+    check_workspace_override(false)?;
     // One CLI resolver for both the gate and `load_config`. Re-parsing
     // `SCITADEL_WORKSPACE` here used to skip the `~`/`~/` expansion
     // the core parser does, and used `find_marker_ancestor` directly
@@ -143,6 +165,7 @@ pub struct InitOptions {
 }
 
 pub fn init(opts: InitOptions) -> Result<()> {
+    check_workspace_override(true)?;
     let mut config = load_config();
 
     // Resolve db path early so we can report it at the end.
@@ -1569,6 +1592,7 @@ pub fn bib_verify(
     question_override: Option<&str>,
     format: &str,
 ) -> Result<i32> {
+    require_project_marker()?;
     let bib_bytes =
         std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
 

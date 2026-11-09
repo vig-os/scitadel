@@ -352,3 +352,57 @@ fn history_in_a_subdir_of_a_normal_project_leaves_no_stray_marker() {
         "and must not seed one at an intermediate dir either"
     );
 }
+
+/// `bib verify` used to reach `open_db` ungated: with a sidecar next
+/// to the `.bib` in a marker-less dir it created `cwd/.scitadel/`.
+#[test]
+fn bib_verify_in_a_fresh_dir_refuses_and_leaves_no_marker() {
+    let tmp = TempDir::new().unwrap();
+    let bib = tmp.path().join("refs.bib");
+    fs::write(&bib, "@article{foo,title={x},author={y}}\n").unwrap();
+    fs::write(tmp.path().join("refs.bib.scitadel-bib.lock"), "{}").unwrap();
+    Command::cargo_bin("scitadel")
+        .unwrap()
+        .args(["bib", "verify"])
+        .arg(&bib)
+        .current_dir(tmp.path())
+        .env_remove("SCITADEL_WORKSPACE")
+        .env_remove("SCITADEL_DB")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("scitadel init"));
+    assert!(
+        !tmp.path().join(".scitadel").exists(),
+        "bib verify must not seed a .scitadel/ dir"
+    );
+}
+
+/// An explicit `SCITADEL_WORKSPACE` without a marker must fail loudly
+/// (write-side and read-only alike), never fall back to cwd.
+#[test]
+fn unmarked_workspace_env_fails_instead_of_falling_back_to_cwd() {
+    let cwd = TempDir::new().unwrap();
+    let ws = TempDir::new().unwrap();
+    for args in [&["history"][..], &["question", "create", "a question"][..]] {
+        Command::cargo_bin("scitadel")
+            .unwrap()
+            .args(args)
+            .current_dir(cwd.path())
+            .env("SCITADEL_WORKSPACE", ws.path())
+            .env_remove("SCITADEL_DB")
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("SCITADEL_WORKSPACE"))
+            .stderr(predicate::str::contains(ws.path().to_str().unwrap()))
+            .stderr(predicate::str::contains(".scitadel/"))
+            .stderr(predicate::str::contains("scitadel init"));
+        assert!(
+            !cwd.path().join(".scitadel").exists(),
+            "{args:?} fell back to cwd"
+        );
+        assert!(
+            !ws.path().join(".scitadel").exists(),
+            "{args:?} planted a marker"
+        );
+    }
+}

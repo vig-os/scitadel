@@ -205,6 +205,26 @@ pub fn find_cli_project_root() -> Option<PathBuf> {
     find_marker_ancestor(&cwd)
 }
 
+/// The directory named by an explicit `SCITADEL_WORKSPACE` when it has
+/// no `.scitadel/` marker; `None` when the variable is unset/empty or
+/// points at a real project. `find_cli_project_root` returns `None` for
+/// this case too, so without this probe the CLI would silently fall back
+/// to cwd and ignore the user's explicit setting.
+#[must_use]
+pub fn unmarked_workspace_override() -> Option<(String, PathBuf)> {
+    let v = std::env::var(WORKSPACE_ENV)
+        .ok()
+        .filter(|v| !v.is_empty())?;
+    let p = expand_tilde(&v);
+    let p = if p.is_absolute() {
+        p
+    } else {
+        std::env::current_dir().ok()?.join(p)
+    };
+    let p = lexical_normalise(&p);
+    (!has_project_marker(&p)).then_some((v, p))
+}
+
 /// Marker safety. Canonical `root/.scitadel` must be a real directory
 /// that still sits inside `root`. A file or a symlink pointing outside
 /// `root` is refused. A symlink to another dir *inside* `root` is
