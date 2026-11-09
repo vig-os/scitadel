@@ -5072,7 +5072,7 @@ mod tests {
         assert_eq!(report.paper.year, Some(2026));
         assert_eq!(
             report.paper.authors.first().map(|a| a.as_str()),
-            Some("Lovelace"),
+            Some("Lovelace, Ada"),
             "the first author is the one Crossref named"
         );
         // And the artefact was recorded against that row.
