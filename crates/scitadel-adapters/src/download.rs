@@ -597,28 +597,13 @@ impl PaperDownloader {
     /// Drop the minimal `papers` row [`Self::download_by_doi`] minted for a
     /// fetch that ended without bytes.
     ///
-    /// Scoped by id **and** by `artefacts.paper_id IS NULL`: a row that gained
-    /// an artefact between the mint and the cleanup is someone else's
-    /// business, so the delete is conditional at the SQL level rather than at
-    /// the Rust level. A delete that would remove a row with artefacts is a
-    /// silent no-op.
+    /// Scoped by id **and** by `NOT EXISTS (… artefacts WHERE paper_id = …)`
+    /// at the SQL level (see [`Database::delete_paper_if_orphan`]): a row
+    /// that gained an artefact between the mint and the cleanup is left
+    /// alone without a race. Best-effort — a failure here is reported in the
+    /// trace, never masks the original error.
     fn cleanup_minted_placeholder(&self, paper: &Paper) {
-        let Ok(conn) = self.db.conn() else {
-            tracing::warn!(
-                paper_id = %paper.id,
-                "could not open a connection to drop the placeholder row \
-                 for a failed download; the row is left behind"
-            );
-            return;
-        };
-        let id = paper.id.as_str();
-        let delete = conn.execute(
-            "DELETE FROM papers
-             WHERE id = ?1
-               AND NOT EXISTS (SELECT 1 FROM artefacts WHERE paper_id = ?2)",
-            rusqlite::params![id, id],
-        );
-        match delete {
+        match self.db.delete_paper_if_orphan(paper.id.as_str()) {
             Ok(rows) => tracing::debug!(
                 paper_id = %paper.id,
                 rows_removed = rows,
