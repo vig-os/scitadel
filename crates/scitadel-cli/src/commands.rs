@@ -847,7 +847,24 @@ pub async fn resolve_doi(doi: &str, json: bool, no_save: bool) -> Result<()> {
 
 pub async fn download(doi: &str, output_dir: Option<PathBuf>) -> Result<()> {
     let config = load_config();
-    let out_dir = output_dir.unwrap_or_else(|| config.papers_dir());
+
+    // `--output-dir` is deprecated: #289 moved every byte that `download`
+    // writes into the content-addressed blob store under the library root,
+    // so a user-chosen directory would be an empty hole next to a file the
+    // caller never sees. The flag is still accepted for one release, but
+    // its value is **ignored** and a one-line warning explains why.
+    // See the enum's help for the forward path.
+    if let Some(requested) = output_dir {
+        eprintln!(
+            "warning: --output-dir is ignored (requested {}): the library \
+             location is managed by `scitadel init`'s config since #289. The \
+             file lands in the blob store under the library root; use \
+             `scitadel export` to copy it elsewhere, or `scitadel acquire` \
+             for queued downloads. The flag will be removed next release.",
+            requested.display()
+        );
+    }
+    let out_dir = config.papers_dir();
 
     // Opened up front so the downloader paces against the same SQLite
     // ledger the rest of scitadel uses — two in-memory ledgers is the
