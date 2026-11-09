@@ -18,6 +18,42 @@ fn open_db() -> Result<Database> {
     Ok(db)
 }
 
+/// Fail a read-only CLI command if no scitadel project marker is
+/// visible AND no explicit `SCITADEL_DB` points at an existing
+/// database file. The MCP side stays strict unconditionally; on
+/// the CLI `load_config` still falls back to cwd so `scitadel
+/// init` can seed a fresh project — but a read-only command must
+/// not be the thing that silently plants `.scitadel/` under
+/// whichever dir the user happens to be in. Round-5 adversarial
+/// finding: running `scitadel history` in a fresh dir created
+/// `fresh/.scitadel`, which then became a valid wide confinement
+/// root for a later MCP start. Read-only commands now refuse with
+/// a clear message and a non-zero exit instead.
+///
+/// The `SCITADEL_DB` escape hatch exists because the CLI test
+/// suite (and users reaching into another library) point at a
+/// specific `.db` file; when that file already exists, opening it
+/// does not create a stray `.scitadel/` anywhere, so the risk the
+/// marker check addresses is not present.
+fn require_project_marker() -> Result<()> {
+    use scitadel_core::project::{ProjectRootError, project_root};
+    if let Ok(db) = std::env::var("SCITADEL_DB")
+        && !db.is_empty()
+    {
+        let path = std::path::PathBuf::from(&db);
+        if path.is_file() {
+            return Ok(());
+        }
+    }
+    match project_root() {
+        Ok(_) => Ok(()),
+        Err(ProjectRootError::MarkerMissing) => {
+            bail!("no scitadel project here; run `scitadel init` in your project root")
+        }
+        Err(e) => bail!("{e}"),
+    }
+}
+
 /// Resolve an ID by prefix match against a list.
 fn resolve_prefix<'a, T, F>(items: &'a [T], prefix: &str, get_id: F) -> Result<&'a T>
 where
@@ -442,6 +478,7 @@ pub async fn search(
 }
 
 pub fn history(limit: i64) -> Result<()> {
+    require_project_marker()?;
     let db = open_db()?;
     let (_, search_repo, _, _, _) = db.repositories();
 
@@ -507,6 +544,7 @@ fn failed_source_names(search: &scitadel_core::models::Search) -> Vec<&str> {
 }
 
 pub fn show(id: &str) -> Result<()> {
+    require_project_marker()?;
     let db = open_db()?;
     let (paper_repo, _, _, _, _) = db.repositories();
 
@@ -528,6 +566,7 @@ pub fn show(id: &str) -> Result<()> {
 pub fn export(search_id: &str, format: &str, output: Option<PathBuf>) -> Result<()> {
     use scitadel_db::sqlite::SqlitePaperTagRepository;
 
+    require_project_marker()?;
     let db = open_db()?;
     let (paper_repo, search_repo, _, _, _) = db.repositories();
     let tag_repo = SqlitePaperTagRepository::new(db);
@@ -579,6 +618,7 @@ pub fn export(search_id: &str, format: &str, output: Option<PathBuf>) -> Result<
 }
 
 pub fn diff(search_a: &str, search_b: &str) -> Result<()> {
+    require_project_marker()?;
     let db = open_db()?;
     let (_, search_repo, _, _, _) = db.repositories();
 
@@ -609,6 +649,7 @@ pub fn question_create(text: &str, description: &str) -> Result<()> {
 }
 
 pub fn question_list() -> Result<()> {
+    require_project_marker()?;
     let db = open_db()?;
     let (_, _, q_repo, _, _) = db.repositories();
 
@@ -1849,8 +1890,12 @@ pub fn action_list(json: bool) -> Result<()> {
     Ok(())
 }
 
-/// The one read both commands make.
+/// The one read both commands make. Read-only, so refuse up front
+/// if no scitadel project marker is visible — `scitadel coverage`
+/// and `scitadel action list` in a fresh dir must not plant a
+/// `.scitadel/` by opening a DB there. (#266 round-5.)
 fn read_action_list() -> Result<ActionList> {
+    require_project_marker()?;
     let db = open_db()?;
     db.action_list().map_err(|e| anyhow::anyhow!("{e}"))
 }

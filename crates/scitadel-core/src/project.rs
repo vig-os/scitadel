@@ -77,6 +77,14 @@ pub enum ProjectRootError {
     /// symlink leaving the project).
     #[error("scitadel project root is not usable: {reason}")]
     Unusable { reason: String },
+    /// The project pinned at server start has moved, been swapped,
+    /// or has had its marker removed. The MCP server never
+    /// re-resolves to a different root mid-session — it hands the
+    /// agent this uniform refusal and asks for a restart. (#266
+    /// round 5: `mv .scitadel/` under a project parent that also
+    /// had a marker could re-resolve the server's root upward.)
+    #[error("scitadel project moved or removed; restart the MCP server ({reason})")]
+    Moved { reason: String },
 }
 
 /// Resolve the project root as a canonical path. Single source of
@@ -316,6 +324,116 @@ pub fn home_from_passwd() -> Option<PathBuf> {
 #[must_use]
 pub fn project_db_path(root: &Path) -> PathBuf {
     root.join(PROJECT_MARKER).join("scitadel.db")
+}
+
+/// A project root pinned at server start (round 5). The MCP server
+/// resolves the root ONCE and holds this record; every later tool
+/// call re-verifies the pinned root is still the same directory
+/// (`(dev, ino)` identity, marker still present) before using it.
+/// A directory swap mid-session (`mv projA/.scitadel …`) does NOT
+/// re-resolve to an ancestor — it surfaces as
+/// [`ProjectRootError::Moved`] and the agent is told to restart the
+/// server.
+///
+/// The identity is the canonical root's inode and device at pin
+/// time; a rename from the outside leaves (`dev, ino`) intact
+/// (POSIX renames preserve the inode), but swapping the dir for a
+/// fresh one changes it. This is the knob that closes the
+/// "re-resolve mid-session" break.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedProject {
+    /// The canonical root at pin time.
+    pub root: PathBuf,
+    /// `st_dev` of `root` at pin time.
+    pub dev: u64,
+    /// `st_ino` of `root` at pin time.
+    pub ino: u64,
+}
+
+/// Resolve the project root once and pin its `(dev, ino)` identity.
+/// Call this at server start (or lazily on the first tool call) and
+/// hold the result; every subsequent access goes through
+/// [`verify_still_pinned`] rather than re-resolving.
+///
+/// # Errors
+///
+/// Same as [`project_root`], plus [`ProjectRootError::Unusable`] if
+/// the resolved root cannot be `stat`ted at pin time.
+pub fn pin_project_root() -> Result<PinnedProject, ProjectRootError> {
+    let root = project_root()?;
+    let (dev, ino) = stat_dev_ino(&root)?;
+    Ok(PinnedProject { root, dev, ino })
+}
+
+/// Confirm the pinned project is still the same directory. Re-stats
+/// `pin.root` and compares `(dev, ino)`; re-runs [`validate_marker`]
+/// and [`reject_system_root`] so a marker removed, swapped for a
+/// file, or re-pointed to a system dir still trips. On any change,
+/// returns [`ProjectRootError::Moved`] with a short reason — never
+/// re-resolves to a different directory. The returned path is the
+/// pinned root itself, so callers can use the pinned path directly.
+///
+/// # Errors
+///
+/// [`ProjectRootError::Moved`] if the pinned root was removed,
+/// swapped (different `(dev, ino)`), or the marker is no longer
+/// usable under it. [`ProjectRootError::Unusable`] if the new state
+/// is "marker usable but system-level", same as pin-time.
+pub fn verify_still_pinned(pin: &PinnedProject) -> Result<PathBuf, ProjectRootError> {
+    let (dev, ino) = match stat_dev_ino(&pin.root) {
+        Ok(x) => x,
+        Err(e) => {
+            return Err(ProjectRootError::Moved {
+                reason: format!("pinned root {} is gone: {e}", pin.root.display()),
+            });
+        }
+    };
+    if dev != pin.dev || ino != pin.ino {
+        return Err(ProjectRootError::Moved {
+            reason: format!(
+                "pinned root {} swapped underneath (dev/ino changed)",
+                pin.root.display()
+            ),
+        });
+    }
+    // Marker must still exist and still be a dir inside the root.
+    if let Err(e) = validate_marker(&pin.root) {
+        return Err(ProjectRootError::Moved {
+            reason: format!("pinned root's '{PROJECT_MARKER}/' marker: {e}"),
+        });
+    }
+    // Still refuse system-level roots in case HOME / passwd shifted.
+    reject_system_root(&pin.root)?;
+    Ok(pin.root.clone())
+}
+
+/// `stat` a directory and return `(st_dev, st_ino)`. Used to pin
+/// and later verify a project root's on-disk identity.
+fn stat_dev_ino(p: &Path) -> Result<(u64, u64), ProjectRootError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(p).map_err(|e| ProjectRootError::Unusable {
+            reason: format!("{}: {e}", p.display()),
+        })?;
+        Ok((meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        // On non-unix the (dev, ino) pair is not meaningful. Use a
+        // canonical path hash as a weaker identity; swap-detection
+        // then relies on validate_marker alone, which is still a
+        // real check (marker vanished / replaced).
+        let canon = p.canonicalize().map_err(|e| ProjectRootError::Unusable {
+            reason: format!("{}: {e}", p.display()),
+        })?;
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        canon.hash(&mut h);
+        let v = h.finish();
+        Ok((0, v))
+    }
 }
 
 #[cfg(test)]
@@ -565,6 +683,97 @@ mod tests {
         assert_eq!(
             project_db_path(&p),
             PathBuf::from("/x/y/.scitadel/scitadel.db")
+        );
+    }
+
+    /// Pinning captures the root's `(dev, ino)` and `verify_still_pinned`
+    /// accepts it unchanged.
+    #[test]
+    fn pin_and_verify_roundtrip() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear();
+        let (_tmp, root) = fresh_project();
+        unsafe {
+            std::env::set_var(WORKSPACE_ENV, &root);
+        }
+        let pin = pin_project_root().unwrap();
+        clear();
+        assert_eq!(pin.root, root);
+        let got = verify_still_pinned(&pin).unwrap();
+        assert_eq!(got, root);
+    }
+
+    /// Swapping the directory out from under the pin (same path, new
+    /// inode) must be detected and surface as `Moved`.
+    #[test]
+    #[cfg(unix)]
+    fn verify_still_pinned_detects_swap() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear();
+        let host = tempfile::tempdir().unwrap();
+        let host = host.path().canonicalize().unwrap();
+        let root = host.join("proj");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(root.join(PROJECT_MARKER)).unwrap();
+        unsafe {
+            std::env::set_var(WORKSPACE_ENV, &root);
+        }
+        let pin = pin_project_root().unwrap();
+        clear();
+        // Swap the whole directory: move it aside, then re-create
+        // a fresh dir at the same path (new inode) with a marker.
+        let aside = host.join("proj.aside");
+        std::fs::rename(&root, &aside).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(root.join(PROJECT_MARKER)).unwrap();
+        let err = verify_still_pinned(&pin).unwrap_err();
+        assert!(
+            matches!(err, ProjectRootError::Moved { .. }),
+            "expected Moved on dev/ino swap, got {err:?}"
+        );
+    }
+
+    /// Removing the marker under the pinned root surfaces as
+    /// `Moved` — we never silently fall back to walking up for a
+    /// new marker.
+    #[test]
+    fn verify_still_pinned_detects_marker_removal() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear();
+        let (_tmp, root) = fresh_project();
+        unsafe {
+            std::env::set_var(WORKSPACE_ENV, &root);
+        }
+        let pin = pin_project_root().unwrap();
+        clear();
+        std::fs::remove_dir(root.join(PROJECT_MARKER)).unwrap();
+        let err = verify_still_pinned(&pin).unwrap_err();
+        assert!(
+            matches!(err, ProjectRootError::Moved { .. }),
+            "expected Moved when marker vanished, got {err:?}"
+        );
+    }
+
+    /// Removing the pinned directory altogether surfaces as `Moved`.
+    #[test]
+    fn verify_still_pinned_detects_root_removal() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear();
+        let host = tempfile::tempdir().unwrap();
+        let host = host.path().canonicalize().unwrap();
+        let root = host.join("proj");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(root.join(PROJECT_MARKER)).unwrap();
+        unsafe {
+            std::env::set_var(WORKSPACE_ENV, &root);
+        }
+        let pin = pin_project_root().unwrap();
+        clear();
+        std::fs::remove_dir_all(&root).unwrap();
+        let err = verify_still_pinned(&pin).unwrap_err();
+        assert!(
+            matches!(err, ProjectRootError::Moved { .. }),
+            "expected Moved when root vanished, got {err:?}"
         );
     }
 }

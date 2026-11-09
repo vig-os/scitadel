@@ -65,7 +65,7 @@ use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
 pub use scitadel_core::project::PROJECT_MARKER;
-use scitadel_core::project::{self, ProjectRootError};
+use scitadel_core::project::ProjectRootError;
 
 /// Reasons a caller-supplied path is refused. Rendered to the agent
 /// as the `Err` arm of the tool response.
@@ -85,6 +85,12 @@ pub enum PathScopeError {
         "no scitadel project marker ('.scitadel/') found above the server's cwd; run `scitadel init` in your project, or set SCITADEL_WORKSPACE to the project root"
     )]
     MarkerMissing,
+    /// The server's pinned project has moved, been swapped, or has
+    /// had its marker removed. The agent sees a uniform "restart
+    /// the MCP server" refusal — we never silently cross into a
+    /// different project mid-session (#266 round 5).
+    #[error("scitadel project moved or removed; restart the MCP server ({reason})")]
+    ProjectMoved { reason: String },
     /// The caller-supplied path resolves outside the workspace — any
     /// of `..` traversal, an absolute path outside the root, a
     /// symlink anywhere on the path whose target lands outside, or
@@ -112,20 +118,42 @@ impl From<ProjectRootError> for PathScopeError {
             ProjectRootError::Unusable { reason } => {
                 PathScopeError::WorkspaceInaccessible { reason }
             }
+            // `Moved` carries its own distinct shape so the agent
+            // reliably reads "restart the MCP server" rather than
+            // the generic "workspace root is not accessible" one.
+            ProjectRootError::Moved { reason } => PathScopeError::ProjectMoved { reason },
         }
     }
 }
 
-/// Workspace root for MCP path scoping. Delegates to
-/// [`scitadel_core::project::project_root`] so the MCP confinement
-/// and the core config/DB logic agree on where the project lives.
+/// Test-only knob: force `safe_read_to_string` down the generic
+/// fallback path even on Linux, so tests can drive the
+/// ENOSYS-fallback race through the fd-path verification without
+/// actually blocking `openat2` (or running on a kernel < 5.6).
+/// Always `false` outside tests.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub static FORCE_FALLBACK_FOR_TESTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn force_fallback_for_tests() -> bool {
+    FORCE_FALLBACK_FOR_TESTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Workspace root for MCP path scoping. Routes through the PINNED
+/// project (round 5 of #266): the first call resolves and pins the
+/// root's `(dev, ino)` identity; every later call re-verifies. A
+/// mid-session marker swap cannot cross the server into a
+/// neighbouring project.
 ///
 /// # Errors
 ///
 /// Propagates every [`ProjectRootError`] as the matching
 /// [`PathScopeError`] variant.
 pub fn workspace_root() -> Result<PathBuf, PathScopeError> {
-    Ok(project::project_root()?)
+    Ok(crate::project_pin::pinned_project_root()?)
 }
 
 /// Expand a leading `~` / `~/` against `$HOME`.
@@ -442,26 +470,34 @@ pub(crate) fn display_rel(root: &Path, p: &Path) -> String {
 
 /// Atomic, symlink-safe write under the workspace root (#266).
 ///
-/// - `target` must sit under `root`. The parent is canonicalised
-///   and must `starts_with(root)`.
-/// - Writes to a sibling tempfile created `O_CREAT | O_EXCL | O_NOFOLLOW`.
-/// - Replaces `target` by `rename` (Unix: replaces a destination
-///   symlink without following it).
+/// Round-5 closes the intermediate-dir swap race in the write
+/// path: we open the parent as a directory FD with
+/// `O_DIRECTORY | O_NOFOLLOW`, verify the FD's real path sits
+/// under `root`, then create the sibling tempfile with `openat`
+/// relative to that FD and finalise with `renameat` against the
+/// same FD. After the real-path check, the FD identifies the
+/// directory even if someone swaps its name for a symlink in the
+/// meantime; `openat`/`renameat` operate on the inode, not the
+/// re-walked path. The round-3 `O_NOFOLLOW` on the tempfile open
+/// stays, and the mode-mask fix (round 3) stays.
+///
+/// - `target` must sit under `root`. The parent is opened through
+///   an `O_DIRECTORY | O_NOFOLLOW` fd and that fd's real path is
+///   verified to start with `root`.
+/// - The sibling tempfile is created `openat(dirfd, name,
+///   O_CREAT|O_EXCL|O_NOFOLLOW|O_WRONLY|O_CLOEXEC)`.
+/// - The rename is `renameat(dirfd, tmp, dirfd, target)` so it
+///   stays inside the same directory inode.
 /// - Preserves the mode of any existing regular file at `target`,
 ///   masked with `0o777` so setuid / setgid / sticky bits (0o7000)
 ///   never carry across a write — the round-3 "4755 stays 4755"
 ///   finding.
 ///
-/// Residual risk: an intermediate-directory swap between parent
-/// canonicalisation and the tempfile open can still redirect
-/// writes. On Linux the `openat2(RESOLVE_BENEATH |
-/// RESOLVE_NO_SYMLINKS)` fast path in [`safe_read_to_string`]
-/// closes this for reads; the analogous `renameat2`-walk for
-/// writes is out of scope here (noted in the PR).
-///
 /// # Errors
 ///
 /// - [`PathScopeError::WorkspaceInaccessible`] for scoping failures.
+/// - [`PathScopeError::OutsideWorkspace`] if the parent-dir FD's
+///   real path does not sit under `root` (round-5 race refusal).
 /// - [`PathScopeError::WriteFailed`] for write-time failures.
 pub fn safe_write_in_root(root: &Path, target: &Path, bytes: &[u8]) -> Result<(), PathScopeError> {
     let parent = target
@@ -504,14 +540,166 @@ pub fn safe_write_in_root(root: &Path, target: &Path, bytes: &[u8]) -> Result<()
     let mut tmp_name = OsString::from(".");
     tmp_name.push(fname);
     tmp_name.push(format!(".tmp-{}-{now}", std::process::id()));
-    let tmp = parent_canon.join(&tmp_name);
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
+
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
+        safe_write_via_dir_fd(
+            root,
+            target,
+            &parent_canon,
+            fname,
+            &tmp_name,
+            bytes,
+            preserve_mode,
+        )
     }
+    #[cfg(not(unix))]
+    {
+        safe_write_fallback_rename(root, target, &parent_canon, &tmp_name, bytes)
+    }
+}
+
+/// Unix write path: open the parent dir as an `O_DIRECTORY|O_NOFOLLOW`
+/// fd, verify the fd's real path is inside `root`, then operate
+/// relative to that fd for the tempfile create, write, mode-set,
+/// and the final rename. After the path verify, a last-moment swap
+/// of the parent for a symlink to outside no longer lands the
+/// create on an outside-root inode — the fd we hold still points
+/// at the original dir inode.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn safe_write_via_dir_fd(
+    root: &Path,
+    target: &Path,
+    parent_canon: &Path,
+    fname: &std::ffi::OsStr,
+    tmp_name: &OsString,
+    bytes: &[u8],
+    preserve_mode: Option<u32>,
+) -> Result<(), PathScopeError> {
+    use std::ffi::CString;
+    use std::fs::File;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let parent_c = CString::new(parent_canon.as_os_str().as_bytes()).map_err(|_| {
+        PathScopeError::WorkspaceInaccessible {
+            reason: "parent path has an interior NUL".into(),
+        }
+    })?;
+    // SAFETY: nul-terminated path; flags are valid.
+    let raw = unsafe {
+        libc::open(
+            parent_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(PathScopeError::WorkspaceInaccessible {
+            reason: format!(
+                "{}: {}",
+                display_rel(root, parent_canon),
+                io::Error::last_os_error()
+            ),
+        });
+    }
+    // SAFETY: fd just returned by libc::open.
+    let dir_fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // Verify the FD's real path lies inside root. This closes the
+    // post-canonicalise swap race.
+    let dir_file = File::from(dir_fd);
+    verify_fd_inside_root(&dir_file, root, &display_rel(root, parent_canon))?;
+    let dir_fd = OwnedFd::from(dir_file);
+
+    let tmp_c = CString::new(tmp_name.as_bytes()).map_err(|_| PathScopeError::WriteFailed {
+        path: display_rel(root, &parent_canon.join(tmp_name)),
+        reason: "tempfile name has an interior NUL".into(),
+    })?;
+    // SAFETY: openat with a dir fd + nul-terminated name.
+    let tmp_raw = unsafe {
+        libc::openat(
+            dir_fd.as_raw_fd(),
+            tmp_c.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if tmp_raw < 0 {
+        return Err(PathScopeError::WriteFailed {
+            path: display_rel(root, &parent_canon.join(tmp_name)),
+            reason: io::Error::last_os_error().to_string(),
+        });
+    }
+    // SAFETY: fd just returned by libc::openat.
+    let tmp_fd = unsafe { OwnedFd::from_raw_fd(tmp_raw) };
+    let mut file: File = tmp_fd.into();
+
+    let write_res: io::Result<()> = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Some(mode) = preserve_mode
+        && write_res.is_ok()
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perm = std::fs::Permissions::from_mode(mode);
+        let _ = file.set_permissions(perm);
+    }
+    drop(file);
+
+    if let Err(e) = write_res {
+        // Clean up the tempfile relative to the dir fd.
+        // SAFETY: unlinkat with a valid dir fd + nul-terminated name.
+        unsafe {
+            libc::unlinkat(dir_fd.as_raw_fd(), tmp_c.as_ptr(), 0);
+        }
+        return Err(PathScopeError::WriteFailed {
+            path: display_rel(root, &parent_canon.join(tmp_name)),
+            reason: e.to_string(),
+        });
+    }
+
+    let target_c =
+        CString::new(fname.as_bytes()).map_err(|_| PathScopeError::WorkspaceInaccessible {
+            reason: "target filename has an interior NUL".into(),
+        })?;
+    // SAFETY: renameat within the same dir fd; both names are nul-terminated.
+    let rc = unsafe {
+        libc::renameat(
+            dir_fd.as_raw_fd(),
+            tmp_c.as_ptr(),
+            dir_fd.as_raw_fd(),
+            target_c.as_ptr(),
+        )
+    };
+    if rc != 0 {
+        let e = io::Error::last_os_error();
+        // SAFETY: cleanup unlinkat.
+        unsafe {
+            libc::unlinkat(dir_fd.as_raw_fd(), tmp_c.as_ptr(), 0);
+        }
+        return Err(PathScopeError::WriteFailed {
+            path: display_rel(root, target),
+            reason: e.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Non-Unix write path: unchanged `rename`-based atomic replace.
+/// Windows does not expose the dir-fd machinery the Unix path uses.
+#[cfg(not(unix))]
+fn safe_write_fallback_rename(
+    root: &Path,
+    target: &Path,
+    parent_canon: &Path,
+    tmp_name: &OsString,
+    bytes: &[u8],
+) -> Result<(), PathScopeError> {
+    let tmp = parent_canon.join(tmp_name);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     let mut file = opts.open(&tmp).map_err(|e| PathScopeError::WriteFailed {
         path: display_rel(root, &tmp),
         reason: e.to_string(),
@@ -521,14 +709,6 @@ pub fn safe_write_in_root(root: &Path, target: &Path, bytes: &[u8]) -> Result<()
         file.sync_all()?;
         Ok(())
     })();
-    #[cfg(unix)]
-    if write_res.is_ok()
-        && let Some(mode) = preserve_mode
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perm = std::fs::Permissions::from_mode(mode);
-        let _ = file.set_permissions(perm);
-    }
     drop(file);
     if let Err(e) = write_res {
         let _ = std::fs::remove_file(&tmp);
@@ -574,7 +754,7 @@ pub fn safe_read_to_string(root: &Path, canon: &Path) -> Result<String, PathScop
     let rel = display_rel(root, canon);
 
     #[cfg(target_os = "linux")]
-    {
+    if !force_fallback_for_tests() {
         match openat2_read_to_string(root, canon, &rel) {
             Ok(s) => return Ok(s),
             Err(OpenAt2Outcome::Unsupported) => {
@@ -589,8 +769,21 @@ pub fn safe_read_to_string(root: &Path, canon: &Path) -> Result<String, PathScop
 
 /// Generic (non-Linux and Linux-fallback) path. Open with
 /// `O_NONBLOCK | O_NOFOLLOW`, `fstat`, refuse anything that isn't a
-/// regular file, then read.
-fn generic_read_to_string(_root: &Path, canon: &Path, rel: &str) -> Result<String, PathScopeError> {
+/// regular file, verify the opened FD's real path sits under
+/// `root` (the round-5 ENOSYS-fallback race fix), then read.
+///
+/// The post-open path check closes the race the kernel's
+/// `openat2(RESOLVE_BENEATH)` closes for us on Linux ≥ 5.6: between
+/// the caller's confinement check and `open(2)`, a dir in the path
+/// can be swapped for a symlink to outside, so an `open` on the
+/// still-plausible canonical path can land on an outside-root fd.
+/// On Linux we read `/proc/self/fd/<fd>`; on macOS we ask
+/// `fcntl(F_GETPATH)`. Both return the FD's current real path;
+/// mismatch = refuse. On platforms with neither (unlikely in
+/// scitadel's deploy surface) the extra check degrades to the
+/// previous (pre-round-5) behaviour, which is still safe against
+/// the ENOSYS surface the fallback is normally paired with.
+fn generic_read_to_string(root: &Path, canon: &Path, rel: &str) -> Result<String, PathScopeError> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]
@@ -605,6 +798,9 @@ fn generic_read_to_string(_root: &Path, canon: &Path, rel: &str) -> Result<Strin
             reason: e.to_string(),
         })?;
     refuse_non_regular(&file, rel)?;
+    #[cfg(unix)]
+    verify_fd_inside_root(&file, root, rel)?;
+    let _ = root; // tie to Linux/macOS branches only
     let mut s = String::new();
     file.read_to_string(&mut s)
         .map_err(|e| PathScopeError::NotAccessible {
@@ -612,6 +808,71 @@ fn generic_read_to_string(_root: &Path, canon: &Path, rel: &str) -> Result<Strin
             reason: e.to_string(),
         })?;
     Ok(s)
+}
+
+/// Read the current real path of an open FD and refuse if it does
+/// not sit under `root`. Linux: `readlink /proc/self/fd/<fd>`.
+/// macOS: `fcntl(F_GETPATH)`. Any lookup failure refuses (closed on
+/// doubt). Used after `generic_read_to_string`'s `open(…NOFOLLOW)`
+/// and after `safe_write_in_root`'s parent-dir fd open to close the
+/// intermediate-swap race the Linux `openat2` fast path closes.
+#[cfg(unix)]
+fn verify_fd_inside_root(
+    file: &std::fs::File,
+    root: &Path,
+    rel: &str,
+) -> Result<(), PathScopeError> {
+    let got = fd_real_path(file).ok_or_else(|| PathScopeError::NotAccessible {
+        input: rel.to_string(),
+        reason: "could not resolve the opened FD's real path to verify confinement".into(),
+    })?;
+    // The FD path may resolve to a directory inside root's canonical
+    // form; compare canonicalised prefixes.
+    let got_canon = got.canonicalize().unwrap_or(got);
+    let root_canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    if !got_canon.starts_with(&root_canon) {
+        return Err(PathScopeError::OutsideWorkspace {
+            input: rel.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Return the current real path of an open file descriptor on
+/// Linux and macOS.
+#[cfg(all(unix, target_os = "linux"))]
+fn fd_real_path(file: &std::fs::File) -> Option<PathBuf> {
+    use std::os::fd::AsRawFd;
+    let link = format!("/proc/self/fd/{}", file.as_raw_fd());
+    std::fs::read_link(&link).ok()
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+fn fd_real_path(file: &std::fs::File) -> Option<PathBuf> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStringExt;
+    // F_GETPATH writes up to MAXPATHLEN bytes into the buffer.
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: fcntl with a mutable buffer sized MAXPATHLEN.
+    let rc = unsafe {
+        libc::fcntl(
+            file.as_raw_fd(),
+            libc::F_GETPATH,
+            buf.as_mut_ptr().cast::<libc::c_void>(),
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    // Trim at the first NUL and coerce to a PathBuf.
+    let n = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    buf.truncate(n);
+    Some(PathBuf::from(OsString::from_vec(buf)))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn fd_real_path(_file: &std::fs::File) -> Option<PathBuf> {
+    None
 }
 
 #[cfg(unix)]
@@ -738,7 +999,15 @@ fn openat2_read_to_string(root: &Path, canon: &Path, rel: &str) -> Result<String
     };
     if fd < 0 {
         let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        if errno == libc::ENOSYS || errno == libc::EOPNOTSUPP {
+        // ENOSYS: kernel too old. EOPNOTSUPP: fs rejected. EPERM:
+        // seccomp filter blocked `openat2` outright (Docker's
+        // default-seccomp profile does exactly this on older
+        // runtimes — #266 round-5 "fallback must still cover
+        // sandboxes" fix). Treat all three as "take the generic
+        // fallback" rather than refusing the read, so an agent
+        // confined by a container profile still works; the
+        // fallback has its own fd-path verification.
+        if errno == libc::ENOSYS || errno == libc::EOPNOTSUPP || errno == libc::EPERM {
             return Err(OpenAt2Outcome::Unsupported);
         }
         if errno == libc::ELOOP || errno == libc::EXDEV {
@@ -832,6 +1101,12 @@ mod tests {
         unsafe {
             std::env::set_var("SCITADEL_WORKSPACE", root);
         }
+        // Round-5 pinning: `workspace_root()` is now memoised at
+        // first call. Every test that drives it against a fresh
+        // tempdir must forget the previous pin or the second test
+        // sees the first's root. Tests hold `ENV_LOCK` so the
+        // reset is serialised with the SCITADEL_* env writes.
+        crate::project_pin::reset_pin_for_tests();
     }
 
     fn clear_env() {
@@ -839,6 +1114,10 @@ mod tests {
             std::env::remove_var("SCITADEL_WORKSPACE");
             std::env::remove_var("SCITADEL_DB");
         }
+        // Same reason as `set_workspace_env` — tests may call
+        // `workspace_root()` after clearing the env (expecting
+        // `MarkerMissing`), so the pin must be forgotten first.
+        crate::project_pin::reset_pin_for_tests();
     }
 
     #[test]
@@ -947,6 +1226,7 @@ mod tests {
             PathScopeError::NotAccessible { .. } => "NotAccessible",
             PathScopeError::WorkspaceInaccessible { .. } => "WorkspaceInaccessible",
             PathScopeError::MarkerMissing => "MarkerMissing",
+            PathScopeError::ProjectMoved { .. } => "ProjectMoved",
             PathScopeError::WriteFailed { .. } => "WriteFailed",
         };
         assert_eq!(
@@ -1338,6 +1618,7 @@ mod tests {
             PathScopeError::WorkspaceInaccessible { .. } => "WorkspaceInaccessible",
             PathScopeError::WriteFailed { .. } => "WriteFailed",
             PathScopeError::MarkerMissing => "MarkerMissing",
+            PathScopeError::ProjectMoved { .. } => "ProjectMoved",
         };
         assert_eq!(class(&err_ex), "OutsideWorkspace", "exdir: {err_ex:?}");
         assert_eq!(
@@ -1645,6 +1926,7 @@ mod tests {
             PathScopeError::WorkspaceInaccessible { .. } => "WorkspaceInaccessible",
             PathScopeError::WriteFailed { .. } => "WriteFailed",
             PathScopeError::MarkerMissing => "MarkerMissing",
+            PathScopeError::ProjectMoved { .. } => "ProjectMoved",
         };
         assert_eq!(
             class(&err_exists),
@@ -1728,5 +2010,82 @@ mod tests {
             "absolute workspace path leaked: {msg}"
         );
         assert!(msg.contains("dir"), "relative path missing: {msg}");
+    }
+
+    // ---- #266 round-5: ENOSYS-fallback race + dir-fd write race ----
+
+    /// **Round-5 break #3 — ENOSYS-fallback race.** With
+    /// `openat2` unavailable (or EPERM-blocked by seccomp), the
+    /// fallback path previously opened the target through the raw
+    /// path and read it; a last-moment swap of a middle component
+    /// for a symlink to outside could point the open at an
+    /// outside-root inode even though the pre-walk said the path
+    /// was fine. Round-5 adds a post-open fd-path check
+    /// (`/proc/self/fd/<fd>` on Linux, `F_GETPATH` on macOS) that
+    /// refuses mismatches. Drive the fallback path directly via
+    /// `FORCE_FALLBACK_FOR_TESTS` so we exercise this without
+    /// actually blocking `openat2`.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn fallback_refuses_when_fd_real_path_leaves_the_workspace() {
+        use std::sync::atomic::Ordering;
+        let (_tmp, root) = fresh_workspace();
+        let outside_tmp = tempfile::tempdir().unwrap();
+        let outside = outside_tmp.path().canonicalize().unwrap();
+        std::fs::write(outside.join("victim"), "secret").unwrap();
+        let dir = root.join("sub");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("ok.bib"), "x").unwrap();
+
+        // Swap `sub` for a symlink to outside *after* the confinement
+        // walk completes, i.e. before the fallback opens the file.
+        // `safe_read_to_string` accepts an already-canonical path,
+        // so we construct the pre-swap canonical form and then do
+        // the swap before invoking it.
+        let canon = dir.join("ok.bib");
+        std::fs::remove_file(dir.join("ok.bib")).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(&outside, &dir).unwrap();
+
+        super::FORCE_FALLBACK_FOR_TESTS.store(true, Ordering::Relaxed);
+        let got = super::safe_read_to_string(&root, &canon);
+        super::FORCE_FALLBACK_FOR_TESTS.store(false, Ordering::Relaxed);
+
+        let err = got.expect_err("the fd-path check must catch the swap");
+        // Either OutsideWorkspace (fd path mismatch) or
+        // NotAccessible (readlink failed, closed on doubt) is an
+        // acceptable refusal — the test's claim is that we do NOT
+        // return the outside content.
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("secret"),
+            "outside content leaked through the fallback: {msg}"
+        );
+        assert!(
+            matches!(
+                err,
+                PathScopeError::OutsideWorkspace { .. } | PathScopeError::NotAccessible { .. }
+            ),
+            "unexpected error class, got {err:?}"
+        );
+    }
+
+    /// Round-5 EPERM handling: whatever the reason `openat2`
+    /// fails for (ENOSYS, EOPNOTSUPP, EPERM-from-seccomp), the
+    /// generic fallback with fd-path verification runs and
+    /// correctly reads an in-root file. The two fast-paths are
+    /// unit-tested here through the fallback knob — the EPERM
+    /// branch is a one-line extension of the match.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn fallback_reads_an_in_root_file() {
+        use std::sync::atomic::Ordering;
+        let (_tmp, root) = fresh_workspace();
+        let target = root.join("ok.bib");
+        std::fs::write(&target, "hello").unwrap();
+        super::FORCE_FALLBACK_FOR_TESTS.store(true, Ordering::Relaxed);
+        let got = super::safe_read_to_string(&root, &target);
+        super::FORCE_FALLBACK_FOR_TESTS.store(false, Ordering::Relaxed);
+        assert_eq!(got.unwrap(), "hello");
     }
 }

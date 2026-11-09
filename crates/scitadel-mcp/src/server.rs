@@ -1773,6 +1773,12 @@ mod tests {
             // depends on SCITADEL_DB NOT overriding it here.
             std::env::remove_var("SCITADEL_DB");
         }
+        // Round-5 pinning: the pinned-root cell is process-scoped,
+        // so between serially-run tests we must forget the previous
+        // pin or the second test resolves against the first's
+        // tempdir (which has already been dropped). Callers hold
+        // ENV_LOCK; the reset is safe here.
+        crate::project_pin::reset_pin_for_tests();
         // Force migrations to run before anything else touches the DB.
         let db = scitadel_db::sqlite::Database::open(&db_path).unwrap();
         db.migrate().unwrap();
@@ -2034,6 +2040,10 @@ mod tests {
                 std::env::set_var("SCITADEL_WORKSPACE", &root);
                 std::env::set_var("SCITADEL_DB", &db_path);
             }
+            // Round-5 pinning: clear any prior pin so this test's
+            // SCITADEL_WORKSPACE actually resolves. Caller holds the
+            // ENV_LOCK; the reset is serialised with the env writes.
+            crate::project_pin::reset_pin_for_tests();
             let db = scitadel_db::sqlite::Database::open(&db_path).unwrap();
             db.migrate().unwrap();
             (tmp, root, db_path)
@@ -2489,6 +2499,8 @@ mod tests {
                 std::env::set_var("SCITADEL_WORKSPACE", &proj_a);
                 std::env::set_var("SCITADEL_DB", &db_path);
             }
+            // Round-5 pinning: start this test's server state fresh.
+            crate::project_pin::reset_pin_for_tests();
             let db = scitadel_db::sqlite::Database::open(&db_path).unwrap();
             db.migrate().unwrap();
 
@@ -2534,6 +2546,9 @@ mod tests {
                 std::env::remove_var("SCITADEL_WORKSPACE");
                 std::env::remove_var("SCITADEL_DB");
             }
+            // Round-5 pinning: forget any previous pin so this test
+            // actually re-resolves against the marker-less host.
+            crate::project_pin::reset_pin_for_tests();
             let host = tempfile::tempdir().unwrap();
             let host = host.path().canonicalize().unwrap();
             let prev_cwd = std::env::current_dir().unwrap();
@@ -2673,6 +2688,107 @@ mod tests {
             let out = super::super::tools::import_bibtex_tool(via.to_str().unwrap(), None, "alice")
                 .expect("alias path should be accepted");
             assert!(out.contains("rows"), "expected rows: {out}");
+        }
+
+        // ---- #266 round-5 confirmed-break regression tests ----
+
+        /// **Round-5 break #1 — the resolver was re-resolved on every
+        /// call.** Starting the server pinned to projA, moving
+        /// projA/.scitadel aside, then calling a project-aware
+        /// tool used to silently re-resolve UP to the ancestor's
+        /// marker; `import_bibtex projB/x.bib` then succeeded into
+        /// the ancestor's DB and read across the boundary. With the
+        /// round-5 pin the next call must surface the uniform
+        /// `Moved` ("restart the MCP server") refusal instead.
+        #[test]
+        fn marker_move_mid_session_refuses_rather_than_re_resolving() {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            crate::project_pin::reset_pin_for_tests();
+
+            // Parent W is itself a scitadel project (has its own
+            // marker), and holds a child projA with its own marker.
+            let w_tmp = tempfile::tempdir().unwrap();
+            let w = w_tmp.path().canonicalize().unwrap();
+            fs::create_dir(w.join(".scitadel")).unwrap();
+            let proj_a = w.join("projA");
+            fs::create_dir(&proj_a).unwrap();
+            fs::create_dir(proj_a.join(".scitadel")).unwrap();
+            let db_a = proj_a.join(".scitadel").join("scitadel.db");
+
+            unsafe {
+                std::env::set_var("SCITADEL_WORKSPACE", &proj_a);
+                std::env::remove_var("SCITADEL_DB");
+            }
+            // Pin to projA.
+            scitadel_db::sqlite::Database::open(&db_a)
+                .unwrap()
+                .migrate()
+                .unwrap();
+
+            // A benign call succeeds against projA.
+            fs::write(proj_a.join("ok.bib"), SAMPLE_BIB).unwrap();
+            let ok = super::super::tools::bib_verify_tool("ok.bib", None).unwrap_or_default();
+            // Not asserting ok's exact text — may be "no sidecar"
+            // etc., but it must have NOT come back as a refusal.
+            assert!(
+                !ok.contains("restart the MCP server"),
+                "pre-move call should not already be refused: {ok}"
+            );
+
+            // Now move projA/.scitadel away, mid-session.
+            let aside = w.join("projA-marker-aside");
+            fs::rename(proj_a.join(".scitadel"), &aside).unwrap();
+
+            // A second call must refuse — never re-resolve up to W.
+            let err = super::super::tools::bib_verify_tool("ok.bib", None)
+                .expect_err("post-move call must refuse, not re-resolve");
+            assert!(
+                err.contains("restart the MCP server"),
+                "post-move call must carry the uniform refusal: {err}"
+            );
+
+            unsafe {
+                std::env::remove_var("SCITADEL_WORKSPACE");
+            }
+            fs::rename(&aside, proj_a.join(".scitadel")).ok();
+            crate::project_pin::reset_pin_for_tests();
+        }
+
+        /// **Round-5 break #1 corollary — marker-less server stays
+        /// marker-less.** A server that started outside any project
+        /// must not later resolve into one if an operator does
+        /// `mkdir X/.scitadel` nearby; the state pinned on first
+        /// call is sticky.
+        #[test]
+        fn marker_less_server_stays_marker_less_after_a_new_marker_appears() {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            crate::project_pin::reset_pin_for_tests();
+            unsafe {
+                std::env::remove_var("SCITADEL_WORKSPACE");
+                std::env::remove_var("SCITADEL_DB");
+            }
+            let host = tempfile::tempdir().unwrap();
+            let host = host.path().canonicalize().unwrap();
+            let prev_cwd = std::env::current_dir().unwrap();
+            std::env::set_current_dir(&host).unwrap();
+
+            // First call pins NoProject.
+            let first = super::super::tools::bib_verify_tool("any.bib", None).unwrap_err();
+            assert!(
+                first.contains("no scitadel project marker"),
+                "first-call must be NoProject: {first}"
+            );
+
+            // Someone drops a marker now. The pin must NOT re-resolve.
+            fs::create_dir(host.join(".scitadel")).unwrap();
+            let second = super::super::tools::bib_verify_tool("any.bib", None).unwrap_err();
+            assert!(
+                second.contains("no scitadel project marker"),
+                "second-call must still be NoProject after a marker appears: {second}"
+            );
+
+            std::env::set_current_dir(prev_cwd).unwrap();
+            crate::project_pin::reset_pin_for_tests();
         }
     }
 }

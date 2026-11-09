@@ -2758,7 +2758,24 @@ pub fn find_cached_file(db: &Database, paper: &Paper) -> Result<Option<PathBuf>,
         let Some(rel_path) = artefact.blob_rel_path else {
             continue;
         };
+        // Round-5 confinement: `blob_rel_path` is a DB-carried
+        // string, so a malicious or corrupt row with `..` or an
+        // absolute path could have `root.join(...)` escape the
+        // library. Resolve once, then refuse to offer a file whose
+        // canonical form sits outside `root` — the caller (MCP's
+        // `read_paper`, the TUI's reader) treats `None` as "no file
+        // here", which is the right answer for an out-of-library
+        // blob reference.
         let path = resolve_best_effort(&root.join(&rel_path));
+        if !path.starts_with(&root) {
+            tracing::warn!(
+                paper_id = %paper.id,
+                artefact_id = %artefact.id,
+                rel_path = %rel_path,
+                "artefact row names a blob outside the library root; ignoring"
+            );
+            continue;
+        }
         if path.is_file() {
             return Ok(Some(path));
         }
