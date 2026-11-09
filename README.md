@@ -403,7 +403,7 @@ Other knobs:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SCITADEL_WORKSPACE` | git toplevel from cwd → cwd | Project root the MCP server confines file reads to. Explicit override for when the server runs outside a git repo, or when the project's `.scitadel/` sits somewhere other than the git toplevel. A leading `~` is expanded, relative paths resolve against the server's cwd. Must not be `/`, `$HOME`, or an ancestor of `$HOME`. |
+| `SCITADEL_WORKSPACE` | nearest ancestor of cwd that contains a `.scitadel/` marker | Project root the MCP server confines file reads to. Discovery is marker-only: the server walks up from its cwd looking for `.scitadel/`, which is the definition of a scitadel project. The MCP tools **fail closed** when no marker is found — they do not silently use cwd as the root, and they ignore `GIT_WORK_TREE` / `GIT_DIR` entirely. Set `SCITADEL_WORKSPACE` to override the discovery; the value must itself contain a `.scitadel/` child. A leading `~` is expanded, relative paths resolve against the server's cwd. A root resolving to `/`, `$HOME`, or any ancestor of `$HOME` is refused; the home dir is resolved via `getpwuid` when `HOME` is unset, so stripping the env does not disarm the ancestor check. The CLI is unaffected — only the MCP surface is scoped. |
 | `SCITADEL_DB` | `<workspace>/.scitadel/scitadel.db` | Database path. Independent of `SCITADEL_WORKSPACE`: the DB may live outside the project (`/tmp/x.db`, `~/scitadel.db`), the workspace stays wherever the project is. |
 | `SCITADEL_CREDENTIAL_BACKEND` | auto-detected | `macos-keychain`, `secret-service` or `file` |
 | `SCITADEL_CHAT_MODEL` | `claude-sonnet-4-6` | Model used for scoring |

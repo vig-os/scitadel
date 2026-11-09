@@ -2462,5 +2462,219 @@ mod tests {
                 .expect("inside-root path accepted even with a relative SCITADEL_DB");
             assert_eq!(got, bib.canonicalize().unwrap());
         }
+
+        // ---- #266 confirmed-break regression tests (end-to-end) ----
+
+        /// **Break #1 — cross-project leak.** With no
+        /// `SCITADEL_WORKSPACE` and no git repo (or a stray
+        /// `GIT_WORK_TREE` the pre-fix code would have followed),
+        /// starting the server at `~/Projects` used to make root =
+        /// `~/Projects`, and `bib_diff projA/a.bib projB/secret.bib`
+        /// would read across both projects. With the fix the root
+        /// must be *the project whose `.scitadel/` marker we found*,
+        /// never the directory above it.
+        #[test]
+        fn bib_diff_cannot_cross_project_boundaries() {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let outer = tempfile::tempdir().unwrap();
+            let outer = outer.path().canonicalize().unwrap();
+            let proj_a = outer.join("projA");
+            let proj_b = outer.join("projB");
+            fs::create_dir_all(proj_a.join(".scitadel")).unwrap();
+            fs::create_dir_all(proj_b.join(".scitadel")).unwrap();
+            let db_path = proj_a.join(".scitadel").join("scitadel.db");
+            unsafe {
+                // Explicit workspace = projA. The crate test harness
+                // runs in the project's own cwd, which is scitadel's
+                // own git repo, so SCITADEL_WORKSPACE is what we
+                // test the confinement under.
+                std::env::set_var("SCITADEL_WORKSPACE", &proj_a);
+                std::env::set_var("SCITADEL_DB", &db_path);
+            }
+            let db = scitadel_db::sqlite::Database::open(&db_path).unwrap();
+            db.migrate().unwrap();
+
+            // Bib in projA (inside workspace), secret in projB
+            // (outside — different scitadel project under the same
+            // parent directory).
+            fs::write(proj_a.join("a.bib"), SAMPLE_BIB).unwrap();
+            fs::write(proj_b.join("secret.bib"), SAMPLE_BIB).unwrap();
+
+            let err_abs = super::super::tools::bib_diff_tool(
+                "a.bib",
+                Some(proj_b.join("secret.bib").to_str().unwrap()),
+                None,
+                None,
+            )
+            .expect_err("cross-project absolute path must be refused");
+            assert!(
+                err_abs.contains("escapes the workspace root"),
+                "unexpected error: {err_abs}"
+            );
+
+            let err_rel = super::super::tools::bib_diff_tool(
+                "a.bib",
+                Some("../projB/secret.bib"),
+                None,
+                None,
+            )
+            .expect_err("cross-project traversal must be refused");
+            assert!(
+                err_rel.contains("escapes the workspace root"),
+                "unexpected error: {err_rel}"
+            );
+        }
+
+        /// **Break #1 — no marker, fail closed.** No
+        /// `SCITADEL_WORKSPACE`, no git repo visible from cwd, no
+        /// marker in cwd's ancestry: the MCP read tools must refuse
+        /// outright, not silently use cwd as the root.
+        #[test]
+        fn mcp_read_tools_fail_closed_without_a_project_marker() {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            unsafe {
+                std::env::remove_var("SCITADEL_WORKSPACE");
+                std::env::remove_var("SCITADEL_DB");
+            }
+            let host = tempfile::tempdir().unwrap();
+            let host = host.path().canonicalize().unwrap();
+            let prev_cwd = std::env::current_dir().unwrap();
+            std::env::set_current_dir(&host).unwrap();
+
+            let err = super::super::tools::bib_verify_tool("any.bib", None).unwrap_err();
+
+            std::env::set_current_dir(prev_cwd).unwrap();
+            assert!(
+                err.contains("no scitadel project marker"),
+                "fail-closed error must name the marker: {err}"
+            );
+        }
+
+        /// **Break #2 — no existence oracle via an in-workspace
+        /// symlink pointing outside.** `bib_verify` on a bib whose
+        /// sidecar is a symlink to an outside file must produce
+        /// **the same** response whether the symlink's target
+        /// exists or not — apart from echoing the caller's input,
+        /// which is identical in both runs. The pre-fix code gave
+        /// `Err "escapes"` when the target existed and `Ok "stale"`
+        /// when it did not, leaving the oracle.
+        #[test]
+        #[cfg(unix)]
+        fn bib_verify_outside_sidecar_response_is_identical_whether_existing_or_missing() {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let (_tmp, root, _db) = seed_workspace();
+            let bib = root.join("refs.bib");
+            fs::write(&bib, "@article{x,title={X},year={2024}}\n").unwrap();
+
+            let outside_dir = tempfile::tempdir().unwrap();
+            let outside = outside_dir.path().canonicalize().unwrap();
+            let sidecar_target = root.join("refs.bib.scitadel-bib.lock");
+
+            // Case A: target exists.
+            let exists_target = outside.join("exists.lock");
+            fs::write(&exists_target, b"{}").unwrap();
+            std::os::unix::fs::symlink(&exists_target, &sidecar_target).unwrap();
+            let got_exists = super::super::tools::bib_verify_tool("refs.bib", None);
+            fs::remove_file(&sidecar_target).unwrap();
+
+            // Case B: target missing (dangling symlink).
+            let missing_target = outside.join("never.lock");
+            std::os::unix::fs::symlink(&missing_target, &sidecar_target).unwrap();
+            let got_missing = super::super::tools::bib_verify_tool("refs.bib", None);
+            fs::remove_file(&sidecar_target).unwrap();
+
+            // Both must be errors (existence oracle closed). Match
+            // classes, not byte-exact strings — the echoed input is
+            // the same in both runs, so this *is* byte-identical in
+            // practice; we assert the semantic equivalence.
+            let err_exists =
+                got_exists.expect_err("existing-outside sidecar must be refused as Err");
+            let err_missing =
+                got_missing.expect_err("missing-outside sidecar must also be refused as Err");
+            assert_eq!(
+                err_exists, err_missing,
+                "existence oracle survives: existing={err_exists} vs missing={err_missing}"
+            );
+        }
+
+        // ---- #266 plausible risks ----
+
+        /// **Plausible risk — path leak in read errors.** Reading a
+        /// path that *is* inside the workspace but is not a
+        /// regular file (e.g. a directory) must report the
+        /// workspace-relative path, never the absolute workspace
+        /// path. The pre-fix `fs::read_to_string` leaked the
+        /// absolute root through `load_entries_from_path`.
+        #[test]
+        fn bib_diff_read_errors_report_workspace_relative_paths() {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let (_tmp, root, _db) = seed_workspace();
+            let dir = root.join("adir");
+            fs::create_dir(&dir).unwrap();
+            // Second side has to be a readable bib or diff bails
+            // before we see the first error.
+            let other = root.join("ok.bib");
+            fs::write(&other, SAMPLE_BIB).unwrap();
+
+            let err = super::super::tools::bib_diff_tool("adir", Some("ok.bib"), None, None)
+                .expect_err("reading a directory must fail");
+            assert!(
+                !err.contains(root.to_str().unwrap()),
+                "absolute workspace path leaked in error: {err}"
+            );
+            assert!(
+                err.contains("adir"),
+                "error should echo the relative path 'adir': {err}"
+            );
+        }
+
+        /// **Plausible risk — mode drift on overwrite.** A
+        /// bib_snapshot over an existing `chmod 600` sidecar must
+        /// preserve the 600 bits.
+        #[test]
+        #[cfg(unix)]
+        fn bib_snapshot_preserves_an_existing_lockfile_mode() {
+            use std::os::unix::fs::PermissionsExt;
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let (_tmp, root, _db) = seed_workspace();
+            let qid = seed_question();
+
+            let bib_dir = root.join(".scitadel").join("bib");
+            fs::create_dir_all(&bib_dir).unwrap();
+            let sidecar = bib_dir.join(format!("{qid}.bib.scitadel-bib.lock"));
+            // Pre-create the sidecar with 600 mode — simulates an
+            // owner who tightened the lockfile.
+            fs::write(&sidecar, b"{}").unwrap();
+            fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o600)).unwrap();
+
+            super::super::tools::bib_snapshot_tool(&qid, "alice", false, "bibtex")
+                .expect("snapshot succeeds");
+
+            let mode = fs::metadata(&sidecar).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "sidecar mode drifted to {mode:o}");
+        }
+
+        /// **Over-refusal — symlinked project alias accepted.** A
+        /// workspace reached through a symlinked directory alias
+        /// (`/aliased/proj → /real/proj`) must not falsely refuse
+        /// an absolute path given through that alias — both root
+        /// and user path canonicalise before comparison.
+        #[test]
+        #[cfg(unix)]
+        fn import_bibtex_accepts_a_path_through_a_symlinked_project_alias() {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let (_tmp, root, _db) = seed_workspace();
+            let bib = root.join("refs.bib");
+            fs::write(&bib, SAMPLE_BIB).unwrap();
+
+            let alias_parent = tempfile::tempdir().unwrap();
+            let alias = alias_parent.path().canonicalize().unwrap().join("alias");
+            std::os::unix::fs::symlink(&root, &alias).unwrap();
+
+            let via = alias.join("refs.bib");
+            let out = super::super::tools::import_bibtex_tool(via.to_str().unwrap(), None, "alice")
+                .expect("alias path should be accepted");
+            assert!(out.contains("rows"), "expected rows: {out}");
+        }
     }
 }

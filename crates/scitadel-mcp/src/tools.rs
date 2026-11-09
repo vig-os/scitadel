@@ -1878,7 +1878,7 @@ pub fn import_bibtex_tool(
     strategy: Option<&str>,
     reader: &str,
 ) -> Result<String, String> {
-    use crate::bib_import::{ImportOptions, import_bibtex_file};
+    use crate::bib_import::{ImportOptions, import_bibtex_str};
     use scitadel_db::sqlite::{
         SqliteAnnotationRepository, SqlitePaperAliasRepository, SqlitePaperRepository,
         SqlitePaperTagRepository,
@@ -1892,7 +1892,13 @@ pub fn import_bibtex_tool(
         )
     })?;
 
-    let confined = crate::paths::confine_read_path(path).map_err(|e| e.to_string())?;
+    // Resolve root + confined path once, then read through
+    // `safe_read_to_string` so the bytes arrive via an `O_NOFOLLOW`
+    // open and any read error renders a workspace-relative path
+    // rather than the absolute workspace one (#266 follow-up).
+    let root = crate::paths::workspace_root().map_err(|e| e.to_string())?;
+    let confined = crate::paths::confine_to_workspace(&root, path).map_err(|e| e.to_string())?;
+    let src = crate::paths::safe_read_to_string(&root, &confined).map_err(|e| e.to_string())?;
 
     let db = open_db()?;
     let papers = SqlitePaperRepository::new(db.clone());
@@ -1909,7 +1915,7 @@ pub fn import_bibtex_tool(
         // per-row failure path as `merge` for ambiguous-alias rows.
         prompt_resolver: None,
     };
-    let report = import_bibtex_file(&confined, &options, &papers, &aliases, &annotations, &tags)
+    let report = import_bibtex_str(&src, &options, &papers, &aliases, &annotations, &tags)
         .map_err(|e| e.to_string())?;
 
     let rows: Vec<serde_json::Value> = report
@@ -2262,15 +2268,23 @@ pub fn bib_snapshot_tool(
 /// echoes the caller's input + the sidecar suffix rather than the
 /// resolved path, so no outside-root path is leaked even by accident.
 pub fn bib_verify_tool(file: &str, question_override: Option<&str>) -> Result<String, String> {
-    let bib_path = crate::paths::confine_read_path(file).map_err(|e| e.to_string())?;
-    let bib_bytes = std::fs::read_to_string(&bib_path).map_err(|e| e.to_string())?;
+    // Resolve the workspace root once so reads go through
+    // `safe_read_to_string`, which opens with `O_NOFOLLOW` and
+    // reports errors with workspace-relative paths (#266
+    // adversarial follow-up).
+    let root = crate::paths::workspace_root().map_err(|e| e.to_string())?;
+    let bib_path = crate::paths::confine_to_workspace(&root, file).map_err(|e| e.to_string())?;
+    let bib_bytes =
+        crate::paths::safe_read_to_string(&root, &bib_path).map_err(|e| e.to_string())?;
 
-    // `sidecar_path_for(bib_path)` names a file next to a path that
-    // has already been confined, so the lexical check normally
-    // passes; `confine_read_path` then follows symlinks and catches
-    // the attack where the sidecar itself is a symlink to outside.
+    // The sidecar sits next to the bib file. Routing it back
+    // through `confine_to_workspace` catches the attack where the
+    // sidecar itself is a symlink to outside — now with a uniform
+    // error for *both* the existing-outside and the dangling-
+    // outside cases (#266 confirmed break #2), so a caller probing
+    // for existence cannot read which one it tripped.
     let sidecar_input = format!("{file}{}", SIDECAR_SUFFIX);
-    let sidecar = match crate::paths::confine_read_path(&sidecar_input) {
+    let sidecar = match crate::paths::confine_to_workspace(&root, &sidecar_input) {
         Ok(p) => p,
         Err(crate::paths::PathScopeError::NotAccessible { .. }) => {
             return Ok(serde_json::json!({
@@ -2284,7 +2298,8 @@ pub fn bib_verify_tool(file: &str, question_override: Option<&str>) -> Result<St
         }
         Err(e) => return Err(e.to_string()),
     };
-    let lock_bytes = std::fs::read_to_string(&sidecar).map_err(|e| e.to_string())?;
+    let lock_bytes =
+        crate::paths::safe_read_to_string(&root, &sidecar).map_err(|e| e.to_string())?;
     let lock = scitadel_export::BibLockfile::from_json(&lock_bytes).map_err(|e| e.to_string())?;
 
     // Stale checks first — if the binary moved, drift comparisons mean nothing.
@@ -2364,14 +2379,24 @@ pub fn bib_diff_tool(
     question_id: Option<&str>,
     reader: Option<&str>,
 ) -> Result<String, String> {
-    let path_a = crate::paths::confine_read_path(file_a).map_err(|e| e.to_string())?;
-    let (entries_a, fmt_a) = scitadel_export::load_entries_from_path(&path_a)?;
+    // Route reads through `safe_read_to_string` so an unresolvable
+    // path's error renders a workspace-relative path rather than
+    // leaking the absolute workspace via `load_entries_from_path`'s
+    // own `read {path.display()}: ...` format (#266 follow-up).
+    let root = crate::paths::workspace_root().map_err(|e| e.to_string())?;
+    let path_a = crate::paths::confine_to_workspace(&root, file_a).map_err(|e| e.to_string())?;
+    let bytes_a = crate::paths::safe_read_to_string(&root, &path_a).map_err(|e| e.to_string())?;
+    let (entries_a, fmt_a) = scitadel_export::load_entries_from_str(&bytes_a)
+        .map_err(|e| format!("parse {}: {e}", crate::paths::display_rel(&root, &path_a)))?;
     let entries_b = match (file_b, question_id) {
         (Some(_), Some(_)) => return Err("pass file_b OR question_id, not both".into()),
         (None, None) => return Err("pass file_b or question_id".into()),
         (Some(b), None) => {
-            let path_b = crate::paths::confine_read_path(b).map_err(|e| e.to_string())?;
-            let (e, _) = scitadel_export::load_entries_from_path(&path_b)?;
+            let path_b = crate::paths::confine_to_workspace(&root, b).map_err(|e| e.to_string())?;
+            let bytes_b =
+                crate::paths::safe_read_to_string(&root, &path_b).map_err(|e| e.to_string())?;
+            let (e, _) = scitadel_export::load_entries_from_str(&bytes_b)
+                .map_err(|e| format!("parse {}: {e}", crate::paths::display_rel(&root, &path_b)))?;
             e
         }
         (None, Some(qid)) => {
