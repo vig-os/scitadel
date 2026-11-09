@@ -148,7 +148,17 @@ fn has_project_marker(dir: &Path) -> bool {
     std::fs::symlink_metadata(dir.join(PROJECT_MARKER)).is_ok()
 }
 
-fn find_marker_ancestor(start: &Path) -> Option<PathBuf> {
+/// Walk up from `start`, returning the first ancestor (including
+/// `start` itself) that has a direct `.scitadel` child. The result
+/// is a raw, uncanonicalised path — the caller runs
+/// `validate_marker` / `reject_system_root` as needed.
+///
+/// Pulled out of the private resolver so the CLI's
+/// `require_project_marker` gate can share the same "is there a
+/// project here?" definition without the `reject_system_root`
+/// rule, which is MCP-only (#266 round 6).
+#[must_use]
+pub fn find_marker_ancestor(start: &Path) -> Option<PathBuf> {
     let mut cur: Option<&Path> = Some(start);
     while let Some(p) = cur {
         if has_project_marker(p) {

@@ -36,6 +36,14 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 unicode-normalization = { workspace = true } # ADR-007 §3: diacritic-insensitive title matching. Already in Cargo.lock at 0.1.25 (transitively, via idna), so this adds a dependency edge and no new package
 
+# `O_NOFOLLOW` / `O_NONBLOCK` constants for the verified-open gate
+# `find_cached_file` runs over a DB-supplied `blob_rel_path` (#266
+# round 6): the constants are platform-specific, so we route them
+# through `libc` rather than hard-code them per target. Unix-only;
+# Windows builds don't pull libc for this crate.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # The importer's tests assert on `artefacts` rows directly; the library
 # code itself never names rusqlite (that stays behind scitadel-db).

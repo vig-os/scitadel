@@ -6,6 +6,39 @@
 //! workspace. A single helper owns the rule so future MCP tools
 //! cannot forget it.
 //!
+//! # Threat model
+//!
+//! This confinement layer defends the MCP surface, not the project
+//! tree on disk.
+//!
+//! **In scope.** Every MCP request field (paths, ids, filter
+//! strings), the user's config and environment, and paths carried
+//! inside DB rows that an earlier MCP call wrote (a malicious import
+//! planting `../` in `blob_rel_path`, etc.). An agent — including a
+//! prompt-injected one — whose only lever is what it can send over
+//! the MCP transport is the attacker this module is written for.
+//!
+//! **Out of scope.** Local processes or users who already have write
+//! access to the project tree: `renameat2(RENAME_EXCHANGE)` swaps of
+//! `.scitadel/` or any intermediate directory mid-call, hardlinking
+//! another project's DB into `.scitadel/`, bind mounts, and the
+//! TOCTOU races those enable. An attacker with that level of access
+//! can already read the files MCP reads and write anywhere the user
+//! writes, so MCP confinement cannot protect against them. Root is
+//! likewise out of scope.
+//!
+//! **Residual races.** `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`
+//! on Linux ≥ 5.6 closes every path-canonicalisation race for an
+//! MCP-only attacker. The non-`openat2` fallback (older Linux, macOS
+//! and other Unix) still re-opens the canonical path after the
+//! component walk, so a local-filesystem attacker who can swap a
+//! parent directory with `renameat2` between the canonicalise and
+//! the open could aim the read elsewhere. The FD's real path is
+//! `fstat`-verified before the read, which narrows but does not
+//! eliminate that window; closing it requires write access to the
+//! project tree — a capability the attacker already has if they can
+//! stage the swap. Not fixed here; see #266 round 5.
+//!
 //! # Workspace root
 //!
 //! Resolved by [`scitadel_core::project::project_root`] — the single

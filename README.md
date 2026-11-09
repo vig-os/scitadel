@@ -81,6 +81,8 @@ Verify with `claude mcp list`.
 
 ## Quick start
 
+Every project-aware command (`history`, `export`, `question list`, `bib *`, `acquire`, `gc`, `coverage`, the TUI, the MCP server, …) requires `scitadel init` first; a `.scitadel/` marker is how scitadel knows which directory is your project root. Only `scitadel init` creates it.
+
 ```bash
 # Initialize the database (creates ./.scitadel/scitadel.db)
 scitadel init
@@ -243,6 +245,8 @@ scitadel mcp
 - **Export**: `export_search`
 
 Every long-running tool (search / batch scoring / download) emits MCP `notifications/progress` frames if the caller supplies a `progressToken` (#58). Annotation writes are audit-logged. Identity is trust-on-first-use (real auth ships with the Phase-5 Dolt sync layer).
+
+**Threat model.** The MCP surface is written to resist a prompt-injected or otherwise compromised agent whose only lever is what it can send over the MCP transport. In scope: every MCP request field, the user's config and environment, and paths carried in DB rows an earlier MCP call wrote. Caller-supplied read paths are confined to the workspace root; caller-supplied write destinations are removed from the schema and generated server-side under `.scitadel/`. The MCP server refuses `$HOME`, `/`, and ancestors of `$HOME` as the workspace root. Out of scope: local processes or users with write access to the project tree — they can already read what MCP reads, so `renameat2` swaps, hardlinked DBs, bind mounts, and the TOCTOU races those enable are not defended against. The CLI is for the human running on their own machine; it keeps its unconstrained path behaviour.
 
 The full pipeline — agent formulates a question, generates search terms, runs a search, scores each paper, snowballs relevant citations, writes structured assessments — runs through tool calls with no manual intervention. With #122, the agent can also act on whatever the user is looking at in the TUI without the user pasting IDs.
 

@@ -18,17 +18,25 @@ fn open_db() -> Result<Database> {
     Ok(db)
 }
 
-/// Fail a read-only CLI command if no scitadel project marker is
+/// Fail a project-aware CLI command if no scitadel project marker is
 /// visible AND no explicit `SCITADEL_DB` points at an existing
 /// database file. The MCP side stays strict unconditionally; on
 /// the CLI `load_config` still falls back to cwd so `scitadel
-/// init` can seed a fresh project — but a read-only command must
-/// not be the thing that silently plants `.scitadel/` under
+/// init` can seed a fresh project — but a project-aware command
+/// must not be the thing that silently plants `.scitadel/` under
 /// whichever dir the user happens to be in. Round-5 adversarial
 /// finding: running `scitadel history` in a fresh dir created
 /// `fresh/.scitadel`, which then became a valid wide confinement
-/// root for a later MCP start. Read-only commands now refuse with
-/// a clear message and a non-zero exit instead.
+/// root for a later MCP start. These commands now refuse with a
+/// clear message and a non-zero exit instead.
+///
+/// The gate is a marker-existence probe only. It does NOT apply
+/// the `reject_system_root` rule (`$HOME`, `/`, ancestors of
+/// `$HOME`) — that is an MCP CONFINEMENT rule, not a CLI one. A
+/// user who deliberately runs scitadel in `$HOME` by creating a
+/// `.scitadel/` marker there keeps every CLI command working, as
+/// the pre-round-4 behaviour did (#266 round 6 regression). The
+/// MCP server still refuses `$HOME` as a workspace root.
 ///
 /// The `SCITADEL_DB` escape hatch exists because the CLI test
 /// suite (and users reaching into another library) point at a
@@ -36,7 +44,7 @@ fn open_db() -> Result<Database> {
 /// does not create a stray `.scitadel/` anywhere, so the risk the
 /// marker check addresses is not present.
 fn require_project_marker() -> Result<()> {
-    use scitadel_core::project::{ProjectRootError, project_root};
+    use scitadel_core::project::{PROJECT_MARKER, find_marker_ancestor};
     if let Ok(db) = std::env::var("SCITADEL_DB")
         && !db.is_empty()
     {
@@ -45,13 +53,25 @@ fn require_project_marker() -> Result<()> {
             return Ok(());
         }
     }
-    match project_root() {
-        Ok(_) => Ok(()),
-        Err(ProjectRootError::MarkerMissing) => {
-            bail!("no scitadel project here; run `scitadel init` in your project root")
+    if let Ok(v) = std::env::var(scitadel_core::project::WORKSPACE_ENV)
+        && !v.is_empty()
+    {
+        let p = std::path::PathBuf::from(&v);
+        let p = if p.is_absolute() {
+            p
+        } else {
+            std::env::current_dir().unwrap_or_default().join(p)
+        };
+        if p.join(PROJECT_MARKER).exists() {
+            return Ok(());
         }
-        Err(e) => bail!("{e}"),
     }
+    let cwd = std::env::current_dir()
+        .map_err(|e| anyhow::anyhow!("cannot read current directory: {e}"))?;
+    if find_marker_ancestor(&cwd).is_some() {
+        return Ok(());
+    }
+    bail!("no scitadel project here; run `scitadel init` in your project root")
 }
 
 /// Resolve an ID by prefix match against a list.
@@ -95,6 +115,11 @@ pub fn list_themes() -> Result<()> {
 }
 
 pub fn tui(theme_override: Option<&str>) -> Result<()> {
+    // The TUI has no first-run `init` flow — opening it in a fresh
+    // directory would silently plant a `.scitadel/` under cwd, the
+    // same round-5 trap `history` and `coverage` hit. Refuse with
+    // the init hint instead (#266 round 6).
+    require_project_marker()?;
     let config = load_config();
     let openalex = config.openalex.auth();
     let papers_dir = config.papers_dir();
@@ -820,6 +845,14 @@ pub async fn assess(
 pub async fn resolve_doi(doi: &str, json: bool, no_save: bool) -> Result<()> {
     use scitadel_core::ports::PaperRepository as _;
 
+    // `--no-save` is the "just lookup" shape — a print-only call
+    // that has no business planting a `.scitadel/` under the
+    // current directory. The saving shape still auto-initialises
+    // the project as every other write-side command does. (#266
+    // round 6.)
+    if no_save {
+        require_project_marker()?;
+    }
     let config = load_config();
     let adapter = scitadel_adapters::openalex::OpenAlexAdapter::new(config.openalex.auth(), 30.0);
 
@@ -1043,6 +1076,7 @@ pub fn bib_rekey(paper_id: &str, key: Option<&str>, reader: Option<String>) -> R
     use scitadel_db::sqlite::{SqlitePaperAliasRepository, SqlitePaperRepository};
     use scitadel_mcp::bib_rekey::{RekeyError, rekey_paper};
 
+    require_project_marker()?;
     let reader = reader.unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "rekey".into()));
     let db = open_db()?;
     let papers = SqlitePaperRepository::new(db.clone());
@@ -1375,6 +1409,7 @@ pub fn bib_snapshot(
     no_lock: bool,
     format: &str,
 ) -> Result<()> {
+    require_project_marker()?;
     let reader = reader_arg.map_or_else(current_reader, str::to_string);
     let (question, paper_ids, papers, tags) = load_shortlist(question_prefix, &reader)?;
     let snapshot_format = parse_format(format)?;
@@ -1679,6 +1714,10 @@ pub fn bib_diff(
             (e, format!("{}", b.display()))
         }
         (None, Some(qid)) => {
+            // `--question-id` is the DB side of the diff: it needs an
+            // initialised project. The file-vs-file arm has no such
+            // need and stays unchecked (#266 round 6).
+            require_project_marker()?;
             // Fresh snapshot from DB. Use the same reader resolution
             // as snapshot/verify so stars and shortlist scoping line up.
             let reader = reader_arg.map_or_else(current_reader, str::to_string);
@@ -2335,6 +2374,15 @@ pub struct AcquireOptions {
 /// second run over a library that already holds its full texts puts nothing on
 /// the wire; see `scitadel_adapters::acquire`.
 pub async fn acquire(opts: AcquireOptions, json: bool) -> Result<()> {
+    // `--dry-run` is a read-only preview: no acquisitions, no spend.
+    // Auto-creating `.scitadel/` for a preview is the same round-5
+    // trap as `history` on a fresh dir (#266 round 6). Real
+    // acquisitions (no `--dry-run`) stay auto-initialising; a user
+    // kicking off a long download in a new tree should still Just
+    // Work the way `init` does.
+    if opts.dry_run {
+        require_project_marker()?;
+    }
     let config = load_config();
     // Opened for the pacing ledger as well as the rows: the downloader spends
     // from the same SQLite ledger the rest of scitadel uses, and two in-memory
@@ -2611,6 +2659,10 @@ pub fn attach(
 
 /// `scitadel gc [--dry-run] [--min-age-hours N] [--json]`.
 pub fn gc(dry_run: bool, min_age_hours: i64, json: bool) -> Result<()> {
+    // `gc` is a maintenance command on an existing library — it has
+    // no business planting a fresh `.scitadel/` under the current
+    // directory when there is nothing to collect (#266 round 6).
+    require_project_marker()?;
     let db = open_db()?;
     // `--dry-run` is a real flag rather than the default, and the report says
     // which of the two it is: "gc collected nothing" and "gc would collect

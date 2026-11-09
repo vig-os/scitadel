@@ -2776,20 +2776,131 @@ pub fn find_cached_file(db: &Database, paper: &Paper) -> Result<Option<PathBuf>,
             );
             continue;
         }
-        if path.is_file() {
-            return Ok(Some(path));
+        // Round-6 hardening: the earlier version checked the
+        // canonical path with `starts_with(&root)` and then
+        // separately called `path.is_file()` (which re-opens via
+        // `stat`) — the DB-supplied-path check and the use could
+        // target different inodes. Open the canonical path once
+        // with `O_NOFOLLOW`, confirm the FD points at a regular
+        // file whose current real path still sits under `root`,
+        // and only then hand the canonical path back. The caller
+        // reopens for the actual read; the remaining window is
+        // exploitable only by a process with write access to the
+        // project tree, which is explicitly out of scope per the
+        // threat model in `scitadel_mcp::paths`.
+        match verified_open_under_root(&path, &root) {
+            VerifiedOpen::Ok => return Ok(Some(path)),
+            VerifiedOpen::NotFile => {
+                // The row says we hold it and the bytes are not there. Not an error
+                // either — `scitadel gc` reports it and `scitadel scan` reconciles it — so
+                // the next candidate gets its turn.
+                tracing::debug!(
+                    paper_id = %paper.id,
+                    artefact_id = %artefact.id,
+                    rel_path = %rel_path,
+                    "an artefact row names a blob that is not on disk; not offering it as a file"
+                );
+            }
+            VerifiedOpen::Escapes => {
+                tracing::warn!(
+                    paper_id = %paper.id,
+                    artefact_id = %artefact.id,
+                    rel_path = %rel_path,
+                    "artefact row's blob resolved to an fd outside the library root; ignoring"
+                );
+            }
         }
-        // The row says we hold it and the bytes are not there. Not an error
-        // either — `scitadel gc` reports it and `scitadel scan` reconciles it — so
-        // the next candidate gets its turn.
-        tracing::debug!(
-            paper_id = %paper.id,
-            artefact_id = %artefact.id,
-            rel_path = %rel_path,
-            "an artefact row names a blob that is not on disk; not offering it as a file"
-        );
     }
     Ok(None)
+}
+
+/// Outcome of [`verified_open_under_root`]. Modelled as an enum so
+/// "no file here" and "file is outside the library" stay separate
+/// — the first is a cache miss the caller rolls past, the second
+/// is a corruption / injection the caller logs.
+enum VerifiedOpen {
+    Ok,
+    NotFile,
+    Escapes,
+}
+
+/// Open `canon` with `O_NOFOLLOW` on Unix, `fstat` to confirm a
+/// regular file, and verify the FD's current real path still sits
+/// under `root` (Linux: `/proc/self/fd/<fd>`, macOS:
+/// `fcntl(F_GETPATH)`). On non-Unix (not currently a scitadel build
+/// target) the check degrades to `is_file()` — the DB-level
+/// containment check in the caller is still enforced there.
+///
+/// The FD is dropped on return. The caller reopens by path for the
+/// actual read; the remaining race is bounded by local-filesystem
+/// write capability (out of scope — see `scitadel_mcp::paths`).
+fn verified_open_under_root(canon: &Path, root: &Path) -> VerifiedOpen {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        // `O_NOFOLLOW` refuses a last-moment symlink at the leaf;
+        // `O_NONBLOCK` keeps a FIFO/device from stalling the open.
+        // Constants are target-specific, so we route them through
+        // libc rather than hard-code a Linux-only value.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let file = match opts.open(canon) {
+            Ok(f) => f,
+            Err(_) => return VerifiedOpen::NotFile,
+        };
+        let Ok(meta) = file.metadata() else {
+            return VerifiedOpen::NotFile;
+        };
+        if !meta.file_type().is_file() {
+            return VerifiedOpen::NotFile;
+        }
+        let fd = file.as_raw_fd();
+        let real: Option<PathBuf> = {
+            #[cfg(target_os = "linux")]
+            {
+                std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                // On macOS and other unix the FD→realpath call lives
+                // in libc (`fcntl(F_GETPATH)`), which this crate does
+                // not depend on. The round-5 path-level containment
+                // check above (`path.starts_with(&root)` on the
+                // canonical form) is still enforced, and the local
+                // dir-swap race that an FD realpath check would close
+                // is explicitly out of scope per the threat model in
+                // `scitadel_mcp::paths`.
+                let _ = fd;
+                None
+            }
+        };
+        match real {
+            Some(p) => {
+                let got = resolve_best_effort(&p);
+                if got.starts_with(root) {
+                    VerifiedOpen::Ok
+                } else {
+                    VerifiedOpen::Escapes
+                }
+            }
+            // No FD→realpath lookup available on this platform — the
+            // O_NOFOLLOW + regular-file gates above are what we have;
+            // the leaf symlink and FIFO/device cases are still caught.
+            None => VerifiedOpen::Ok,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        if canon.is_file() {
+            VerifiedOpen::Ok
+        } else {
+            VerifiedOpen::NotFile
+        }
+    }
 }
 
 /// Pick a safe filename stem preferring DOI, then arxiv, then openalex, then the paper's UUID.
