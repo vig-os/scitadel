@@ -15,9 +15,28 @@ use scitadel_core::ports::{
 use scitadel_db::sqlite::Database;
 use scitadel_scoring::{SCORING_SYSTEM_PROMPT, build_user_prompt};
 
+/// Open the MCP-side DB handle. Resolves the project root through
+/// the strict `scitadel_core::project::project_root` first — so no
+/// DB tool ever triggers `Database::open`'s `create_dir_all` on a
+/// marker-less launch directory (round-4 root cause: two independent
+/// notions of "the project" — the pre-fix `load_config` picked a dir
+/// from git or cwd and the first DB call created the marker there,
+/// which the MCP path rule then accepted as the confinement root).
+///
+/// Every DB tool therefore fails closed with the resolver's error
+/// when the server was started outside a scitadel project; the path
+/// tools fail the same way via [`crate::paths::workspace_root`]. The
+/// MCP server starts in both cases — DB and path tools just return a
+/// clear "no marker; run `scitadel init`" error until the user sets
+/// one up, which preserves the README's documented user-scope
+/// install (Claude Code connects from any dir and the server stays
+/// alive, instead of refusing to start and leaving the integration
+/// looking broken).
 fn open_db() -> Result<Database, String> {
-    let config = load_config();
-    let db = Database::open(&config.db_path).map_err(|e| e.to_string())?;
+    use scitadel_core::project;
+    let root = project::project_root().map_err(|e| e.to_string())?;
+    let db_path = project::project_db_path(&root);
+    let db = Database::open(&db_path).map_err(|e| e.to_string())?;
     db.migrate().map_err(|e| e.to_string())?;
     Ok(db)
 }
@@ -591,7 +610,13 @@ pub async fn download_paper_tool(
     doi: Option<&str>,
 ) -> Result<String, String> {
     let config = load_config();
-    let out_dir = config.papers_dir();
+    // Papers live under the project marker, not under load_config's
+    // cwd fallback — the MCP server must not write into the launch
+    // dir if no marker is found (#266 round 4). `project_root`
+    // returns the strict, marker-only root; its error surfaces as
+    // the tool refusal.
+    let root = scitadel_core::project::project_root().map_err(|e| e.to_string())?;
+    let out_dir = root.join(crate::paths::PROJECT_MARKER).join("papers");
 
     // One database for both halves of ADR-007 S1: the SQLite pacing ledger
     // the downloader spends from, and the rows the completed download is
@@ -2450,6 +2475,10 @@ pub async fn acquire_tool(
     limit: Option<u32>,
 ) -> Result<String, String> {
     let config = load_config();
+    // Same project-rooted papers dir as `download_paper_tool` — never
+    // the cwd fallback that `load_config` keeps for the CLI.
+    let root = scitadel_core::project::project_root().map_err(|e| e.to_string())?;
+    let out_dir = root.join(crate::paths::PROJECT_MARKER).join("papers");
     // One database for both halves of ADR-007: the pacing ledger the
     // downloader spends from, and the rows a completed download is written
     // into. Same reason as `download_paper_tool`.
@@ -2464,7 +2493,7 @@ pub async fn acquire_tool(
         resume: resume.unwrap_or(false),
         dry_run: dry_run.unwrap_or(false),
     };
-    acquire_with(&db, &downloader, &config.papers_dir(), &request).await
+    acquire_with(&db, &downloader, &out_dir, &request).await
 }
 
 /// [`acquire_tool`] over a caller-supplied downloader and destination.

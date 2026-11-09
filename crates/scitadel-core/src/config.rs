@@ -255,7 +255,7 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Self {
-        let workspace = find_workspace_root().unwrap_or_else(|| std::env::current_dir().unwrap());
+        let workspace = cli_workspace_root();
         Self {
             db_path: default_db_path(&workspace),
             default_sources: default_sources(),
@@ -272,23 +272,26 @@ impl Default for Config {
     }
 }
 
-/// Find the workspace root by looking for a git repo from cwd upward.
-fn find_workspace_root() -> Option<PathBuf> {
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .ok()?;
-    if output.status.success() {
-        let path = String::from_utf8(output.stdout).ok()?;
-        Some(PathBuf::from(path.trim()))
-    } else {
-        None
+/// Pick a workspace for the CLI. The strict project resolver in
+/// `crate::project` is the single source of truth — but the CLI
+/// needs to run `scitadel init` *before* the marker exists, so a
+/// marker-less dir falls back to the process cwd here (the MCP
+/// server uses `project::project_root` directly and fails closed
+/// in the same case; see #266).
+///
+/// The pre-fix code shelled out to `git rev-parse --show-toplevel`
+/// here, which let `GIT_WORK_TREE=/etc` steer the workspace. We
+/// never trust git env vars.
+fn cli_workspace_root() -> PathBuf {
+    match crate::project::project_root() {
+        Ok(p) => p,
+        Err(_) => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     }
 }
 
 /// Resolve the default database path.
 ///
-/// Priority: `SCITADEL_DB` env var > workspace `.scitadel/scitadel.db` > cwd.
+/// Priority: `SCITADEL_DB` env var > workspace `.scitadel/scitadel.db`.
 fn default_db_path(workspace: &Path) -> PathBuf {
     if let Ok(db) = std::env::var("SCITADEL_DB") {
         let expanded = if db.starts_with('~') {
@@ -302,7 +305,7 @@ fn default_db_path(workspace: &Path) -> PathBuf {
         };
         return PathBuf::from(expanded);
     }
-    workspace.join(".scitadel").join("scitadel.db")
+    crate::project::project_db_path(workspace)
 }
 
 /// Load configuration from keychain, environment variables, and optional TOML file.
@@ -311,7 +314,7 @@ fn default_db_path(workspace: &Path) -> PathBuf {
 pub fn load_config() -> Config {
     use crate::credentials::resolve;
 
-    let workspace = find_workspace_root().unwrap_or_else(|| std::env::current_dir().unwrap());
+    let workspace = cli_workspace_root();
     let db_path = default_db_path(&workspace);
 
     // Try loading TOML config file as base

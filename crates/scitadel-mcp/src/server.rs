@@ -1504,11 +1504,7 @@ mod tests {
         // parallel test taking the lock next can't disturb us.
         let (id, mut rx) = {
             let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-            let tmp = tempfile::tempdir().unwrap();
-            let db_path = tmp.path().join("test.db");
-            unsafe {
-                std::env::set_var("SCITADEL_DB", &db_path);
-            }
+            let (_tmp, db_path) = seed_env_db();
 
             let db = scitadel_db::sqlite::Database::open(&db_path).unwrap();
             db.migrate().unwrap();
@@ -1553,13 +1549,9 @@ mod tests {
         // create_annotation e2e test above — sync setup + write
         // happen under the lock, the .await is on an already-
         // populated broadcast channel.
-        let (id, mut rx, db) = {
+        let (id, mut rx, db, _tmp) = {
             let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-            let tmp = tempfile::tempdir().unwrap();
-            let db_path = tmp.path().join("test.db");
-            unsafe {
-                std::env::set_var("SCITADEL_DB", &db_path);
-            }
+            let (tmp, db_path) = seed_env_db();
             let db = scitadel_db::sqlite::Database::open(&db_path).unwrap();
             db.migrate().unwrap();
             let mut p = scitadel_core::models::Paper::new("paper-note-target");
@@ -1577,7 +1569,7 @@ mod tests {
             let id = server
                 .create_paper_note(rmcp::handler::server::wrapper::Parameters(req))
                 .expect("create_paper_note succeeds");
-            (id, rx, db)
+            (id, rx, db, tmp)
         };
 
         let event = rx.recv().await.expect("event arrives");
@@ -1604,11 +1596,7 @@ mod tests {
         // synchronously, so holding the guard is benign in practice.
         #[allow(clippy::await_holding_lock)]
         let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("test.db");
-        unsafe {
-            std::env::set_var("SCITADEL_DB", &db_path);
-        }
+        let (_tmp, db_path) = seed_env_db();
         let db = scitadel_db::sqlite::Database::open(&db_path).unwrap();
         db.migrate().unwrap();
 
@@ -1765,15 +1753,25 @@ mod tests {
     // ambiguous prefix, and no-such-id.
     // ------------------------------------------------------------------
 
-    /// Seed the SCITADEL_DB env var to a fresh tempdir file so
-    /// `tools::open_db()` picks it up. Returns `(tmpdir, db_path)` —
-    /// the caller keeps `tmpdir` alive for the duration of the test.
-    /// **Caller must hold the ENV_LOCK.**
+    /// Seed a scitadel project in a fresh tempdir and set
+    /// `SCITADEL_WORKSPACE` so `tools::open_db()` resolves the
+    /// project root to it (round-4: MCP never creates `.scitadel`;
+    /// the test now has to seed the marker itself). Returns
+    /// `(tmpdir, db_path)` — the caller keeps `tmpdir` alive for
+    /// the duration of the test. **Caller must hold the ENV_LOCK.**
     fn seed_env_db() -> (tempfile::TempDir, std::path::PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("test.db");
+        let root = tmp.path().canonicalize().unwrap();
+        // The marker IS the project.
+        std::fs::create_dir(root.join(crate::paths::PROJECT_MARKER)).unwrap();
+        let db_path = root.join(crate::paths::PROJECT_MARKER).join("scitadel.db");
         unsafe {
-            std::env::set_var("SCITADEL_DB", &db_path);
+            std::env::set_var("SCITADEL_WORKSPACE", &root);
+            // Clear any leaking SCITADEL_DB from another test —
+            // MCP tools derive the DB path from the project root,
+            // and the test's assumption that `db_path` is the DB
+            // depends on SCITADEL_DB NOT overriding it here.
+            std::env::remove_var("SCITADEL_DB");
         }
         // Force migrations to run before anything else touches the DB.
         let db = scitadel_db::sqlite::Database::open(&db_path).unwrap();
