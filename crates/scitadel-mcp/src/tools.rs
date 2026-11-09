@@ -1589,18 +1589,22 @@ fn build_annotated_paper(
     // slices in stored-text coordinates, so `start`/`end` from the
     // anchor and `offset`/`window_end` here all refer to the same
     // text. Zero-length anchors (`start == end`) are a point in the
-    // document rather than a span: we count one as "inside" when it
-    // lands on the inclusive boundary [offset, window_end], which is
-    // what a caller walking a cursor expects. Annotations without a
-    // `char_range` are counted in their own bucket — they have no
-    // position to compare, so counting them alongside positioned
-    // anchors would hide them from a caller that re-fetches outside
-    // the current window.
+    // document rather than a span: they sit on the half-open window
+    // `[offset, window_end)` — same logic as a text editor's caret —
+    // with ONE exception. The final window reaches `window_end ==
+    // total_chars`; a point anchor at `total_chars` (the end of the
+    // document) belongs to that window rather than nowhere, so the
+    // end-of-document cursor is counted as inside there.
+    // Annotations without a `char_range` are counted in their own
+    // bucket — they have no position to compare, so counting them
+    // alongside positioned anchors would hide them from a caller that
+    // re-fetches outside the current window.
     let window_end = offset.saturating_add(
         body_window
             .as_deref()
             .map_or(0, |body| body.chars().count()),
     );
+    let is_final_window = window_end >= total_chars;
     let mut out_of_window: Vec<serde_json::Value> = Vec::new();
     let mut without_range: Vec<serde_json::Value> = Vec::new();
     for a in &entries {
@@ -1621,11 +1625,16 @@ fn build_annotated_paper(
             Some((start, end)) => {
                 let overlaps = if start == end {
                     // A zero-length anchor is a cursor-shaped marker
-                    // between two characters, not a span. It is "in"
-                    // the window when the cursor sits on the
-                    // half-open window `[offset, window_end)` — same
-                    // logic as a text editor's caret.
-                    start >= offset && start < window_end
+                    // between two characters, not a span. It sits on
+                    // the half-open window `[offset, window_end)` —
+                    // same logic as a text editor's caret — except
+                    // for the end-of-document cursor on the final
+                    // window: `start == total_chars` is reported
+                    // outside every half-open window otherwise, so
+                    // the final window admits its upper bound as
+                    // inclusive for the end-of-document point.
+                    start >= offset
+                        && (start < window_end || (is_final_window && start == window_end))
                 } else {
                     start < window_end && end > offset
                 };
@@ -3050,6 +3059,58 @@ mod tests {
         assert_eq!(
             v["annotations_outside_window"], 0,
             "zero-length anchor at offset is inside the window: {v}"
+        );
+    }
+
+    /// A zero-length anchor at the very end of the document
+    /// (`start == end == total_chars`) sits on no half-open window
+    /// `[offset, window_end)` by construction — every window has
+    /// `window_end <= total_chars`, so a naive half-open check
+    /// reports the end-of-document cursor as outside every window.
+    /// The final window (the one that reaches `total_chars`) admits
+    /// its upper bound as inclusive for a point anchor, so the
+    /// cursor at EOF is inside there. (#307 review nit.)
+    #[test]
+    fn get_annotated_paper_zero_length_anchor_at_eof_is_inside_final_window() {
+        let db = fresh_db();
+        let total = 100;
+        let pid = save_paper(&db, "p-zl-eof", "ZL EOF", Some(&"x".repeat(total)));
+        let repo = SqliteAnnotationRepository::new(db.clone());
+        let ann = Annotation::new_root(
+            pid,
+            "lars".into(),
+            "end-of-document cursor".into(),
+            Anchor {
+                char_range: Some((total, total)),
+                quote: Some(String::new()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&ann).unwrap();
+
+        // Final window `[60, 100]`: the cursor at 100 is the document
+        // end, and the final window admits its upper bound.
+        let final_window: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-zl-eof", 40, 60).unwrap()).unwrap();
+        assert_eq!(
+            final_window["annotations_outside_window"], 0,
+            "end-of-document point anchor is inside the final window: \
+             {final_window}"
+        );
+        assert_eq!(
+            final_window["total_chars"].as_u64().unwrap() as usize,
+            total,
+            "sanity: the final window reaches total_chars"
+        );
+
+        // A non-final window `[0, 40)`: the EOF cursor at 100 is
+        // genuinely outside — reported, not silently dropped.
+        let first_window: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-zl-eof", 40, 0).unwrap()).unwrap();
+        assert_eq!(
+            first_window["annotations_outside_window"], 1,
+            "an EOF point anchor is outside a non-final window: \
+             {first_window}"
         );
     }
 
