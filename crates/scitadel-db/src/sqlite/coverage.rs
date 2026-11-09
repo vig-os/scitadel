@@ -177,7 +177,9 @@ pub const ALL_STATUSES: [StatusVocab; 14] = [
     StatusVocab {
         status: "too_large",
         meaning: "a route served a body over ADR-007 §1's per-kind cap (#288)",
-        action: Some("fetch manually and import, or raise the body cap and re-acquire by id"),
+        action: Some(
+            "raise acquire.body_cap_bytes, then re-acquire by id or fetch manually and import",
+        ),
         goes_to: "the human list",
     },
     StatusVocab {
@@ -2305,9 +2307,14 @@ mod tests {
     }
 
     /// #288: a `too_large` row lands in `action_list` as its own group under
-    /// its own human action ("fetch manually and import, or raise the body
-    /// cap and re-acquire by id"), separate from the deferred `unavailable`
-    /// bucket. The whole point of the migration 015 split.
+    /// its own human action ("raise acquire.body_cap_bytes, then re-acquire
+    /// by id or fetch manually and import"), separate from the deferred
+    /// `unavailable` bucket. The whole point of the migration 015 split.
+    ///
+    /// The revised wording groups the cap-raise step first because *both*
+    /// escape hatches need it: scan and attach now read the same
+    /// `cap_for_kind_with_override` the ladder reads, so a manual import of
+    /// an oversized fulltext only lands if the operator raised the cap too.
     #[test]
     fn a_too_large_row_lands_in_its_own_action_group() {
         let (_dir, db) = open();
@@ -2330,7 +2337,7 @@ mod tests {
         assert_eq!(group.status, "too_large");
         assert_eq!(
             group.action,
-            "fetch manually and import, or raise the body cap and re-acquire by id",
+            "raise acquire.body_cap_bytes, then re-acquire by id or fetch manually and import",
         );
         assert_eq!(group.entries.len(), 1);
 

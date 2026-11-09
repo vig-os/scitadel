@@ -2509,8 +2509,15 @@ fn resolve_paper(
 /// `scitadel scan --paper <id> [--root <dir>] [--dry-run] [--json]`.
 pub fn scan(paper: &str, root: Option<&std::path::Path>, dry_run: bool, json: bool) -> Result<()> {
     let (db, paper_row) = resolve_paper(paper)?;
+    // One source of truth for the fetch-body cap (#288): `scan` reads the
+    // same `config.acquire.body_cap_bytes` the ladder reads, so an operator
+    // who raised the cap for a named re-acquire can also drop the file in
+    // and `scan` admits the same bytes.
+    let options = scitadel_adapters::scan::ScanOptions::from_body_cap_override(
+        load_config().acquire.body_cap_bytes,
+    );
     if dry_run {
-        let report = scitadel_adapters::scan::plan(&db, &paper_row, root)
+        let report = scitadel_adapters::scan::plan(&db, &paper_row, root, options)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         if json {
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -2519,8 +2526,8 @@ pub fn scan(paper: &str, root: Option<&std::path::Path>, dry_run: bool, json: bo
         }
         return Ok(());
     }
-    let report =
-        scitadel_adapters::scan::scan(&db, &paper_row, root).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let report = scitadel_adapters::scan::scan(&db, &paper_row, root, options)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -2539,8 +2546,12 @@ pub fn attach(
     json: bool,
 ) -> Result<()> {
     let (db, paper_row) = resolve_paper(paper)?;
-    let report = scitadel_adapters::scan::attach(&db, &paper_row, file, kind, label, locator)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let options = scitadel_adapters::scan::ScanOptions::from_body_cap_override(
+        load_config().acquire.body_cap_bytes,
+    );
+    let report =
+        scitadel_adapters::scan::attach(&db, &paper_row, file, kind, label, locator, options)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
     // A refusal is a non-zero exit **in both output modes**. Returning 0 with
     // `"refused_because": "bad_magic"` on stdout would put back exactly the silent
     // failure ADR-007 §1 measured: a landing page saved as an SI, in a script that

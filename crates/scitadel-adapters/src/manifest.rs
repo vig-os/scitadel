@@ -651,7 +651,13 @@ mod tests {
         let plan = crate::acquire::plan(db, &crate::acquire::AcquireRequest::queue())
             .expect("acquire plan");
         let artefacts = db.artefacts_for_paper("p-1").expect("artefacts");
-        let scan = crate::scan::plan(db, &paper_of(db), Some(&work_dir(db))).expect("scan plan");
+        let scan = crate::scan::plan(
+            db,
+            &paper_of(db),
+            Some(&work_dir(db)),
+            crate::scan::ScanOptions::default(),
+        )
+        .expect("scan plan");
         vec![
             Derived(format!("missing={:?}", report.missing_total())),
             Derived(format!("entries={:?}", report.entries)),
@@ -832,7 +838,13 @@ mod tests {
             .unwrap();
         let before_blobs = count_files(&fx.root().join(scitadel_db::sqlite::BLOB_DIR));
 
-        let plan = crate::scan::plan(&fx.db, &paper_of(&fx.db), Some(&dir)).expect("planned");
+        let plan = crate::scan::plan(
+            &fx.db,
+            &paper_of(&fx.db),
+            Some(&dir),
+            crate::scan::ScanOptions::default(),
+        )
+        .expect("planned");
         assert_eq!(plan.files.len(), 1, "the plan saw the file");
         assert!(
             plan.manifest.is_none(),

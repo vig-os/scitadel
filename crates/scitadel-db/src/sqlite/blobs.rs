@@ -60,6 +60,45 @@ pub fn cap_for_kind(kind: &str) -> Option<i64> {
     })
 }
 
+/// The cap that applies to an `artefacts.kind`, with the operator's fetch-body
+/// override honoured (#288).
+///
+/// The override — `config.acquire.body_cap_bytes` /
+/// `SCITADEL_ACQUIRE_BODY_CAP_BYTES` — replaces the **fulltext** row of ADR-007
+/// §1's cap table (`fulltext_pdf` / `fulltext_html` / `fulltext_xml`), the one
+/// `scitadel_adapters::download::FETCH_BODY_CAP_BYTES` re-exports and the one
+/// the ladder's current routes actually hit. SI, figure and table caps are left
+/// on their own rows:
+///
+/// - Scope matches the knob's name: it is spelled *the fetch body cap*, and the
+///   fetch body the ladder streams is a fulltext. Scaling every row out of one
+///   knob would silently relax a 20 MB figure cap by a factor of five the first
+///   time an operator raises the fulltext cap for a 500 MB PDF.
+/// - The design of [`cap_for_kind`] is deliberately per-kind. The override
+///   edits one row of that table and leaves the others as ADR-007 §1 writes
+///   them, so a 300 MB supplementary workbook still cannot be filed as a
+///   `figure` even on a raised fulltext cap.
+///
+/// Scan/attach pass the operator's `body_cap_bytes` through this function so a
+/// manual import of an oversized fulltext is accepted iff the configured fetch
+/// path would accept the same bytes — closing the "fetch and scan diverge when
+/// the override is set" gap (#288). When `body_cap_bytes` is `None`, the result
+/// is identical to [`cap_for_kind`].
+#[must_use]
+pub fn cap_for_kind_with_override(kind: &str, body_cap_bytes: Option<u64>) -> Option<i64> {
+    match (kind, body_cap_bytes) {
+        ("fulltext_pdf" | "fulltext_html" | "fulltext_xml", Some(cap)) => {
+            // `u64 -> i64`: an override above `i64::MAX` bytes is nine
+            // exabytes; clamping down to `i64::MAX` leaves the cap effectively
+            // unbounded without a surprising wrap. The config loader rejects
+            // sub-floor values (#288) before we get here, so we only have to
+            // reason about the upper edge.
+            Some(i64::try_from(cap).unwrap_or(i64::MAX))
+        }
+        _ => cap_for_kind(kind),
+    }
+}
+
 /// The library root: the absolute parent directory of the DB file.
 /// `None` for an in-memory database, whose `PRAGMA database_list` file
 /// is the empty string — such a DB gets no blobs (ADR-007 §1
@@ -310,6 +349,61 @@ mod tests {
         // margin — and no other kind borrows it.
         assert!(cap_for_kind("si") > cap_for_kind("figure"));
         assert_eq!(cap_for_kind("nonsense"), None);
+    }
+
+    /// #288: the override replaces the fulltext row of ADR-007 §1's cap table,
+    /// and only that row. A `None` override is a verbatim [`cap_for_kind`].
+    #[test]
+    fn the_override_replaces_the_fulltext_row_and_only_that_row() {
+        // `None` — unchanged behaviour.
+        for kind in [
+            "fulltext_pdf",
+            "fulltext_html",
+            "fulltext_xml",
+            "si",
+            "figure",
+            "table",
+            "nonsense",
+        ] {
+            assert_eq!(cap_for_kind_with_override(kind, None), cap_for_kind(kind));
+        }
+
+        // A raised override: fulltext goes up, the rest stay where ADR-007 §1
+        // writes them. Raising the fetch cap for a 500 MB PDF must not
+        // silently relax the 20 MB figure cap.
+        let raised = 500 * 1024 * 1024_u64;
+        assert_eq!(
+            cap_for_kind_with_override("fulltext_pdf", Some(raised)),
+            Some(raised as i64)
+        );
+        assert_eq!(
+            cap_for_kind_with_override("fulltext_html", Some(raised)),
+            Some(raised as i64)
+        );
+        assert_eq!(
+            cap_for_kind_with_override("fulltext_xml", Some(raised)),
+            Some(raised as i64)
+        );
+        assert_eq!(
+            cap_for_kind_with_override("si", Some(raised)),
+            Some(CAP_SI_BYTES)
+        );
+        assert_eq!(
+            cap_for_kind_with_override("figure", Some(raised)),
+            Some(CAP_FIGURE_BYTES)
+        );
+        assert_eq!(
+            cap_for_kind_with_override("table", Some(raised)),
+            Some(CAP_FIGURE_BYTES)
+        );
+        assert_eq!(cap_for_kind_with_override("nonsense", Some(raised)), None);
+
+        // A pathological above-i64 override clamps instead of wrapping — the
+        // config loader's floor guards the lower edge; this guards the upper.
+        assert_eq!(
+            cap_for_kind_with_override("fulltext_pdf", Some(u64::MAX)),
+            Some(i64::MAX)
+        );
     }
 
     #[test]

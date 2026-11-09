@@ -2385,10 +2385,10 @@ impl LegOutcome {
     /// attempted leg closed the door, by them or by us". Which door is
     /// recorded on `acquisition_state.status` (migration 015, #288): a cap
     /// refusal lands `too_large` so `action_list` can group it under its own
-    /// human action — fetch manually and import, or raise the body cap and
-    /// re-acquire the work by id — while a straight server refusal lands
-    /// `unavailable`. `scitadel action_list` reads that `status`, which is
-    /// why it is a column and not a free-text reason.
+    /// human action — raise `acquire.body_cap_bytes`, then re-acquire the
+    /// work by id or fetch manually and import — while a straight server
+    /// refusal lands `unavailable`. `scitadel action_list` reads that
+    /// `status`, which is why it is a column and not a free-text reason.
     ///
     /// Replaces the narrower `was_refused` predicate, which only read the
     /// publisher's side of the refusal and let a cap-refused route fall
