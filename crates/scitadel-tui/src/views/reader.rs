@@ -1254,4 +1254,82 @@ mod tests {
              new wrapped max: was {narrow_max}, now {scroll}",
         );
     }
+
+    /// Resize re-clamps the stored scroll when the **wrap** changes —
+    /// i.e. when pane WIDTH changes on a single long paragraph (the
+    /// 40 kB zero-`\n` shape from #307), not just when pane HEIGHT
+    /// changes on a line-separated body. A wider pane fits more
+    /// characters per row, so the wrapped row count drops and the
+    /// `G`-sentinel offset must drop with it. (#307 review nit.)
+    #[test]
+    fn resize_wider_reclamps_scroll_on_a_wrapping_paragraph() {
+        // A single long paragraph: no `\n`, so the whole body wraps
+        // against the pane's inner width. 4 000 chars is plenty to
+        // outrun a 24-row viewport at any reasonable pane width.
+        let body: String = "word ".repeat(800);
+        let mut p = Paper::new("Wrap resize");
+        p.id = PaperId::from("p-wrap-resize");
+        p.r#abstract = UntrustedBody::publisher_supplied("abs");
+        p.full_text = Some(UntrustedBody::publisher_supplied(body));
+
+        let (_dir, data) = seed_paper(&p, &[]);
+
+        // Narrow terminal, same height as the wide one below so we
+        // isolate the width-driven wrap change from any height
+        // contribution. `G`'s `u16::MAX` sentinel clamps to the
+        // narrow-pane row max on the first draw.
+        let mut scroll = u16::MAX;
+        let mut pane_width = 0u16;
+        let mut terminal = Terminal::new(TestBackend::new(40, 24)).expect("narrow terminal");
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    frame.area(),
+                    &data,
+                    p.id.as_str(),
+                    None,
+                    "lars",
+                    &mut scroll,
+                    &mut pane_width,
+                );
+            })
+            .expect("narrow draw");
+        let narrow_max = scroll;
+        let narrow_pane_width = pane_width;
+        assert!(
+            narrow_max > 0 && narrow_max < u16::MAX,
+            "narrow draw clamps the sentinel to a real wrapped max: \
+             {narrow_max}",
+        );
+
+        // Wide terminal at the SAME height. Fewer wrap breaks per
+        // row means a smaller row count, and therefore a smaller
+        // max offset. The clamp rewrites `scroll` in place.
+        let mut terminal = Terminal::new(TestBackend::new(200, 24)).expect("wide terminal");
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    frame.area(),
+                    &data,
+                    p.id.as_str(),
+                    None,
+                    "lars",
+                    &mut scroll,
+                    &mut pane_width,
+                );
+            })
+            .expect("wide draw");
+        assert!(
+            pane_width > narrow_pane_width,
+            "sanity: the wide draw records a wider text pane \
+             ({pane_width} > {narrow_pane_width})",
+        );
+        assert!(
+            scroll < narrow_max,
+            "width-driven re-wrap re-clamps the stored scroll on a \
+             single wrapping paragraph: was {narrow_max}, now {scroll}",
+        );
+    }
 }
