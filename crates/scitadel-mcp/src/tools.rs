@@ -579,7 +579,9 @@ pub fn save_assessment_tool(
 
 /// Download a paper. If `paper_id` is provided, uses the full multi-source chain
 /// (arxiv → openalex → doi/Unpaywall → publisher) against the stored Paper record.
-/// Otherwise falls back to DOI-only.
+/// A `doi` resolves to a `papers` row first — reusing an existing row, an
+/// OpenAlex record, or a minimal one with the DOI as a placeholder — and then
+/// flows through the same recording ladder (#289).
 ///
 /// The destination is always the configured `papers_dir` and the filename is
 /// derived from the paper's own identifiers. No caller — including a
@@ -595,7 +597,7 @@ pub async fn download_paper_tool(
 
     // One database for both halves of ADR-007 S1: the SQLite pacing ledger
     // the downloader spends from, and the rows the completed download is
-    // dual-written into. Opening it here rather than per-branch is also
+    // written into. Opening it here rather than per-branch is also
     // what keeps the MCP process on the *same* budget as a TUI running
     // against the same library.
     let db = open_db()?;
@@ -610,12 +612,16 @@ pub async fn download_paper_tool(
             .await
             .map_err(|e| e.to_string())?
     } else if let Some(d) = doi {
-        // DOI-only: no `Paper`, so nothing is dual-written here — this is
-        // the one path that leaves the library untouched.
+        // #289: the DOI-only path now records. `download_by_doi` resolves the
+        // DOI to a `papers` row (or mints a minimal one) before fetching
+        // through the same ladder, so the library sees every byte we fetched.
+        let openalex =
+            scitadel_adapters::openalex::OpenAlexAdapter::new(config.openalex.auth(), 30.0);
         downloader
-            .download(d, &out_dir)
+            .download_by_doi(&openalex, d, &out_dir)
             .await
             .map_err(|e| e.to_string())?
+            .result
     } else {
         return Err("need either paper_id or doi".into());
     };
