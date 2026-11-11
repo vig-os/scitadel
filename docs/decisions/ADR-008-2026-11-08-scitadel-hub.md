@@ -666,7 +666,7 @@ could not settle:
 | T0 | Parse JATS / publisher HTML / USPTO XML | CPU | No structured source, or a QC flag |
 | T1 | Tool extraction: Grobid, Docling, Marker, math OCR | CPU + the 5090 (`gpu_submit`) | A QC flag, or two extractors disagree |
 | T2 | System One yes/no checks (Clef/Kev, #246): "is this table complete?", "is this the reading order?" | Clef hosted / Kev local | The answer is below the calibrated confidence |
-| T3 | A Qwen vision-language model compares the page image with the extraction and repairs it (model size to be decided) | sage | It cannot repair, or its confidence is low |
+| T3 | A Qwen vision-language model compares the page image with the extraction and repairs it. The model and size are picked by a golden-set bake-off (H7): the smallest that meets the extraction-QC target | the executor named by T3's **service definition** (below). The stage-0 default is the 5090 via `gpu_submit` (owner, 2026-11-11: throughput, and the page images are local), with an optional sage overflow for a model that doesn't fit in 32 GB | It cannot repair, or its confidence is low |
 | T4 | Opus (`claude-opus-5-5`) via the API gives the final verdict | external API | Fails → quarantine + a red fixture (§13) |
 
 **Guardrails:**
@@ -674,6 +674,28 @@ could not settle:
   and public-domain content (US patents) may reach it. Paywalled or
   unlicensed content stops at T3, which runs on our own hardware,
   unless its licence allows more.
+- **Every tier runs through a service definition, never through code
+  that names a host or a model** (owner, 2026-11-11). A service
+  definition is a versioned, content-hashed record in the hub's
+  service registry (config, not code). It names:
+  - the tier or job kind (T1–T4, embedding, figure description,
+    rerank, re-embedding);
+  - the executor (a `gpu_submit` queue on anvil, sage, the Opus API, a
+    CPU pool) with its limits (declared vram, max runtime, priority,
+    chunk size);
+  - the model (id, version or revision, quantization, weights hash) and
+    the runtime (e.g. vLLM version);
+  - its budget cap, its escalation target, and the licence classes it
+    may process (T4 is CC BY / CC0 / public domain only).
+
+  Every run records the hash of each service definition it used in the
+  run ledger, and every output row's provenance carries that hash. So
+  "which model on which machine produced this value" is answerable per
+  row, a re-derive can target "everything produced by definition X",
+  and moving a tier (e.g. T3 from the 5090 to sage) is a new definition
+  version, not a code change. The same registry backs the `capabilities`
+  response (§14) and the re-embedding window when an embedding model
+  changes.
 - **T3 and T4 have budget caps,** and work queues when a cap is reached;
   nothing is skipped silently.
 - **Every tier's verdict goes into provenance** (§11): model and
@@ -1418,7 +1440,7 @@ product. The only use that remains is the CC0
   branded release: `scitadel` registered at IGE Switzerland in
   Nice classes 9 + 42 after a TMview + IGE + USPTO + WIPO search
   ("Citadel" is crowded).
-- T3 (sage) and T4 (the Opus API) cost GPU time and money. Budget caps
+- T3 (stage-0 default: the 5090) and T4 (the Opus API) cost GPU time and money. Budget caps
   and queueing bound them; the random-sample QC sets a floor on that
   spend.
 - The golden set is a permanent asset to curate: its private half
@@ -1461,10 +1483,15 @@ product. The only use that remains is the CC0
    under CopA Art. 24d, and which publisher licences allow sharing
    among ETH members through a hub?
 8. **Retention:** keep the last 2 bases (default), or more?
-9. **T3 model:** which Qwen vision-language model size fits sage? sage's
-   specs are unverified.
-10. **T3/T4 budgets:** the daily caps for sage time and Opus API spend.
-11. **Rerank placement (§14):** on the hub's `gpu_submit` queue by
+9. **T3 model size:** T3's stage-0 service definition targets the
+   5090 (owner, 2026-11-11; §10 service definitions). The
+   golden-set bake-off picks the size among the ones that fit a 32 GB
+   card. Estimates: Qwen3-VL 8B at bf16/FP8 is ~12–20 GB, 30B-A3B at
+   int4 ~18–22 GB, 32B at int4 ~20–24 GB. Open: the bake-off result,
+   and whether sage is needed at all.
+10. **T3/T4 budgets:** the daily caps for 5090 GPU-hours (T3, shared
+    with T1, figure descriptions and embedding) and Opus API spend.
+11. **Rerank placement (§14)** (a service-definition default, §10): on the hub's `gpu_submit` queue by
     default (co-located, but shares the 5090 queue with inference
     and ingest), on sage (lower-contention GPU, one more hop), or
     either, chosen by cost and queue depth? The `reranked: false`
