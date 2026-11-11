@@ -725,8 +725,13 @@ results), each keyed by blake3 with its provenance. Re-extracting after
 a model or parser upgrade then starts from the stored OCR instead of
 re-running the GPU, and nothing depends on upstream availability (link
 rot, retractions, withdrawn snapshots). That is the same reason the
-GPU hours behind the corpus stay walled (decision 19). Kept is not
-served: PDFs are still never served (§12 client store model), and the
+GPU hours behind the corpus stay walled (decision 19). The kept
+originals also feed **image processing**:
+- page renders and region crops for the extraction-feedback loop (H12 #324): a report on a bad table or formula is shown against its source region and re-extracted from it;
+- image embeddings of figures and page regions (Qwen3-VL-Embedding);
+- re-running the vision tiers on demand.
+
+A crop shown to a reporting user is a derived image of a licence-clean page, gated like any other content. Kept is not served: PDFs are still never served (§12 client store model), and the
 intermediates are internal inputs, not products.
 
 | Raw input or output | Where it lives | Notes |
