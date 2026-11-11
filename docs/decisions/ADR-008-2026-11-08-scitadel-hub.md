@@ -717,17 +717,33 @@ and raw JATS/TEI/HTML live in a content-addressed artefact store:
 - `works` rows reference it by hash and source URL;
 - raw XML never goes into tessera products.
 
-**Raw retention is set by size and by the cost of fetching again:**
+**Raw retention: keep everything, raw inputs and cascade outputs**
+(owner decision, 2026-11-11, once the 20+ TB warm tier is available).
+Every raw input is kept, together with **every cascade tier's
+intermediate output** (T1 Marker/OCR, T2 math OCR, T3 VLM, T4
+results), each keyed by blake3 with its provenance. Re-extracting after
+a model or parser upgrade then starts from the stored OCR instead of
+re-running the GPU, and nothing depends on upstream availability (link
+rot, retractions, withdrawn snapshots). That is the same reason the
+GPU hours behind the corpus stay walled (decision 19). Kept is not
+served: PDFs are still never served (§12 client store model), and the
+intermediates are internal inputs, not products.
 
-| Raw input | Policy | Why |
+| Raw input or output | Where it lives | Notes |
 |---|---|---|
-| Open-access PDF | Delete after ingest. Keep blake3 + URL + fetch date; a re-fetch is verified against the hash. | Large (~1.5 MB), free to fetch again |
-| Paywalled, acquired PDF | Keep, in cold storage, as the version of record | Hard to obtain again |
-| JATS from PMC / Europe PMC bulk | Either way; default keep (small) | Free to fetch again |
-| TEI from the OpenAlex content API | Keep, zstd-compressed: ~40 GB raw, ~8–10 GB zstd for a 2M-paper subset *(estimate)* | $0.01 per fetch |
+| Open-access PDF | warm tier (g-fleet#1363), mirrored cold | blake3 + URL + fetch date as before; a re-fetch is no longer needed, but is still verified against the hash if it happens |
+| Paywalled, acquired PDF | warm, mirrored cold, as the version of record | licence-gated, disabled in phase 1 |
+| JATS / TEI / USPTO XML / bulk snapshots (e.g. SQLite) | warm, zstd-compressed, mirrored cold | TEI ≈ 8–10 GB zstd for a 2M-paper subset *(estimate)* |
+| Cascade outputs T1–T4 (OCR text, layout, math, VLM descriptions) | warm, mirrored cold | keyed by input hash + tool + model + version; the input to any re-derive |
 
-Keeping the XML lets us re-derive after extractor upgrades without
-paying again, and protects against upstream link rot and retractions.
+**Stage 0, before the warm tier exists:** raw inputs and cascade
+outputs are kept on the KC3000 within an explicit quota. When that
+quota is reached, ingest **pauses with an alert** rather than
+silently deleting; the operator either frees space or waits for the
+warm tier. The only class the operator may drop by hand is a
+re-fetchable OA PDF whose hash is recorded. Nothing is deleted
+automatically. The capacity model and quotas live in the hub's L2
+infrastructure doc (nerdmachines/scitadel-hub#4).
 
 **Licence classes, recorded per artefact (per-row column on every
 product):**
