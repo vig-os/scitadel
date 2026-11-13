@@ -81,7 +81,7 @@ use scitadel_core::untrusted::UntrustedText;
 use scitadel_db::sqlite::{
     ACCESS_BASIS_MANUAL, ArtefactWrite, AttemptWrite, BlobWrite, Database, FULLTEXT_LOCATOR,
     IdentityPhase, IdentitySource, StateWrite, VERSION_UNKNOWN, WriteMode, blob_rel_path,
-    cap_for_kind, fulltext_kind, hash_file, new_lease_owner, store_blob,
+    cap_for_kind_with_override, fulltext_kind, hash_file, new_lease_owner, store_blob,
 };
 use serde::Serialize;
 
@@ -122,6 +122,35 @@ pub const ATTACH_KINDS: [&str; 7] = [
     "table",
     "figure",
 ];
+
+/// Caller-tunable options for a scan/attach pass.
+///
+/// Today one knob — the fetch-body override (#288), so a drop-in fulltext is
+/// admitted iff a fetch of the same bytes would be. The option carries no
+/// other state because the override is the only thing that has to travel from
+/// `config.acquire.body_cap_bytes` to the per-kind cap decision; future scan
+/// knobs land here rather than growing another parameter.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScanOptions {
+    /// Override for the fetch-body cap (`config.acquire.body_cap_bytes`;
+    /// #288). `None` keeps every row of ADR-007 §1's cap table verbatim. A
+    /// `Some(bytes)` replaces the fulltext row only — see
+    /// [`scitadel_db::sqlite::cap_for_kind_with_override`] for the rationale
+    /// (the knob names *the fetch body* cap; SI and figure caps live on their
+    /// own rows).
+    pub body_cap_bytes: Option<u64>,
+}
+
+impl ScanOptions {
+    /// `ScanOptions` from a resolved `config.acquire.body_cap_bytes` — the
+    /// one place the config binding is spelled, mirroring
+    /// [`crate::download::PaperDownloader::with_body_cap_override`] so the
+    /// fetch path and `scan`/`attach` read the same knob.
+    #[must_use]
+    pub fn from_body_cap_override(body_cap_bytes: Option<u64>) -> Self {
+        Self { body_cap_bytes }
+    }
+}
 
 /// One artefact a `scan` / `attach` run decided something about.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -336,7 +365,12 @@ impl Drop for Claim {
 /// unreadable file becomes a flagged row and a refused path becomes a line in the
 /// report, so one bad file cannot abort a whole library.
 #[allow(clippy::too_many_lines)]
-pub fn scan(db: &Database, paper: &Paper, root: Option<&Path>) -> Result<ScanReport, ScanError> {
+pub fn scan(
+    db: &Database,
+    paper: &Paper,
+    root: Option<&Path>,
+    options: ScanOptions,
+) -> Result<ScanReport, ScanError> {
     let library_root = db.library_root()?.ok_or(ScanError::NoLibraryRoot)?;
     let paper_id = paper.id.as_str().to_string();
 
@@ -372,7 +406,7 @@ pub fn scan(db: &Database, paper: &Paper, root: Option<&Path>) -> Result<ScanRep
     // hashing a 250 MB supplement never blocks another process's write.
     let planned: Vec<Planned> = candidates
         .iter()
-        .map(|candidate| plan_one(db, &paper_id, candidate, &library_root, now))
+        .map(|candidate| plan_one(db, &paper_id, candidate, &library_root, now, options))
         .collect();
 
     // Phase 2 — one short transaction for the artefact rows, and only for the
@@ -456,7 +490,12 @@ pub fn scan(db: &Database, paper: &Paper, root: Option<&Path>) -> Result<ScanRep
 /// would record, so the plan is a faithful preview of the `attempts` table.
 ///
 /// Never takes a lease, so a plan works while another process is mid-fetch.
-pub fn plan(db: &Database, paper: &Paper, root: Option<&Path>) -> Result<ScanReport, ScanError> {
+pub fn plan(
+    db: &Database,
+    paper: &Paper,
+    root: Option<&Path>,
+    options: ScanOptions,
+) -> Result<ScanReport, ScanError> {
     let library_root = db.library_root()?.ok_or(ScanError::NoLibraryRoot)?;
     let paper_id = paper.id.as_str().to_string();
     let paper_dir = match root {
@@ -477,7 +516,7 @@ pub fn plan(db: &Database, paper: &Paper, root: Option<&Path>) -> Result<ScanRep
         if candidate.kind.starts_with("fulltext") {
             holds_fulltext = true;
         }
-        let (refused_because, detail) = preview(candidate);
+        let (refused_because, detail) = preview(candidate, options);
         if refused_because.is_none() {
             *counts.entry(candidate.kind.to_string()).or_insert(0) += 1;
         }
@@ -525,7 +564,10 @@ pub fn plan(db: &Database, paper: &Paper, root: Option<&Path>) -> Result<ScanRep
 /// The two refusals mirror the size and magic arms of [`plan_one`], and the "gone"
 /// arm is the one a plan can see and a report must say: the walk listed the file,
 /// so the plan says a real run would keep the row and flag it.
-fn preview(candidate: &import_flat::Candidate) -> (Option<String>, Option<String>) {
+fn preview(
+    candidate: &import_flat::Candidate,
+    options: ScanOptions,
+) -> (Option<String>, Option<String>) {
     let path = &candidate.path;
     let Ok(meta) = std::fs::metadata(path) else {
         return (
@@ -537,7 +579,7 @@ fn preview(candidate: &import_flat::Candidate) -> (Option<String>, Option<String
             ),
         );
     };
-    if let Some(cap) = cap_for_kind(candidate.kind)
+    if let Some(cap) = cap_for_kind_with_override(candidate.kind, options.body_cap_bytes)
         && meta.len() as i64 > cap
     {
         return (
@@ -584,6 +626,7 @@ pub fn attach(
     kind: &str,
     label: Option<&str>,
     locator: Option<&str>,
+    options: ScanOptions,
 ) -> Result<AttachReport, ScanError> {
     let library_root = db.library_root()?.ok_or(ScanError::NoLibraryRoot)?;
     let paper_id = paper.id.as_str().to_string();
@@ -637,7 +680,7 @@ pub fn attach(
         caption: None,
     };
     let now = Utc::now();
-    let planned = plan_one(db, &paper_id, &candidate, &library_root, now);
+    let planned = plan_one(db, &paper_id, &candidate, &library_root, now, options);
     let mut outcome = planned.outcome();
 
     // One short transaction, exactly as `scan` does.
@@ -741,6 +784,7 @@ fn plan_one(
     candidate: &import_flat::Candidate,
     library_root: &Path,
     now: DateTime<Utc>,
+    options: ScanOptions,
 ) -> Planned {
     let want_kind = want_kind_for(candidate.kind);
     let full_text = candidate.slot == import_flat::Slot::FullText;
@@ -815,7 +859,7 @@ fn plan_one(
             return planned;
         }
     };
-    if let Some(cap) = cap_for_kind(candidate.kind)
+    if let Some(cap) = cap_for_kind_with_override(candidate.kind, options.body_cap_bytes)
         && bytes > cap
     {
         let reason = format!(
@@ -1414,8 +1458,12 @@ mod tests {
         }
 
         fn scan(&self) -> ScanReport {
+            self.scan_with(ScanOptions::default())
+        }
+
+        fn scan_with(&self, options: ScanOptions) -> ScanReport {
             let dir = self.work_dir();
-            scan(&self.db, &self.paper, Some(&dir)).expect("scan runs")
+            scan(&self.db, &self.paper, Some(&dir), options).expect("scan runs")
         }
 
         /// `(kind, locator, route, access_status, missing_on_disk, sha256?)`.
@@ -1756,6 +1804,125 @@ mod tests {
         assert_eq!(fx.attempts()[0].2, "too_large");
     }
 
+    /// #288: a raised `config.acquire.body_cap_bytes` admits an oversized
+    /// fulltext drop-in, so the fetch path and the drop-in path agree about
+    /// what the cap is in every configuration — the one source of truth the
+    /// config doc claims.
+    ///
+    /// The scenario mirrors the action-list guidance "raise
+    /// acquire.body_cap_bytes, then re-acquire by id or fetch manually and
+    /// import": an operator raises
+    /// the cap, the ladder would admit the body, and the manual-import path
+    /// must admit the same bytes for `attach`'s advice to be honest.
+    #[test]
+    fn a_raised_body_cap_override_admits_an_oversized_fulltext_scan_and_attach() {
+        use scitadel_db::sqlite::CAP_FULLTEXT_BYTES;
+
+        // A PDF that is one byte over the default fulltext cap, but under a
+        // raised override. `set_len` makes a sparse file, so this costs no
+        // real disk.
+        let over_default = (CAP_FULLTEXT_BYTES + 1) as u64;
+        let raised = over_default + 1024;
+
+        // ---- scan ----
+        let scan_fx = Fx::new();
+        let scan_path = scan_fx.drop("fulltext.pdf", b"%PDF-1.7\n");
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&scan_path)
+            .unwrap();
+        file.set_len(over_default).unwrap();
+        drop(file);
+
+        // Default options: the stock cap refuses, as the existing
+        // `a_file_over_its_cap_is_refused_as_too_large` test pins for a figure.
+        let refused = scan_fx.scan();
+        assert_eq!(
+            refused.files[0].refused_because.as_deref(),
+            Some("too_large"),
+            "sanity: the default cap refuses an oversized fulltext"
+        );
+        assert!(scan_fx.artefacts().is_empty());
+
+        // Raised override: the same bytes are admitted. This is the one
+        // behaviour the config doc's "fetch path and `scan` can never drift"
+        // claim depends on — and the behaviour the action-list guidance needs
+        // to be honest.
+        let admitted = scan_fx.scan_with(ScanOptions::from_body_cap_override(Some(raised)));
+        assert_eq!(
+            admitted.files[0].refused_because, None,
+            "the raised override admits the bytes scan would refuse by default: {:?}",
+            admitted.files[0].detail
+        );
+        assert_eq!(
+            scan_fx.artefacts(),
+            vec!["fulltext_pdf||manual|full_text|0|true"],
+            "and the artefact is filed as a fulltext_pdf"
+        );
+        assert_eq!(scan_fx.blob_count(), 1, "and the bytes reach the store");
+
+        // ---- attach ----
+        let attach_fx = Fx::new();
+        let attach_path = attach_fx.drop("dropped.pdf", b"%PDF-1.7\n");
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&attach_path)
+            .unwrap();
+        file.set_len(over_default).unwrap();
+        drop(file);
+
+        // Default options refuse.
+        let refused = attach(
+            &attach_fx.db,
+            &attach_fx.paper,
+            &attach_path,
+            "fulltext_pdf",
+            None,
+            None,
+            ScanOptions::default(),
+        )
+        .expect("attach runs; a refusal is in the report");
+        assert_eq!(
+            refused.file.refused_because.as_deref(),
+            Some("too_large"),
+            "sanity: the default cap refuses the oversized bytes on attach too"
+        );
+        assert!(attach_fx.artefacts().is_empty());
+
+        // Raised override admits them.
+        let admitted = attach(
+            &attach_fx.db,
+            &attach_fx.paper,
+            &attach_path,
+            "fulltext_pdf",
+            None,
+            None,
+            ScanOptions::from_body_cap_override(Some(raised)),
+        )
+        .expect("admitted on a raised cap");
+        assert_eq!(
+            admitted.file.refused_because, None,
+            "the attach path reads the same cap as scan and the fetch path: {:?}",
+            admitted.file.detail
+        );
+        assert_eq!(
+            attach_fx.artefacts(),
+            vec!["fulltext_pdf||manual|full_text|0|true"],
+            "and the artefact is filed"
+        );
+
+        // The one-source-of-truth test: the fetch path's constant is still
+        // the same number scan reads by default (`None` override). Tested
+        // elsewhere, pinned here to keep the two bindings together in a
+        // review.
+        assert_eq!(
+            scitadel_db::sqlite::cap_for_kind_with_override("fulltext_pdf", None),
+            scitadel_db::sqlite::cap_for_kind("fulltext_pdf"),
+            "scan's default is cap_for_kind('fulltext_pdf'), which is the \
+             fetch path's FETCH_BODY_CAP_BYTES"
+        );
+    }
+
     /// A dropped-in file that is another work's is not filed, and saying so is
     /// one `override-identity` away from being filed.
     #[test]
@@ -1802,8 +1969,16 @@ mod tests {
         let fx = Fx::new();
         let html = fx.drop("dropped.html", LANDING_PAGE);
 
-        let err = attach(&fx.db, &fx.paper, &html, "fulltext_pdf", None, None)
-            .expect_err("refused by name");
+        let err = attach(
+            &fx.db,
+            &fx.paper,
+            &html,
+            "fulltext_pdf",
+            None,
+            None,
+            ScanOptions::default(),
+        )
+        .expect_err("refused by name");
         let message = err.to_string();
         assert!(message.contains("fulltext_pdf"), "{message}");
         assert!(
@@ -1813,7 +1988,16 @@ mod tests {
         assert!(fx.artefacts().is_empty());
 
         // The honest spelling files it.
-        let ok = attach(&fx.db, &fx.paper, &html, "fulltext", None, None).expect("filed");
+        let ok = attach(
+            &fx.db,
+            &fx.paper,
+            &html,
+            "fulltext",
+            None,
+            None,
+            ScanOptions::default(),
+        )
+        .expect("filed");
         assert_eq!(ok.file.refused_because, None);
         assert_eq!(
             fx.artefacts(),
@@ -1866,7 +2050,7 @@ mod tests {
         fx.drop("si/Supporting Information S1.pdf", SI_FOR_THIS_WORK);
 
         let dir = fx.work_dir();
-        let plan = plan(&fx.db, &fx.paper, Some(&dir)).expect("planned");
+        let plan = plan(&fx.db, &fx.paper, Some(&dir), ScanOptions::default()).expect("planned");
         assert!(plan.manifest.is_none());
         assert!(
             plan.lease.is_none(),

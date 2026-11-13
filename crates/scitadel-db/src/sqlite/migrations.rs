@@ -16,6 +16,7 @@ const MIGRATION_011: &str = include_str!("../../migrations/011_paper_aliases.sql
 const MIGRATION_012: &str = include_str!("../../migrations/012_paper_tags.sql");
 const MIGRATION_013: &str = include_str!("../../migrations/013_acquisition.sql");
 const MIGRATION_014: &str = include_str!("../../migrations/014_publisher_note.sql");
+const MIGRATION_015: &str = include_str!("../../migrations/015_too_large_status.sql");
 
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, MIGRATION_001),
@@ -32,6 +33,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (12, MIGRATION_012),
     (13, MIGRATION_013),
     (14, MIGRATION_014),
+    (15, MIGRATION_015),
 ];
 
 /// Run all pending migrations, skipping already-applied ones.
@@ -287,6 +289,167 @@ mod tests {
                 "attempt {attempt}: every version recorded exactly once"
             );
         }
+    }
+
+    /// #288 migration 015: upgrading a v14 database with real
+    /// `acquisition_state` rows carries every pre-v15 status through, the
+    /// `ON DELETE CASCADE` foreign key survives the table rebuild, and the
+    /// new `too_large` status is accepted on the upgraded table.
+    ///
+    /// SQLite has no `ALTER TABLE ... DROP CHECK`, so migration 015 rebuilds
+    /// the table from scratch — the shape where rows, triggers, FKs or
+    /// defaults quietly go missing. This test fills every risk in turn: it
+    /// loads one row per pre-v15 status, migrates to v15, and asserts each
+    /// survives. It then deletes the parent `papers` row to assert that the
+    /// FK's `ON DELETE CASCADE` was preserved by the rebuild (not only
+    /// declared), and then inserts a fresh `too_large` row to assert the new
+    /// CHECK accepts it.
+    #[test]
+    fn migration_015_preserves_v14_rows_and_the_cascade_fk() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        // The 13 statuses `acquisition_state.status` accepted at v14 — the
+        // list migration 013 encodes, migration 014 does not touch, and
+        // migration 015 must carry through intact.
+        const V14_STATUSES: &[&str] = &[
+            "pending",
+            "oa_fetchable",
+            "tdm_available",
+            "tdm_key_missing",
+            "needs_login",
+            "not_entitled",
+            "needs_authorisation",
+            "needs_ill",
+            "unavailable",
+            "identity_mismatch",
+            "wrong_version",
+            "rate_limited",
+            "error",
+        ];
+
+        // Bring the DB up to v14 only (migrations 1..=14).
+        let up_to_14: Vec<(i64, &str)> = MIGRATIONS
+            .iter()
+            .filter(|(v, _)| *v <= 14)
+            .copied()
+            .collect();
+        run_migrations_with(&conn, &up_to_14).unwrap();
+
+        // One paper so the FK can be exercised, and one acquisition_state
+        // row per v14 status so every status is reconstituted on the rebuild.
+        conn.execute(
+            "INSERT INTO papers (id, title, created_at, updated_at)
+             VALUES ('p-cascade', 'Status survival test',
+                     '2026-11-09T00:00:00Z', '2026-11-09T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        for (idx, status) in V14_STATUSES.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO acquisition_state
+                    (paper_id, kind, locator, wanted_version, status, reason,
+                     publisher, hint_url, drop_path, next_attempt_at, updated_at)
+                 VALUES ('p-cascade', 'fulltext', ?1, 'vor', ?2, ?3, NULL, NULL, NULL, NULL,
+                         '2026-11-09T00:00:00Z')",
+                params![format!("loc-{idx}"), *status, format!("reason-{status}")],
+            )
+            .unwrap();
+        }
+        // Enforce foreign keys so a bad rebuild (FK declared but empty,
+        // orphan rows left behind) is caught by the next DELETE.
+        conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+
+        let v14_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM acquisition_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v14_count, V14_STATUSES.len() as i64);
+
+        // v14 did NOT accept `too_large`, so the new status is refused on the
+        // pre-migration table — the fact migration 015 exists to reverse.
+        conn.execute(
+            "INSERT INTO acquisition_state
+                (paper_id, kind, locator, wanted_version, status, reason,
+                 publisher, hint_url, drop_path, next_attempt_at, updated_at)
+             VALUES ('p-cascade', 'fulltext', 'v14-too-large', 'vor',
+                     'too_large', 'should be refused at v14', NULL, NULL, NULL, NULL,
+                     '2026-11-09T00:30:00Z')",
+            [],
+        )
+        .expect_err("v14's CHECK must refuse `too_large`");
+
+        // Apply migration 015 the production way — through run_migrations,
+        // which reads schema_version and applies only 015.
+        run_migrations(&conn).unwrap();
+
+        // Every status row survived, in the same order, with the same reason.
+        // Compare the (status, reason) pairs rather than only counts so a
+        // rebuild that dropped reasons (e.g. forgot to copy `reason`) fails
+        // this test rather than a later one.
+        let mut stmt = conn
+            .prepare(
+                "SELECT status, COALESCE(reason, '')
+                   FROM acquisition_state
+                  ORDER BY locator",
+            )
+            .unwrap();
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        // `loc-10`, `loc-11`, `loc-12` sort before `loc-2`..`loc-9`
+        // lexicographically, so build the expected list by locator the same
+        // way SQL ordered the rows.
+        let mut expected: Vec<(String, String, String)> = V14_STATUSES
+            .iter()
+            .enumerate()
+            .map(|(idx, s)| {
+                (
+                    format!("loc-{idx}"),
+                    (*s).to_string(),
+                    format!("reason-{s}"),
+                )
+            })
+            .collect();
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        let expected_pairs: Vec<(String, String)> = expected
+            .into_iter()
+            .map(|(_, status, reason)| (status, reason))
+            .collect();
+
+        assert_eq!(
+            rows, expected_pairs,
+            "every v14 (status, reason) pair must survive the v15 rebuild"
+        );
+
+        // The new `too_large` status is accepted on the upgraded table.
+        conn.execute(
+            "INSERT INTO acquisition_state
+                (paper_id, kind, locator, wanted_version, status, reason,
+                 publisher, hint_url, drop_path, next_attempt_at, updated_at)
+             VALUES ('p-cascade', 'fulltext', 'loc-too-large', 'vor',
+                     'too_large', 'over the cap', NULL, NULL, NULL, NULL,
+                     '2026-11-09T01:00:00Z')",
+            [],
+        )
+        .expect("the v15 CHECK accepts the new status");
+
+        // And the cascade FK survived the rebuild: deleting the parent
+        // paper row removes every acquisition_state row that pointed to it.
+        // Without the cascade, the DELETE would fail (FK ON) or leave orphan
+        // rows (FK OFF).
+        conn.execute("DELETE FROM papers WHERE id = 'p-cascade'", [])
+            .unwrap();
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM acquisition_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            after, 0,
+            "ON DELETE CASCADE must carry through the v14 → v15 rebuild"
+        );
     }
 
     #[test]

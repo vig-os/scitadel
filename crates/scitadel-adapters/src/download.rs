@@ -376,6 +376,21 @@ impl Endpoints {
     }
 }
 
+/// The in-stream cap on a fetched body, in bytes (ADR-007 §1 "Storage").
+///
+/// Every route in [`PaperDownloader`] fetches a full-text artefact
+/// (`fulltext_pdf`/`fulltext_html`/`fulltext_xml`), and those share one row
+/// in the ADR's size-cap table. `cap_for_kind("fulltext_pdf")` is the canonical
+/// value; this constant pulls that number so #288's fetch-path cap and #286's
+/// scan-path cap are the *same number* under two names. A caller that wants a
+/// different value for a test or an operator override says so through
+/// [`PaperDownloader::with_body_cap`].
+///
+/// The future scitadel-hub harvesters will reuse this fetch path at scale —
+/// [`cap_for_kind`] is the single source of truth and this constant is its one
+/// re-export into the fetch chain, so there is no second cap to drift against.
+pub const FETCH_BODY_CAP_BYTES: u64 = scitadel_db::sqlite::CAP_FULLTEXT_BYTES as u64;
+
 /// Downloads papers by DOI using Unpaywall (OA PDFs) with publisher HTML fallback.
 pub struct PaperDownloader {
     /// The only way a request leaves this process (ADR-007 §3).
@@ -385,6 +400,14 @@ pub struct PaperDownloader {
     /// ever needs the email; the OpenAlex leg needs both (#212).
     openalex: OpenAlexAuth,
     endpoints: Endpoints,
+    /// Cap on the body the ladder is willing to pull off a publisher
+    /// (ADR-007 §1 "Storage"; #288). Enforced during the streaming read, not
+    /// via `Content-Length` alone — a server that declares one length and
+    /// sends another is the shape of the bug this exists to close. The
+    /// workspace-wide default is [`FETCH_BODY_CAP_BYTES`]; tests override it
+    /// through [`Self::with_body_cap`] to exercise the limit on bodies small
+    /// enough to fit in a unit test.
+    body_cap: u64,
 }
 
 impl PaperDownloader {
@@ -448,6 +471,44 @@ impl PaperDownloader {
             db,
             openalex,
             endpoints,
+            body_cap: FETCH_BODY_CAP_BYTES,
+        }
+    }
+
+    /// Override the fetch body cap (ADR-007 §1 "Storage"; #288).
+    ///
+    /// The one knob through which a caller sets the cap. Two callers today:
+    ///
+    /// - **tests** — exercise the `too_large` path on bodies small enough
+    ///   for a unit test to serve;
+    /// - **the CLI/MCP/TUI** — honour an operator override, read from
+    ///   `config.acquire.body_cap_bytes` or `SCITADEL_ACQUIRE_BODY_CAP_BYTES`
+    ///   (see `scitadel_core::config::AcquireConfig`). An override is the
+    ///   one documented way out of `too_large`: raise the cap, then name
+    ///   the work for a re-acquire (`scitadel acquire --paper <id>`), which
+    ///   bypasses the queue filter that excludes terminal statuses.
+    ///
+    /// The workspace-wide default is [`FETCH_BODY_CAP_BYTES`], derived from
+    /// `cap_for_kind("fulltext_pdf")` so the fetch path and `scan` cannot
+    /// drift. Raising the cap above the default **will** admit a body
+    /// larger than ADR-007 §1 provides for, which is a deliberate choice:
+    /// the operator declared it by editing the config.
+    #[must_use]
+    pub fn with_body_cap(mut self, cap: u64) -> Self {
+        self.body_cap = cap;
+        self
+    }
+
+    /// Apply the operator's body-cap override, when one is set.
+    ///
+    /// `None` keeps the workspace default: the thin wrapper exists so the
+    /// CLI, MCP and TUI call sites spell the config binding the same way
+    /// (one source of truth: `config.acquire.body_cap_bytes`).
+    #[must_use]
+    pub fn with_body_cap_override(self, cap: Option<u64>) -> Self {
+        match cap {
+            Some(cap) => self.with_body_cap(cap),
+            None => self,
         }
     }
 
@@ -500,6 +561,7 @@ impl PaperDownloader {
         {
             Ok(fetched) => return self.finish(&work, None, fetched).await,
             Err(e) => {
+                self.record_doi_only_too_large(&e, "preprint");
                 tracing::info!(doi = %normalized, error = %e, "preprint transform failed, falling back to Unpaywall");
             }
         }
@@ -507,18 +569,59 @@ impl PaperDownloader {
         match self.try_unpaywall(&work, &normalized, output_dir).await {
             Ok(fetched) => return self.finish(&work, None, fetched).await,
             Err(e) => {
+                self.record_doi_only_too_large(&e, RouteId::Unpaywall.label());
                 tracing::info!(doi = %normalized, error = %e, "Unpaywall lookup failed, falling back to publisher");
             }
         }
 
         // The DOI-only path has no `papers` row to record a gap against, so
         // the leg error is simply propagated — exactly the error this
-        // function returned before #260.
-        let fetched = self
+        // function returned before #260. A cap refusal still lands an audit
+        // row (with `paper_id = NULL`) so `scitadel action_list` and a human
+        // can see why the CLI said no (#288).
+        let fetched = match self
             .download_publisher_html(&work, &normalized, output_dir)
             .await
-            .map_err(LegError::into_adapter)?;
+        {
+            Ok(fetched) => fetched,
+            Err(e) => {
+                self.record_doi_only_too_large(&e, RouteId::Publisher.label());
+                return Err(e.into_adapter());
+            }
+        };
         self.finish(&work, None, fetched).await
+    }
+
+    /// Record a `too_large` audit row for the DOI-only `scitadel download`
+    /// path, if the leg's failure was a cap refusal (#288).
+    ///
+    /// The three legs of [`Self::download`] each know their own route label,
+    /// and that label is what the audit row carries — the `preprint` label
+    /// collapses the arXiv/bioRxiv candidate pair for the same reason
+    /// [`Leg::Preprint`] does: the DOI cannot say which server a posting is
+    /// on, and the per-candidate URL is already in the detail text.
+    ///
+    /// Silent on non-`TooLarge` errors: a transport failure records nothing
+    /// because the DOI-only path has no `papers` row to key an
+    /// `acquisition_state` against, and the walk's own error is what the
+    /// caller sees. The cap case is the one audit row that remains useful
+    /// without a `papers` row: an audit trail nothing else writes, because
+    /// `scitadel download <doi>` resolves no `papers.id` and so writes no
+    /// `acquisition_state` row at all — unlike the queued path through
+    /// [`Self::download_paper`], whose `too_large` status lives in
+    /// `acquisition_state` (migration 015, #288) and is what
+    /// `scitadel action_list` groups by. The row here is for an operator
+    /// grepping `acquisition_attempts` for cap refusals the CLI drove.
+    fn record_doi_only_too_large(&self, error: &LegError, route: &str) {
+        if let LegOutcome::TooLarge {
+            url,
+            cap,
+            observed,
+            from_content_length,
+        } = &error.outcome
+        {
+            self.record_too_large_attempt(None, route, url, *cap, *observed, *from_content_length);
+        }
     }
 
     /// Download a paper by **resolving, then ranking, then fetching one**
@@ -767,6 +870,27 @@ impl PaperDownloader {
             Ok(fetched) => self.finish(&work, Some(paper), fetched).await,
             Err(e) => {
                 let (error, outcome) = e.into_parts();
+                // #288: a body over the cap is recorded in `acquisition_attempts`
+                // alongside the other fetch outcomes migration 013 declares —
+                // the same table `scan` writes `too_large` to for a dropped-in
+                // file (#286). Best-effort: a failure to record the audit row
+                // must never mask the error the caller is about to receive.
+                if let LegOutcome::TooLarge {
+                    url,
+                    cap,
+                    observed,
+                    from_content_length,
+                } = &outcome
+                {
+                    self.record_too_large_attempt(
+                        Some(paper.id.as_str()),
+                        chosen.candidate.route.label(),
+                        url,
+                        *cap,
+                        *observed,
+                        *from_content_length,
+                    );
+                }
                 ladder.record(leg_of(chosen.candidate.route), outcome);
                 tracing::info!(
                     paper_id = %paper.id,
@@ -779,6 +903,64 @@ impl PaperDownloader {
             }
         };
         (result, resolution)
+    }
+
+    /// Record an `acquisition_attempts.outcome = 'too_large'` row for a fetch
+    /// the cap refused (ADR-007 §1 "Storage"; #288).
+    ///
+    /// The counterpart to `scan`'s refuser (`crates/scitadel-adapters/src/scan.rs`,
+    /// `record_attempt`), so the fetch path and the scan path write the same
+    /// row for the same rule — the one sentence ADR-007 §1 makes of it. The
+    /// audit row is **best-effort**: a failure to insert is logged, because a
+    /// row about a refused fetch must never become the refusal the caller sees.
+    ///
+    /// `paper_id` is `None` only for the DOI-only `scitadel download <doi>`
+    /// path, which resolves no `papers` row and so has no id to key against.
+    /// `acquisition_attempts.paper_id` is nullable (migration 013), and this
+    /// is one of the two call sites that uses it that way — the other is the
+    /// `ON DELETE SET NULL` from `papers`, which preserves attempt history
+    /// when a work is removed.
+    fn record_too_large_attempt(
+        &self,
+        paper_id: Option<&str>,
+        route: &str,
+        url: &str,
+        cap: u64,
+        observed: u64,
+        from_content_length: bool,
+    ) {
+        let now = Utc::now().to_rfc3339();
+        let detail = if from_content_length {
+            format!(
+                "{url}: Content-Length declared {observed} bytes, over the {cap}-byte cap \
+                 ADR-007 §1 \"Storage\" sets for a full-text artefact; nothing was pulled from \
+                 the wire, so no blob was staged"
+            )
+        } else {
+            format!(
+                "{url}: the streamed body passed the {cap}-byte cap ADR-007 §1 \"Storage\" sets \
+                 for a full-text artefact after {observed}+ bytes; the read was aborted and no \
+                 blob was staged"
+            )
+        };
+        if let Err(error) = self.db.record_attempt(&AttemptWrite {
+            paper_id: paper_id.map(str::to_string),
+            kind: GAP_FULLTEXT_KIND.to_string(),
+            locator: FULLTEXT_LOCATOR.to_string(),
+            route: route.to_string(),
+            bucket: None,
+            started_at: now,
+            outcome: "too_large".to_string(),
+            http_status: None,
+            detail: Some(detail),
+        }) {
+            tracing::warn!(
+                paper_id = ?paper_id,
+                route = %route,
+                %error,
+                "could not record the too-large fetch in acquisition_attempts"
+            );
+        }
     }
 
     /// The metadata pass, built from this downloader's own endpoints.    ///
@@ -847,12 +1029,12 @@ impl PaperDownloader {
         // URLs are files whose extension is not always to be trusted.
         let is_pdf = !matches!(route, RouteId::Publisher | RouteId::ManualUrl)
             && looks_like_pdf(url, response.content_type());
-        // Read the URL off before `bytes()` consumes the response: this is the
-        // post-redirect URL, which is where the bytes actually live and what
-        // `artefacts.source_url` records.
+        // Read the URL off before `bytes_capped()` consumes the response: this
+        // is the post-redirect URL, which is where the bytes actually live and
+        // what `artefacts.source_url` records.
         let source_url = response.url.to_string();
         let bytes = response
-            .bytes()
+            .bytes_capped(self.body_cap)
             .await
             .map_err(|e| fetch_failure("failed to read bytes", e))?;
 
@@ -1629,11 +1811,11 @@ impl PaperDownloader {
         // decide the format on its own — the same rule the OpenAlex leg
         // already applies, shared rather than re-derived.
         let is_pdf = looks_like_pdf(url, response.content_type());
-        // Read the URL off before `bytes()` consumes the response: this is the
-        // post-redirect URL, which is where the bytes actually live.
+        // Read the URL off before `bytes_capped()` consumes the response: this
+        // is the post-redirect URL, which is where the bytes actually live.
         let source_url = response.url.to_string();
         let bytes = response
-            .bytes()
+            .bytes_capped(self.body_cap)
             .await
             .map_err(|e| fetch_failure("failed to read preprint bytes", e))?;
 
@@ -1799,7 +1981,7 @@ impl PaperDownloader {
         let response = self.get(work, url, tier, what).await?;
         let source_url = response.url.to_string();
         let bytes = response
-            .bytes()
+            .bytes_capped(self.body_cap)
             .await
             .map_err(|e| fetch_failure("failed to read bytes", e))?;
         Ok((bytes, source_url))
@@ -2127,6 +2309,31 @@ enum LegOutcome {
     /// Asked, and we could not find out: transport failure, pacing refusal, a
     /// login redirect, a 5xx, an unparseable body.
     Inconclusive { detail: String },
+    /// Asked, and the body is over the cap (ADR-007 §1 "Storage"; #288).
+    ///
+    /// A route answered usefully — the publisher accepted the connection and
+    /// started sending — but the body would have been over the per-kind cap,
+    /// so the fetch refused to keep it and the staging file never existed. A
+    /// place of its own and not a sub-case of [`Self::Refused`]: refusal is the
+    /// publisher's answer, this is **ours**, and conflating them would turn
+    /// "we refused to file what came back" into "the server would not serve
+    /// it".
+    ///
+    /// `observed` is a lower bound when the running stream caught the overrun
+    /// (`from_content_length == false`) and exact when the declared
+    /// `Content-Length` refused early.
+    ///
+    /// `url` is the exact URL the cap refused — carried on the outcome so
+    /// the status (`too_large`, since migration 015) can tell `action_list`
+    /// which host to point a human at. Not stripped to the host up front
+    /// because an oversized SI link already includes the file name, and a
+    /// human fetching it manually needs the whole path.
+    TooLarge {
+        url: String,
+        cap: u64,
+        observed: u64,
+        from_content_length: bool,
+    },
     /// Asked, and it **answered with locations**, which the metadata pass ranked
     /// and the fetch either took or did not.
     ///
@@ -2154,13 +2361,52 @@ impl LegOutcome {
     fn was_attempted(&self) -> bool {
         matches!(
             self,
-            Self::Refused { .. } | Self::NoLocation { .. } | Self::Inconclusive { .. }
+            Self::Refused { .. }
+                | Self::NoLocation { .. }
+                | Self::Inconclusive { .. }
+                | Self::TooLarge { .. }
         )
     }
 
-    /// Did the place itself say no?
-    fn was_refused(&self) -> bool {
-        matches!(self, Self::Refused { .. })
+    /// Is this outcome a **terminal no** — a refusal that trying again cannot
+    /// change? Two shapes under one predicate:
+    ///
+    /// - [`Self::Refused`] — the place itself said no (403, 404, …): the
+    ///   refusal is theirs, and retrying will see the same answer. This is
+    ///   the one case in which "there is no such full text here" is supported
+    ///   by evidence rather than by exhaustion.
+    /// - [`Self::TooLarge`] — the cap refused what came back (#288): the
+    ///   refusal is **ours**, but a publisher that serves an oversized body
+    ///   today will serve the same oversized body tomorrow, so the gap is
+    ///   terminal and routing it back through `acquire` would redownload up
+    ///   to the cap on every run.
+    ///
+    /// This is what the two terminal verdicts read, taken together: "every
+    /// attempted leg closed the door, by them or by us". Which door is
+    /// recorded on `acquisition_state.status` (migration 015, #288): a cap
+    /// refusal lands `too_large` so `action_list` can group it under its own
+    /// human action — raise `acquire.body_cap_bytes`, then re-acquire the
+    /// work by id or fetch manually and import — while a straight server
+    /// refusal lands `unavailable`. `scitadel action_list` reads that
+    /// `status`, which is why it is a column and not a free-text reason.
+    ///
+    /// Replaces the narrower `was_refused` predicate, which only read the
+    /// publisher's side of the refusal and let a cap-refused route fall
+    /// through to the retryable `error` status (#288).
+    fn is_terminal_no(&self) -> bool {
+        matches!(self, Self::Refused { .. } | Self::TooLarge { .. })
+    }
+
+    /// Is this outcome a cap refusal — **ours**, not the publisher's (#288)?
+    ///
+    /// Read by [`Ladder::status`] to pick the terminal spelling: a walk
+    /// whose terminal legs include at least one [`Self::TooLarge`] records
+    /// `too_large`, so `action_list` groups it under its own human action
+    /// rather than the "no artefact" bucket a bare [`Self::Refused`] gets.
+    /// Both are still terminal — see [`Self::is_terminal_no`] — and both
+    /// stay out of [`crate::acquire::ACQUIRE_QUEUE_STATUSES`].
+    fn is_too_large(&self) -> bool {
+        matches!(self, Self::TooLarge { .. })
     }
 
     /// The clause this outcome contributes to the recorded reason.
@@ -2175,6 +2421,33 @@ impl LegOutcome {
                 format!("named no location ({detail}) — not evidence that the work is unavailable")
             }
             Self::Inconclusive { detail } => format!("could not be resolved: {detail}"),
+            Self::TooLarge {
+                url,
+                cap,
+                observed,
+                from_content_length,
+            } => {
+                // Host, not the full URL, because the reason is a one-line
+                // sentence and the whole path is in the `too_large` audit
+                // row's `detail` already — see `record_too_large_attempt`.
+                // Falls back to the full URL for a value `host_of_url` cannot
+                // shape rather than dropping the only locator we have.
+                let host = host_of_url(url).unwrap_or_else(|| url.clone());
+                let shape = if *from_content_length {
+                    format!(
+                        "declared {observed} bytes, over the {cap}-byte cap ADR-007 §1 \
+                         \"Storage\" sets for a full-text artefact; nothing was pulled from the \
+                         wire"
+                    )
+                } else {
+                    format!(
+                        "the streamed body passed the {cap}-byte cap ADR-007 §1 \"Storage\" sets \
+                         for a full-text artefact after {observed}+ bytes; the read was aborted \
+                         and no file was staged"
+                    )
+                };
+                format!("refused to file what {host} served: {shape}")
+            }
             Self::Ranked {
                 candidates,
                 position,
@@ -2256,6 +2529,31 @@ impl LegError {
         }
     }
 
+    /// The body exceeded the cap (ADR-007 §1 "Storage"; #288).
+    ///
+    /// Takes the structured fields rather than a `FetchError` so the
+    /// constructor is total — there is no "wrong variant" case to panic on,
+    /// because the caller has already matched the variant. The ladder's
+    /// [`LegOutcome::TooLarge`] and the `AdapterError::Paced` the walk
+    /// surfaces to its caller both come from the same four fields, so the
+    /// two cannot disagree about what the cap refused.
+    fn too_large(url: String, cap: u64, observed: u64, from_content_length: bool) -> Self {
+        Self {
+            error: AdapterError::Paced(FetchError::BodyTooLarge {
+                url: url.clone(),
+                cap,
+                observed,
+                from_content_length,
+            }),
+            outcome: LegOutcome::TooLarge {
+                url,
+                cap,
+                observed,
+                from_content_length,
+            },
+        }
+    }
+
     /// The error the walk has always returned for this failure.
     fn into_adapter(self) -> AdapterError {
         self.error
@@ -2297,9 +2595,16 @@ impl std::fmt::Display for LegError {
 ///   achieves nothing, and this row's action group is where a human who fixes
 ///   the DOI belongs.
 /// - **`unavailable`** only when at least one leg was attempted and *every*
-///   attempted leg was refused by the place itself. That is the one case in
-///   which "there is no such full text here" is supported by evidence rather
-///   than by exhaustion.
+///   attempted leg was a **terminal no** — refused by the place itself
+///   ([`LegOutcome::Refused`]) or over our storage cap
+///   ([`LegOutcome::TooLarge`]; #288). A publisher that serves an oversized
+///   body serves the same body on every retry, so routing it back through
+///   `acquire` would redownload up to the cap on every run; the `too_large`
+///   row in `acquisition_attempts` is what tells a human *why* the verdict
+///   is `unavailable`, in the same table `scan` writes its own refusals to
+///   (#286). The [`LegOutcome::is_terminal_no`] predicate carries both
+///   shapes under one name so the verdict reads a superset of refusals —
+///   both theirs and ours.
 /// - **`error`** ("transient failure", retry with backoff) when legs were
 ///   attempted but at least one of them could not give a yes or a no — a
 ///   transport failure, a 5xx, a pacing refusal, or an index that named no
@@ -2505,9 +2810,22 @@ impl Ladder {
             // nothing, and `pending`'s action group ("picked up again by
             // `acquire`") is where a human who fixes the DOI belongs.
             STATUS_PENDING
-        } else if attempted.iter().all(|outcome| outcome.was_refused()) {
-            // Every route we could evaluate was asked, and every one refused.
-            STATUS_UNAVAILABLE
+        } else if attempted.iter().all(|outcome| outcome.is_terminal_no()) {
+            // Every route we could evaluate closed the door, by them (a
+            // [`LegOutcome::Refused`]) or by us (a [`LegOutcome::TooLarge`]).
+            // Neither spelling is in [`crate::acquire::ACQUIRE_QUEUE_STATUSES`]
+            // — a cap-refused route cannot be redownloaded on every `acquire`
+            // run — but `action_list` splits the two: a cap refusal lands
+            // [`STATUS_TOO_LARGE`] (migration 015, #288) so a human sees the
+            // "fetch manually or raise the cap" group, while a straight server
+            // refusal keeps [`STATUS_UNAVAILABLE`] ("the work has no such
+            // artefact"). The audit row in `acquisition_attempts` stays, as the
+            // trail for an operator grepping cap refusals by route.
+            if attempted.iter().any(|outcome| outcome.is_too_large()) {
+                STATUS_TOO_LARGE
+            } else {
+                STATUS_UNAVAILABLE
+            }
         } else {
             // We asked, and at least one answer was not a no. Retryable, and
             // emphatically not a verdict about the work.
@@ -2547,6 +2865,16 @@ impl Ladder {
 const STATUS_PENDING: &str = "pending";
 /// `acquisition_state.status`: every route that could be evaluated refused.
 const STATUS_UNAVAILABLE: &str = "unavailable";
+/// `acquisition_state.status`: at least one route served a body over
+/// ADR-007 §1's per-kind cap (migration 015, #288).
+///
+/// Terminal like [`STATUS_UNAVAILABLE`] — a publisher that served an
+/// oversized body today will serve the same oversized body tomorrow — so
+/// it is **not** in [`crate::acquire::ACQUIRE_QUEUE_STATUSES`]. The one
+/// exit is a named `--paper <id>` run after the operator raises
+/// `acquire.body_cap_bytes` in the config: naming the id bypasses the
+/// queue filter.
+const STATUS_TOO_LARGE: &str = "too_large";
 /// `acquisition_state.status`: a route was tried and could not be resolved.
 const STATUS_ERROR: &str = "error";
 
@@ -2619,6 +2947,35 @@ pub(crate) fn publisher_columns(doi: Option<&str>) -> (Option<String>, Option<St
     }
 }
 
+/// The hostname of an `http(s)://host[:port]/…` URL.
+///
+/// Used by [`LegOutcome::TooLarge`]'s clause (#288) to tell `action_list`
+/// which publisher host served the oversized body, without taking a `url`
+/// crate dep for one call site. Returns `None` for any input a human needs
+/// to read as-is: a relative or non-`http` URL, a URL with no authority, a
+/// port-less host that is empty. The caller falls back to the full URL,
+/// which is what `FetchError`'s `Display` prints anyway.
+fn host_of_url(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    // Authority runs until the first `/`, `?` or `#`. An empty host
+    // (`http:///path`) is not a host.
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|a| !a.is_empty())?;
+    // Strip credentials (`user:pass@host`) and the port, in that order.
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = host_port.rsplit_once(':').map_or(host_port, |(h, _)| h);
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
 /// Does this response look like a PDF?
 ///
 /// One rule for the two legs that fetch a URL whose extension cannot always
@@ -2658,6 +3015,18 @@ fn fetch_failure(what: &str, error: FetchError) -> LegError {
                 "{what} returned status {code}"
             )))
         }
+        // The body was over the per-kind cap (#288). Classified in its own
+        // bucket because it is **our** refusal, not the publisher's: the route
+        // answered and the bytes started arriving, and the cap is what refused
+        // to file them. Destructured here so [`LegError::too_large`] stays a
+        // total constructor on the four fields — no `unreachable!` branch in
+        // non-test code.
+        FetchError::BodyTooLarge {
+            url,
+            cap,
+            observed,
+            from_content_length,
+        } => LegError::too_large(url, cap, observed, from_content_length),
         // A login redirect says a route exists that needs a human's session,
         // not that the work is unobtainable, so it is inconclusive here: the
         // tier-4 leg has not been taken. Same for a pacing refusal, which is
@@ -3094,6 +3463,38 @@ mod tests {
                 .await;
         }
 
+        /// Mount a PDF route with a caller-supplied body. The seam the #288
+        /// tests use to drive a body of exactly the shape and size the cap is
+        /// being asked about.
+        async fn serve_pdf_body(&self, route: &str, body: Vec<u8>) {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/pdf")
+                        .set_body_bytes(body),
+                )
+                .mount(&self.server)
+                .await;
+        }
+
+        /// Mount a chunked PDF route: the body is served with
+        /// `Transfer-Encoding: chunked` so `Content-Length` is not advertised,
+        /// which is the publisher shape #288's acceptance criterion needs —
+        /// "a chunked response with no `Content-Length` is bounded".
+        async fn serve_pdf_chunked(&self, route: &str, body: Vec<u8>) {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/pdf")
+                        .insert_header("transfer-encoding", "chunked")
+                        .set_body_bytes(body),
+                )
+                .mount(&self.server)
+                .await;
+        }
+
         /// The `acquisition_state` rows for a work, as
         /// `(status, reason, hint_url, drop_path)`.
         fn states(&self, paper_id: &str) -> Vec<StateRow> {
@@ -3187,6 +3588,78 @@ mod tests {
             let conn = self.db.conn().expect("conn");
             conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
                 .expect("count")
+        }
+
+        /// The audit rows migration 013 writes for a work, as
+        /// `(kind, route, outcome, detail)` in insert order. Used by the #288
+        /// fetch-cap tests, where the one assertion the acceptance criterion
+        /// pins is that `too_large` landed in the same table scan writes to.
+        fn attempts(&self, paper_id: &str) -> Vec<(String, String, String, String)> {
+            let conn = self.db.conn().expect("conn");
+            let mut stmt = conn
+                .prepare(
+                    "SELECT kind, route, outcome, COALESCE(detail, '')
+                       FROM acquisition_attempts
+                      WHERE paper_id = ?1
+                      ORDER BY id",
+                )
+                .expect("prepare");
+            stmt.query_map([paper_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("rows")
+        }
+
+        /// Paths on disk under the library root, with `blobs/.tmp/` (the
+        /// staging directory) listed separately so a test can prove that a
+        /// refused fetch left nothing behind. The acceptance criterion the
+        /// #288 tests pin: never write more than the cap, and leave no partial
+        /// file.
+        fn stored_blobs(&self) -> Vec<PathBuf> {
+            let blobs = self.root().join("blobs");
+            if !blobs.exists() {
+                return Vec::new();
+            }
+            let mut out = Vec::new();
+            let mut stack = vec![blobs];
+            while let Some(dir) = stack.pop() {
+                for entry in std::fs::read_dir(&dir).expect("read_dir") {
+                    let entry = entry.expect("entry");
+                    let path = entry.path();
+                    // The staging directory lives under blobs/ but is not a
+                    // placed blob — list it under its own helper instead.
+                    if path.ends_with(".tmp") {
+                        continue;
+                    }
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else {
+                        out.push(path);
+                    }
+                }
+            }
+            out.sort();
+            out
+        }
+
+        fn staged_files(&self) -> Vec<PathBuf> {
+            let staging = self.root().join("blobs").join(".tmp");
+            if !staging.exists() {
+                return Vec::new();
+            }
+            let mut out: Vec<PathBuf> = std::fs::read_dir(&staging)
+                .expect("read_dir")
+                .map(|e| e.expect("entry").path())
+                .collect();
+            out.sort();
+            out
         }
     }
 
@@ -4672,6 +5145,663 @@ mod tests {
             reason.contains("ranked") || reason.contains("derived"),
             "and it says the routes were *ranked* rather than walked: {reason}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // #288: the fetch body cap, end to end.
+    //
+    // The http layer owns the mechanics — four shapes of body under one cap,
+    // tested in `scitadel_http::client::tests::bytes_capped`. These tests pin
+    // the *integration*: a cap-refused fetch records `too_large` in the same
+    // audit table that `scan` writes to (#286), nothing is staged, and no
+    // artefact row is written. The cap is injected through
+    // `PaperDownloader::with_body_cap`, which keeps the test's bodies small
+    // and the one constant that encodes the production value — `FETCH_BODY_CAP_BYTES`,
+    // itself a re-export of `cap_for_kind("fulltext_pdf")` — unchanged.
+    //
+    // All four of #288's shapes are exercised here, mirroring the http-layer
+    // suite. The "lying Content-Length" shape runs through `wiremock` with the
+    // publisher declaring **more** bytes than the cap, because reqwest's
+    // transport truncates a lying-small declaration before the stream check
+    // ever sees it; the attack we must bound in-process is the one where the
+    // declared length is under the cap and the real body is chunked — which is
+    // the "chunked body over the cap" test below.
+    // -----------------------------------------------------------------
+
+    /// A fixture that steers a work through the arXiv preprint transform —
+    /// the simplest route to drive, because `arxiv_id` on the paper names the
+    /// one URL the metadata pass's ranking has to pick.
+    fn save_arxiv_work(fx: &Fixture, id: &str, arxiv_id: &str) -> Paper {
+        save(
+            fx,
+            id,
+            Some(&format!("10.48550/arxiv.{arxiv_id}")),
+            Some(arxiv_id),
+            None,
+            None,
+        )
+    }
+
+    /// Acceptance criterion: a fetched body above the cap is never written to
+    /// the blob store, and records `too_large`.
+    ///
+    /// Shape 1 — chunked body over the cap, no honest `Content-Length`. This
+    /// is the worst case: the server promises nothing about size up front, so
+    /// the stream check is the only line between the cap and a 2 GB blob.
+    #[tokio::test]
+    async fn a_chunked_body_over_the_cap_is_bounded_and_records_too_large() {
+        let fx = Fixture::new().await;
+        let arxiv_id = "2401.00001";
+        let body = vec![b'P'; 4 * 1024]; // 4 KiB, exceeds the 1 KiB test cap
+        fx.serve_pdf_chunked(&format!("/pdf/{arxiv_id}.pdf"), body.clone())
+            .await;
+        let paper = save_arxiv_work(&fx, "p-too-large-chunked", arxiv_id);
+
+        let err = fx
+            .downloader()
+            .with_body_cap(1024)
+            .download_paper(&paper, &fx.papers_dir())
+            .await
+            .expect_err("a body over the cap is a refused fetch");
+        match &err {
+            AdapterError::Paced(FetchError::BodyTooLarge {
+                cap,
+                observed,
+                from_content_length,
+                ..
+            }) => {
+                assert_eq!(*cap, 1024);
+                assert!(
+                    !*from_content_length,
+                    "no honest Content-Length — the stream caught this"
+                );
+                assert!(observed > cap, "observed {observed} > cap {cap}");
+            }
+            other => panic!("expected BodyTooLarge, got {other:?}"),
+        }
+
+        // No artefact was written.
+        assert!(
+            fx.artefact("p-too-large-chunked").is_none(),
+            "a body over the cap must never be filed"
+        );
+        // And no blob reached the store — not even in staging, because the
+        // `too_large` error short-circuits before `store_bytes` is called.
+        assert!(
+            fx.stored_blobs().is_empty(),
+            "nothing is placed in blobs/: {:?}",
+            fx.stored_blobs()
+        );
+        assert!(
+            fx.staged_files().is_empty(),
+            "nothing is left in blobs/.tmp/: {:?}",
+            fx.staged_files()
+        );
+        assert_eq!(fx.count("blobs"), 0, "no `blobs` row was written");
+
+        // The audit row is `too_large`, in the same table and with the same
+        // outcome spelling `scan` uses (`crates/scitadel-adapters/src/scan.rs`
+        // writes this one for a dropped-in file; #288 adds this call site).
+        let attempts = fx.attempts("p-too-large-chunked");
+        let too_large: Vec<_> = attempts
+            .iter()
+            .filter(|(_, _, outcome, _)| outcome == "too_large")
+            .collect();
+        assert_eq!(
+            too_large.len(),
+            1,
+            "exactly one too_large row: {attempts:?}"
+        );
+        let (kind, route, _, detail) = too_large[0];
+        assert_eq!(kind, "fulltext", "the gap kind this fetch was for");
+        assert_eq!(route, "arxiv", "the route that served the oversized body");
+        assert!(
+            detail.contains("1024"),
+            "the cap is in the detail: {detail}"
+        );
+        assert!(
+            detail.contains("stream"),
+            "the detail says the stream check was what refused: {detail}"
+        );
+    }
+
+    /// Acceptance criterion: a declared `Content-Length` over the cap is
+    /// refused early. The pre-flight may use the header to refuse; it never
+    /// uses it to raise the limit.
+    ///
+    /// Shape 2 of #288's tests — a lying-upward `Content-Length`: the server
+    /// declares a length that happens to equal the body it then sends, but
+    /// that length is already over the per-kind cap. The cap refuses without
+    /// reading the body, and the audit row says so.
+    #[tokio::test]
+    async fn a_declared_length_over_the_cap_refuses_before_reading() {
+        let fx = Fixture::new().await;
+        let arxiv_id = "2401.00002";
+        let body = vec![b'Q'; 4 * 1024]; // 4 KiB body with honest Content-Length
+        fx.serve_pdf_body(&format!("/pdf/{arxiv_id}.pdf"), body)
+            .await;
+        let paper = save_arxiv_work(&fx, "p-too-large-declared", arxiv_id);
+
+        let err = fx
+            .downloader()
+            .with_body_cap(1024)
+            .download_paper(&paper, &fx.papers_dir())
+            .await
+            .expect_err("a declared length over the cap is a refused fetch");
+        match &err {
+            AdapterError::Paced(FetchError::BodyTooLarge {
+                cap,
+                observed,
+                from_content_length,
+                ..
+            }) => {
+                assert_eq!(*cap, 1024);
+                assert!(
+                    *from_content_length,
+                    "the declared length is what refused: nothing was pulled"
+                );
+                assert_eq!(*observed, 4 * 1024, "the declared length verbatim");
+            }
+            other => panic!("expected BodyTooLarge, got {other:?}"),
+        }
+        assert!(fx.artefact("p-too-large-declared").is_none());
+        assert!(fx.stored_blobs().is_empty());
+        assert!(fx.staged_files().is_empty());
+
+        let too_large: Vec<_> = fx
+            .attempts("p-too-large-declared")
+            .into_iter()
+            .filter(|(_, _, outcome, _)| outcome == "too_large")
+            .collect();
+        assert_eq!(too_large.len(), 1);
+        let detail = &too_large[0].3;
+        assert!(
+            detail.contains("Content-Length declared"),
+            "the detail distinguishes the pre-flight case: {detail}"
+        );
+    }
+
+    /// Acceptance criterion: `scan` and the fetch path share one implementation
+    /// of the rule.
+    ///
+    /// Shape 3 — a body **exactly at** the cap lands. The cap is the first
+    /// size that is refused, not the last that is accepted, which is also what
+    /// `scan` enforces on a dropped-in file (`crates/scitadel-db/src/sqlite/blobs.rs`
+    /// is `cap_for_kind`'s one definition, and both paths read it).
+    #[tokio::test]
+    async fn a_body_exactly_at_the_cap_is_filed() {
+        // A 1024-byte PDF-shaped body: the `%PDF` prefix is enough for the
+        // `looks_like_pdf` classification to read as a PDF, and the rest is
+        // padding so that `body.len() == cap`.
+        const CAP: u64 = 1024;
+        let fx = Fixture::new().await;
+        let arxiv_id = "2401.00003";
+        let mut body = b"%PDF-1.7\n".to_vec();
+        body.resize(CAP as usize, b'x');
+        fx.serve_pdf_body(&format!("/pdf/{arxiv_id}.pdf"), body.clone())
+            .await;
+        let paper = save_arxiv_work(&fx, "p-at-cap", arxiv_id);
+
+        let result = fx
+            .downloader()
+            .with_body_cap(CAP)
+            .download_paper(&paper, &fx.papers_dir())
+            .await
+            .expect("a body exactly at the cap is accepted");
+        assert_eq!(result.bytes, CAP as usize);
+        assert_eq!(result.format, DownloadFormat::Pdf);
+        assert_eq!(result.route, RouteId::Arxiv);
+
+        // The artefact and its blob are both written — the cap did not get in
+        // the way.
+        let artefact = fx
+            .artefact("p-at-cap")
+            .expect("an artefact for a body at the cap");
+        assert_eq!(artefact.kind, "fulltext_pdf");
+        assert!(artefact.sha256.is_some(), "a blob was hashed and filed");
+        assert_eq!(
+            fx.stored_blobs().len(),
+            1,
+            "exactly one blob file placed: {:?}",
+            fx.stored_blobs()
+        );
+        assert!(
+            fx.staged_files().is_empty(),
+            "the staging file was renamed into place, not left behind"
+        );
+        assert!(
+            fx.attempts("p-at-cap")
+                .iter()
+                .all(|(_, _, outcome, _)| outcome != "too_large"),
+            "and no too_large audit row was written"
+        );
+    }
+
+    /// Shape 4 — a body just under the cap is accepted, with every byte
+    /// intact. The symmetrical case to `a_body_exactly_at_the_cap_is_filed`,
+    /// which proves the boundary itself holds without rounding either way.
+    #[tokio::test]
+    async fn a_body_just_under_the_cap_is_filed() {
+        const CAP: u64 = 1024;
+        let fx = Fixture::new().await;
+        let arxiv_id = "2401.00004";
+        let mut body = b"%PDF-1.7\n".to_vec();
+        body.resize(CAP as usize - 1, b'x');
+        fx.serve_pdf_body(&format!("/pdf/{arxiv_id}.pdf"), body.clone())
+            .await;
+        let paper = save_arxiv_work(&fx, "p-under-cap", arxiv_id);
+
+        let result = fx
+            .downloader()
+            .with_body_cap(CAP)
+            .download_paper(&paper, &fx.papers_dir())
+            .await
+            .expect("a body one byte under the cap is accepted");
+        assert_eq!(result.bytes, CAP as usize - 1);
+        assert_eq!(result.format, DownloadFormat::Pdf);
+
+        let artefact = fx
+            .artefact("p-under-cap")
+            .expect("an artefact for a body under the cap");
+        assert!(artefact.sha256.is_some());
+        assert_eq!(fx.stored_blobs().len(), 1);
+        assert!(fx.staged_files().is_empty());
+        assert!(
+            fx.attempts("p-under-cap")
+                .iter()
+                .all(|(_, _, outcome, _)| outcome != "too_large"),
+        );
+    }
+
+    /// A body over the cap is a **terminal** refusal, not a retryable error.
+    /// The ladder records `unavailable`, which is not in
+    /// [`crate::acquire::ACQUIRE_QUEUE_STATUSES`], so a second `acquire` run
+    /// does not redownload the same oversized body.
+    ///
+    /// The bug this guards against: before this test, a `TooLarge` outcome
+    /// read as "attempted but not refused by the place itself", so
+    /// `Ladder::status()` fell through to `STATUS_ERROR` ("transient failure,
+    /// retry with backoff") and a route that always served a 2 GB body would
+    /// be redownloaded up to the cap on every scheduled run. Migration 015
+    /// then split the terminal spelling — `too_large` instead of
+    /// `unavailable` — so `action_list` can group a cap refusal under its own
+    /// human action.
+    #[test]
+    fn a_too_large_outcome_is_a_terminal_refusal() {
+        // One attempted leg, and it was over the cap. The ladder has to read
+        // this as terminal, otherwise `acquire` loops.
+        let mut ladder = Ladder::default();
+        ladder.record(
+            Leg::Preprint,
+            LegOutcome::TooLarge {
+                url: "https://example.org/pdf".into(),
+                cap: 1024,
+                observed: 4 * 1024,
+                from_content_length: false,
+            },
+        );
+        ladder.skip(Leg::ArxivId, "the record carries no arxiv_id");
+        ladder.skip(Leg::ManualUrl, "the record carries no url");
+        assert_eq!(
+            ladder.status(),
+            "too_large",
+            "a cap refusal is terminal and lands in its own `action_list` \
+             group, not `unavailable`'s"
+        );
+        assert!(
+            !crate::acquire::ACQUIRE_QUEUE_STATUSES.contains(&ladder.status()),
+            "the terminal status is not in the `acquire` queue, so no second \
+             run refetches: {:?}",
+            crate::acquire::ACQUIRE_QUEUE_STATUSES
+        );
+
+        // A mix of {Refused, TooLarge} is `too_large`: both close the door,
+        // by them or by us, but if any leg was cap-refused the walk belongs
+        // in the cap group — a human can act on it by raising the cap and
+        // naming the paper, which they cannot for a plain server refusal.
+        let mut mixed = Ladder::default();
+        mixed.record(Leg::Preprint, LegOutcome::Refused { status: 404 });
+        mixed.record(
+            Leg::Publisher,
+            LegOutcome::TooLarge {
+                url: "https://example.org/pdf".into(),
+                cap: 1024,
+                observed: 2048,
+                from_content_length: true,
+            },
+        );
+        assert_eq!(mixed.status(), "too_large");
+
+        // Only server refusals: the original `unavailable` spelling — the
+        // work has no such artefact at the places we asked.
+        let mut all_refused = Ladder::default();
+        all_refused.record(Leg::Preprint, LegOutcome::Refused { status: 404 });
+        all_refused.record(Leg::Publisher, LegOutcome::Refused { status: 404 });
+        assert_eq!(all_refused.status(), "unavailable");
+
+        // A TooLarge alongside an Inconclusive stays `error`: at least one
+        // leg could not give a yes or a no, so the walk is not terminal. The
+        // inverse case the `error` branch exists to protect.
+        let mut not_terminal = Ladder::default();
+        not_terminal.record(
+            Leg::Preprint,
+            LegOutcome::TooLarge {
+                url: "https://example.org/pdf".into(),
+                cap: 1024,
+                observed: 2048,
+                from_content_length: true,
+            },
+        );
+        not_terminal.record(
+            Leg::Publisher,
+            LegOutcome::Inconclusive {
+                detail: "connection failed".into(),
+            },
+        );
+        assert_eq!(
+            not_terminal.status(),
+            "error",
+            "one unanswered leg withholds the terminal verdict, same as before"
+        );
+    }
+
+    /// End-to-end: a fetch that fails the cap records `too_large`, and a
+    /// second `acquire` run over the same queue puts **not one more byte
+    /// request on the wire** for the same URL (#288's acceptance criterion
+    /// against retry loops).
+    ///
+    /// The flow this pins is the one `acquire` runs on a schedule: the first
+    /// walk records the gap; the second one would, pre-#288, read the stored
+    /// `error` status, re-queue the work, and pull the same 4 KiB body off
+    /// the wire again — up to the cap on every scheduled run. The test name
+    /// is "does not refetch", so the test counts what the wiremock server
+    /// actually received, not just the planner's shape: `ladder_requests()`
+    /// filters out the metadata pass's four registry hops and leaves only the
+    /// byte-fetching hits against the publisher route.
+    #[tokio::test]
+    async fn a_second_acquire_run_after_a_too_large_fetch_does_not_refetch() {
+        let fx = Fixture::new().await;
+        let arxiv_id = "2401.00042";
+        let body = vec![b'R'; 4 * 1024];
+        let pdf_path = format!("/pdf/{arxiv_id}.pdf");
+        fx.serve_pdf_chunked(&pdf_path, body).await;
+        let paper = save_arxiv_work(&fx, "p-terminal-too-large", arxiv_id);
+
+        // First run: fail the cap via `download_paper`, which writes the gap
+        // row. `acquire::run` reads that row through `coverage_report`, so
+        // the second run's queue is populated by this first write — no
+        // separate `queue_add` seeding needed.
+        let downloader = fx.downloader().with_body_cap(1024);
+        let _ = downloader
+            .download_paper(&paper, &fx.papers_dir())
+            .await
+            .expect_err("a chunked body over the cap is refused");
+        let states_after_first = fx.states("p-terminal-too-large");
+        assert_eq!(states_after_first.len(), 1);
+        assert_eq!(
+            states_after_first[0].status, "too_large",
+            "a cap refusal lands `too_large`, the terminal status `action_list` \
+             groups under its own human action (migration 015)"
+        );
+        // The real server received the first run's byte request(s). Counted
+        // specifically for `pdf_path` so metadata-pass hops (which `acquire`
+        // *does* resolve from scratch on a full run) are not folded in by
+        // either direction.
+        let ladder_hits_after_first = fx
+            .ladder_requests()
+            .await
+            .into_iter()
+            .filter(|url| url.contains(&pdf_path))
+            .count();
+        assert!(
+            ladder_hits_after_first >= 1,
+            "sanity: the first run put at least one byte request on the wire \
+             for {pdf_path}"
+        );
+        let too_large_after_first = fx
+            .attempts("p-terminal-too-large")
+            .into_iter()
+            .filter(|(_, _, outcome, _)| outcome == "too_large")
+            .count();
+        assert_eq!(too_large_after_first, 1);
+
+        // The row the first walk wrote is terminal, so `acquire` must skip
+        // this work: `too_large` is not in `ACQUIRE_QUEUE_STATUSES`.
+        assert!(
+            !crate::acquire::ACQUIRE_QUEUE_STATUSES.contains(&"too_large"),
+            "sanity: the terminal cap status is not in the acquire queue"
+        );
+
+        // Second run goes through the real `acquire::run` against the queue
+        // populated by the first walk's gap row. The mock server is still
+        // mounted on the same path, so if the walk decides to fetch it the
+        // byte count goes up — this is the acceptance criterion the test
+        // name promises.
+        let _ = crate::acquire::run(
+            &fx.db,
+            &downloader,
+            &fx.papers_dir(),
+            &crate::acquire::AcquireRequest::queue(),
+        )
+        .await
+        .expect("acquire run always returns a report; outcomes carry errors");
+        let ladder_hits_after_second = fx
+            .ladder_requests()
+            .await
+            .into_iter()
+            .filter(|url| url.contains(&pdf_path))
+            .count();
+        assert_eq!(
+            ladder_hits_after_second, ladder_hits_after_first,
+            "the second `acquire` run must not have put another byte request \
+             on the wire for {pdf_path} (it saw {ladder_hits_after_second}, \
+             first run saw {ladder_hits_after_first})"
+        );
+        // And nothing in `acquisition_attempts` either — the test name is
+        // "does not refetch", so a second `too_large` row would be a lie by
+        // omission.
+        let too_large_after_second = fx
+            .attempts("p-terminal-too-large")
+            .into_iter()
+            .filter(|(_, _, outcome, _)| outcome == "too_large")
+            .count();
+        assert_eq!(
+            too_large_after_second, too_large_after_first,
+            "no second cap refusal row, because the planner never asked for one"
+        );
+    }
+
+    /// The **named re-acquire** path: after raising the cap, calling
+    /// `acquire` with an explicit `--paper <id>` bypasses the queue filter
+    /// and fetches the work again. This is the one documented way out of
+    /// `too_large` (#288): naming the id declares the inputs changed.
+    #[tokio::test]
+    async fn a_raised_cap_and_a_named_re_acquire_fetches_the_work() {
+        let fx = Fixture::new().await;
+        let arxiv_id = "2401.00043";
+        let body = vec![b'S'; 4 * 1024];
+        // Two mounts: the record-arxiv-id variant (`/pdf/<id>.pdf`, used
+        // when `paper.arxiv_id` is set in-memory — the first walk here
+        // passes the `Paper` object directly) and the preprint-transform
+        // variant (`/pdf/<id>`, used by `acquire::run` which reads the
+        // `papers` row back and finds no `arxiv_id` column in the test
+        // fixture's `save()` — ARXIV transforms the DOI itself to an
+        // arxiv URL in that path). Both resolve to the same 4 KiB body so
+        // the test does not accidentally depend on which URL won.
+        let pdf_path_arxiv = format!("/pdf/{arxiv_id}.pdf");
+        let pdf_path_doi = format!("/pdf/{arxiv_id}");
+        fx.serve_pdf_chunked(&pdf_path_arxiv, body.clone()).await;
+        fx.serve_pdf_chunked(&pdf_path_doi, body).await;
+        let paper = save_arxiv_work(&fx, "p-raised-cap", arxiv_id);
+
+        // First walk via `download_paper` (which records the gap row). The
+        // 4 KiB body is over the 1 KiB cap, so status is `too_large`.
+        let strict = fx.downloader().with_body_cap(1024);
+        let _ = strict
+            .download_paper(&paper, &fx.papers_dir())
+            .await
+            .expect_err("the 4 KiB body is over the strict 1 KiB cap");
+        let states = fx.states("p-raised-cap");
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].status, "too_large");
+        // `fx.ladder_requests()` strips the metadata pass, and the fetch
+        // can route through either arxiv URL shape (see mock setup).
+        let count_fetches = |urls: Vec<String>| -> usize {
+            urls.into_iter()
+                .filter(|u| u.contains(&pdf_path_arxiv) || u.contains(&pdf_path_doi))
+                .count()
+        };
+        let ladder_after_first = count_fetches(fx.ladder_requests().await);
+        assert!(
+            ladder_after_first >= 1,
+            "sanity: the first walk put a byte request on the wire for an \
+             arxiv pdf url"
+        );
+
+        // A plain queue run, now with the raised cap, must skip the work
+        // because `too_large` is terminal — the queue has no way to know
+        // the operator raised the cap.
+        let raised = fx.downloader().with_body_cap(8 * 1024);
+        let _ = crate::acquire::run(
+            &fx.db,
+            &raised,
+            &fx.papers_dir(),
+            &crate::acquire::AcquireRequest::queue(),
+        )
+        .await
+        .expect("acquire run always returns a report");
+        let ladder_after_queue_run = count_fetches(fx.ladder_requests().await);
+        assert_eq!(
+            ladder_after_queue_run, ladder_after_first,
+            "the queue filter still skips `too_large`: the raised cap on its \
+             own is not a signal to re-fetch"
+        );
+
+        // The named re-acquire bypasses the queue filter
+        // (`acquire::plan`'s `explicit` branch — `acquire.rs:~525`). With
+        // the raised cap the 4 KiB body fits, so the walk succeeds — a new
+        // byte request lands on the wire and the status leaves `too_large`.
+        let named = crate::acquire::AcquireRequest::for_papers(["p-raised-cap".to_string()]);
+        let report = crate::acquire::run(&fx.db, &raised, &fx.papers_dir(), &named)
+            .await
+            .expect("acquire run always returns a report");
+        assert_eq!(
+            report.plan.works.len(),
+            1,
+            "the named re-acquire bypassed the queue filter and planned the \
+             one work: {report:?}"
+        );
+        let ladder_after_named = count_fetches(fx.ladder_requests().await);
+        assert!(
+            ladder_after_named > ladder_after_queue_run,
+            "the named re-acquire must have put another byte request on the \
+             wire for an arxiv pdf url (saw {ladder_after_named}, pre-named \
+             {ladder_after_queue_run}): {report:?}"
+        );
+        // The work was fetched. The `acquisition_state` row for `fulltext`
+        // is retracted by `record_download`; its absence is the success
+        // signal.
+        let states_after = fx.states("p-raised-cap");
+        assert!(
+            states_after
+                .iter()
+                .all(|s| !(s.kind == "fulltext" && s.locator.is_empty())),
+            "the gap row was retracted by the successful fetch: {states_after:?}"
+        );
+    }
+
+    /// The DOI-only `scitadel download <doi>` path writes a `too_large` audit
+    /// row too (`paper_id = NULL`): the row is nullable by migration 013, and
+    /// this is the one audit shape that remains useful without a `papers` row
+    /// — it is a statement that **we** refused, and `scitadel action_list`
+    /// prints the detail (#288).
+    #[tokio::test]
+    async fn the_doi_only_download_writes_a_too_large_row_with_null_paper_id() {
+        let fx = Fixture::new().await;
+        // bioRxiv has two candidate URLs (versioned + un-versioned): the
+        // DOI-only path tries both, taking the **last** candidate's outcome
+        // as its leg verdict. Both must serve the over-cap body so the leg
+        // ends in `TooLarge` rather than a mix that forgets the cap refusal.
+        let over_cap = vec![b'B'; 4 * 1024];
+        fx.serve_pdf_body(
+            "/content/10.1101/2025.11.10.123456v1.full.pdf",
+            over_cap.clone(),
+        )
+        .await;
+        fx.serve_pdf_body("/content/10.1101/2025.11.10.123456.full.pdf", over_cap)
+            .await;
+        let out_dir = fx.papers_dir();
+
+        let err = fx
+            .downloader()
+            .with_body_cap(1024)
+            .download("https://doi.org/10.1101/2025.11.10.123456", &out_dir)
+            .await;
+        // The DOI-only path tries preprint → Unpaywall → publisher: the
+        // preprint leg caps, Unpaywall and the publisher miss (unmocked
+        // paths return 404), and the final error is the walk's own.
+        assert!(err.is_err(), "nothing served under the cap: {err:?}");
+
+        // One `too_large` row, written against a NULL paper_id — the
+        // preprint leg's label, no paper id to key against. Unpaywall and
+        // the publisher miss with 404s, not cap refusals, so they write no
+        // row of their own.
+        let conn = fx.db.conn().expect("conn");
+        let rows: Vec<(Option<String>, String, String)> = conn
+            .prepare(
+                "SELECT paper_id, route, outcome
+                   FROM acquisition_attempts
+                  WHERE outcome = 'too_large'
+                  ORDER BY id",
+            )
+            .expect("prepare")
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("rows");
+        assert_eq!(rows.len(), 1, "exactly one too_large audit row: {rows:?}");
+        let (paper_id, route, outcome) = &rows[0];
+        assert_eq!(
+            paper_id.as_deref(),
+            None,
+            "the DOI-only path has no papers row to key against"
+        );
+        assert_eq!(outcome, "too_large");
+        assert_eq!(
+            route, "preprint",
+            "the preprint leg's label, collapsing the arXiv/bioRxiv candidate pair"
+        );
+    }
+
+    /// Acceptance criterion: `scan` and the fetch path share **one**
+    /// implementation of the rule.
+    ///
+    /// The one constant that encodes ADR-007 §1's full-text cap is
+    /// [`scitadel_db::sqlite::CAP_FULLTEXT_BYTES`], read by `scan` through
+    /// `cap_for_kind("fulltext_pdf")` and by the fetch path through the
+    /// [`FETCH_BODY_CAP_BYTES`] re-export. If anyone edits one side without
+    /// the other, this test fails — which is the whole mechanical point of
+    /// having one source of truth for the number.
+    #[test]
+    fn the_fetch_cap_is_the_same_rule_scan_enforces() {
+        assert_eq!(
+            FETCH_BODY_CAP_BYTES,
+            scitadel_db::sqlite::CAP_FULLTEXT_BYTES as u64,
+            "the fetch path's cap is cap_for_kind('fulltext_pdf') verbatim"
+        );
+        assert_eq!(
+            Some(FETCH_BODY_CAP_BYTES as i64),
+            scitadel_db::sqlite::cap_for_kind("fulltext_pdf"),
+            "and `scan` reads the same number through `cap_for_kind`"
+        );
+        // 100 MB, pinned so a later change to the ADR has to land here too.
+        assert_eq!(FETCH_BODY_CAP_BYTES, 100 * 1024 * 1024);
     }
 
     /// **"Unreachable" must never be reachable-by-download**, part one: a work

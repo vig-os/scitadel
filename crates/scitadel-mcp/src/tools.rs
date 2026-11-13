@@ -601,7 +601,8 @@ pub async fn download_paper_tool(
     let db = open_db()?;
     let downloader =
         scitadel_adapters::download::PaperDownloader::new(db.clone(), config.openalex.auth(), 60.0)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?
+            .with_body_cap_override(config.acquire.body_cap_bytes);
 
     let result = if let Some(pid) = paper_id {
         let paper = resolve_paper_id(&db, pid)?;
@@ -2377,7 +2378,8 @@ pub async fn acquire_tool(
     let db = open_db()?;
     let downloader =
         scitadel_adapters::download::PaperDownloader::new(db.clone(), config.openalex.auth(), 60.0)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?
+            .with_body_cap_override(config.acquire.body_cap_bytes);
     let request = scitadel_adapters::acquire::AcquireRequest {
         paper_ids,
         kind: None,
