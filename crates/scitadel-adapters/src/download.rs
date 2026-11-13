@@ -76,12 +76,19 @@
 //! write into `blobs/` happen with no write lock held, then one short
 //! `BEGIN IMMEDIATE` for the rows.
 //!
-//! ## The DOI-only path is not a download into the library
+//! ## The DOI-only path records too (#289)
 //!
-//! [`PaperDownloader::download`] resolves no `papers` row, so there is no work to
-//! file bytes under and no artefact to record. It writes the file the caller asked
-//! for into the caller's `output_dir` and stops — see
-//! [`write_download_output`].
+//! [`PaperDownloader::download_by_doi`] is the one entry the CLI's
+//! `scitadel download <doi>` and the `download_paper_tool` MCP tool take: it
+//! resolves the DOI into a `papers` row — reusing the row that already carries
+//! that DOI, or minting one from OpenAlex, or minting a minimal one when
+//! OpenAlex doesn't know it — and then hands the work to
+//! [`PaperDownloader::download_paper`], the same ladder `scitadel acquire`
+//! uses. So every path that fetches bytes against this library records an
+//! artefact in the same transaction as the blob, and no path writes a file
+//! into the library without a row naming it (ADR-007 §1, #289 acceptance).
+//! The `write_download_output` helper #253 S2e kept for the non-recording
+//! DOI-only path is gone with it.
 //!
 //! ## The DOI gate (#262)
 //!
@@ -125,7 +132,7 @@ use crate::identity_chain::{ChainOutcome, HopOutcome, IdentityChain};
 use crate::import_flat::resolve_best_effort;
 use crate::openalex::OPENALEX_API_URL;
 use crate::osti;
-use crate::preprint::{self, PreprintBases};
+use crate::preprint::PreprintBases;
 
 /// The format of a downloaded paper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -457,68 +464,157 @@ impl PaperDownloader {
         &self.endpoints
     }
 
-    /// Download by DOI only — kept for the CLI `download <doi>` path.
-    /// Tries Unpaywall first, then publisher HTML fallback.
+    /// Download by DOI, **recording** an artefact against a `papers` row — the
+    /// one entry the CLI's `scitadel download <doi>` and the MCP's
+    /// `download_paper_tool` take when they are handed a DOI rather than a
+    /// paper id (#289).
     ///
-    /// Nothing about the library changes here: there is no `Paper` row to file the
-    /// bytes against, and inventing one is not this function's job. The file lands
-    /// in the caller's `output_dir` and the result carries its path. For the same
-    /// reason there is no `acquisition_state` row either — the gap table is keyed by
-    /// `paper_id`.
+    /// The DOI is resolved to a row in one of three ways, in order:
     ///
-    /// That also means `scitadel download <doi>` records **no** artefact, and
-    /// therefore no `papers.local_path` and no status. It never recorded an
-    /// artefact; what it recorded was the retired three-column shape, and the
-    /// reader of that shape (the TUI state column) now derives its answer from
-    /// `artefacts`. A library that wants a DOI-only download *recorded* goes
-    /// through [`Self::download_paper`] — which is what `scitadel acquire` does.
-    pub async fn download(
+    /// 1. an existing `papers` row that already carries this DOI, so a
+    ///    re-download writes against the row the user already knows;
+    /// 2. an OpenAlex record, saved on success so the row carries the full
+    ///    metadata the identity chain and the TUI expect;
+    /// 3. a **minimal** row — DOI, and the DOI as a placeholder title —
+    ///    minted when OpenAlex has no record for this DOI. ADR-007 §1 is
+    ///    about the file layout mirroring the database, and a row that says
+    ///    only "we know this DOI and we fetched something for it" is still
+    ///    what the acceptance asks for: one artefact, one row that names it.
+    ///    A later `scitadel resolve-doi` or metadata import fills the rest
+    ///    in without touching the artefact.
+    ///
+    /// The fetch itself is [`Self::download_paper`] — the same recording
+    /// ladder `scitadel acquire` uses. There is no second route into the
+    /// library from a DOI, and no file lands beside a row that does not name
+    /// it (#289 acceptance, ADR-007 §1).
+    ///
+    /// # Errors
+    ///
+    /// - `AdapterError::Validation` on a DOI that fails the DOI gate (#262).
+    /// - Whatever `OpenAlexAdapter::fetch_paper_by_doi` returned on a hard
+    ///   failure (a 404 is not one — that is the minimal-row fallback).
+    /// - Whatever [`Self::download_paper`] propagates: the one fetch, the
+    ///   identity gate, or the `record_download` transaction.
+    pub async fn download_by_doi(
         &self,
+        openalex: &crate::openalex::OpenAlexAdapter,
         doi: &str,
         output_dir: &Path,
-    ) -> Result<DownloadResult, AdapterError> {
+    ) -> Result<DownloadByDoiReport, AdapterError> {
+        use scitadel_core::models::PaperId;
+        use scitadel_core::ports::PaperRepository as _;
+        use scitadel_core::untrusted::UntrustedText;
+
         let normalized = validate_doi_detailed(doi)
             .map_err(|reason| AdapterError::Validation(format!("invalid DOI: {reason}")))?;
 
-        tokio::fs::create_dir_all(output_dir).await.map_err(|e| {
-            AdapterError::Io(format!(
-                "failed to create output dir {}: {e}",
-                output_dir.display()
-            ))
+        // 1. An existing row by DOI takes precedence over resolving one, so a
+        // re-download writes against the row the user already knows and the
+        // row's existing metadata (title, authors) is what the identity gate
+        // compares against. `find_by_doi` is case-insensitive (see the
+        // repository), so an existing row written with a differently-cased
+        // DOI is still found and the pre-row-write dedup holds.
+        let (paper_repo, _, _, _, _) = self.db.repositories();
+        let existing = paper_repo.find_by_doi(&normalized).map_err(|e| {
+            AdapterError::Other(format!("could not read papers row for {normalized}: {e}"))
         })?;
+        let (paper, minted) = if let Some(paper) = existing {
+            (paper, false)
+        } else {
+            // 2. OpenAlex. A hard failure is surfaced (the caller asked for a
+            // DOI, and giving up on the registry it names first is not an
+            // answer); a 404 is reported as `Ok(None)` and falls through to
+            // the minimal row.
+            match openalex.fetch_paper_by_doi(&normalized).await {
+                Ok(Some(paper)) => {
+                    paper_repo.save(&paper).map_err(|e| {
+                        AdapterError::Other(format!("could not save papers row: {e}"))
+                    })?;
+                    (paper, true)
+                }
+                Ok(None) => {
+                    // 3. Minimal row. The DOI is unknown to OpenAlex but the
+                    // identity chain still asks Crossref and DataCite, so a
+                    // `10.18434`/`10.5281`/`10.26434` DOI comes back with a
+                    // real title here. That is the whole point of this branch:
+                    // a DOI-as-placeholder-title would score below the mismatch
+                    // floor against any Crossref/DataCite answer and the
+                    // identity gate would refuse the download it exists to
+                    // record (#289's blocker 1). When no registry registers
+                    // the DOI either, the title stays empty and the pre-fetch
+                    // check is honestly `unverified` — "no title on one side,
+                    // so there was nothing to compare".
+                    let work = WorkScope::new();
+                    let chain = self
+                        .identity_chain()
+                        .resolve(&self.client, &work, Some(&normalized), None)
+                        .await;
+                    let mut paper = Paper::new(String::new());
+                    paper.id = PaperId::new();
+                    paper.doi = Some(normalized.clone());
+                    if let Some(answer) = chain.resolved {
+                        if let Some(title) = answer.identity.title {
+                            paper.title = UntrustedText::ours(title);
+                        }
+                        paper.year = answer.identity.year;
+                        if let Some(first_author) = answer.identity.first_author {
+                            paper.authors = vec![UntrustedText::ours(first_author)];
+                        }
+                    }
+                    paper_repo.save(&paper).map_err(|e| {
+                        AdapterError::Other(format!("could not save minimal papers row: {e}"))
+                    })?;
+                    (paper, true)
+                }
+                Err(e) => {
+                    return Err(AdapterError::Other(format!(
+                        "OpenAlex lookup for DOI {normalized} failed: {e}"
+                    )));
+                }
+            }
+        };
 
-        let work = WorkScope::new();
-
-        // The same transform, in the same place relative to the index legs,
-        // for the same reason as in `download_paper`: `scitadel download <doi>`
-        // is a user-facing way to ask for exactly the DOIs in #260, and
-        // sending those to Unpaywall first is what reported them unreachable.
-        let stem = doi_to_filename(&normalized);
-        match self
-            .try_preprint(&work, &normalized, &stem, output_dir)
-            .await
-        {
-            Ok(fetched) => return self.finish(&work, None, fetched).await,
-            Err(e) => {
-                tracing::info!(doi = %normalized, error = %e, "preprint transform failed, falling back to Unpaywall");
+        match self.download_paper(&paper, output_dir).await {
+            Ok(result) => Ok(DownloadByDoiReport { paper, result }),
+            Err(error) => {
+                // A failed download must not leave a bare `papers` row behind:
+                // the row was minted for this fetch and now names no artefact,
+                // so `scitadel show`/`coverage` would report a paper that
+                // does not exist in the library. Only the row this call just
+                // minted is removed (never a row that already existed, and
+                // only if the fetch wrote no artefact — the two callers that
+                // land here on a `record_download` failure keep the half
+                // they wrote). Best-effort: a failure here is reported in the
+                // trace, never masks the original error.
+                if minted {
+                    self.cleanup_minted_placeholder(&paper);
+                }
+                Err(error)
             }
         }
+    }
 
-        match self.try_unpaywall(&work, &normalized, output_dir).await {
-            Ok(fetched) => return self.finish(&work, None, fetched).await,
-            Err(e) => {
-                tracing::info!(doi = %normalized, error = %e, "Unpaywall lookup failed, falling back to publisher");
-            }
+    /// Drop the minimal `papers` row [`Self::download_by_doi`] minted for a
+    /// fetch that ended without bytes.
+    ///
+    /// Scoped by id **and** by `NOT EXISTS (… artefacts WHERE paper_id = …)`
+    /// at the SQL level (see [`Database::delete_paper_if_orphan`]): a row
+    /// that gained an artefact between the mint and the cleanup is left
+    /// alone without a race. Best-effort — a failure here is reported in the
+    /// trace, never masks the original error.
+    fn cleanup_minted_placeholder(&self, paper: &Paper) {
+        match self.db.delete_paper_if_orphan(paper.id.as_str()) {
+            Ok(rows) => tracing::debug!(
+                paper_id = %paper.id,
+                rows_removed = rows,
+                "dropped the placeholder row minted for a failed download"
+            ),
+            Err(e) => tracing::warn!(
+                paper_id = %paper.id,
+                error = %e,
+                "could not drop the placeholder row for a failed download"
+            ),
         }
-
-        // The DOI-only path has no `papers` row to record a gap against, so
-        // the leg error is simply propagated — exactly the error this
-        // function returned before #260.
-        let fetched = self
-            .download_publisher_html(&work, &normalized, output_dir)
-            .await
-            .map_err(LegError::into_adapter)?;
-        self.finish(&work, None, fetched).await
     }
 
     /// Download a paper by **resolving, then ranking, then fetching one**
@@ -646,7 +742,6 @@ impl PaperDownloader {
             );
         }
 
-        let stem = file_stem_for(paper);
         // One scope for the whole walk: the pass and the one fetch are one work
         // to every platform they touch, so the `Work` permit is charged once per
         // bucket rather than once per request (ADR-007 §4).
@@ -760,11 +855,8 @@ impl PaperDownloader {
         );
 
         // ---- step 3: exactly one fetch ----
-        let result = match self
-            .fetch_candidate(&work, &resolution, chosen, &stem, output_dir)
-            .await
-        {
-            Ok(fetched) => self.finish(&work, Some(paper), fetched).await,
+        let result = match self.fetch_candidate(&work, &resolution, chosen).await {
+            Ok(fetched) => self.finish(&work, paper, fetched).await,
             Err(e) => {
                 let (error, outcome) = e.into_parts();
                 ladder.record(leg_of(chosen.candidate.route), outcome);
@@ -814,8 +906,6 @@ impl PaperDownloader {
         work: &WorkScope,
         resolution: &crate::resolve::Resolution,
         chosen: &crate::resolve::RankedCandidate,
-        stem: &str,
-        output_dir: &Path,
     ) -> Result<Fetched, LegError> {
         let route = chosen.candidate.route;
         let url = &chosen.candidate.url;
@@ -879,7 +969,6 @@ impl PaperDownloader {
 
         Ok(Fetched {
             reference: url.clone(),
-            path: output_dir.join(format!("{stem}.{ext}")),
             bytes,
             ext,
             format,
@@ -989,10 +1078,12 @@ impl PaperDownloader {
             // already spent that hop's budget".
             let outcome = match established {
                 Some(outcome) => outcome.clone(),
-                // The only way there is no established answer is the DOI-only
-                // path, which resolves no `papers` row and runs no gate at all.
-                // The fallback walks the chain rather than inventing a `None`
-                // that would read as "no registry was asked".
+                // Nothing was established by an earlier pass — a caller
+                // reached `gate_identity` without `download_paper_ranked`'s
+                // metadata pass (today, nobody does; `download_by_doi` itself
+                // runs the ranked walk via `download_paper`). The fallback
+                // walks the chain rather than inventing a `None` that would
+                // read as "no registry was asked".
                 None => {
                     self.identity_chain()
                         .resolve(&self.client, work, paper.doi.as_deref(), None)
@@ -1383,10 +1474,6 @@ impl PaperDownloader {
 
     /// Store the blob and record the download.
     ///
-    /// `paper` is `None` for the DOI-only path, which has no work row to write
-    /// against; the bytes are written to the caller's `output_dir` and the result
-    /// returned, and nothing about the library changes.
-    ///
     /// # Errors
     ///
     /// Every phase propagates. The phases are, in order: the content hash and the
@@ -1395,7 +1482,7 @@ impl PaperDownloader {
     async fn finish(
         &self,
         work: &WorkScope,
-        paper: Option<&Paper>,
+        paper: &Paper,
         fetched: Fetched,
     ) -> Result<DownloadResult, AdapterError> {
         let Fetched {
@@ -1407,21 +1494,18 @@ impl PaperDownloader {
             route,
             source_url,
             publisher_url,
-            path,
             identity,
             version,
             licence,
         } = fetched;
 
-        // #253, and the reason the bytes are still only in memory here: nothing
-        // is written before the identity gate has passed. `Fetched::path` is
-        // never created by a leg, so refusing here means the response body is
-        // dropped on the floor — no blob, no `artefacts` row, no gap retraction,
-        // and no file anywhere claiming to be this paper's.
-        if let Some(paper) = paper {
-            self.gate_identity(paper, route, work, &bytes, identity.as_ref())
-                .await?;
-        }
+        // #253, and the reason the bytes are still only in memory here:
+        // nothing is written before the identity gate has passed. Refusing
+        // here means the response body is dropped on the floor — no blob, no
+        // `artefacts` row, no gap retraction, and no file anywhere claiming
+        // to be this paper's.
+        self.gate_identity(paper, route, work, &bytes, identity.as_ref())
+            .await?;
 
         // The `kind` vocabulary is closed, so an extension outside it is a
         // refusal rather than a guess: filing a `.docx` as `fulltext_html`
@@ -1434,28 +1518,6 @@ impl PaperDownloader {
                 "{ext:?} is not a full-text kind, so this download cannot be recorded"
             ))
         })?;
-
-        let result = DownloadResult {
-            doi: reference,
-            path: path.clone(),
-            format,
-            route,
-            bytes: bytes.len(),
-            access,
-            publisher_url,
-            source_url: Some(source_url),
-            publisher_note: None,
-        };
-
-        let Some(paper) = paper else {
-            // No work row to write against, so there is no artefact to file the
-            // bytes under: the file the caller asked for *is* the deliverable of
-            // `scitadel download <doi>`. It is not a mirror of anything — there is
-            // no row saying where it should be — which is the difference between
-            // this and the retired `papers/<stem>.<ext>` copy.
-            write_download_output(&path, &bytes)?;
-            return Ok(result);
-        };
 
         let library_root = self.db.library_root()?.ok_or_else(|| {
             AdapterError::Other(
@@ -1476,6 +1538,7 @@ impl PaperDownloader {
         // also why there is no `papers/<stem>.<ext>` copy any more. The blob *is*
         // the file now, and `find_cached_file` opens it through the artefact row.
         let stored_root = library_root.clone();
+        let fetched_len = bytes.len();
         let (sha256, byte_len) = tokio::task::spawn_blocking(move || {
             store_bytes(&bytes, ext, &stored_root).map_err(AdapterError::from)
         })
@@ -1489,17 +1552,15 @@ impl PaperDownloader {
         // Phase 2 — one transaction: `blobs`, the `artefacts` row, and the
         // retraction of the want this fetch just satisfied.
         //
-        // `version` is what the ranking established for the chosen candidate, and
-        // `None` — meaning "consult the route" — for the DOI-only path, which
-        // records no artefact at all and so has nothing to attribute. The
-        // precedence itself lives in `record_download`, not here.
+        // `version` is what the ranking established for the chosen candidate,
+        // recorded in preference to `RouteId::artefact_version`.
         self.db.record_download(&DownloadWrite {
             paper_id: paper.id.as_str().to_string(),
             route,
             version,
             ext: ext.to_string(),
             access_status: access.into(),
-            source_url: result.source_url.clone(),
+            source_url: Some(source_url.clone()),
             publisher,
             publisher_note: publisher_note.clone(),
             licence,
@@ -1514,13 +1575,19 @@ impl PaperDownloader {
         })?;
 
         Ok(DownloadResult {
-            // The path a reader can open is now the blob's, and it exists. This
-            // used to be the legacy copy's path, which is the one thing about it
-            // that was worth keeping: a caller that printed `result.path` got a
-            // file it could hand to a viewer, and still does.
+            doi: reference,
+            // The path a reader can open is the blob's, and it exists. This
+            // used to be the legacy copy's path, which is the one thing about
+            // it that was worth keeping: a caller that printed `result.path`
+            // got a file it could hand to a viewer, and still does.
             path: library_root.join(blob_rel_path(&sha256, ext)),
+            format,
+            route,
+            bytes: fetched_len,
+            access,
+            publisher_url,
+            source_url: Some(source_url),
             publisher_note,
-            ..result
         })
     }
 
@@ -1551,259 +1618,6 @@ impl PaperDownloader {
             .await
             .map_err(|e| fetch_failure(what, e))
     }
-
-    /// Try the DOI's deterministic preprint transform (#260).
-    ///
-    /// Ahead of every index leg, and for a reason that is about *access*
-    /// rather than about ordering: a preprint server serves its postings
-    /// openly and always has, so the ladder's first question about a `10.1101`
-    /// or `10.48550` DOI is not "where might this be free?" — which is what
-    /// OpenAlex was asked, and which answered null for every preprint in the
-    /// corpus that opened the issue — but "where does this DOI certainly
-    /// live?", which is a function of the DOI.
-    ///
-    /// Each candidate is charged [`PaceTier::Oa`] like any other OA host and
-    /// records the route that served it, so an artefact from this leg carries
-    /// `RouteId::Biorxiv` (or `Arxiv`) and inherits `version = 'preprint'` and
-    /// `access_basis = 'oa_license'` from the route rather than from a guess
-    /// made here.
-    ///
-    /// # Errors
-    ///
-    /// [`LegError`], with the *last* candidate's outcome when every candidate
-    /// missed: the un-versioned bioRxiv URL is the more permissive of the two,
-    /// so its verdict is the one that describes the leg as a whole.
-    async fn try_preprint(
-        &self,
-        work: &WorkScope,
-        doi: &str,
-        stem: &str,
-        output_dir: &Path,
-    ) -> Result<Fetched, LegError> {
-        let candidates = preprint::preprint_candidates_at(&self.preprint_bases(), doi);
-        let mut last: Option<LegError> = None;
-        for candidate in candidates {
-            match self
-                .preprint_candidate(work, &candidate, stem, output_dir)
-                .await
-            {
-                Ok(fetched) => {
-                    tracing::info!(
-                        doi = %doi,
-                        url = %candidate.url,
-                        route = candidate.route.label(),
-                        note = candidate.note,
-                        "preprint transform served the PDF with no index lookup"
-                    );
-                    return Ok(fetched);
-                }
-                Err(e) => {
-                    tracing::info!(
-                        doi = %doi,
-                        url = %candidate.url,
-                        error = %e,
-                        "preprint candidate missed"
-                    );
-                    last = Some(e);
-                }
-            }
-        }
-        Err(last.unwrap_or_else(|| {
-            LegError::skipped(preprint::no_transform_reason(doi).unwrap_or(NO_PREPRINT_ROUTE))
-        }))
-    }
-
-    /// Fetch one preprint candidate and classify what came back.
-    async fn preprint_candidate(
-        &self,
-        work: &WorkScope,
-        candidate: &preprint::PreprintCandidate,
-        stem: &str,
-        output_dir: &Path,
-    ) -> Result<Fetched, LegError> {
-        let url = &candidate.url;
-        let response = self
-            .get(work, url, PaceTier::Oa, candidate.route.label())
-            .await?;
-        // The arXiv transform carries no `.pdf` extension, so the URL cannot
-        // decide the format on its own — the same rule the OpenAlex leg
-        // already applies, shared rather than re-derived.
-        let is_pdf = looks_like_pdf(url, response.content_type());
-        // Read the URL off before `bytes()` consumes the response: this is the
-        // post-redirect URL, which is where the bytes actually live.
-        let source_url = response.url.to_string();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| fetch_failure("failed to read preprint bytes", e))?;
-
-        let (ext, format, access) = if is_pdf {
-            (PDF_EXT, DownloadFormat::Pdf, AccessStatus::FullText)
-        } else {
-            (HTML_EXT, DownloadFormat::Html, classify_html(&bytes))
-        };
-
-        Ok(Fetched {
-            reference: candidate.url.clone(),
-            path: output_dir.join(format!("{stem}.{ext}")),
-            bytes,
-            ext,
-            format,
-            access,
-            // A preprint server serves preprints: the route says so, and the
-            // `preprint` version claim comes from the route rather than from a
-            // judgement made here.
-            route: candidate.route,
-            source_url,
-            // The PDF we asked for, which is also the posting's canonical
-            // page — a human handed this URL sees the preprint.
-            publisher_url: Some(candidate.url.clone()),
-            identity: None,
-            // The DOI-only path resolves no `papers` row, so it records no
-            // artefact and the version has nowhere to go. See `fetch_candidate`
-            // for the one site that establishes one.
-            version: None,
-            // No metadata pass ran on this leg either, so no registry stated a
-            // licence and there is nothing to attribute.
-            licence: None,
-        })
-    }
-
-    /// The servers the preprint transforms are built against, taken from this
-    /// downloader's endpoints so one rule serves production and tests alike.
-    fn preprint_bases(&self) -> PreprintBases {
-        PreprintBases {
-            biorxiv_content: self.endpoints.biorxiv_content.clone(),
-            arxiv_pdf: self.endpoints.arxiv_pdf.clone(),
-        }
-    }
-
-    /// Query Unpaywall for an open-access PDF URL and download it.
-    async fn try_unpaywall(
-        &self,
-        work: &WorkScope,
-        doi: &str,
-        output_dir: &Path,
-    ) -> Result<Fetched, LegError> {
-        // The polite-pool email is always present, even empty — that is the
-        // request line this chain has always sent.
-        let url = self.endpoints.unpaywall_url(doi, &self.openalex.email);
-        let text = self
-            .get(work, &url, PaceTier::Meta, "Unpaywall API")
-            .await?
-            .text()
-            .await
-            .map_err(|e| fetch_failure("Unpaywall JSON parse failed", e))?;
-        let body: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-            LegError::inconclusive(AdapterError::Parse(format!(
-                "Unpaywall JSON parse failed: {e}"
-            )))
-        })?;
-
-        let pdf_url = body
-            .get("best_oa_location")
-            .and_then(|loc| loc.get("url_for_pdf"))
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                // An index that answers "no location" is **not** evidence that
-                // the work is unobtainable. That single null field is what made
-                // #260 report three free preprints as unreachable, so this
-                // outcome is classified separately from a refusal and can never
-                // become a `no access` verdict.
-                LegError::no_location(AdapterError::NotFound(
-                    "no open-access PDF found via Unpaywall".into(),
-                ))
-            })?;
-
-        tracing::info!(doi = %doi, pdf_url = %pdf_url, "found OA PDF via Unpaywall");
-
-        // The resolved PDF is charged as `Oa`, not `Meta`: the metadata API
-        // found it, but the bytes come off an OA host, and ADR-007 §4
-        // budgets those separately.
-        let (bytes, source_url) = self
-            .download_body(work, pdf_url, PaceTier::Oa, "PDF download")
-            .await?;
-
-        Ok(Fetched {
-            reference: doi.to_string(),
-            path: output_dir.join(format!("{}.pdf", doi_to_filename(doi))),
-            bytes,
-            ext: PDF_EXT,
-            format: DownloadFormat::Pdf,
-            access: AccessStatus::FullText,
-            route: RouteId::Unpaywall,
-            source_url,
-            publisher_url: None,
-            // Deliberately `None`: Unpaywall's `title` is a copy of the
-            // publisher-supplied title it was handed, so using it as the
-            // identity reference would be a second opinion about the same
-            // string — and ADR-007 §3's chain is "OpenAlex → Crossref →
-            // DataCite", which does not include Unpaywall. See
-            // [`try_openalex`].
-            identity: None,
-            // The DOI-only path; see `preprint_candidate` above.
-            version: None,
-            // And it asks no registry, so no licence is stated for it.
-            licence: None,
-        })
-    }
-
-    /// Resolve a DOI to its publisher page and download the HTML.
-    async fn download_publisher_html(
-        &self,
-        work: &WorkScope,
-        doi: &str,
-        output_dir: &Path,
-    ) -> Result<Fetched, LegError> {
-        let doi_url = self.endpoints.doi_url(doi);
-
-        let (bytes, source_url) = self
-            .download_body(work, &doi_url, PaceTier::Oa, "DOI resolution")
-            .await?;
-        let access = classify_html(&bytes);
-
-        Ok(Fetched {
-            reference: doi.to_string(),
-            path: output_dir.join(format!("{}.html", doi_to_filename(doi))),
-            bytes,
-            ext: HTML_EXT,
-            format: DownloadFormat::Html,
-            access,
-            route: RouteId::Publisher,
-            source_url,
-            // The URL we asked for, not the one we landed on: this is the
-            // canonical page a human should be pointed at, and a paywalled
-            // article needs the DOI, not whichever CDN served the stub.
-            publisher_url: Some(doi_url),
-            identity: None,
-            // The DOI-only path; see `preprint_candidate` above.
-            version: None,
-            // A resolver answers with a redirect and states no terms of its own.
-            licence: None,
-        })
-    }
-
-    /// Fetch a body and hand back the bytes with the URL they came from.
-    ///
-    /// The returned URL is the **post-redirect** one, because that is where
-    /// the bytes actually live: a landing page that redirects to a CDN is
-    /// recorded as the CDN URL, which is what a later `gc` or a
-    /// `source_url` consumer needs.
-    async fn download_body(
-        &self,
-        work: &WorkScope,
-        url: &str,
-        tier: PaceTier,
-        what: &str,
-    ) -> Result<(Vec<u8>, String), LegError> {
-        let response = self.get(work, url, tier, what).await?;
-        let source_url = response.url.to_string();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| fetch_failure("failed to read bytes", e))?;
-        Ok((bytes, source_url))
-    }
 }
 
 /// A download and the ranked plan it decided from.
@@ -1817,6 +1631,20 @@ pub struct RankedDownload {
     pub result: Result<DownloadResult, AdapterError>,
     /// Every candidate the pass found, ranked or explicitly not.
     pub plan: crate::resolve::Resolution,
+}
+
+/// What a `scitadel download <doi>` recorded — see
+/// [`PaperDownloader::download_by_doi`] (#289).
+///
+/// The `papers` row is the row the download was filed against, with whatever
+/// metadata it carries — the OpenAlex record on the lucky path, the user's
+/// existing row on the re-download, or the DOI-as-placeholder on the
+/// fallback. It is returned so the CLI and MCP can name the id in the output
+/// line rather than re-querying for the row they just created.
+#[derive(Debug)]
+pub struct DownloadByDoiReport {
+    pub paper: Paper,
+    pub result: DownloadResult,
 }
 
 /// What one ladder step brought back, before anything is recorded.
@@ -1840,7 +1668,6 @@ struct Fetched {
     /// Post-redirect URL the bytes came from.
     source_url: String,
     publisher_url: Option<String>,
-    path: PathBuf,
     /// What a **metadata registry** said this work is, on the legs that ask one.
     ///
     /// `None` for a leg that derives its URL from an identifier and never asks:
@@ -1881,12 +1708,12 @@ struct Fetched {
     /// The licence the **chosen candidate** carried, as the registry stated it.
     ///
     /// `None` on every leg that establishes nothing: the arXiv and preprint
-    /// transforms ask no registry, the DOI-only path resolves no row at all, and
-    /// a candidate whose source named no licence has no offer to carry. What is
-    /// *not* `None`-able is the attribution — the offer belongs to the candidate
-    /// that was fetched, so a grant another source published for the work never
-    /// reaches these bytes. `access_basis` remains the answer for why those
-    /// fetches were lawful.
+    /// transforms ask no registry, and a candidate whose source named no
+    /// licence has no offer to carry. What is *not* `None`-able is the
+    /// attribution — the offer belongs to the candidate that was fetched, so
+    /// a grant another source published for the work never reaches these
+    /// bytes. `access_basis` remains the answer for why those fetches were
+    /// lawful.
     licence: Option<LicenceWrite>,
 }
 
@@ -1923,6 +1750,7 @@ const WANTED_VERSION_VOR: &str = "vor";
 
 /// The reason recorded when a DOI belongs to no preprint server this module
 /// has a rule for.
+#[cfg(test)]
 const NO_PREPRINT_ROUTE: &str = "the DOI belongs to no preprint server with a verified route";
 
 /// One step of the ladder, named for a report rather than for a call site.
@@ -2215,16 +2043,6 @@ impl LegError {
         }
     }
 
-    /// A route that answered and had nothing to give.
-    fn no_location(error: AdapterError) -> Self {
-        Self {
-            outcome: LegOutcome::NoLocation {
-                detail: error.to_string(),
-            },
-            error,
-        }
-    }
-
     /// A failure that says nothing about access either way.
     fn inconclusive(error: AdapterError) -> Self {
         Self {
@@ -2243,22 +2061,6 @@ impl LegError {
             },
             error,
         }
-    }
-
-    /// No route applied — recorded for the preprint leg's absent transform,
-    /// and named rather than left as a bare `true`.
-    fn skipped(why: &'static str) -> Self {
-        Self {
-            error: AdapterError::NotFound(why.to_string()),
-            outcome: LegOutcome::Skipped {
-                why: why.to_string(),
-            },
-        }
-    }
-
-    /// The error the walk has always returned for this failure.
-    fn into_adapter(self) -> AdapterError {
-        self.error
     }
 
     /// The error and the outcome, without cloning either — used by the
@@ -2558,26 +2360,6 @@ const STATUS_ERROR: &str = "error";
 /// queue leaves it alone and `action_list` prints the group with the evidence
 /// beside it.
 const STATUS_IDENTITY_MISMATCH: &str = "identity_mismatch";
-
-/// Write the caller's chosen output file — the DOI-only path's deliverable.
-///
-/// The only file this module writes outside the blob store, and it is not a
-/// mirror of anything: `scitadel download <doi>` resolves no `papers` row, so
-/// there is no `artefacts` row to mirror and no `local_path` to keep in step
-/// with. `output_dir` is the user's own choice, and the file lands there under
-/// the name it has always had.
-///
-/// A download **against a work** never comes here. It is stored in `blobs/` and
-/// read back through the artefact row, which is ADR-007 §1's rule that the
-/// database is the source of truth and the file layout is a mirror.
-fn write_download_output(path: &Path, bytes: &[u8]) -> Result<(), AdapterError> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| AdapterError::Io(format!("failed to create {}: {e}", dir.display())))?;
-    }
-    std::fs::write(path, bytes)
-        .map_err(|e| AdapterError::Io(format!("failed to write {}: {e}", path.display())))
-}
 
 /// Classify a fetched body as full text / abstract / paywall.
 ///
@@ -2917,6 +2699,16 @@ mod tests {
             self.root().join("papers")
         }
 
+        /// The `OpenAlexAuth` the downloader is built with — reused by tests
+        /// that also construct an [`crate::openalex::OpenAlexAdapter`] pointed
+        /// at the same mock server (#289's DOI-only tests).
+        fn auth() -> OpenAlexAuth {
+            OpenAlexAuth {
+                email: "polite@example.org".to_string(),
+                api_key: "openalex-secret-key".to_string(),
+            }
+        }
+
         /// The whole ladder pointed at the mock server, paced by the
         /// counting pacer. One server for every endpoint, so every leg lands
         /// in the same bucket and the `Work` accounting is the only variable.
@@ -2929,10 +2721,7 @@ mod tests {
             let base = self.server.uri();
             PaperDownloader::with_client(
                 self.db.clone(),
-                OpenAlexAuth {
-                    email: "polite@example.org".to_string(),
-                    api_key: "openalex-secret-key".to_string(),
-                },
+                Self::auth(),
                 client,
                 Endpoints {
                     unpaywall_api: format!("{base}/v2"),
@@ -5019,42 +4808,516 @@ mod tests {
         assert!(!fx.requests_to("/v2/10.26434").await.is_empty());
     }
 
-    /// The DOI-only entry point (`scitadel download <doi>`) gets the same
-    /// transform in the same position. It is a user-facing way to ask for
-    /// precisely the DOIs in #260, and it has no `Paper` — so the assertions
-    /// are about the request line and the returned route, and the file is the
-    /// legacy copy `finish(None, …)` has always written.
+    /// #289 acceptance: `scitadel download <doi>` records *exactly one*
+    /// `artefacts` row naming the fetched file, and the paper then reports as
+    /// downloaded through the derivation every other reader uses.
+    ///
+    /// The setup is the tightest shape that covers the real DOI-only case: a
+    /// DOI OpenAlex does not know (returns 404), so [`download_by_doi`] falls
+    /// back to a minimal `papers` row and still records against it. The
+    /// preprint transform fires for the bioRxiv prefix without any index
+    /// having to speak, so the only request on the wire is the OpenAlex miss
+    /// and the PDF itself — the "distinct, still-needed behaviour" of this
+    /// entry point, now carrying a row with it.
     #[tokio::test]
-    async fn the_doi_only_path_also_tries_the_preprint_transform_first() {
+    async fn download_by_doi_records_exactly_one_artefact_naming_the_file() {
+        use scitadel_core::ports::PaperRepository as _;
+
         let fx = Fixture::new().await;
+        let doi = "10.1101/2025.06.14.659707";
+        // OpenAlex has nothing for this DOI — the minimal-row fallback path.
+        fx.miss(&format!("/works/doi:{doi}")).await;
+        // The preprint PDF is the only byte source.
         fx.serve_pdf("/content/10.1101/2025.06.14.659707v1.full.pdf")
             .await;
-        let out_dir = fx.papers_dir();
 
-        let result = fx
+        let openalex = crate::openalex::OpenAlexAdapter::new(Fixture::auth(), 10.0)
+            .with_base_url(format!("{}/works", fx.server.uri()));
+        let report = fx
             .downloader()
-            .download("https://doi.org/10.1101/2025.06.14.659707", &out_dir)
+            .download_by_doi(&openalex, doi, &fx.papers_dir())
             .await
-            .expect("the preprint transform should serve the PDF");
+            .expect("the DOI-only path records against a minimal row");
 
-        assert_eq!(result.route, RouteId::Biorxiv);
-        assert_eq!(result.format, DownloadFormat::Pdf);
-        assert!(
-            fx.requests_to("/v2/").await.is_empty(),
-            "no index lookup for a DOI that determines its own location: {:?}",
-            fx.requests().await
+        // --- exactly one artefact row, and it names the fetched file ---
+        let rows = fx.artefacts();
+        assert_eq!(
+            rows.len(),
+            1,
+            "one DOI fetched = one artefact row: {rows:?}"
         );
-        assert_eq!(fx.requests().await.len(), 1, "{:?}", fx.requests().await);
-        assert!(
-            result.path.exists(),
-            "the DOI-only path still writes its legacy copy: {}",
-            result.path.display()
+        let row = &rows[0];
+        assert_eq!(row.paper_id, report.paper.id.as_str());
+        assert_eq!(row.kind, "fulltext_pdf");
+        assert_eq!(row.route, "biorxiv");
+        assert_eq!(row.access_status, "full_text");
+        let sha = row.sha256.clone().expect("the blob was hashed");
+        // The reported path is the blob store's, not a legacy copy.
+        let stored = resolve_best_effort(
+            &fx.root()
+                .join("blobs")
+                .join(&sha[..2])
+                .join(format!("{sha}.{}", row.format.as_deref().expect("format"))),
         );
         assert_eq!(
-            std::fs::read(&result.path).expect("read back"),
-            PDF_BYTES,
-            "and it is the bytes the server served"
+            resolve_best_effort(&report.result.path),
+            stored,
+            "the recorded path is the blob — one file, one row"
         );
+
+        // --- the paper reports as downloaded through the derived "have" ---
+        let (paper_repo, _, _, _, _) = fx.db.repositories();
+        let saved = paper_repo
+            .get(report.paper.id.as_str())
+            .expect("db read")
+            .expect("paper row exists");
+        assert_eq!(
+            saved.doi.as_deref(),
+            Some(doi),
+            "the minimal row carries the DOI we were asked for"
+        );
+        let state = fx
+            .derived_state(report.paper.id.as_str())
+            .expect("the paper has a state");
+        assert_eq!(
+            state,
+            DownloadState::FullText,
+            "ADR-007 §1's \"have\" derivation says downloaded: the TUI's state \
+             column, `find_cached_file` and `coverage` all read this same answer"
+        );
+        assert!(
+            find_cached_file(&fx.db, &saved)
+                .expect("library root exists")
+                .is_some(),
+            "and `find_cached_file` opens the file through the artefact row"
+        );
+
+        // --- and nothing was written outside the blob store ---
+        let legacy_copies: Vec<PathBuf> = std::fs::read_dir(fx.papers_dir())
+            .map(|entries| entries.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        assert!(
+            legacy_copies.is_empty(),
+            "the DOI-only path writes no orphan into `papers/`: {legacy_copies:?}"
+        );
+    }
+
+    /// #289 acceptance: when every fetch leg fails, the DOI-only path writes
+    /// **nothing** — no file, no artefact row, no blob, and no `papers`
+    /// placeholder either. The minimal row is minted for the fetch, and when
+    /// the fetch ends without bytes `cleanup_minted_placeholder` drops it
+    /// again, so `scitadel show` is not left reporting a paper that does not
+    /// exist in the library. The ladder's own failure record (an
+    /// `acquisition_state` row saying nothing was obtained) is what `acquire`
+    /// reads to decide what to do next.
+    #[tokio::test]
+    async fn download_by_doi_failure_cleans_up_the_placeholder_row() {
+        use scitadel_core::ports::PaperRepository as _;
+
+        let fx = Fixture::new().await;
+        let doi = "10.99999/no.such.paper";
+        // OpenAlex has nothing — minimal row fallback.
+        fx.miss(&format!("/works/doi:{doi}")).await;
+        // Every index and byte leg misses, including the Crossref and
+        // DataCite fallback the minimal-row path now consults.
+        for miss in [
+            format!("/v2/{doi}"),
+            format!("/cr/{doi}"),
+            format!("/dc/{doi}"),
+            format!("/epmc/{doi}"),
+            format!("/doi/{doi}"),
+        ] {
+            fx.miss(&miss).await;
+        }
+
+        let openalex = crate::openalex::OpenAlexAdapter::new(Fixture::auth(), 10.0)
+            .with_base_url(format!("{}/works", fx.server.uri()));
+        let err = fx
+            .downloader()
+            .download_by_doi(&openalex, doi, &fx.papers_dir())
+            .await
+            .expect_err("every leg misses, so no bytes arrive");
+        assert!(
+            !format!("{err}").is_empty(),
+            "the error carries a description"
+        );
+
+        // No artefact row. ADR-007 §1 §1's rule is "a file beside a row that
+        // names it" — a missed fetch wrote no file, so there is no row to
+        // write either.
+        let rows = fx.artefacts();
+        assert!(
+            rows.is_empty(),
+            "a failed fetch records no artefact: {rows:?}"
+        );
+        // No blob in the content-addressed store.
+        assert_eq!(fx.count("blobs"), 0, "and no bytes land in the blob store");
+        // No orphan in `papers/<stem>.<ext>`.
+        let papers_dir_files: Vec<PathBuf> = std::fs::read_dir(fx.papers_dir())
+            .map(|entries| entries.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        assert!(
+            papers_dir_files.is_empty(),
+            "and no orphan file in `papers/`: {papers_dir_files:?}"
+        );
+        // And the `papers` row the mint created is gone — a failed download
+        // must not leave a stub row behind (#289 review nit).
+        let (paper_repo, _, _, _, _) = fx.db.repositories();
+        assert!(
+            paper_repo.find_by_doi(doi).expect("read").is_none(),
+            "a failed fetch's placeholder `papers` row is cleaned up"
+        );
+    }
+
+    /// #289: an existing `papers` row that already carries this DOI is reused
+    /// rather than duplicated. A re-download writes against the row the user
+    /// already knows; the row's metadata (title, authors) is what the identity
+    /// gate compares against, so a second write cannot drift from the first.
+    #[tokio::test]
+    async fn download_by_doi_reuses_the_existing_paper_row() {
+        use scitadel_core::ports::PaperRepository as _;
+
+        let fx = Fixture::new().await;
+        let doi = "10.1101/known-paper";
+        // A paper already exists for this DOI — a BibTeX import, a search hit,
+        // a previous `resolve-doi`. OpenAlex is not consulted on this branch;
+        // the fixture's catch-all would 404 if it were.
+        let existing = save(&fx, "p-known", Some(doi), None, None, None);
+        fx.serve_pdf(&format!("/content/{doi}v1.full.pdf")).await;
+
+        let openalex = crate::openalex::OpenAlexAdapter::new(Fixture::auth(), 10.0)
+            .with_base_url(format!("{}/works", fx.server.uri()));
+        let report = fx
+            .downloader()
+            .download_by_doi(&openalex, doi, &fx.papers_dir())
+            .await
+            .expect("the existing row carries the DOI");
+
+        assert_eq!(
+            report.paper.id, existing.id,
+            "the row the user already knows is the one we file against"
+        );
+        let rows = fx.artefacts();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].paper_id, existing.id.as_str());
+        // One row for this DOI: no duplicate `papers` entry under a fresh id.
+        let (paper_repo, _, _, _, _) = fx.db.repositories();
+        let by_doi = paper_repo.find_by_doi(doi).expect("read").expect("row");
+        assert_eq!(by_doi.id, existing.id);
+    }
+
+    /// #289 review blocker: a DOI OpenAlex does not index but **Crossref**
+    /// does gets a minimal row whose title is Crossref's answer, not the DOI.
+    /// That is the whole point of the fallback: a DOI-as-placeholder-title
+    /// scores below `identity::MISMATCH_FLOOR` against any real title and the
+    /// identity gate refuses, blocking the download this entry point exists to
+    /// record (#260's `10.26434/chemrxiv…` and `10.18434/m…` DOIs are two live
+    /// examples).
+    #[tokio::test]
+    async fn download_by_doi_falls_back_to_crossref_for_the_title() {
+        use wiremock::{Mock, ResponseTemplate, matchers};
+
+        let fx = Fixture::new().await;
+        // A bioRxiv-registered DOI OpenAlex does not index: the preprint
+        // transform fires for `10.1101` so the download has a candidate to
+        // fetch, while the identity chain's Crossref hop answers the title
+        // the fallback needs.
+        let doi = "10.1101/known.only.to.crossref";
+        // Crossref's URL builder percent-encodes the DOI's inner `/` to
+        // `%2F` via `path_segments_mut`, so a test mock has to match on the
+        // encoded form or the mock does not fire and the request falls
+        // through to wiremock's default 404 — which looks like "Crossref not
+        // registered", the opposite of what this test is checking.
+        let encoded = doi.replace('/', "%2F");
+        // OpenAlex has nothing — the minimal-row fallback path.
+        fx.miss(&format!("/works/doi:{doi}")).await;
+        // Crossref answers with a real record, in the shape Crossref actually
+        // serves (`title` is an array, `published` is a nested `date-parts`
+        // array, `author` is an object).
+        let crossref_body = serde_json::json!({
+            "status": "ok",
+            "message": {
+                "DOI": doi,
+                "title": ["A real article title Crossref registered"],
+                "published": {"date-parts": [[2026, 4, 2]]},
+                "author": [{"family": "Lovelace", "given": "Ada"}],
+                "type": "journal-article",
+            }
+        });
+        Mock::given(matchers::method("GET"))
+            .and(matchers::path(format!("/cr/{encoded}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(crossref_body))
+            .mount(&fx.server)
+            .await;
+        // The preprint transform builds the ChemRxiv-style URL off the DOI
+        // suffix. Serve the PDF there so the download succeeds end to end.
+        fx.serve_pdf(&format!("/content/{doi}v1.full.pdf")).await;
+
+        let openalex = crate::openalex::OpenAlexAdapter::new(Fixture::auth(), 10.0)
+            .with_base_url(format!("{}/works", fx.server.uri()));
+        let report = fx
+            .downloader()
+            .download_by_doi(&openalex, doi, &fx.papers_dir())
+            .await
+            .expect("Crossref's title lets the identity gate pass");
+
+        // The minimal row carries Crossref's title (not the DOI) and
+        // Crossref's year and first author, so a later pre-fetch check can
+        // corroborate.
+        assert_eq!(
+            report.paper.title.as_str(),
+            "A real article title Crossref registered",
+            "the minimal row's title is Crossref's, not the DOI"
+        );
+        assert_eq!(report.paper.year, Some(2026));
+        assert_eq!(
+            report.paper.authors.first().map(|a| a.as_str()),
+            Some("Lovelace, Ada"),
+            "the first author is the one Crossref named"
+        );
+        // And the artefact was recorded against that row.
+        let rows = fx.artefacts();
+        assert_eq!(rows.len(), 1, "one DOI fetched = one artefact row");
+        assert_eq!(rows[0].paper_id, report.paper.id.as_str());
+    }
+
+    /// #289 review blocker: the minimal-row fallback does not invent a title.
+    /// When no registry on the identity chain names the DOI, the title stays
+    /// empty — which the identity matcher honestly reports as `unverified`
+    /// ("no title on one side") rather than a DOI-as-title that would score
+    /// below the mismatch floor against the served PDF's `/Title`.
+    #[tokio::test]
+    async fn download_by_doi_leaves_the_title_empty_when_no_registry_answers() {
+        use scitadel_core::ports::PaperRepository as _;
+
+        let fx = Fixture::new().await;
+        let doi = "10.1101/2025.06.14.659707";
+        fx.miss(&format!("/works/doi:{doi}")).await;
+        // The preprint PDF is served. The chain's Crossref / DataCite hops
+        // return 404 (wiremock's default for an unmounted path), which is the
+        // "no registry registers this DOI" case.
+        fx.serve_pdf("/content/10.1101/2025.06.14.659707v1.full.pdf")
+            .await;
+
+        let openalex = crate::openalex::OpenAlexAdapter::new(Fixture::auth(), 10.0)
+            .with_base_url(format!("{}/works", fx.server.uri()));
+        let report = fx
+            .downloader()
+            .download_by_doi(&openalex, doi, &fx.papers_dir())
+            .await
+            .expect("an empty title is `unverified`, which allows filing");
+
+        // Empty title in the saved row — the DOI is on the `doi` column, not
+        // the `title` column.
+        let (paper_repo, _, _, _, _) = fx.db.repositories();
+        let saved = paper_repo
+            .get(report.paper.id.as_str())
+            .expect("db read")
+            .expect("paper row");
+        assert_eq!(
+            saved.title.as_str(),
+            "",
+            "no registry answered, so no title"
+        );
+        assert_eq!(saved.doi.as_deref(), Some(doi));
+        // And the download still recorded.
+        assert_eq!(fx.artefacts().len(), 1);
+    }
+
+    /// #289 review: a DOI OpenAlex does index is filed against the full
+    /// record OpenAlex returned, not a placeholder. Title, year, authors and
+    /// (where present) the OpenAlex id all land on the row — so a later
+    /// `scitadel show` sees the work the registry named, and the pre-fetch
+    /// identity gate has a real expected title to corroborate against.
+    #[tokio::test]
+    async fn download_by_doi_populates_the_row_from_an_openalex_match() {
+        use scitadel_core::ports::PaperRepository as _;
+        use wiremock::{Mock, ResponseTemplate, matchers};
+
+        let fx = Fixture::new().await;
+        // A bioRxiv-prefix DOI so the preprint transform has a route to
+        // fetch; OpenAlex answers with a real Work for it.
+        let doi = "10.1101/oa.known.paper";
+        let title = "A work OpenAlex has on record";
+        let oa_body = serde_json::json!({
+            "id": "https://openalex.org/W3091980497",
+            "doi": format!("https://doi.org/{doi}"),
+            "title": title,
+            "display_name": title,
+            "publication_year": 2020,
+            "authorships": [
+                {"author": {"display_name": "Charles R. Harris"}},
+            ],
+            "primary_location": {"source": {"display_name": "Nature"}},
+            "abstract_inverted_index": {},
+        });
+        Mock::given(matchers::method("GET"))
+            .and(matchers::path(format!("/works/doi:{doi}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(oa_body))
+            .mount(&fx.server)
+            .await;
+        fx.serve_pdf(&format!("/content/{doi}v1.full.pdf")).await;
+
+        let openalex = crate::openalex::OpenAlexAdapter::new(Fixture::auth(), 10.0)
+            .with_base_url(format!("{}/works", fx.server.uri()));
+        let report = fx
+            .downloader()
+            .download_by_doi(&openalex, doi, &fx.papers_dir())
+            .await
+            .expect("OpenAlex named the work, so the download is recorded");
+
+        let (paper_repo, _, _, _, _) = fx.db.repositories();
+        let saved = paper_repo
+            .get(report.paper.id.as_str())
+            .expect("db read")
+            .expect("paper row");
+        assert_eq!(saved.title.as_str(), title);
+        assert_eq!(saved.year, Some(2020));
+        assert_eq!(
+            saved.authors.first().map(|a| a.as_str()),
+            Some("Charles R. Harris")
+        );
+        // The DOI is **lowercased** on the saved row (`normalize_doi` is on
+        // every OpenAlex write path). A later `find_by_doi(<mixed case>)`
+        // would otherwise miss and mint a duplicate.
+        assert_eq!(saved.doi.as_deref(), Some(doi));
+        assert_eq!(fx.artefacts().len(), 1);
+    }
+
+    /// #289 review: downloading the same DOI twice must not create a second
+    /// `artefacts` row for the same bytes. Migration 013's artefact unique
+    /// index is `(paper_id, kind, version, sha256)` (see
+    /// `migrations/013_acquisition.sql:414`), and the ladder's
+    /// `record_download` is ON CONFLICT-aware — so the second call writes no
+    /// duplicate even though it fetched the same PDF again.
+    #[tokio::test]
+    async fn download_by_doi_is_idempotent_against_a_second_call() {
+        let fx = Fixture::new().await;
+        let doi = "10.1101/known.idempotent";
+        let existing = save(&fx, "p-idempotent", Some(doi), None, None, None);
+        fx.serve_pdf(&format!("/content/{doi}v1.full.pdf")).await;
+
+        let openalex = crate::openalex::OpenAlexAdapter::new(Fixture::auth(), 10.0)
+            .with_base_url(format!("{}/works", fx.server.uri()));
+        let downloader = fx.downloader();
+        let first = downloader
+            .download_by_doi(&openalex, doi, &fx.papers_dir())
+            .await
+            .expect("first call records the download");
+        let second = downloader
+            .download_by_doi(&openalex, doi, &fx.papers_dir())
+            .await
+            .expect("second call finds the existing row and re-fetches");
+
+        // Same `papers` row both times.
+        assert_eq!(first.paper.id, existing.id);
+        assert_eq!(second.paper.id, existing.id);
+        // Exactly one `artefacts` row for this paper: the second write hit the
+        // unique index and merged rather than duplicated.
+        let rows = fx.artefacts();
+        assert_eq!(
+            rows.len(),
+            1,
+            "a second download writes no duplicate artefact row: {rows:?}"
+        );
+        assert_eq!(rows[0].paper_id, existing.id.as_str());
+    }
+
+    /// Review nit: a mixed-case DOI must not create a duplicate `papers` row.
+    /// DOIs are case-insensitive per the DOI Handbook (§2.4) and
+    /// `normalize_doi` lowercases every scitadel-owned write path, but a row
+    /// seeded by hand or by an adapter that only strips the resolver prefix
+    /// may be mixed case. `find_by_doi` therefore compares on
+    /// `unicode_lower(...)` so a `download` of the same DOI reuses the
+    /// existing row.
+    #[tokio::test]
+    async fn download_by_doi_matches_a_mixed_case_existing_row() {
+        use scitadel_core::ports::PaperRepository as _;
+
+        let fx = Fixture::new().await;
+        // Store the row with mixed case.
+        let stored_doi = "10.1101/MixedCase.ABC";
+        let lookup_doi = "10.1101/mixedcase.abc";
+        let existing = save(&fx, "p-mixedcase", Some(stored_doi), None, None, None);
+        fx.serve_pdf(&format!("/content/{lookup_doi}v1.full.pdf"))
+            .await;
+
+        let openalex = crate::openalex::OpenAlexAdapter::new(Fixture::auth(), 10.0)
+            .with_base_url(format!("{}/works", fx.server.uri()));
+        let report = fx
+            .downloader()
+            .download_by_doi(&openalex, lookup_doi, &fx.papers_dir())
+            .await
+            .expect("the lowercased lookup matches the mixed-case stored row");
+
+        assert_eq!(
+            report.paper.id, existing.id,
+            "no duplicate `papers` row — the mixed-case existing row is reused"
+        );
+        // Only one artefact, filed against the existing row.
+        let rows = fx.artefacts();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].paper_id, existing.id.as_str());
+        // One papers row with this DOI (either case): the unique index on
+        // `doi` is case-sensitive, so a case-sensitive lookup here would have
+        // minted a second row (which would then have failed the unique
+        // index's insert on a subsequent write — the exact failure the
+        // reviewer flagged).
+        let (paper_repo, _, _, _, _) = fx.db.repositories();
+        assert!(paper_repo.find_by_doi(lookup_doi).expect("read").is_some());
+    }
+
+    /// #289 review blocker: a served PDF whose `/Title` matches the chain's
+    /// resolved title passes the **post-fetch** identity gate as well, so the
+    /// Crossref-driven minimal row survives both halves of the check.
+    #[tokio::test]
+    async fn download_by_doi_served_pdf_title_corroborates_crossref() {
+        use wiremock::{Mock, ResponseTemplate, matchers};
+
+        let fx = Fixture::new().await;
+        // bioRxiv prefix so the preprint transform has a route to fetch.
+        let doi = "10.1101/pdf.titled.paper";
+        let title = "A real titled article";
+        let encoded = doi.replace('/', "%2F");
+        fx.miss(&format!("/works/doi:{doi}")).await;
+        Mock::given(matchers::method("GET"))
+            .and(matchers::path(format!("/cr/{encoded}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": {
+                    "DOI": doi,
+                    "title": [title],
+                    "published": {"date-parts": [[2026, 1, 1]]},
+                    "author": [{"family": "Hopper"}],
+                    "type": "posted-content",
+                }
+            })))
+            .mount(&fx.server)
+            .await;
+        // A PDF whose `/Title` is exactly Crossref's title: the post-fetch
+        // check compares the served title against the chain's title (not the
+        // paper's), so the two agree and the verdict is `Ok` (corroborated by
+        // Crossref's year).
+        let titled_pdf = format!("%PDF-1.7\n/Title({title})\n%%EOF\n");
+        Mock::given(matchers::method("GET"))
+            .and(matchers::path(format!("/content/{doi}v1.full.pdf")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/pdf")
+                    .set_body_bytes(titled_pdf.into_bytes()),
+            )
+            .mount(&fx.server)
+            .await;
+
+        let openalex = crate::openalex::OpenAlexAdapter::new(Fixture::auth(), 10.0)
+            .with_base_url(format!("{}/works", fx.server.uri()));
+        let report = fx
+            .downloader()
+            .download_by_doi(&openalex, doi, &fx.papers_dir())
+            .await
+            .expect("post-fetch check against Crossref's title agrees");
+
+        assert_eq!(report.paper.title.as_str(), title);
+        assert_eq!(fx.artefacts().len(), 1);
     }
 
     /// The other end of the "no route tried" case: a work with **no**

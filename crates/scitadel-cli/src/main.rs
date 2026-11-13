@@ -106,11 +106,20 @@ enum Commands {
         #[arg(long, default_value = "auto")]
         scorer: String,
     },
-    /// Download a paper (PDF or HTML) by DOI
+    /// Download a paper (PDF or HTML) by DOI.
+    ///
+    /// Bytes land in the content-addressed blob store under the configured
+    /// library root (ADR-007 §1 "Storage"), beside an `artefacts` row that
+    /// names them. `scitadel show` / `scitadel coverage` / `scitadel export`
+    /// reach the file through that row.
     Download {
         /// DOI of the paper to download
         doi: String,
-        /// Output directory (default: .scitadel/papers/)
+        /// [deprecated] The library location is managed by `scitadel init`'s
+        /// config and cannot be overridden per-call. The flag is accepted for
+        /// one release so existing scripts do not break, but its value is
+        /// **ignored** — use `scitadel acquire` for queued downloads, or
+        /// `scitadel export` to copy bytes out.
         #[arg(short, long)]
         output_dir: Option<PathBuf>,
     },

@@ -847,41 +847,62 @@ pub async fn resolve_doi(doi: &str, json: bool, no_save: bool) -> Result<()> {
 
 pub async fn download(doi: &str, output_dir: Option<PathBuf>) -> Result<()> {
     let config = load_config();
-    let out_dir = output_dir.unwrap_or_else(|| config.papers_dir());
+
+    // `--output-dir` is deprecated: #289 moved every byte that `download`
+    // writes into the content-addressed blob store under the library root,
+    // so a user-chosen directory would be an empty hole next to a file the
+    // caller never sees. The flag is still accepted for one release, but
+    // its value is **ignored** and a one-line warning explains why.
+    // See the enum's help for the forward path.
+    if let Some(requested) = output_dir {
+        eprintln!(
+            "warning: --output-dir is ignored (requested {}): the library \
+             location is managed by `scitadel init`'s config since #289. The \
+             file lands in the blob store under the library root; use \
+             `scitadel export` to copy it elsewhere, or `scitadel acquire` \
+             for queued downloads. The flag will be removed next release.",
+            requested.display()
+        );
+    }
+    let out_dir = config.papers_dir();
 
     // Opened up front so the downloader paces against the same SQLite
     // ledger the rest of scitadel uses — two in-memory ledgers is the
     // twice-the-traffic failure ADR-007 §4 exists to prevent.
     let db = scitadel_db::sqlite::Database::open(&config.db_path)
         .context("open database for the pacing ledger")?;
+    db.migrate().context("migration failed")?;
+
     let downloader =
         scitadel_adapters::download::PaperDownloader::new(db, config.openalex.auth(), 60.0)
             .context("build the downloader")?;
+    let openalex = scitadel_adapters::openalex::OpenAlexAdapter::new(config.openalex.auth(), 30.0);
 
     println!("Downloading paper: {doi}");
-    println!("  Output dir: {}", out_dir.display());
 
-    let result = downloader.download(doi, &out_dir).await;
+    // #289: the DOI-only path records too. The downloader resolves the DOI
+    // into a `papers` row (an existing one, an OpenAlex record, or a minimal
+    // row with the DOI as a placeholder title), fetches through the recording
+    // ladder `scitadel acquire` uses, and the bytes land in the blob store
+    // beside an `artefacts` row that names them. No path writes a file into
+    // the library without a row naming it (ADR-007 §1).
+    let report = downloader
+        .download_by_doi(&openalex, doi, &out_dir)
+        .await
+        .context("download failed")?;
 
-    // #253's S2e: the outcome is no longer written to the matching paper row. This
-    // path resolves no `Paper` — the downloader stores no artefact and no
-    // `acquisition_state` row — so the only thing it used to record was the retired
-    // `local_path` / `download_status` / `last_attempt_at` triple, whose reader (the
-    // TUI's state column) now derives its answer from `artefacts`. Writing it would
-    // have kept a second answer alive that nothing reads and that goes stale the
-    // moment the paper is fetched properly.
-    let result = result.context("download failed")?;
+    let scitadel_adapters::download::DownloadByDoiReport { paper, result } = report;
 
+    println!("  Paper:  {} ({})", paper.title.as_str(), paper.id.short());
     println!("  Format: {}", result.format);
     println!("  Source: {}", result.source());
     println!("  Access: {}", result.access);
     println!("  Size:   {} bytes", result.bytes);
     println!("  Saved:  {}", result.path.display());
     println!(
-        "  Note:   this path records nothing in the library — the file above is the \
-         deliverable. To have it acquired *and* recorded (so `scitadel coverage` and \
-         the TUI's state column see it), queue the work and run `scitadel acquire`, \
-         which fetches it into the blob store as an artefact."
+        "  Note:   recorded in the library as an artefact — `scitadel coverage` and \
+         the TUI's state column see it. `scitadel acquire` is the queue-driven path \
+         for the same ladder; prefer it for batches."
     );
 
     Ok(())

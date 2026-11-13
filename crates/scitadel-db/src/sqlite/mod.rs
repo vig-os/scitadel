@@ -318,6 +318,31 @@ impl Database {
         artefacts::record_download(&mut conn, write)
     }
 
+    /// Delete a `papers` row **only** when nothing in `artefacts` references
+    /// it, returning the number of rows removed.
+    ///
+    /// The scoping lives in SQL — `DELETE … WHERE NOT EXISTS (… artefacts
+    /// WHERE paper_id = …)` — so a row that gained an artefact between the
+    /// decision to clean up and the delete is left alone without a race.
+    /// Added so [`PaperDownloader::download_by_doi`] can drop the placeholder
+    /// row it minted when the subsequent fetch failed without taking a
+    /// direct `rusqlite` dependency (adapters crate's convention).
+    ///
+    /// # Errors
+    ///
+    /// Only the connection or SQL-layer errors — a scoped delete that
+    /// matches nothing is `Ok(0)`, not an error.
+    pub fn delete_paper_if_orphan(&self, paper_id: &str) -> Result<usize, DbError> {
+        let conn = self.pool.get()?;
+        let rows = conn.execute(
+            "DELETE FROM papers
+             WHERE id = ?1
+               AND NOT EXISTS (SELECT 1 FROM artefacts WHERE paper_id = ?2)",
+            rusqlite::params![paper_id, paper_id],
+        )?;
+        Ok(rows)
+    }
+
     /// ADR-007 §1: record one wanted-but-absent artefact. See
     /// [`write_acquisition_states`].
     pub fn upsert_acquisition_state(&self, row: &StateWrite) -> Result<(), DbError> {
