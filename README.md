@@ -81,6 +81,8 @@ Verify with `claude mcp list`.
 
 ## Quick start
 
+Every project-aware command needs a `.scitadel/` marker — that directory is how scitadel knows which cwd ancestor is your project root. Read-only and inspection commands (`history`, `show`, `export`, `diff`, `question list`, `coverage`, `action list`, `bib snapshot`, `bib verify`, `bib rekey`, `bib diff --question-id`, `resolve-doi --no-save`, `acquire --dry-run`, `gc`, the TUI) refuse with an init hint if the marker is not visible. Write-side commands (`search`, `assess`, `download`, real `acquire`, `snowball`, `scan`, `attach`, `bib import`, `bib watch`, `question create`, `question add-terms`, `override-identity`, `resolve-doi` saving, `import-flat`) will create the marker in cwd if none exists above you, so a first real acquisition in a fresh tree still Just Works. `scitadel init` is the documented creator and the one to use when you want control over where the project lives.
+
 ```bash
 # Initialize the database (creates ./.scitadel/scitadel.db)
 scitadel init
@@ -244,6 +246,8 @@ scitadel mcp
 
 Every long-running tool (search / batch scoring / download) emits MCP `notifications/progress` frames if the caller supplies a `progressToken` (#58). Annotation writes are audit-logged. Identity is trust-on-first-use (real auth ships with the Phase-5 Dolt sync layer).
 
+**Threat model.** The MCP surface is written to resist a prompt-injected or otherwise compromised agent whose only lever is what it can send over the MCP transport. In scope: every MCP request field, the user's config and environment, and paths carried in DB rows an earlier MCP call wrote. Caller-supplied read paths are confined to the workspace root; caller-supplied write destinations are removed from the schema and generated server-side under `.scitadel/`. The MCP server refuses `$HOME`, `/`, and ancestors of `$HOME` as the workspace root. Out of scope: local processes or users with write access to the project tree — they can already read what MCP reads, so `renameat2` swaps, hardlinked DBs, bind mounts, and the TOCTOU races those enable are not defended against. The CLI is for the human running on their own machine; it keeps its unconstrained path behaviour.
+
 The full pipeline — agent formulates a question, generates search terms, runs a search, scores each paper, snowballs relevant citations, writes structured assessments — runs through tool calls with no manual intervention. With #122, the agent can also act on whatever the user is looking at in the TUI without the user pasting IDs.
 
 ## Workflow coverage
@@ -403,7 +407,8 @@ Other knobs:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SCITADEL_DB` | `./.scitadel/scitadel.db` | Database path |
+| `SCITADEL_WORKSPACE` | nearest ancestor of cwd that contains a `.scitadel/` marker | Project root. Resolved by one shared function in `scitadel-core` — the MCP confinement boundary and the config/DB placement are now the same thing (#266). Discovery is marker-only: walk up from cwd looking for `.scitadel/`, which is the definition of a scitadel project. The MCP server **never creates** that marker; the CLI's `scitadel init` does. When no marker is visible the MCP server still starts, but its DB and path tools return a single clear "run `scitadel init` in your project, or set `SCITADEL_WORKSPACE`" error until one is set — so the documented user-scope install (`claude mcp add --scope user …`) keeps working from every directory and other tools (search, resolve-doi, etc.) stay reachable. `GIT_WORK_TREE` / `GIT_DIR` are ignored. The override must itself contain a `.scitadel/` child, which must be a real directory (or a symlink whose canonical target sits inside the project); a plain file or an outside-pointing symlink is refused. A leading `~` is expanded; relative paths resolve against the server's cwd. A root at `/`, `$HOME`, or any ancestor of `$HOME` is refused; `$HOME` AND `getpwuid` are both consulted so a spoofed `HOME` cannot disarm the ancestor check. The CLI does not apply the MCP confinement rules, but it honours an explicit `SCITADEL_WORKSPACE` strictly: if the directory has no `.scitadel/` marker, CLI commands fail naming the variable instead of silently falling back to cwd (run `scitadel init` in that directory). |
+| `SCITADEL_DB` | `<workspace>/.scitadel/scitadel.db` | Database path **for the CLI**. The MCP server ignores this env var and always opens the DB at `<project_root>/.scitadel/scitadel.db` — the marker is the project boundary, and letting an env var rehome the DB away from the project is what let the pre-fix MCP code confine against a broader directory (#266 round 4). |
 | `SCITADEL_CREDENTIAL_BACKEND` | auto-detected | `macos-keychain`, `secret-service` or `file` |
 | `SCITADEL_CHAT_MODEL` | `claude-sonnet-4-6` | Model used for scoring |
 | `SCITADEL_CHAT_MAX_TOKENS` | `4096` | Max completion tokens |

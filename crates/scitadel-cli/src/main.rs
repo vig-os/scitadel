@@ -581,11 +581,23 @@ enum QuestionCommands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
-
     let cli = Cli::parse();
+
+    // The MCP subcommand speaks JSON-RPC on stdout. Tracing output —
+    // including r2d2's `LoggingErrorHandler` log lines on "database is
+    // locked" (bridged into tracing by `tracing-subscriber`'s default
+    // `tracing-log` feature) and every `tracing::warn!` inside the
+    // tool handlers — must never land on that stream, or the next
+    // frame of the protocol is a malformed JSON-RPC message and the
+    // agent client hangs up. Route all logging to stderr for `mcp`
+    // (#266 round 6); keep the default writer for every other
+    // subcommand so local CLI output is unchanged.
+    let builder = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env());
+    if matches!(cli.command, Commands::Mcp) {
+        builder.with_writer(std::io::stderr).init();
+    } else {
+        builder.init();
+    }
 
     match cli.command {
         Commands::Init {

@@ -1,0 +1,408 @@
+//! Round-5 adversarial regression (#266 break #2): a read-only
+//! CLI command in a fresh directory used to call `load_config()` →
+//! `Database::open()` → `create_dir_all(.scitadel/)`, seeding a
+//! marker under whatever dir the user happened to be in. A later
+//! `scitadel mcp` launched from a parent of that dir then accepted
+//! the fresh marker as a wide confinement root. Read-only commands
+//! must now refuse with a clear message and leave no `.scitadel/`
+//! behind.
+//!
+//! Round-6 pins every project-aware command the same way (`bib
+//! snapshot`, `bib rekey`, `bib diff --question-id`, `resolve-doi
+//! --no-save`, `acquire --dry-run`, `gc`, `tui`) and adds the
+//! `$HOME`-as-project regression: a user with a `.scitadel/` in
+//! their home directory kept the full CLI working before round 5;
+//! the round-5 gate reused the MCP confinement rules
+//! (`reject_system_root`) and started refusing `history` /
+//! `question list` there with "root is $HOME". Only MCP needs
+//! that rule — the CLI's gate is a marker-existence probe.
+
+#![allow(deprecated)] // `Command::cargo_bin` is still the standard entry on stable assert_cmd.
+
+use std::fs;
+
+use assert_cmd::Command;
+use predicates::prelude::*;
+use tempfile::TempDir;
+
+/// `scitadel history` in a fresh directory must not create a
+/// `.scitadel/` and must exit non-zero with "no scitadel project".
+#[test]
+fn history_in_a_fresh_dir_refuses_and_leaves_no_marker() {
+    let tmp = TempDir::new().unwrap();
+    // Belt-and-braces: strip any `SCITADEL_WORKSPACE` / `SCITADEL_DB`
+    // that could leak in from the parent env and defeat the test.
+    Command::cargo_bin("scitadel")
+        .unwrap()
+        .arg("history")
+        .current_dir(tmp.path())
+        .env_remove("SCITADEL_WORKSPACE")
+        .env_remove("SCITADEL_DB")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("scitadel init"));
+
+    assert!(
+        !tmp.path().join(".scitadel").exists(),
+        "a read-only command must not seed a .scitadel/ dir"
+    );
+}
+
+/// Same guarantee for `scitadel coverage`, which was the other
+/// adversarial example (any command that opens the DB via
+/// `read_action_list`).
+#[test]
+fn coverage_in_a_fresh_dir_refuses_and_leaves_no_marker() {
+    let tmp = TempDir::new().unwrap();
+    Command::cargo_bin("scitadel")
+        .unwrap()
+        .arg("coverage")
+        .current_dir(tmp.path())
+        .env_remove("SCITADEL_WORKSPACE")
+        .env_remove("SCITADEL_DB")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("scitadel init"));
+    assert!(
+        !tmp.path().join(".scitadel").exists(),
+        "a read-only command must not seed a .scitadel/ dir"
+    );
+}
+
+/// Round-6 additions: every project-aware command that used to
+/// silently seed `.scitadel/` under cwd now refuses with the init
+/// hint instead. One parameterised assertion covers all of them so
+/// a new auto-initialising read-only command cannot forget the gate.
+fn assert_refuses_without_marker(args: &[&str]) {
+    let tmp = TempDir::new().unwrap();
+    Command::cargo_bin("scitadel")
+        .unwrap()
+        .args(args)
+        .current_dir(tmp.path())
+        .env_remove("SCITADEL_WORKSPACE")
+        .env_remove("SCITADEL_DB")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("scitadel init"));
+    assert!(
+        !tmp.path().join(".scitadel").exists(),
+        "{:?} must not seed a .scitadel/ dir",
+        args
+    );
+}
+
+#[test]
+fn bib_snapshot_in_a_fresh_dir_refuses_and_leaves_no_marker() {
+    assert_refuses_without_marker(&["bib", "snapshot", "somequestion"]);
+}
+
+#[test]
+fn bib_rekey_in_a_fresh_dir_refuses_and_leaves_no_marker() {
+    assert_refuses_without_marker(&["bib", "rekey", "somepaper"]);
+}
+
+#[test]
+fn gc_in_a_fresh_dir_refuses_and_leaves_no_marker() {
+    assert_refuses_without_marker(&["gc"]);
+}
+
+#[test]
+fn gc_dry_run_in_a_fresh_dir_refuses_and_leaves_no_marker() {
+    assert_refuses_without_marker(&["gc", "--dry-run"]);
+}
+
+#[test]
+fn acquire_dry_run_in_a_fresh_dir_refuses_and_leaves_no_marker() {
+    assert_refuses_without_marker(&["acquire", "--dry-run"]);
+}
+
+#[test]
+fn resolve_doi_no_save_in_a_fresh_dir_refuses_and_leaves_no_marker() {
+    assert_refuses_without_marker(&["resolve-doi", "10.1214/aos/1176344136", "--no-save"]);
+}
+
+#[test]
+fn tui_in_a_fresh_dir_refuses_and_leaves_no_marker() {
+    assert_refuses_without_marker(&["tui"]);
+}
+
+/// `bib diff a.bib --question-id x` is the DB arm of diff, so it
+/// refuses without a marker; the file-vs-file arm is unaffected.
+#[test]
+fn bib_diff_question_id_in_a_fresh_dir_refuses_and_leaves_no_marker() {
+    let tmp = TempDir::new().unwrap();
+    let bib = tmp.path().join("a.bib");
+    fs::write(&bib, "@article{foo,title={x},author={y}}\n").unwrap();
+    Command::cargo_bin("scitadel")
+        .unwrap()
+        .args(["bib", "diff"])
+        .arg(&bib)
+        .args(["--question-id", "someq"])
+        .current_dir(tmp.path())
+        .env_remove("SCITADEL_WORKSPACE")
+        .env_remove("SCITADEL_DB")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("scitadel init"));
+    assert!(
+        !tmp.path().join(".scitadel").exists(),
+        "bib diff --question-id must not seed a .scitadel/ dir"
+    );
+}
+
+/// Round-6 CLI regression: a user with a `.scitadel/` in `$HOME`
+/// kept the full CLI working before round 5. The round-5 gate
+/// shared the MCP `reject_system_root` rule and started refusing
+/// `history` there with "root is $HOME". Only MCP needs that rule
+/// — the CLI's gate is a marker-existence probe. We fake `$HOME`
+/// via the env var (scitadel's project resolver consults it) and
+/// put the marker under the fake home.
+#[test]
+fn history_in_a_home_project_succeeds() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    fs::create_dir_all(home.join(".scitadel")).unwrap();
+    // `history` needs a usable DB — point SCITADEL_DB at a file in
+    // the fake home so the command has something to read.
+    let db_path = home.join(".scitadel").join("scitadel.db");
+    Command::cargo_bin("scitadel")
+        .unwrap()
+        .arg("init")
+        .arg("--yes")
+        .arg("--email")
+        .arg("foo@example.test")
+        .arg("--db")
+        .arg(&db_path)
+        .env("HOME", home)
+        .env_remove("SCITADEL_WORKSPACE")
+        .env_remove("SCITADEL_DB")
+        .current_dir(home)
+        .assert()
+        .success();
+
+    // Now `history` from `$HOME` must succeed. Before the round-6
+    // fix this failed with "root is $HOME".
+    Command::cargo_bin("scitadel")
+        .unwrap()
+        .arg("history")
+        .env("HOME", home)
+        .env_remove("SCITADEL_WORKSPACE")
+        .env_remove("SCITADEL_DB")
+        .current_dir(home)
+        .assert()
+        .success();
+}
+
+/// Same CLI regression, exercised through `question list` (the
+/// other command the round-6 brief called out by name).
+#[test]
+fn question_list_in_a_home_project_succeeds() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    fs::create_dir_all(home.join(".scitadel")).unwrap();
+    let db_path = home.join(".scitadel").join("scitadel.db");
+    Command::cargo_bin("scitadel")
+        .unwrap()
+        .arg("init")
+        .arg("--yes")
+        .arg("--email")
+        .arg("foo@example.test")
+        .arg("--db")
+        .arg(&db_path)
+        .env("HOME", home)
+        .env_remove("SCITADEL_WORKSPACE")
+        .env_remove("SCITADEL_DB")
+        .current_dir(home)
+        .assert()
+        .success();
+
+    Command::cargo_bin("scitadel")
+        .unwrap()
+        .args(["question", "list"])
+        .env("HOME", home)
+        .env_remove("SCITADEL_WORKSPACE")
+        .env_remove("SCITADEL_DB")
+        .current_dir(home)
+        .assert()
+        .success();
+}
+
+/// Round-7 blocker: `cd $HOME/notes && scitadel history` with a
+/// marker at `$HOME`. The gate accepted it (via
+/// `find_marker_ancestor`), but `load_config` routed through
+/// `project_root`, which refuses `$HOME` and silently fell back to
+/// cwd. `Database::open` then created `$HOME/notes/.scitadel/` — a
+/// fresh marker a later MCP start could accept. After the fix both
+/// resolvers share `find_cli_project_root`, so the command reads the
+/// real DB and leaves no stray marker.
+#[test]
+fn history_in_a_subdir_of_a_home_project_leaves_no_stray_marker() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    fs::create_dir_all(home.join(".scitadel")).unwrap();
+    let db_path = home.join(".scitadel").join("scitadel.db");
+    // Seed a usable DB at $HOME/.scitadel/scitadel.db.
+    Command::cargo_bin("scitadel")
+        .unwrap()
+        .arg("init")
+        .arg("--yes")
+        .arg("--email")
+        .arg("foo@example.test")
+        .arg("--db")
+        .arg(&db_path)
+        .env("HOME", home)
+        .env_remove("SCITADEL_WORKSPACE")
+        .env_remove("SCITADEL_DB")
+        .current_dir(home)
+        .assert()
+        .success();
+
+    let notes = home.join("notes");
+    fs::create_dir_all(&notes).unwrap();
+
+    Command::cargo_bin("scitadel")
+        .unwrap()
+        .arg("history")
+        .env("HOME", home)
+        .env_remove("SCITADEL_WORKSPACE")
+        .env_remove("SCITADEL_DB")
+        .current_dir(&notes)
+        .assert()
+        .success();
+
+    assert!(
+        !notes.join(".scitadel").exists(),
+        "history in $HOME/notes must not seed $HOME/notes/.scitadel/"
+    );
+}
+
+/// Round-7 blocker: a FILE at `$HOME/.scitadel` (not a directory)
+/// used to let the gate pass — `has_project_marker` only checked
+/// `symlink_metadata`. `load_config`'s `project_root` then refused
+/// the file marker and fell back to cwd, so `Database::open`
+/// created `cwd/.scitadel/`. The gate now requires the marker be a
+/// directory, so the command refuses with the init hint and leaves
+/// no stray marker.
+#[test]
+fn history_with_a_file_marker_refuses_and_leaves_no_stray_marker() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    fs::write(home.join(".scitadel"), b"not a dir").unwrap();
+    let notes = home.join("notes");
+    fs::create_dir_all(&notes).unwrap();
+
+    Command::cargo_bin("scitadel")
+        .unwrap()
+        .arg("history")
+        .env("HOME", home)
+        .env_remove("SCITADEL_WORKSPACE")
+        .env_remove("SCITADEL_DB")
+        .current_dir(&notes)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("scitadel init"));
+
+    assert!(
+        !notes.join(".scitadel").exists(),
+        "a file marker must not steer cwd/.scitadel/ into being seeded"
+    );
+}
+
+/// Round-7 blocker: a subdirectory of a normal (non-`$HOME`)
+/// project. `history` must walk up from the subdir to the parent
+/// marker, open the parent's DB, and leave no new `.scitadel/`
+/// under the subdir.
+#[test]
+fn history_in_a_subdir_of_a_normal_project_leaves_no_stray_marker() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let db_path = root.join(".scitadel").join("scitadel.db");
+    Command::cargo_bin("scitadel")
+        .unwrap()
+        .arg("init")
+        .arg("--yes")
+        .arg("--email")
+        .arg("foo@example.test")
+        .arg("--db")
+        .arg(&db_path)
+        .env_remove("SCITADEL_WORKSPACE")
+        .env_remove("SCITADEL_DB")
+        .current_dir(root)
+        .assert()
+        .success();
+
+    let sub = root.join("deep").join("sub");
+    fs::create_dir_all(&sub).unwrap();
+
+    Command::cargo_bin("scitadel")
+        .unwrap()
+        .arg("history")
+        .env_remove("SCITADEL_WORKSPACE")
+        .env_remove("SCITADEL_DB")
+        .current_dir(&sub)
+        .assert()
+        .success();
+
+    assert!(
+        !sub.join(".scitadel").exists(),
+        "history in a subdir must not seed a .scitadel/ there"
+    );
+    assert!(
+        !root.join("deep").join(".scitadel").exists(),
+        "and must not seed one at an intermediate dir either"
+    );
+}
+
+/// `bib verify` used to reach `open_db` ungated: with a sidecar next
+/// to the `.bib` in a marker-less dir it created `cwd/.scitadel/`.
+#[test]
+fn bib_verify_in_a_fresh_dir_refuses_and_leaves_no_marker() {
+    let tmp = TempDir::new().unwrap();
+    let bib = tmp.path().join("refs.bib");
+    fs::write(&bib, "@article{foo,title={x},author={y}}\n").unwrap();
+    fs::write(tmp.path().join("refs.bib.scitadel-bib.lock"), "{}").unwrap();
+    Command::cargo_bin("scitadel")
+        .unwrap()
+        .args(["bib", "verify"])
+        .arg(&bib)
+        .current_dir(tmp.path())
+        .env_remove("SCITADEL_WORKSPACE")
+        .env_remove("SCITADEL_DB")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("scitadel init"));
+    assert!(
+        !tmp.path().join(".scitadel").exists(),
+        "bib verify must not seed a .scitadel/ dir"
+    );
+}
+
+/// An explicit `SCITADEL_WORKSPACE` without a marker must fail loudly
+/// (write-side and read-only alike), never fall back to cwd.
+#[test]
+fn unmarked_workspace_env_fails_instead_of_falling_back_to_cwd() {
+    let cwd = TempDir::new().unwrap();
+    let ws = TempDir::new().unwrap();
+    for args in [&["history"][..], &["question", "create", "a question"][..]] {
+        Command::cargo_bin("scitadel")
+            .unwrap()
+            .args(args)
+            .current_dir(cwd.path())
+            .env("SCITADEL_WORKSPACE", ws.path())
+            .env_remove("SCITADEL_DB")
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("SCITADEL_WORKSPACE"))
+            .stderr(predicate::str::contains(ws.path().to_str().unwrap()))
+            .stderr(predicate::str::contains(".scitadel/"))
+            .stderr(predicate::str::contains("scitadel init"));
+        assert!(
+            !cwd.path().join(".scitadel").exists(),
+            "{args:?} fell back to cwd"
+        );
+        assert!(
+            !ws.path().join(".scitadel").exists(),
+            "{args:?} planted a marker"
+        );
+    }
+}

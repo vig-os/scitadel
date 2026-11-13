@@ -2891,6 +2891,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "insta",
+ "libc",
  "quick-xml",
  "reqwest",
  "rusqlite",
@@ -2944,6 +2945,7 @@ dependencies = [
  "chrono",
  "futures",
  "insta",
+ "libc",
  "proptest",
  "security-framework",
  "serde",
@@ -3017,6 +3019,7 @@ version = "0.8.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "libc",
  "pdf-extract",
  "rmcp",
  "schemars",

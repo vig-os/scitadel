@@ -255,7 +255,7 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Self {
-        let workspace = find_workspace_root().unwrap_or_else(|| std::env::current_dir().unwrap());
+        let workspace = cli_workspace_root();
         Self {
             db_path: default_db_path(&workspace),
             default_sources: default_sources(),
@@ -272,23 +272,33 @@ impl Default for Config {
     }
 }
 
-/// Find the workspace root by looking for a git repo from cwd upward.
-fn find_workspace_root() -> Option<PathBuf> {
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .ok()?;
-    if output.status.success() {
-        let path = String::from_utf8(output.stdout).ok()?;
-        Some(PathBuf::from(path.trim()))
-    } else {
-        None
-    }
+/// Pick a workspace for the CLI. Shares the gate's resolver
+/// (`project::find_cli_project_root`) so a visible marker always
+/// settles both the gate decision and the DB location. A
+/// marker-less dir falls back to cwd so `scitadel init` and the
+/// documented auto-creators (`search`, `assess`, `download`,
+/// `acquire`, `snowball`, `scan`, `attach`, `bib import`, `bib
+/// watch`, `question create`, `question add-terms`,
+/// `override-identity`, `resolve-doi` saving, `import-flat`) can
+/// seed a fresh project; every project-aware read-only command
+/// gates on `require_project_marker` first, so cwd fallback never
+/// plants a stray `.scitadel/` on their behalf.
+///
+/// Pre-fix: this routed through the strict `project::project_root`,
+/// which refuses `$HOME`, `/` and bad markers. The gate accepted
+/// those (`find_marker_ancestor`), so config silently fell back to
+/// cwd and `Database::open` created a stray `.scitadel/` there
+/// (round-7 blocker). The pre-round-4 code also shelled out to
+/// `git rev-parse --show-toplevel`, which let `GIT_WORK_TREE=/etc`
+/// steer the workspace; we never trust git env vars.
+fn cli_workspace_root() -> PathBuf {
+    crate::project::find_cli_project_root()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
 /// Resolve the default database path.
 ///
-/// Priority: `SCITADEL_DB` env var > workspace `.scitadel/scitadel.db` > cwd.
+/// Priority: `SCITADEL_DB` env var > workspace `.scitadel/scitadel.db`.
 fn default_db_path(workspace: &Path) -> PathBuf {
     if let Ok(db) = std::env::var("SCITADEL_DB") {
         let expanded = if db.starts_with('~') {
@@ -302,7 +312,7 @@ fn default_db_path(workspace: &Path) -> PathBuf {
         };
         return PathBuf::from(expanded);
     }
-    workspace.join(".scitadel").join("scitadel.db")
+    crate::project::project_db_path(workspace)
 }
 
 /// Load configuration from keychain, environment variables, and optional TOML file.
@@ -311,7 +321,7 @@ fn default_db_path(workspace: &Path) -> PathBuf {
 pub fn load_config() -> Config {
     use crate::credentials::resolve;
 
-    let workspace = find_workspace_root().unwrap_or_else(|| std::env::current_dir().unwrap());
+    let workspace = cli_workspace_root();
     let db_path = default_db_path(&workspace);
 
     // Try loading TOML config file as base

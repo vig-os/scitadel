@@ -31,6 +31,11 @@ zeroize = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = { workspace = true }
 
+# `getpwuid` fallback for the ancestor-of-home guard in `project.rs`.
+# Unix-only; the `cfg(unix)` gate means Windows builds don't pull libc.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 insta = { workspace = true }
 tempfile = { workspace = true }

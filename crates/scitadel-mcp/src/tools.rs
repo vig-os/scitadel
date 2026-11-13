@@ -15,9 +15,33 @@ use scitadel_core::ports::{
 use scitadel_db::sqlite::Database;
 use scitadel_scoring::{SCORING_SYSTEM_PROMPT, build_user_prompt};
 
+/// Open the MCP-side DB handle. Routes the DB path through the
+/// server's PINNED project root (round 5 of #266) — resolved once
+/// lazily on the first project-aware tool call and re-verified
+/// (`(dev, ino)` + marker) on every subsequent call. Moving a child
+/// project's `.scitadel/` away mid-session therefore does NOT
+/// re-resolve to an ancestor with its own marker: that surfaces as
+/// `ProjectRootError::Moved` ("restart the MCP server") instead.
+///
+/// Round-4 root cause (fixed): two independent notions of "the
+/// project" — the pre-fix `load_config` picked a dir from git or
+/// cwd and the first DB call created the marker there, which the
+/// MCP path rule then accepted as the confinement root. Round 5:
+/// the shared resolver was still RE-RESOLVED on every call, so a
+/// swap mid-session could cross projects. Pinning closes that.
+///
+/// Every DB tool therefore fails closed with the resolver's error
+/// when the server was started outside a scitadel project; the path
+/// tools fail the same way via [`crate::paths::workspace_root`]. The
+/// MCP server starts in both cases — DB and path tools just return a
+/// clear "no marker; run `scitadel init`" error until the user sets
+/// one up, which preserves the README's documented user-scope
+/// install (Claude Code connects from any dir and the server stays
+/// alive, instead of refusing to start and leaving the integration
+/// looking broken).
 fn open_db() -> Result<Database, String> {
-    let config = load_config();
-    let db = Database::open(&config.db_path).map_err(|e| e.to_string())?;
+    let db_path = crate::project_pin::pinned_project_db_path().map_err(|e| e.to_string())?;
+    let db = Database::open(&db_path).map_err(|e| e.to_string())?;
     db.migrate().map_err(|e| e.to_string())?;
     Ok(db)
 }
@@ -591,7 +615,13 @@ pub async fn download_paper_tool(
     doi: Option<&str>,
 ) -> Result<String, String> {
     let config = load_config();
-    let out_dir = config.papers_dir();
+    // Papers live under the project marker, not under load_config's
+    // cwd fallback — the MCP server must not write into the launch
+    // dir if no marker is found (#266 round 4). `project_root`
+    // returns the strict, marker-only root; its error surfaces as
+    // the tool refusal.
+    let root = crate::project_pin::pinned_project_root().map_err(|e| e.to_string())?;
+    let out_dir = root.join(crate::paths::PROJECT_MARKER).join("papers");
 
     // One database for both halves of ADR-007 S1: the SQLite pacing ledger
     // the downloader spends from, and the rows the completed download is
@@ -1867,12 +1897,18 @@ pub fn list_starred_tool(reader: &str) -> Result<String, String> {
 /// the import pipeline. Returns a JSON summary mirroring what the CLI
 /// prints, so downstream agents can decide whether to follow up
 /// (resolve ambiguous aliases, retry rejected entries, etc).
+///
+/// `path` is a caller-controlled read, so it is funnelled through the
+/// workspace-root confinement helper first (#266). Relative paths
+/// resolve against the workspace root rather than the process CWD,
+/// absolute paths outside the root and `..` traversal are refused,
+/// and symlinks are followed before the containment check.
 pub fn import_bibtex_tool(
     path: &str,
     strategy: Option<&str>,
     reader: &str,
 ) -> Result<String, String> {
-    use crate::bib_import::{ImportOptions, import_bibtex_file};
+    use crate::bib_import::{ImportOptions, import_bibtex_str};
     use scitadel_db::sqlite::{
         SqliteAnnotationRepository, SqlitePaperAliasRepository, SqlitePaperRepository,
         SqlitePaperTagRepository,
@@ -1885,6 +1921,14 @@ pub fn import_bibtex_tool(
             "unknown strategy '{strategy}'; valid: reject, db-wins, bib-wins, merge, interactive"
         )
     })?;
+
+    // Resolve root + confined path once, then read through
+    // `safe_read_to_string` so the bytes arrive via an `O_NOFOLLOW`
+    // open and any read error renders a workspace-relative path
+    // rather than the absolute workspace one (#266 follow-up).
+    let root = crate::paths::workspace_root().map_err(|e| e.to_string())?;
+    let confined = crate::paths::confine_to_workspace(&root, path).map_err(|e| e.to_string())?;
+    let src = crate::paths::safe_read_to_string(&root, &confined).map_err(|e| e.to_string())?;
 
     let db = open_db()?;
     let papers = SqlitePaperRepository::new(db.clone());
@@ -1901,15 +1945,8 @@ pub fn import_bibtex_tool(
         // per-row failure path as `merge` for ambiguous-alias rows.
         prompt_resolver: None,
     };
-    let report = import_bibtex_file(
-        std::path::Path::new(path),
-        &options,
-        &papers,
-        &aliases,
-        &annotations,
-        &tags,
-    )
-    .map_err(|e| e.to_string())?;
+    let report = import_bibtex_str(&src, &options, &papers, &aliases, &annotations, &tags)
+        .map_err(|e| e.to_string())?;
 
     let rows: Vec<serde_json::Value> = report
         .rows
@@ -2148,9 +2185,16 @@ fn load_papers_and_tags(
     (papers, tags)
 }
 
+/// `bib_snapshot` MCP tool — write a deterministic export of a
+/// question's shortlist to disk, plus the drift-tracking sidecar.
+///
+/// The output path is **not** caller-supplied (#266): the agent names
+/// *what* to snapshot (`question_prefix` + `format`), scitadel picks
+/// *where* — `.scitadel/bib/<sanitised-question-id>.<ext>`. This is
+/// the same arbitrary-write class #249 closed on `download_paper`,
+/// lifted to a shared helper so future MCP tools cannot forget.
 pub fn bib_snapshot_tool(
     question_prefix: &str,
-    output: &str,
     reader: &str,
     no_lock: bool,
     format: &str,
@@ -2176,12 +2220,30 @@ pub fn bib_snapshot_tool(
         render_shortlist_bibtex(&db, &paper_ids)?
     };
 
-    let output_path = std::path::Path::new(output);
-    std::fs::write(output_path, &content).map_err(|e| e.to_string())?;
+    // Generate the output path the #249 way: derive the filename from
+    // the inputs, pin the directory to a configured location under the
+    // workspace. `sanitize_filename_component` strips `/` and `.` so
+    // the sanitised question id cannot carry any path semantics.
+    let root = crate::paths::workspace_root().map_err(|e| e.to_string())?;
+    let export_dir = crate::paths::mcp_export_dir().map_err(|e| e.to_string())?;
+    let ext = if is_csl { "json" } else { "bib" };
+    let fname = format!(
+        "{}.{ext}",
+        crate::paths::sanitize_filename_component(question.id.as_str())
+    );
+    let output_path = export_dir.join(&fname);
+    let output = output_path.to_string_lossy().into_owned();
 
-    let sidecar = sidecar_path_for(output_path);
+    // `safe_write_in_root` refuses to follow a symlink at the target
+    // or in the parent (#266 adversarial review): a prior symlink
+    // under `.scitadel/bib/<qid>.bib` is replaced by an atomic rename,
+    // not written through to whatever it pointed at.
+    crate::paths::safe_write_in_root(&root, &output_path, content.as_bytes())
+        .map_err(|e| e.to_string())?;
+
+    let sidecar = sidecar_path_for(&output_path);
     let mut response = serde_json::Map::new();
-    response.insert("output".into(), serde_json::Value::String(output.into()));
+    response.insert("output".into(), serde_json::Value::String(output));
     response.insert("papers".into(), serde_json::Value::from(papers.len()));
 
     if no_lock {
@@ -2202,7 +2264,11 @@ pub fn bib_snapshot_tool(
                 &content,
             )
         };
-        std::fs::write(&sidecar, lock.to_json().map_err(|e| e.to_string())?)
+        // Same symlink-safety guarantees as the bib write above:
+        // a dangling or planted sidecar symlink is replaced, not
+        // followed.
+        let sidecar_bytes = lock.to_json().map_err(|e| e.to_string())?;
+        crate::paths::safe_write_in_root(&root, &sidecar, sidecar_bytes.as_bytes())
             .map_err(|e| e.to_string())?;
         response.insert(
             "sidecar".into(),
@@ -2221,20 +2287,49 @@ pub fn bib_snapshot_tool(
     Ok(serde_json::Value::Object(response).to_string())
 }
 
+/// `bib_verify` MCP tool — confirm a `.bib` matches its sidecar
+/// lockfile. `file` is caller-supplied and read, so it is confined to
+/// the workspace root first (#266).
+///
+/// The sidecar `<file>.scitadel-bib.lock` is also routed through the
+/// confinement helper (adversarial-review follow-up): without this,
+/// a symlink at the derived sidecar path pointed `fs::read_to_string`
+/// at an outside victim file. The message for a missing sidecar
+/// echoes the caller's input + the sidecar suffix rather than the
+/// resolved path, so no outside-root path is leaked even by accident.
 pub fn bib_verify_tool(file: &str, question_override: Option<&str>) -> Result<String, String> {
-    let bib_path = std::path::Path::new(file);
-    let bib_bytes = std::fs::read_to_string(bib_path).map_err(|e| e.to_string())?;
+    // Resolve the workspace root once so reads go through
+    // `safe_read_to_string`, which opens with `O_NOFOLLOW` and
+    // reports errors with workspace-relative paths (#266
+    // adversarial follow-up).
+    let root = crate::paths::workspace_root().map_err(|e| e.to_string())?;
+    let bib_path = crate::paths::confine_to_workspace(&root, file).map_err(|e| e.to_string())?;
+    let bib_bytes =
+        crate::paths::safe_read_to_string(&root, &bib_path).map_err(|e| e.to_string())?;
 
-    let sidecar = sidecar_path_for(bib_path);
-    if !sidecar.exists() {
-        return Ok(serde_json::json!({
-            "status": "stale",
-            "exit_code": 2,
-            "message": format!("no lockfile at {} — run bib_snapshot first", sidecar.display()),
-        })
-        .to_string());
-    }
-    let lock_bytes = std::fs::read_to_string(&sidecar).map_err(|e| e.to_string())?;
+    // The sidecar sits next to the bib file. Routing it back
+    // through `confine_to_workspace` catches the attack where the
+    // sidecar itself is a symlink to outside — now with a uniform
+    // error for *both* the existing-outside and the dangling-
+    // outside cases (#266 confirmed break #2), so a caller probing
+    // for existence cannot read which one it tripped.
+    let sidecar_input = format!("{file}{}", SIDECAR_SUFFIX);
+    let sidecar = match crate::paths::confine_to_workspace(&root, &sidecar_input) {
+        Ok(p) => p,
+        Err(crate::paths::PathScopeError::NotAccessible { .. }) => {
+            return Ok(serde_json::json!({
+                "status": "stale",
+                "exit_code": 2,
+                "message": format!(
+                    "no lockfile at {sidecar_input} — run bib_snapshot first",
+                ),
+            })
+            .to_string());
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    let lock_bytes =
+        crate::paths::safe_read_to_string(&root, &sidecar).map_err(|e| e.to_string())?;
     let lock = scitadel_export::BibLockfile::from_json(&lock_bytes).map_err(|e| e.to_string())?;
 
     // Stale checks first — if the binary moved, drift comparisons mean nothing.
@@ -2305,19 +2400,33 @@ pub fn bib_verify_tool(file: &str, question_override: Option<&str>) -> Result<St
 /// Returns: JSON `{added, removed, changed}` (empty arrays if zero
 /// drift). Exit-code semantics live in the CLI; the MCP tool returns
 /// the structure unconditionally so the caller can branch on it.
+///
+/// Both `file_a` and `file_b` are caller-supplied reads, so each is
+/// routed through the workspace-root confinement helper first (#266).
 pub fn bib_diff_tool(
     file_a: &str,
     file_b: Option<&str>,
     question_id: Option<&str>,
     reader: Option<&str>,
 ) -> Result<String, String> {
-    let path_a = std::path::Path::new(file_a);
-    let (entries_a, fmt_a) = scitadel_export::load_entries_from_path(path_a)?;
+    // Route reads through `safe_read_to_string` so an unresolvable
+    // path's error renders a workspace-relative path rather than
+    // leaking the absolute workspace via `load_entries_from_path`'s
+    // own `read {path.display()}: ...` format (#266 follow-up).
+    let root = crate::paths::workspace_root().map_err(|e| e.to_string())?;
+    let path_a = crate::paths::confine_to_workspace(&root, file_a).map_err(|e| e.to_string())?;
+    let bytes_a = crate::paths::safe_read_to_string(&root, &path_a).map_err(|e| e.to_string())?;
+    let (entries_a, fmt_a) = scitadel_export::load_entries_from_str(&bytes_a)
+        .map_err(|e| format!("parse {}: {e}", crate::paths::display_rel(&root, &path_a)))?;
     let entries_b = match (file_b, question_id) {
         (Some(_), Some(_)) => return Err("pass file_b OR question_id, not both".into()),
         (None, None) => return Err("pass file_b or question_id".into()),
         (Some(b), None) => {
-            let (e, _) = scitadel_export::load_entries_from_path(std::path::Path::new(b))?;
+            let path_b = crate::paths::confine_to_workspace(&root, b).map_err(|e| e.to_string())?;
+            let bytes_b =
+                crate::paths::safe_read_to_string(&root, &path_b).map_err(|e| e.to_string())?;
+            let (e, _) = scitadel_export::load_entries_from_str(&bytes_b)
+                .map_err(|e| format!("parse {}: {e}", crate::paths::display_rel(&root, &path_b)))?;
             e
         }
         (None, Some(qid)) => {
@@ -2371,6 +2480,10 @@ pub async fn acquire_tool(
     limit: Option<u32>,
 ) -> Result<String, String> {
     let config = load_config();
+    // Same project-rooted papers dir as `download_paper_tool` — never
+    // the cwd fallback that `load_config` keeps for the CLI.
+    let root = crate::project_pin::pinned_project_root().map_err(|e| e.to_string())?;
+    let out_dir = root.join(crate::paths::PROJECT_MARKER).join("papers");
     // One database for both halves of ADR-007: the pacing ledger the
     // downloader spends from, and the rows a completed download is written
     // into. Same reason as `download_paper_tool`.
@@ -2385,7 +2498,7 @@ pub async fn acquire_tool(
         resume: resume.unwrap_or(false),
         dry_run: dry_run.unwrap_or(false),
     };
-    acquire_with(&db, &downloader, &config.papers_dir(), &request).await
+    acquire_with(&db, &downloader, &out_dir, &request).await
 }
 
 /// [`acquire_tool`] over a caller-supplied downloader and destination.
