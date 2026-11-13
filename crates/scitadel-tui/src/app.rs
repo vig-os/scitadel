@@ -91,6 +91,26 @@ pub enum Overlay {
         /// Index into the paper's root annotations while the reader
         /// is open; cycles via `J` / `K` to hop between highlights.
         highlight_focus: Option<usize>,
+        /// Vertical scroll offset of the reader's text pane, in
+        /// post-wrap rows. Driven by j/k/Down/Up (1 row), d/u + the
+        /// page keys (10 rows), and g/G (top/bottom). Clamped **in
+        /// state** at draw time against the current viewport's
+        /// wrapped row count, so a `G` sentinel is rewritten before
+        /// the next `k` sees it (rather than walking down from
+        /// `u16::MAX` for thousands of presses). A J/K highlight hop
+        /// auto-adjusts this to the wrapped row of the hopped
+        /// highlight so a match below the fold is reachable (#307).
+        reader_scroll: u16,
+        /// Width (in cells) of the reader's text pane, refreshed on
+        /// every draw. Used by `views::reader::line_of_highlight` so
+        /// a `J` / `K` hop maps to the wrapped row the quote falls
+        /// on at the current viewport width. Starts at 0 and
+        /// gains its real value on the first draw; a key handler
+        /// that runs before the first draw treats a 0 width as
+        /// "fall back to a pre-wrap line count", so the usual case
+        /// (user presses J after the view has been drawn once)
+        /// stays correct.
+        reader_text_width: u16,
     },
     SearchPapers {
         search_id: String,
@@ -676,6 +696,8 @@ impl App {
         self.overlay = Some(Overlay::PaperDetail {
             paper_id: paper_id.to_string(),
             scroll: 0,
+            reader_scroll: 0,
+            reader_text_width: 0,
             annotation_focus: None,
             prompt: None,
             reader: true,
@@ -720,6 +742,8 @@ impl App {
                         self.overlay = Some(Overlay::PaperDetail {
                             paper_id: paper.id.as_str().to_string(),
                             scroll: 0,
+                            reader_scroll: 0,
+                            reader_text_width: 0,
                             annotation_focus: None,
                             prompt: None,
                             reader: false,
@@ -847,6 +871,8 @@ impl App {
                     self.overlay = Some(Overlay::PaperDetail {
                         paper_id: paper.id.as_str().to_string(),
                         scroll: 0,
+                        reader_scroll: 0,
+                        reader_text_width: 0,
                         annotation_focus: None,
                         prompt: None,
                         reader: false,
@@ -986,6 +1012,8 @@ impl App {
             prompt,
             reader,
             highlight_focus,
+            reader_scroll,
+            reader_text_width,
         }) = self.overlay.as_mut()
         else {
             return;
@@ -998,6 +1026,7 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('q' | 'R') => {
                     *reader = false;
                     *highlight_focus = None;
+                    *reader_scroll = 0;
                     // Focus left the reader entirely — mark whatever
                     // thread was focused as seen. (#185)
                     focus_thread_by_root_idx(
@@ -1008,9 +1037,24 @@ impl App {
                         None,
                     );
                 }
-                KeyCode::Char('J') | KeyCode::Down if count > 0 => {
+                // `J` / `K` hop between highlights. Keeps the Up/Down
+                // and Shift+J/K ergonomics the reader shipped with
+                // (#97), *and* auto-adjusts `reader_scroll` so a
+                // highlight below the fold lands in view (#307's
+                // "a match below the fold is reachable" acceptance).
+                KeyCode::Char('J') if count > 0 => {
                     let next = Some(highlight_focus.map_or(0, |f| (f + 1).min(count - 1)));
                     *highlight_focus = next;
+                    if let Some(idx) = next
+                        && let Some(line) = crate::views::reader::line_of_highlight(
+                            &self.data,
+                            paper_id,
+                            idx,
+                            *reader_text_width,
+                        )
+                    {
+                        *reader_scroll = line;
+                    }
                     focus_thread_by_root_idx(
                         &self.data,
                         &self.reader,
@@ -1019,9 +1063,19 @@ impl App {
                         next,
                     );
                 }
-                KeyCode::Char('K') | KeyCode::Up if count > 0 => {
+                KeyCode::Char('K') if count > 0 => {
                     let next = Some(highlight_focus.map_or(0, |f| f.saturating_sub(1)));
                     *highlight_focus = next;
+                    if let Some(idx) = next
+                        && let Some(line) = crate::views::reader::line_of_highlight(
+                            &self.data,
+                            paper_id,
+                            idx,
+                            *reader_text_width,
+                        )
+                    {
+                        *reader_scroll = line;
+                    }
                     focus_thread_by_root_idx(
                         &self.data,
                         &self.reader,
@@ -1030,6 +1084,29 @@ impl App {
                         next,
                     );
                 }
+                // Scroll keys (#307). j/k and arrows walk one row;
+                // d/u and the page keys walk half a page; g/G jump
+                // to the top / bottom. The reader body can be tens of
+                // thousands of rows, so the bottom-sentinel is u16::MAX
+                // and the draw layer clamps it in state against the
+                // viewport's wrapped row count — a stale `u16::MAX` is
+                // rewritten before the next `k` sees it, so a key after
+                // `G` moves immediately rather than walking down from
+                // the saturated sentinel for thousands of presses.
+                KeyCode::Char('j') | KeyCode::Down => {
+                    *reader_scroll = reader_scroll.saturating_add(1);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    *reader_scroll = reader_scroll.saturating_sub(1);
+                }
+                KeyCode::Char('d') | KeyCode::PageDown => {
+                    *reader_scroll = reader_scroll.saturating_add(10);
+                }
+                KeyCode::Char('u') | KeyCode::PageUp => {
+                    *reader_scroll = reader_scroll.saturating_sub(10);
+                }
+                KeyCode::Char('g') => *reader_scroll = 0,
+                KeyCode::Char('G') => *reader_scroll = u16::MAX,
                 KeyCode::Char('D') => {
                     let pid = paper_id.clone();
                     self.queue_download(&pid);
@@ -1335,6 +1412,8 @@ impl App {
                             self.overlay = Some(Overlay::PaperDetail {
                                 paper_id: paper.id.as_str().to_string(),
                                 scroll: 0,
+                                reader_scroll: 0,
+                                reader_text_width: 0,
                                 annotation_focus: None,
                                 prompt: None,
                                 reader: false,
@@ -1395,6 +1474,8 @@ impl App {
                             self.overlay = Some(Overlay::PaperDetail {
                                 paper_id: paper.id.as_str().to_string(),
                                 scroll: 0,
+                                reader_scroll: 0,
+                                reader_text_width: 0,
                                 annotation_focus: None,
                                 prompt: None,
                                 reader: false,
@@ -1538,7 +1619,15 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
 
     frame.render_widget(tabs, chunks[0]);
 
-    match &app.overlay {
+    // Snapshot the immutable fields the draw arms below need before
+    // the `&mut app.overlay` borrow starts — otherwise an arm that
+    // calls `app.downloading_paper_ids()` would try to re-borrow
+    // `app` while `overlay` is still held mutably. `reader::draw`
+    // mutates `reader_scroll` and `reader_text_width` in state so a
+    // stale `u16::MAX` after `G` and a stale offset after resize are
+    // rewritten in state, not just at render time (#307).
+    let downloading = app.downloading_paper_ids();
+    match &mut app.overlay {
         Some(Overlay::PaperDetail {
             paper_id,
             scroll,
@@ -1546,6 +1635,8 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             prompt,
             reader,
             highlight_focus,
+            reader_scroll,
+            reader_text_width,
         }) => {
             if *reader {
                 crate::views::reader::draw(
@@ -1555,6 +1646,8 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                     paper_id,
                     *highlight_focus,
                     &app.reader,
+                    reader_scroll,
+                    reader_text_width,
                 );
             } else {
                 detail::draw(
@@ -1581,7 +1674,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 search_id,
                 *selected,
                 &app.starred,
-                &app.downloading_paper_ids(),
+                &downloading,
                 &app.papers_with_unread,
             );
         }
@@ -1613,7 +1706,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 &app.data,
                 app.paper_selected,
                 &app.starred,
-                &app.downloading_paper_ids(),
+                &downloading,
                 &app.papers_with_unread,
             ),
             Tab::Questions => {
@@ -1625,7 +1718,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 &app.data,
                 &app.reader,
                 app.queue_selected,
-                &app.downloading_paper_ids(),
+                &downloading,
             ),
         },
     }
@@ -1645,7 +1738,11 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             _,
         ) => {
             if *reader {
-                "Esc/R: leave reader | J/K: hop highlight | D: download"
+                // Up/Down changed from hop to scroll in #307 — the
+                // footer has to list the scroll keys or the user has
+                // no way to discover that `j`/`k`/`d`/`u`/`g`/`G`
+                // drive the viewport.
+                "Esc/R: leave reader | j/k: scroll | d/u: page | g/G: top/bottom | J/K: hop highlight | D: download"
             } else {
                 match (prompt, annotation_focus) {
                     (Some(p), _) => match p {
@@ -2228,6 +2325,8 @@ mod tests {
         app.overlay = Some(Overlay::PaperDetail {
             paper_id: "p-attn".into(),
             scroll: 0,
+            reader_scroll: 0,
+            reader_text_width: 0,
             annotation_focus: None,
             prompt: None,
             reader: false,
@@ -2288,6 +2387,8 @@ mod tests {
         app.overlay = Some(Overlay::PaperDetail {
             paper_id: "p-attn".into(),
             scroll: 0,
+            reader_scroll: 0,
+            reader_text_width: 0,
             annotation_focus: None,
             prompt: None,
             reader: true,
@@ -2313,6 +2414,8 @@ mod tests {
         app.overlay = Some(Overlay::PaperDetail {
             paper_id: "p-attn".into(),
             scroll: 0,
+            reader_scroll: 0,
+            reader_text_width: 0,
             annotation_focus: None,
             prompt: None,
             reader: true,
@@ -2377,6 +2480,8 @@ mod tests {
             app.overlay = Some(Overlay::PaperDetail {
                 paper_id: "p-attn".into(),
                 scroll: 0,
+                reader_scroll: 0,
+                reader_text_width: 0,
                 annotation_focus: None,
                 prompt: None,
                 reader: true,
@@ -2420,6 +2525,8 @@ mod tests {
         app.overlay = Some(Overlay::PaperDetail {
             paper_id: "p-attn".into(),
             scroll: 0,
+            reader_scroll: 0,
+            reader_text_width: 0,
             annotation_focus: Some(1),
             prompt: None,
             reader: false,
@@ -2431,5 +2538,358 @@ mod tests {
             Some(reply.id.as_str()),
             "annotation_focus=1 must map to the reply (index over full list, not roots-only)"
         );
+    }
+
+    // ---- #307 reader scroll ----
+
+    /// Pressing `j` / `k` / `d` / `u` / `g` / `G` while the reader is
+    /// open moves `reader_scroll` the way vim does. Covers the key
+    /// convention end of #307 — the `draw` layer's clamping is
+    /// exercised separately in `views::reader::tests`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reader_scroll_keys_walk_and_clamp_the_offset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        app.overlay = Some(Overlay::PaperDetail {
+            paper_id: "p-attn".into(),
+            scroll: 0,
+            reader_scroll: 0,
+            reader_text_width: 0,
+            annotation_focus: None,
+            prompt: None,
+            reader: true,
+            highlight_focus: None,
+        });
+
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(reader_scroll_of(&app), 3, "j and Down each walk one row");
+
+        app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(reader_scroll_of(&app), 1, "k and Up each walk one row back");
+
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        assert_eq!(reader_scroll_of(&app), 11, "d jumps a half page");
+
+        app.handle_key(KeyCode::PageUp, KeyModifiers::NONE);
+        assert_eq!(reader_scroll_of(&app), 1, "PageUp mirrors u");
+
+        app.handle_key(KeyCode::PageDown, KeyModifiers::NONE);
+        assert_eq!(reader_scroll_of(&app), 11, "PageDown mirrors d");
+
+        app.handle_key(KeyCode::Char('g'), KeyModifiers::NONE);
+        assert_eq!(reader_scroll_of(&app), 0, "g snaps to the top");
+
+        app.handle_key(KeyCode::Char('G'), KeyModifiers::NONE);
+        assert_eq!(
+            reader_scroll_of(&app),
+            u16::MAX,
+            "G sends the state-value sentinel; the draw layer clamps it"
+        );
+
+        app.handle_key(KeyCode::Char('g'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(
+            reader_scroll_of(&app),
+            0,
+            "k at the top is saturating, not a wrap-around"
+        );
+    }
+
+    /// `R`/`q`/`Esc` resets `reader_scroll` so a reopen starts at the
+    /// top — otherwise a user who scrolled, left, and came back
+    /// would land mid-document for no obvious reason.
+    #[tokio::test(flavor = "current_thread")]
+    async fn leaving_the_reader_resets_its_scroll() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        app.overlay = Some(Overlay::PaperDetail {
+            paper_id: "p-attn".into(),
+            scroll: 0,
+            reader_scroll: 42,
+            reader_text_width: 60,
+            annotation_focus: None,
+            prompt: None,
+            reader: true,
+            highlight_focus: None,
+        });
+
+        app.handle_key(KeyCode::Char('R'), KeyModifiers::NONE);
+        match app.overlay {
+            Some(Overlay::PaperDetail {
+                reader,
+                reader_scroll,
+                ..
+            }) => {
+                assert!(!reader, "R toggles the reader back off");
+                assert_eq!(reader_scroll, 0, "closing the reader resets its scroll");
+            }
+            other => panic!("expected PaperDetail after R, got {other:?}"),
+        }
+    }
+
+    /// Shift+J hops to a below-fold highlight AND auto-scrolls to its
+    /// line, so the acceptance criterion "a search match below the
+    /// fold is reachable" is still met after a user presses J.
+    #[tokio::test(flavor = "current_thread")]
+    async fn capital_j_hops_highlight_and_scrolls_to_it() {
+        use scitadel_core::models::{Anchor, Annotation};
+        use scitadel_core::untrusted::UntrustedBody;
+        use std::fmt::Write as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+
+        // Give the seeded paper a long body so a highlight can live
+        // past the viewport, then anchor an annotation on a line
+        // deep in the body.
+        let db = scitadel_db::sqlite::Database::open(&tmp.path().join("scitadel.db")).unwrap();
+        let mut body = String::new();
+        for i in 0..40 {
+            writeln!(body, "line {i}").unwrap();
+        }
+        let target_start = body.find("line 30").expect("line 30 in the body");
+        let target_char_start = body[..target_start].chars().count();
+        let target_char_end = target_char_start + "line 30".chars().count();
+
+        let (paper_repo, _, _, _, _) = db.repositories();
+        let mut paper = paper_repo.get("p-attn").unwrap().unwrap();
+        paper.full_text = Some(UntrustedBody::publisher_supplied(body.clone()));
+        paper_repo.save(&paper).unwrap();
+
+        let repo = scitadel_db::sqlite::SqliteAnnotationRepository::new(db);
+        let mut root = Annotation::new_root(
+            PaperId::from("p-attn"),
+            "claude".into(),
+            "below the fold".into(),
+            Anchor {
+                char_range: Some((target_char_start, target_char_end)),
+                quote: Some("line 30".into()),
+                ..Anchor::default()
+            },
+        );
+        root.id = scitadel_core::models::AnnotationId::from("ann-below-fold");
+        repo.create(&root).unwrap();
+
+        app.overlay = Some(Overlay::PaperDetail {
+            paper_id: "p-attn".into(),
+            scroll: 0,
+            reader_scroll: 0,
+            // Simulate the width a prior draw would have written
+            // back — each "line N" line fits on one wrapped row at
+            // width 60, so the wrapped row and the source line
+            // match for this fixture.
+            reader_text_width: 60,
+            annotation_focus: None,
+            prompt: None,
+            reader: true,
+            highlight_focus: None,
+        });
+
+        app.handle_key(KeyCode::Char('J'), KeyModifiers::NONE);
+
+        match app.overlay {
+            Some(Overlay::PaperDetail {
+                highlight_focus,
+                reader_scroll,
+                ..
+            }) => {
+                assert_eq!(highlight_focus, Some(0), "J lands on the first root");
+                // 30 `\n` precede "line 30" and each source line is
+                // short enough not to wrap at inner width 58, so the
+                // wrapped row matches the source-line count (30).
+                assert_eq!(
+                    reader_scroll, 30,
+                    "J auto-scrolls to the hopped highlight's wrapped row \
+                     so it is reachable below the fold"
+                );
+            }
+            other => panic!("expected PaperDetail after J, got {other:?}"),
+        }
+    }
+
+    // ---- #307 review: state-side clamping ----
+
+    /// `G` then `k` must move up immediately. Before the fix `G` set
+    /// the state to `u16::MAX` and `k`/`u` walked down from the
+    /// sentinel for thousands of presses before anything moved. The
+    /// draw-time clamp rewrites the stored offset against the current
+    /// viewport's wrapped max, so the next `k` subtracts from the
+    /// real last line rather than from the saturated sentinel.
+    #[tokio::test(flavor = "current_thread")]
+    async fn capital_g_then_k_moves_up_immediately() {
+        use scitadel_core::untrusted::UntrustedBody;
+        use std::fmt::Write as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        // Give the seeded paper a long body so `G` has somewhere to go.
+        let db = scitadel_db::sqlite::Database::open(&tmp.path().join("scitadel.db")).unwrap();
+        let mut body = String::new();
+        for i in 0..200 {
+            writeln!(body, "line {i}").unwrap();
+        }
+        let (paper_repo, _, _, _, _) = db.repositories();
+        let mut paper = paper_repo.get("p-attn").unwrap().unwrap();
+        paper.full_text = Some(UntrustedBody::publisher_supplied(body));
+        paper_repo.save(&paper).unwrap();
+
+        app.overlay = Some(Overlay::PaperDetail {
+            paper_id: "p-attn".into(),
+            scroll: 0,
+            reader_scroll: 0,
+            reader_text_width: 60,
+            annotation_focus: None,
+            prompt: None,
+            reader: true,
+            highlight_focus: None,
+        });
+
+        // Simulate the draw clamp: a draw at 60x12 writes the stored
+        // offset to the real max. (`render` hits the same code path.)
+        clamp_reader_scroll_via_draw(&mut app, 60, 12);
+        // `G` sets u16::MAX in state.
+        app.handle_key(KeyCode::Char('G'), KeyModifiers::NONE);
+        assert_eq!(reader_scroll_of(&app), u16::MAX, "G sentinel is in state");
+        // A draw clamps the sentinel to the real max.
+        clamp_reader_scroll_via_draw(&mut app, 60, 12);
+        let at_bottom = reader_scroll_of(&app);
+        assert!(
+            at_bottom > 0 && at_bottom < u16::MAX,
+            "draw rewrote u16::MAX to the real wrapped max: {at_bottom}",
+        );
+        // Now a single `k` must move up one row from the real max,
+        // not from u16::MAX.
+        app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(
+            reader_scroll_of(&app),
+            at_bottom - 1,
+            "k after G moves one row up from the clamped max, not the sentinel",
+        );
+    }
+
+    /// `j` past the last wrapped row must not accumulate: the stored
+    /// offset is clamped in state at each draw, so a user who holds
+    /// `j` past the end does not have to press `k` the same number
+    /// of times to get back.
+    #[tokio::test(flavor = "current_thread")]
+    async fn j_past_the_end_does_not_accumulate() {
+        use scitadel_core::untrusted::UntrustedBody;
+        use std::fmt::Write as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        let db = scitadel_db::sqlite::Database::open(&tmp.path().join("scitadel.db")).unwrap();
+        let mut body = String::new();
+        for i in 0..40 {
+            writeln!(body, "line {i}").unwrap();
+        }
+        let (paper_repo, _, _, _, _) = db.repositories();
+        let mut paper = paper_repo.get("p-attn").unwrap().unwrap();
+        paper.full_text = Some(UntrustedBody::publisher_supplied(body));
+        paper_repo.save(&paper).unwrap();
+
+        app.overlay = Some(Overlay::PaperDetail {
+            paper_id: "p-attn".into(),
+            scroll: 0,
+            reader_scroll: 0,
+            reader_text_width: 60,
+            annotation_focus: None,
+            prompt: None,
+            reader: true,
+            highlight_focus: None,
+        });
+        clamp_reader_scroll_via_draw(&mut app, 60, 12);
+        // Pound `j` well past the end: the stored offset clamps on
+        // every draw, so after many presses it is still at the max.
+        for _ in 0..200 {
+            app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+            clamp_reader_scroll_via_draw(&mut app, 60, 12);
+        }
+        let max_after_mashing = reader_scroll_of(&app);
+
+        // A single `k` from the max moves exactly one row up — not
+        // one row from the saturated `max + 200` the handler
+        // *would* have accumulated without the draw clamp.
+        app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(
+            reader_scroll_of(&app),
+            max_after_mashing - 1,
+            "a single k after j-mashing walks up by exactly one, \
+             so the overshoot didn't accumulate in state",
+        );
+    }
+
+    /// Resizing the terminal re-clamps the stored scroll offset. A
+    /// user who scrolled to the bottom at narrow width must not be
+    /// left with a stale offset past the new (wider) wrapped last
+    /// row; the next draw rewrites the state.
+    #[tokio::test(flavor = "current_thread")]
+    async fn resize_re_clamps_reader_scroll_in_state() {
+        use scitadel_core::untrusted::UntrustedBody;
+        use std::fmt::Write as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _, _) = fixture(&tmp);
+        let db = scitadel_db::sqlite::Database::open(&tmp.path().join("scitadel.db")).unwrap();
+        let mut body = String::new();
+        for i in 0..800 {
+            write!(body, "word{i} ").unwrap();
+        }
+        let (paper_repo, _, _, _, _) = db.repositories();
+        let mut paper = paper_repo.get("p-attn").unwrap().unwrap();
+        paper.full_text = Some(UntrustedBody::publisher_supplied(body));
+        paper_repo.save(&paper).unwrap();
+
+        app.overlay = Some(Overlay::PaperDetail {
+            paper_id: "p-attn".into(),
+            scroll: 0,
+            reader_scroll: 0,
+            reader_text_width: 0,
+            annotation_focus: None,
+            prompt: None,
+            reader: true,
+            highlight_focus: None,
+        });
+
+        // Draw narrow, scroll to bottom via `G`, draw to clamp.
+        clamp_reader_scroll_via_draw(&mut app, 60, 12);
+        app.handle_key(KeyCode::Char('G'), KeyModifiers::NONE);
+        clamp_reader_scroll_via_draw(&mut app, 60, 12);
+        let narrow_max = reader_scroll_of(&app);
+        assert!(
+            narrow_max > 10,
+            "narrow draw gave a non-trivial max: {narrow_max}"
+        );
+
+        // Resize wider: the next draw re-clamps the stored offset
+        // against the new (smaller) wrapped max.
+        clamp_reader_scroll_via_draw(&mut app, 200, 24);
+        let wide_max = reader_scroll_of(&app);
+        assert!(
+            wide_max < narrow_max,
+            "resize re-clamps reader_scroll in state: narrow={narrow_max} wide={wide_max}",
+        );
+    }
+
+    /// Drive one draw cycle against a `TestBackend` so the reader's
+    /// in-state clamp fires. Factored out of the three state-side
+    /// clamping tests because it is identical in each.
+    fn clamp_reader_scroll_via_draw(app: &mut App, width: u16, height: u16) {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal.draw(|frame| draw(frame, app)).expect("draw");
+    }
+
+    /// Read the current `reader_scroll`, panicking if the overlay is
+    /// not a `PaperDetail`.
+    fn reader_scroll_of(app: &App) -> u16 {
+        match &app.overlay {
+            Some(Overlay::PaperDetail { reader_scroll, .. }) => *reader_scroll,
+            other => panic!("expected PaperDetail, got {other:?}"),
+        }
     }
 }

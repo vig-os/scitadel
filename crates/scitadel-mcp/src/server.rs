@@ -242,6 +242,32 @@ pub struct PaperIdRequest {
     pub paper_id: String,
 }
 
+/// Request shape for `get_annotated_paper`, which honours the same
+/// `max_chars` cap as `read_paper` (default 20000) and takes an `offset`
+/// so an agent can page through long bodies deterministically (#307).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetAnnotatedPaperRequest {
+    /// Paper ID
+    pub paper_id: String,
+    /// Max **scalar chars** of `full_text` to return (default 20000,
+    /// same as `read_paper`). Must be ≥ 1 — 0 is rejected to avoid an
+    /// infinite paging loop. The response carries `truncated`,
+    /// `total_chars`, `offset` and `next_offset` so the caller can
+    /// resume. The split is on chars (Unicode scalar values), not
+    /// graphemes, matching `read_paper`; a cluster that straddles a
+    /// boundary (base + combining mark, flag emoji, etc.) can be cut
+    /// across windows.
+    pub max_chars: Option<usize>,
+    /// Char offset into `full_text` to start the window (default 0).
+    /// Pass the previous response's `next_offset` to read the next
+    /// window. **Coordinates:** `offset`, `next_offset`, `total_chars`
+    /// and every annotation anchor's `char_range` are in the same
+    /// stored-text scalar-char space — so a `char_range` that fits
+    /// inside `[offset, offset + max_chars)` is guaranteed to be
+    /// served by the current window.
+    pub offset: Option<usize>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetCitationsRequest {
     /// Source paper ID (must have openalex_id)
@@ -362,9 +388,12 @@ pub struct AcquireQueueAddRequest {
 pub struct ReadPaperRequest {
     /// Paper ID
     pub paper_id: String,
-    /// Max characters of `full_text` to return (default 20000). When
-    /// truncated, the JSON response carries `truncated: true` and
-    /// `total_chars` so the agent can request more.
+    /// Max **scalar chars** of `full_text` to return (default 20000).
+    /// When truncated, the JSON response carries `truncated: true`
+    /// and `total_chars` so the agent can request more. The split is
+    /// on chars (Unicode scalar values), not graphemes; a cluster
+    /// that straddles the cap (base + combining mark, flag emoji,
+    /// etc.) can be cut across windows.
     pub max_chars: Option<usize>,
     /// When true (the default), the response is a JSON envelope that
     /// also includes every live annotation anchored to the paper. When
@@ -932,13 +961,13 @@ impl ScitadelServer {
     }
 
     #[tool(
-        description = "Returns: JSON {paper {id,title,abstract,full_text}, annotations[] (live only, with parent_id/root_id and full anchor incl. char_range/quote/prefix/suffix/sentence_id/source_version/status), source_version}. One call replaces get_paper + list_annotations when an agent needs to reason over offsets. NOTE: `read_paper` (with default `with_annotations: true`) returns the same envelope plus extractor metadata and PDF/HTML extraction; prefer it when you need the full text. (#185)"
+        description = "Returns: JSON {paper {id,title,abstract,full_text,truncated,total_chars,offset,next_offset}, annotations[] (live only, with parent_id/root_id and full anchor incl. char_range/quote/prefix/suffix/sentence_id/source_version/status), annotations_outside_window(_anchors), annotations_without_char_range(_ids), source_version}. `full_text` is windowed with the same default cap (20000 chars) as `read_paper` (#307); pass `max_chars` (≥ 1) / `offset` to page through. Coordinates are **stored-text scalar chars** — `offset`, `next_offset`, `total_chars` and every `char_range` share one space, so a `char_range` inside `[offset, offset+max_chars)` is in this window. `annotations_outside_window(_anchors)` reports placed anchors past the window; anchors with no `char_range` (paper-level notes) are counted separately in `annotations_without_char_range(_ids)` so a paging caller sees them exactly once. Windows split on chars, not graphemes — same as `read_paper`. One call replaces get_paper + list_annotations when an agent needs to reason over offsets. NOTE: `read_paper` (with default `with_annotations: true`) returns the same envelope plus extractor metadata and PDF/HTML extraction; prefer it when you need the full text. (#185)"
     )]
     fn get_annotated_paper(
         &self,
-        Parameters(req): Parameters<PaperIdRequest>,
+        Parameters(req): Parameters<GetAnnotatedPaperRequest>,
     ) -> Result<String, String> {
-        tools::get_annotated_paper_tool(&req.paper_id)
+        tools::get_annotated_paper_tool(&req.paper_id, req.max_chars, req.offset)
     }
 
     #[tool(

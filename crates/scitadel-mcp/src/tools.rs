@@ -1449,9 +1449,24 @@ pub fn list_annotations_tool(
 /// Soft-deleted annotations are excluded. Replies are flat with
 /// `parent_id` and `root_id` so threads can be reconstructed without
 /// extra round-trips.
-pub fn get_annotated_paper_tool(paper_id: &str) -> Result<String, String> {
+///
+/// `max_chars` (default 20_000, same as `read_paper`) windows the
+/// `full_text` so this tool never returns a different amount of the
+/// same document than `read_paper` by accident (#307). `offset`
+/// (default 0) lets a caller page through long bodies deterministically
+/// — the response's `next_offset` is the value to pass next.
+pub fn get_annotated_paper_tool(
+    paper_id: &str,
+    max_chars: Option<usize>,
+    offset: Option<usize>,
+) -> Result<String, String> {
     let db = open_db()?;
-    build_annotated_paper(&db, paper_id)
+    build_annotated_paper(
+        &db,
+        paper_id,
+        max_chars.unwrap_or(20_000),
+        offset.unwrap_or(0),
+    )
 }
 
 /// Build the annotation array + source_version block shared by
@@ -1520,10 +1535,118 @@ fn build_annotations_json(
     Ok((entries, source_version))
 }
 
-fn build_annotated_paper(db: &Database, paper_id: &str) -> Result<String, String> {
+fn build_annotated_paper(
+    db: &Database,
+    paper_id: &str,
+    max_chars: usize,
+    offset: usize,
+) -> Result<String, String> {
+    // Reject `max_chars == 0` up front. The paging contract is
+    // `next_offset = offset + max_chars`, so a zero width pins
+    // `next_offset` to `offset` forever — a caller looping on
+    // `next_offset.is_some()` would spin without consuming any body.
+    // Same shape as other typed-argument errors so a caller can route
+    // on the message prefix. (#307 review.)
+    if max_chars == 0 {
+        return Err("max_chars must be at least 1 (0 would loop forever)".into());
+    }
+
     let paper = resolve_paper_id(db, paper_id)?;
 
     let (entries, source_version) = build_annotations_json(db, paper.id.as_str())?;
+
+    // Window the `full_text` with the same default (20_000) `read_paper`
+    // uses, so two tools returning the same document now return the same
+    // amount of it (#307). The abstract stays whole — abstracts are short
+    // and a truncated abstract is a corrupted citation record, the same
+    // reasoning that kept it out of `read_paper`'s `max_chars` cap.
+    //
+    // `offset`, `window_end`, `next_offset`, `total_chars` AND the
+    // annotation `char_range` positions are all stored-text char
+    // offsets — the coordinate space a `char_range` was recorded in
+    // (over `UntrustedBody::as_str`, before neutralisation). Sliding
+    // the window over `rendered()` would drift these apart when a
+    // zero-width, bidi or BOM character is stripped: the anchor at
+    // "position 500" would move relative to the "position 500" the
+    // window ends at. We therefore slice `as_str()` and render the
+    // slice for output — `UntrustedBody::rendered` is pure
+    // neutralisation, so running it after slicing strips the same
+    // bytes and leaves no escape in the response (#287), while every
+    // position the caller is told about is the position it was
+    // stored at.
+    let stored_body = paper
+        .full_text
+        .as_ref()
+        .map(scitadel_core::untrusted::UntrustedBody::as_str);
+    let (body_window, total_chars, was_truncated, next_offset) = stored_body.map_or_else(
+        || (None, 0usize, false, None),
+        |body| window_body(body, offset, max_chars),
+    );
+
+    // Report every annotation whose anchor can be placed in the document
+    // but falls outside the returned window — the acceptance criterion
+    // against silently dropping them (#307). The body window above
+    // slices in stored-text coordinates, so `start`/`end` from the
+    // anchor and `offset`/`window_end` here all refer to the same
+    // text. Zero-length anchors (`start == end`) are a point in the
+    // document rather than a span: they sit on the half-open window
+    // `[offset, window_end)` — same logic as a text editor's caret —
+    // with ONE exception. The final window reaches `window_end ==
+    // total_chars`; a point anchor at `total_chars` (the end of the
+    // document) belongs to that window rather than nowhere, so the
+    // end-of-document cursor is counted as inside there.
+    // Annotations without a `char_range` are counted in their own
+    // bucket — they have no position to compare, so counting them
+    // alongside positioned anchors would hide them from a caller that
+    // re-fetches outside the current window.
+    let window_end = offset.saturating_add(
+        body_window
+            .as_deref()
+            .map_or(0, |body| body.chars().count()),
+    );
+    let is_final_window = window_end >= total_chars;
+    let mut out_of_window: Vec<serde_json::Value> = Vec::new();
+    let mut without_range: Vec<serde_json::Value> = Vec::new();
+    for a in &entries {
+        let anchor = a.get("anchor");
+        let cr = anchor.and_then(|an| an.get("char_range"));
+        let arr = cr.and_then(|v| v.as_array());
+        let placed = arr.and_then(|arr| {
+            let start = arr.first()?.as_u64()? as usize;
+            let end = arr.get(1)?.as_u64()? as usize;
+            Some((start, end))
+        });
+        match placed {
+            None => {
+                without_range.push(serde_json::json!({
+                    "id": a.get("id"),
+                }));
+            }
+            Some((start, end)) => {
+                let overlaps = if start == end {
+                    // A zero-length anchor is a cursor-shaped marker
+                    // between two characters, not a span. It sits on
+                    // the half-open window `[offset, window_end)` —
+                    // same logic as a text editor's caret — except
+                    // for the end-of-document cursor on the final
+                    // window: `start == total_chars` is reported
+                    // outside every half-open window otherwise, so
+                    // the final window admits its upper bound as
+                    // inclusive for the end-of-document point.
+                    start >= offset
+                        && (start < window_end || (is_final_window && start == window_end))
+                } else {
+                    start < window_end && end > offset
+                };
+                if !overlaps {
+                    out_of_window.push(serde_json::json!({
+                        "id": a.get("id"),
+                        "char_range": [start, end],
+                    }));
+                }
+            }
+        }
+    }
 
     let response = serde_json::json!({
         "paper": {
@@ -1531,19 +1654,112 @@ fn build_annotated_paper(db: &Database, paper_id: &str) -> Result<String, String
             "title": paper.title.rendered(),
             // Rendered, not stored: this return is an agent's context (#287).
             // `UntrustedBody::rendered` is the security half alone — a body's
-            // paragraph structure survives, and nothing here truncates it.
+            // paragraph structure survives.
             "abstract": paper.r#abstract.rendered(),
-            // Already neutralised on the way in: either the `papers.full_text`
-            // cache hit (rendered in `read_paper_tool`) or a fresh extraction,
-            // which is the same bytes the column stores — a data path, and one
-            // whose shape contract a caller depends on.
-            "full_text": paper.full_text.as_ref().map(|b| b.as_str()),
+            // Windowed by `max_chars` / `offset`; `truncated` + `next_offset`
+            // tell the caller whether and where to page (#307). Positions
+            // (`offset`, `next_offset`, `total_chars`, and the `char_range`
+            // of every anchor) are in **stored-text char coordinates** — the
+            // bytes the record carries, before neutralisation and before any
+            // grapheme-cluster reshaping. Same contract as `read_paper`: the
+            // split is on scalar chars, not graphemes.
+            "full_text": body_window.as_deref().map(neutralise_window),
+            "truncated": was_truncated,
+            "total_chars": total_chars,
+            "offset": offset,
+            "next_offset": next_offset,
         },
         "annotations": entries,
+        "annotations_outside_window": out_of_window.len(),
+        "annotations_outside_window_anchors": out_of_window,
+        // Annotations with no `char_range` are reported separately so a
+        // caller paging through `next_offset` sees them exactly once
+        // regardless of which window it is on (#307 review).
+        "annotations_without_char_range": without_range.len(),
+        "annotations_without_char_range_ids": without_range,
         "source_version": source_version,
     });
 
     serde_json::to_string_pretty(&response).map_err(|e| e.to_string())
+}
+
+/// Pass a windowed slice of a stored body through
+/// `UntrustedBody::rendered`'s neutraliser so the response can never
+/// carry escape sequences, bidi overrides or control characters —
+/// matching the `#287` contract `rendered()` enforces on the full
+/// body. Keeps the slice's char positions aligned with the stored-text
+/// coordinate space `char_range` was recorded in: this call drops
+/// bytes, never shifts them.
+fn neutralise_window(window: &str) -> String {
+    scitadel_core::untrusted::UntrustedBody::publisher_supplied(window)
+        .rendered()
+        .into_owned()
+}
+
+/// Take a `char_range`-based slice of `body`, starting at `offset` and
+/// at most `max_chars` wide. Returns `(windowed_text, total_chars,
+/// was_truncated, next_offset)`. `next_offset` is `Some(end)` when
+/// there is more body past the window, `None` at EOF.
+///
+/// Char-based, like `assemble_read_paper_response`'s own slice: this is
+/// a character budget, not a byte budget, so multi-byte scripts cap at
+/// a predictable count.
+///
+/// Window edges snap to `UntrustedBody`'s escape-sequence boundaries so
+/// an OSC 8 hyperlink (or any ANSI/CSI/OSC sequence) is never split
+/// across windows. A split would leave the sequence's tail — including
+/// the URL of an OSC 8 — as visible text in the next window, because
+/// `neutralise` needs the opening `ESC` to recognise the payload. The
+/// snap preserves `char_range` coordinate consistency (positions stay
+/// in stored-text char coordinates), unlike neutralising the full body
+/// first and slicing after, which would drift positions whenever a
+/// zero-width or bidi character was stripped. The window may extend a
+/// few chars past `offset + max_chars` to cover a straddling sequence;
+/// `max_chars` stays a floor on progress rather than a hard cap, and
+/// `next_offset` reflects the snapped end so a paging caller crosses
+/// the boundary cleanly.
+fn window_body(
+    body: &str,
+    offset: usize,
+    max_chars: usize,
+) -> (Option<String>, usize, bool, Option<usize>) {
+    let total_chars = body.chars().count();
+    let start = offset.min(total_chars);
+    let preferred_end = start.saturating_add(max_chars).min(total_chars);
+    let end = snap_window_end(body, start, preferred_end, total_chars);
+    let slice: String = body.chars().skip(start).take(end - start).collect();
+    // `truncated` captures *either* side of the window being cut: a
+    // mid-document offset with no body past it is still a truncation on
+    // the front, and the caller cares that it is not getting the whole
+    // document in one call.
+    let was_truncated = start > 0 || end < total_chars;
+    let next_offset = if end < total_chars { Some(end) } else { None };
+    (Some(slice), total_chars, was_truncated, next_offset)
+}
+
+/// Snap `preferred_end` forward past any escape sequence that would be
+/// split by cutting the body there. Returns the end to use, capped at
+/// `total_chars`.
+///
+/// A sequence that starts inside `[start, preferred_end)` but extends
+/// past `preferred_end` is extended to its full span. A sequence that
+/// starts at or after `preferred_end` is left alone — it belongs to
+/// the next window, which starts at the returned end. A sequence that
+/// started before `start` is not our concern: this window is one in a
+/// paged walk, and the previous window's snap already included the
+/// whole sequence.
+fn snap_window_end(body: &str, start: usize, preferred_end: usize, total_chars: usize) -> usize {
+    use scitadel_core::untrusted::escape_ranges;
+    let mut end = preferred_end;
+    for (es, ee) in escape_ranges(body) {
+        if es >= start && es < end && ee > end {
+            end = ee;
+        }
+        if es >= end {
+            break;
+        }
+    }
+    end.min(total_chars)
 }
 
 /// Full-text search over stored search queries. Returns a JSON array of
@@ -2493,7 +2709,7 @@ mod tests {
         ann.tags = vec!["physics".into()];
         repo.create(&ann).expect("create ann");
 
-        let json = build_annotated_paper(&db, "p-1").expect("build");
+        let json = build_annotated_paper(&db, "p-1", 20_000, 0).expect("build");
         let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
         assert_eq!(v["paper"]["id"], "p-1");
         assert_eq!(v["paper"]["full_text"], "Neutron stars are dense.");
@@ -2534,7 +2750,7 @@ mod tests {
         repo.soft_delete(doomed.id.as_str()).unwrap();
 
         let v: serde_json::Value =
-            serde_json::from_str(&build_annotated_paper(&db, "p-2").unwrap()).unwrap();
+            serde_json::from_str(&build_annotated_paper(&db, "p-2", 20_000, 0).unwrap()).unwrap();
         let arr = v["annotations"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["note"], "live");
@@ -2545,7 +2761,7 @@ mod tests {
         let db = fresh_db();
         save_paper(&db, "p-3", "Empty", None);
         let v: serde_json::Value =
-            serde_json::from_str(&build_annotated_paper(&db, "p-3").unwrap()).unwrap();
+            serde_json::from_str(&build_annotated_paper(&db, "p-3", 20_000, 0).unwrap()).unwrap();
         assert_eq!(v["annotations"].as_array().unwrap().len(), 0);
         assert!(v["source_version"].is_null());
     }
@@ -2569,7 +2785,7 @@ mod tests {
         repo.create(&reply).unwrap();
 
         let v: serde_json::Value =
-            serde_json::from_str(&build_annotated_paper(&db, "p-4").unwrap()).unwrap();
+            serde_json::from_str(&build_annotated_paper(&db, "p-4", 20_000, 0).unwrap()).unwrap();
         let arr = v["annotations"].as_array().unwrap();
         assert_eq!(arr.len(), 2);
         let reply_entry = arr
@@ -2582,8 +2798,550 @@ mod tests {
     #[test]
     fn get_annotated_paper_unknown_paper_errors() {
         let db = fresh_db();
-        let err = build_annotated_paper(&db, "nope").unwrap_err();
+        let err = build_annotated_paper(&db, "nope", 20_000, 0).unwrap_err();
         assert!(err.contains("not found"));
+    }
+
+    // -- #307: `build_annotated_paper` honours `max_chars` / `offset`
+    //    with the same semantics as `read_paper`, and surfaces
+    //    continuation + out-of-window anchors so pagination is
+    //    deterministic.
+
+    /// A body shorter than `max_chars` round-trips whole: `truncated`
+    /// is false, `total_chars` is the true length, and `next_offset`
+    /// is null so a paging caller stops here.
+    #[test]
+    fn get_annotated_paper_returns_whole_body_when_under_cap() {
+        let db = fresh_db();
+        save_paper(&db, "p-cap-1", "Short", Some("hello world"));
+
+        let v: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-cap-1", 20_000, 0).unwrap())
+                .unwrap();
+        assert_eq!(v["paper"]["full_text"], "hello world");
+        assert_eq!(v["paper"]["truncated"], false);
+        assert_eq!(v["paper"]["total_chars"], 11);
+        assert_eq!(v["paper"]["offset"], 0);
+        assert!(v["paper"]["next_offset"].is_null());
+        assert_eq!(v["annotations_outside_window"], 0);
+    }
+
+    /// Body length == `max_chars` exactly is not truncated — the
+    /// boundary case that stays off the paging path, mirroring
+    /// `read_paper`'s `>` test.
+    #[test]
+    fn get_annotated_paper_cap_boundary_exact_length_is_not_truncated() {
+        let db = fresh_db();
+        let body: String = "a".repeat(10);
+        save_paper(&db, "p-cap-2", "Edge", Some(&body));
+
+        let v: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-cap-2", 10, 0).unwrap()).unwrap();
+        assert_eq!(v["paper"]["full_text"], body);
+        assert_eq!(v["paper"]["truncated"], false);
+        assert_eq!(v["paper"]["total_chars"], 10);
+        assert!(v["paper"]["next_offset"].is_null());
+    }
+
+    /// Body longer than `max_chars` is capped at a char boundary and
+    /// reports `truncated: true` + a `next_offset` pointing at the
+    /// first un-returned character. The same shape `read_paper` uses.
+    #[test]
+    fn get_annotated_paper_cap_boundary_truncates_and_reports_next_offset() {
+        let db = fresh_db();
+        let body: String = "a".repeat(50);
+        save_paper(&db, "p-cap-3", "Long", Some(&body));
+
+        let v: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-cap-3", 10, 0).unwrap()).unwrap();
+        assert_eq!(
+            v["paper"]["full_text"].as_str().unwrap().chars().count(),
+            10
+        );
+        assert_eq!(v["paper"]["truncated"], true);
+        assert_eq!(v["paper"]["total_chars"], 50);
+        assert_eq!(v["paper"]["offset"], 0);
+        assert_eq!(v["paper"]["next_offset"], 10);
+    }
+
+    /// `max_chars` defaults to 20_000 — the same default as
+    /// `read_paper` — which is #307's invariant: two tools returning
+    /// the same document now return the same amount of it.
+    #[test]
+    fn get_annotated_paper_default_cap_matches_read_paper() {
+        let db = fresh_db();
+        let body: String = "x".repeat(25_000);
+        save_paper(&db, "p-cap-4", "Very long", Some(&body));
+
+        let v: serde_json::Value = serde_json::from_str(
+            &get_annotated_paper_tool_with(&db, "p-cap-4", None, None).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            v["paper"]["full_text"].as_str().unwrap().chars().count(),
+            20_000
+        );
+        assert_eq!(v["paper"]["truncated"], true);
+        assert_eq!(v["paper"]["total_chars"], 25_000);
+        assert_eq!(v["paper"]["next_offset"], 20_000);
+    }
+
+    /// Continuation round-trip: window 1 says `next_offset = N`; feeding
+    /// `offset = N` returns the rest of the body and `next_offset: null`
+    /// at EOF. Concatenating the two windows reconstructs the original.
+    #[test]
+    fn get_annotated_paper_continuation_round_trips_the_body() {
+        let db = fresh_db();
+        let body: String = (b'a'..=b'z').map(char::from).collect::<String>().repeat(4);
+        assert_eq!(body.chars().count(), 104);
+        save_paper(&db, "p-cap-5", "Rolling", Some(&body));
+
+        let page1: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-cap-5", 40, 0).unwrap()).unwrap();
+        assert_eq!(page1["paper"]["truncated"], true);
+        assert_eq!(page1["paper"]["next_offset"], 40);
+
+        let mid = page1["paper"]["next_offset"].as_u64().unwrap() as usize;
+        let page2: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-cap-5", 40, mid).unwrap()).unwrap();
+        assert_eq!(page2["paper"]["truncated"], true);
+        assert_eq!(page2["paper"]["next_offset"], 80);
+
+        let end = page2["paper"]["next_offset"].as_u64().unwrap() as usize;
+        let page3: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-cap-5", 40, end).unwrap()).unwrap();
+        // The tail is a partial window, truncated on the front but not
+        // the back — `next_offset` is null at EOF.
+        assert!(page3["paper"]["next_offset"].is_null());
+        assert_eq!(page3["paper"]["truncated"], true);
+
+        let reassembled = format!(
+            "{}{}{}",
+            page1["paper"]["full_text"].as_str().unwrap(),
+            page2["paper"]["full_text"].as_str().unwrap(),
+            page3["paper"]["full_text"].as_str().unwrap(),
+        );
+        assert_eq!(reassembled, body, "pages re-concatenate to the original");
+    }
+
+    /// Annotations whose `char_range` falls outside the returned window
+    /// are counted (and listed) in the response — the acceptance
+    /// criterion against silently dropping them.
+    #[test]
+    fn get_annotated_paper_reports_annotations_outside_the_window() {
+        let db = fresh_db();
+        let body: String = "a".repeat(100);
+        let pid = save_paper(&db, "p-cap-6", "Spans", Some(&body));
+
+        let repo = SqliteAnnotationRepository::new(db.clone());
+        let in_window = Annotation::new_root(
+            pid.clone(),
+            "lars".into(),
+            "in window".into(),
+            Anchor {
+                char_range: Some((5, 15)),
+                quote: Some("in-win".into()),
+                ..Anchor::default()
+            },
+        );
+        let straddles = Annotation::new_root(
+            pid.clone(),
+            "lars".into(),
+            "straddles the boundary".into(),
+            Anchor {
+                char_range: Some((35, 55)),
+                quote: Some("straddle".into()),
+                ..Anchor::default()
+            },
+        );
+        let after_window = Annotation::new_root(
+            pid,
+            "lars".into(),
+            "well past".into(),
+            Anchor {
+                char_range: Some((70, 90)),
+                quote: Some("after".into()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&in_window).unwrap();
+        repo.create(&straddles).unwrap();
+        repo.create(&after_window).unwrap();
+
+        // Window [0, 40): `in_window` is inside, `straddles` overlaps,
+        // `after_window` is outside. The two that touch the window are
+        // *not* counted as outside; only the fully-past one is.
+        let v: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-cap-6", 40, 0).unwrap()).unwrap();
+        assert_eq!(v["annotations"].as_array().unwrap().len(), 3);
+        assert_eq!(v["annotations_outside_window"], 1);
+        let anchors = v["annotations_outside_window_anchors"]
+            .as_array()
+            .expect("anchors array");
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0]["char_range"][0], 70);
+        assert_eq!(anchors[0]["char_range"][1], 90);
+    }
+
+    /// Thin wrapper so the default-cap test can exercise the
+    /// `get_annotated_paper_tool` entrypoint against an in-memory DB
+    /// without going through `open_db`'s config load.
+    fn get_annotated_paper_tool_with(
+        db: &Database,
+        paper_id: &str,
+        max_chars: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<String, String> {
+        build_annotated_paper(
+            db,
+            paper_id,
+            max_chars.unwrap_or(20_000),
+            offset.unwrap_or(0),
+        )
+    }
+
+    /// `max_chars == 0` would make `next_offset == offset`, an
+    /// infinite paging loop. The tool rejects it with a typed error
+    /// rather than returning a zero-width window. (#307 review.)
+    #[test]
+    fn get_annotated_paper_rejects_zero_max_chars() {
+        let db = fresh_db();
+        save_paper(&db, "p-zero", "Z", Some("some body"));
+        let err = build_annotated_paper(&db, "p-zero", 0, 0).expect_err("rejects zero");
+        assert!(
+            err.contains("max_chars must be at least 1"),
+            "typed message: {err}"
+        );
+    }
+
+    /// `char_range` positions and `offset` / `window_end` must refer
+    /// to the same coordinate space. Before the fix we sliced
+    /// `rendered()` (post-neutralisation) and compared against
+    /// `char_range` positions stored over `as_str()` (pre-
+    /// neutralisation). A zero-width joiner in the stored body
+    /// shifted the rendered coordinates relative to the anchor's,
+    /// so an anchor that *should* have been inside a window at the
+    /// end of the first page looked past it. The fix slices
+    /// `as_str()` and renders the slice. (#307 review.)
+    #[test]
+    fn get_annotated_paper_window_and_char_range_share_a_coordinate_space() {
+        let db = fresh_db();
+        // 10 chars of ASCII, then a zero-width joiner (dropped by
+        // `rendered`), then an anchor at char positions 11..20 in
+        // STORED text. `rendered` returns 19 chars; a slice with
+        // char-coords 0..11 that uses `rendered` would end one char
+        // short of the anchor.
+        let mut body = String::new();
+        body.push_str("prefix1234");
+        body.push('\u{200d}'); // zero-width joiner
+        body.push_str("ANCHORED!");
+        let pid = save_paper(&db, "p-zw", "ZW", Some(&body));
+        // The anchor lives at stored-char positions 11..20 — right
+        // after the zero-width joiner.
+        let repo = SqliteAnnotationRepository::new(db.clone());
+        let ann = Annotation::new_root(
+            pid,
+            "lars".into(),
+            "anchor past the ZWJ".into(),
+            Anchor {
+                char_range: Some((11, 20)),
+                quote: Some("ANCHORED!".into()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&ann).unwrap();
+
+        // Window `[0, 20)` in stored coords includes the anchor's
+        // whole span — it must not be reported as outside.
+        let v: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-zw", 20, 0).unwrap()).unwrap();
+        assert_eq!(
+            v["annotations_outside_window"], 0,
+            "the anchor at [11, 20) is inside window `[0, 20)`: {v}",
+        );
+        // And the window really does cover 20 stored chars.
+        assert_eq!(v["paper"]["total_chars"], body.chars().count());
+        assert_eq!(
+            v["paper"]["full_text"].as_str().unwrap().chars().count(),
+            20 - 1, // one ZWJ in that range was neutralised
+            "the ZWJ is stripped by `rendered`, but the position \
+             coordinates still refer to the stored-text char index",
+        );
+    }
+
+    /// A zero-length anchor at exactly `offset` must be reported as
+    /// inside the window — it is a cursor-shaped marker on the
+    /// first character of the window, not a span past it. The
+    /// pre-fix overlap check `end > offset` wrongly rejected it.
+    /// (#307 review.)
+    #[test]
+    fn get_annotated_paper_zero_length_anchor_at_offset_is_inside() {
+        let db = fresh_db();
+        let pid = save_paper(&db, "p-zl", "ZL", Some(&"x".repeat(100)));
+        let repo = SqliteAnnotationRepository::new(db.clone());
+        // Zero-length anchor on char 40 — the start of the window
+        // for the second page.
+        let ann = Annotation::new_root(
+            pid,
+            "lars".into(),
+            "point-shaped anchor".into(),
+            Anchor {
+                char_range: Some((40, 40)),
+                quote: Some(String::new()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&ann).unwrap();
+
+        // Window `[40, 80)`: a point anchor at 40 is at the start.
+        let v: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-zl", 40, 40).unwrap()).unwrap();
+        assert_eq!(
+            v["annotations_outside_window"], 0,
+            "zero-length anchor at offset is inside the window: {v}"
+        );
+    }
+
+    /// A zero-length anchor at the very end of the document
+    /// (`start == end == total_chars`) sits on no half-open window
+    /// `[offset, window_end)` by construction — every window has
+    /// `window_end <= total_chars`, so a naive half-open check
+    /// reports the end-of-document cursor as outside every window.
+    /// The final window (the one that reaches `total_chars`) admits
+    /// its upper bound as inclusive for a point anchor, so the
+    /// cursor at EOF is inside there. (#307 review nit.)
+    #[test]
+    fn get_annotated_paper_zero_length_anchor_at_eof_is_inside_final_window() {
+        let db = fresh_db();
+        let total = 100;
+        let pid = save_paper(&db, "p-zl-eof", "ZL EOF", Some(&"x".repeat(total)));
+        let repo = SqliteAnnotationRepository::new(db.clone());
+        let ann = Annotation::new_root(
+            pid,
+            "lars".into(),
+            "end-of-document cursor".into(),
+            Anchor {
+                char_range: Some((total, total)),
+                quote: Some(String::new()),
+                ..Anchor::default()
+            },
+        );
+        repo.create(&ann).unwrap();
+
+        // Final window `[60, 100]`: the cursor at 100 is the document
+        // end, and the final window admits its upper bound.
+        let final_window: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-zl-eof", 40, 60).unwrap()).unwrap();
+        assert_eq!(
+            final_window["annotations_outside_window"], 0,
+            "end-of-document point anchor is inside the final window: \
+             {final_window}"
+        );
+        assert_eq!(
+            final_window["paper"]["total_chars"].as_u64().unwrap() as usize,
+            total,
+            "sanity: the final window reaches total_chars"
+        );
+
+        // A non-final window `[0, 40)`: the EOF cursor at 100 is
+        // genuinely outside — reported, not silently dropped.
+        let first_window: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-zl-eof", 40, 0).unwrap()).unwrap();
+        assert_eq!(
+            first_window["annotations_outside_window"], 1,
+            "an EOF point anchor is outside a non-final window: \
+             {first_window}"
+        );
+    }
+
+    /// A window boundary that cuts through an ANSI/OSC escape
+    /// sequence used to leave the sequence's tail — including the
+    /// URL of an OSC 8 hyperlink — as visible text in the next
+    /// window: `neutralise` needs the opening `ESC` to recognise
+    /// the payload, and the tail arrives without it. `window_body`
+    /// now snaps the window's end past a straddling sequence, so
+    /// every window renders clean of ESC, control and bidi/
+    /// zero-width characters, and the hidden URL never appears as
+    /// visible text. The snap keeps `char_range` coordinate
+    /// consistency intact (positions are still stored-text char
+    /// offsets). (#307 review nit.)
+    #[test]
+    fn get_annotated_paper_windows_never_leak_escape_or_invisible_chars() {
+        let db = fresh_db();
+        // Build a body that lands each class of hazard across a
+        // `max_chars = 20` window boundary:
+        //  * an OSC 8 hyperlink carrying a URL that straddles
+        //    boundary 20 (first OSC at char 6..38, URL mid-boundary),
+        //  * a CSI colour sequence that straddles boundary 60 (SGR
+        //    at char 59..63, cut after `ESC [`),
+        //  * a zero-width joiner and a bidi RLO interleaved with
+        //    prose (single-char invisibles, dropped per-char),
+        //  * a bare BEL control char in body text.
+        // Positions are counted out in the comments next to each
+        // piece so an edit knows what moves.
+        let osc = "\u{1b}]8;;http://evil.example/secret\u{7}click here\u{1b}]8;;\u{7}";
+        let csi = "\u{1b}[31mred\u{1b}[0m";
+        let invisibles = "zwj\u{200d}joiner bidi\u{202e}reversed\u{7}bell";
+        let body = format!("start {osc} mid {csi} end {invisibles} tail");
+
+        save_paper(&db, "p-esc", "Escapes across windows", Some(&body));
+        let total = body.chars().count();
+
+        // `max_chars = 20` cuts inside the first OSC's URL (boundary
+        // ~20 falls at char 20 of the body, inside `http://evil…` at
+        // positions 6..38) and inside the first CSI at boundary
+        // ~60 (CSI at 59..63). The snap must advance each window's
+        // end past these sequences, and the next window must start
+        // on clean text.
+        let page = 20usize;
+
+        // Walk every page via `next_offset`, collect rendered windows.
+        let mut rendered = Vec::<String>::new();
+        let mut offset = 0usize;
+        let mut covered_through: usize = 0;
+        loop {
+            let v: serde_json::Value =
+                serde_json::from_str(&build_annotated_paper(&db, "p-esc", page, offset).unwrap())
+                    .unwrap();
+            let window_text = v["paper"]["full_text"]
+                .as_str()
+                .expect("rendered window text")
+                .to_string();
+            let reported_offset = v["paper"]["offset"].as_u64().unwrap() as usize;
+            assert_eq!(reported_offset, offset);
+            rendered.push(window_text);
+            match v["paper"]["next_offset"].as_u64() {
+                Some(next) => {
+                    let next = next as usize;
+                    assert!(
+                        next > offset,
+                        "next_offset must advance past the current window"
+                    );
+                    covered_through = next;
+                    offset = next;
+                }
+                None => {
+                    covered_through = total;
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            covered_through, total,
+            "paging via next_offset reaches total_chars: {covered_through} / {total}"
+        );
+
+        // Every window is clean: no raw ESC / BEL / control / bidi /
+        // zero-width chars, and no fragment of the hidden URL.
+        for (i, win) in rendered.iter().enumerate() {
+            assert!(
+                !win.contains('\u{1b}'),
+                "window {i} still carries ESC: {win:?}"
+            );
+            assert!(
+                !win.contains('\u{7}'),
+                "window {i} still carries BEL: {win:?}"
+            );
+            for c in win.chars() {
+                assert!(
+                    !c.is_control() || c.is_whitespace(),
+                    "window {i} carries non-whitespace control {c:?}: {win:?}"
+                );
+            }
+            for bad in [
+                '\u{200b}', '\u{200c}', '\u{200d}', '\u{2060}', '\u{feff}', '\u{200e}', '\u{200f}',
+                '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}',
+                '\u{2068}', '\u{2069}',
+            ] {
+                assert!(
+                    !win.contains(bad),
+                    "window {i} carries invisible/bidi {bad:?}: {win:?}"
+                );
+            }
+            // The URL (and the "evil" substring that tells us we
+            // leaked its text) must never appear — the OSC 8 wraps
+            // it, and `neutralise` strips the whole sequence.
+            assert!(
+                !win.contains("evil"),
+                "window {i} leaked the OSC 8 URL: {win:?}"
+            );
+            assert!(
+                !win.contains("http://"),
+                "window {i} leaked the URL scheme: {win:?}"
+            );
+            assert!(
+                !win.contains("[31m") && !win.contains("[0m"),
+                "window {i} leaked a CSI parameter list: {win:?}"
+            );
+        }
+
+        // Positive check: the visible label from the hyperlink and
+        // the plain prose survive across the paged walk.
+        let joined = rendered.concat();
+        assert!(joined.contains("click here"), "label kept: {joined:?}");
+        assert!(joined.contains("start"), "start kept: {joined:?}");
+        assert!(joined.contains("tail"), "tail kept: {joined:?}");
+    }
+
+    /// Annotations with no `char_range` are counted in a separate
+    /// bucket. Pre-fix code dropped them from the outside-window
+    /// count silently, hiding paper-level notes from a caller that
+    /// expected the response to surface every annotation it was not
+    /// serving in the current window. (#307 review.)
+    #[test]
+    fn get_annotated_paper_annotations_without_char_range_report_separately() {
+        let db = fresh_db();
+        let pid = save_paper(&db, "p-nr", "No range", Some(&"x".repeat(100)));
+        let repo = SqliteAnnotationRepository::new(db.clone());
+        // An anchor-less paper note (`char_range = None`).
+        let note = Annotation::new_root(
+            pid,
+            "lars".into(),
+            "paper-level comment".into(),
+            Anchor {
+                char_range: None,
+                quote: None,
+                ..Anchor::default()
+            },
+        );
+        repo.create(&note).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-nr", 40, 0).unwrap()).unwrap();
+        assert_eq!(
+            v["annotations_outside_window"], 0,
+            "anchor-less annotations are not counted as outside: {v}"
+        );
+        assert_eq!(
+            v["annotations_without_char_range"], 1,
+            "they are counted in their own bucket: {v}"
+        );
+        let ids = v["annotations_without_char_range_ids"]
+            .as_array()
+            .expect("ids array");
+        assert_eq!(ids.len(), 1);
+    }
+
+    /// `max_chars` is a *character* budget, so a body of 3-byte glyphs
+    /// caps at exactly `max_chars` glyphs — not a byte count that would
+    /// slice a glyph in half. Same invariant as `truncate_abstract`.
+    #[test]
+    fn get_annotated_paper_cap_respects_multibyte_char_boundary() {
+        let db = fresh_db();
+        // U+2019 RIGHT SINGLE QUOTATION MARK is 3 bytes in UTF-8.
+        let body: String = "\u{2019}".repeat(10);
+        save_paper(&db, "p-cap-mb", "Multibyte", Some(&body));
+
+        let v: serde_json::Value =
+            serde_json::from_str(&build_annotated_paper(&db, "p-cap-mb", 5, 0).unwrap()).unwrap();
+        let out = v["paper"]["full_text"].as_str().expect("text");
+        assert_eq!(out.chars().count(), 5, "capped at char count, not bytes");
+        assert!(
+            out.chars().all(|c| c == '\u{2019}'),
+            "every slice char is a whole glyph: {out:?}"
+        );
+        assert_eq!(v["paper"]["truncated"], true);
+        assert_eq!(v["paper"]["total_chars"], 10);
+        assert_eq!(v["paper"]["next_offset"], 5);
     }
 
     // -- read_paper #185: with_annotations folds the annotation array

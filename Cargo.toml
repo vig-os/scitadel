@@ -71,7 +71,13 @@ security-framework = "3"
 clap = { version = "4", features = ["derive"] }
 
 # TUI
-ratatui = "0.30"
+# `unstable-rendered-line-info` exposes `Paragraph::line_count(width)`
+# so the reader can compute the real wrapped row count for a long
+# single-paragraph body and clamp `reader_scroll` accurately (#307).
+# The API is gated in ratatui because the wrap model may change; if
+# the surface moves, `views::reader::wrapped_row_count` is the single
+# place to update.
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29"
 
 # MCP

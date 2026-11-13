@@ -677,6 +677,56 @@ fn strip(text: &str) -> Cow<'_, str> {
     }
 }
 
+/// Char-coordinate `(start, end_exclusive)` spans of every ANSI/OSC escape
+/// sequence in `text`, found with the same state machine [`neutralise`] uses
+/// to strip them. Positions are in char coordinates — the space
+/// [`UntrustedBody::as_str`] is measured in, which matches how
+/// `read_paper` / `get_annotated_paper` slice a body.
+///
+/// A windowed reader snaps window edges to these spans to avoid splitting a
+/// sequence across windows: a split leaves the sequence's tail (an OSC 8 URL,
+/// a CSI parameter list) as visible text in the next window.
+pub fn escape_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut counter = CountingChars::new(text.chars());
+    while let Some(c) = counter.next() {
+        if c == ESC {
+            // `skip_escape_sequence` sees the first char PAST ESC, so the
+            // sequence starts at the position of the ESC we just read.
+            let start = counter.consumed - 1;
+            skip_escape_sequence(&mut counter);
+            ranges.push((start, counter.consumed));
+        }
+    }
+    ranges
+}
+
+/// A `char` iterator that counts how many items the caller has pulled from
+/// it, so `skip_escape_sequence` (which consumes chars via `Iterator::next`)
+/// also reports where the sequence ended.
+struct CountingChars<I: Iterator<Item = char>> {
+    inner: I,
+    /// Number of chars returned so far by `next`.
+    consumed: usize,
+}
+
+impl<I: Iterator<Item = char>> CountingChars<I> {
+    fn new(inner: I) -> Self {
+        Self { inner, consumed: 0 }
+    }
+}
+
+impl<I: Iterator<Item = char>> Iterator for CountingChars<I> {
+    type Item = char;
+    fn next(&mut self) -> Option<char> {
+        let c = self.inner.next();
+        if c.is_some() {
+            self.consumed += 1;
+        }
+        c
+    }
+}
+
 /// Consume the rest of an escape sequence, `ESC` already taken.
 ///
 /// Every branch is best-effort: a truncated sequence consumes what is left and
@@ -1330,5 +1380,54 @@ mod tests {
                 .rendered()
                 .is_empty()
         );
+    }
+
+    /// `escape_ranges` marks every ANSI/OSC sequence [`neutralise`] would
+    /// drop, in char coordinates. A windowed reader snaps to these to
+    /// avoid splitting a sequence across windows and leaking its tail.
+    #[test]
+    fn escape_ranges_mark_every_sequence_in_char_coordinates() {
+        // OSC 8 hyperlink: `ESC ] 8 ; ; URI BEL label ESC ] 8 ; ; BEL`.
+        let link = "\u{1b}]8;;http://x\u{7}label\u{1b}]8;;\u{7}";
+        let before = "prefix ";
+        let between = " mid ";
+        let csi = "\u{1b}[31m";
+        let text = format!("{before}{link}{between}{csi}suffix");
+        let ranges = escape_ranges(&text);
+
+        let before_len = before.chars().count();
+        let link_len = link.chars().count();
+        let between_len = between.chars().count();
+        let csi_len = csi.chars().count();
+
+        // Two OSC blocks (the hyperlink opens and closes) plus the CSI.
+        assert_eq!(ranges.len(), 3, "three sequences: {ranges:?}");
+
+        // First OSC: from position `before_len` for the length up to and
+        // including the BEL — "ESC]8;;http://xBEL" = 15 chars.
+        let (osc1_start, osc1_end) = ranges[0];
+        assert_eq!(osc1_start, before_len);
+        assert_eq!(
+            osc1_end,
+            before_len + "\u{1b}]8;;http://x\u{7}".chars().count()
+        );
+
+        // Second OSC closes the hyperlink. The intervening "label" is
+        // visible text, not inside a sequence, so the range starts past
+        // it.
+        let (osc2_start, osc2_end) = ranges[1];
+        assert_eq!(
+            osc2_start,
+            before_len + "\u{1b}]8;;http://x\u{7}label".chars().count()
+        );
+        assert_eq!(osc2_end, before_len + link_len);
+
+        // CSI after " mid ": 4 chars (ESC [ 3 1 m).
+        let (csi_start, csi_end) = ranges[2];
+        assert_eq!(csi_start, before_len + link_len + between_len);
+        assert_eq!(csi_end, before_len + link_len + between_len + csi_len);
+
+        // A body with no escapes: no ranges.
+        assert!(escape_ranges("plain prose").is_empty());
     }
 }
