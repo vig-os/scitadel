@@ -26,6 +26,7 @@ scitadel-db = { path = "../scitadel-db", version = "0.8.0" } # x-release-please-
 scitadel-http = { path = "../scitadel-http", version = "0.8.0" } # x-release-please-version # ADR-007 §3: PacedClient is the only way a request leaves the process
 chrono = { workspace = true }
 reqwest = { workspace = true }
+url = { workspace = true } # patentsview base_url validation (#268)
 quick-xml = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

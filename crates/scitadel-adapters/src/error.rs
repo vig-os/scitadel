@@ -53,6 +53,15 @@ pub enum AdapterError {
     #[error("database error: {0}")]
     Db(#[from] scitadel_db::error::DbError),
 
+    /// A core-level failure surfaced from scitadel-core (e.g. the
+    /// patentsview `base_url` validator in `build_adapters_with_field`
+    /// rejects an http-non-loopback or malformed URL, #268). Kept as a
+    /// typed variant rather than flattened into [`Self::Validation`] so
+    /// the original `CoreError` is preserved for callers that already
+    /// pattern-match on it.
+    #[error(transparent)]
+    Core(#[from] scitadel_core::error::CoreError),
+
     #[error("{0}")]
     Other(String),
 }

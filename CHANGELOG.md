@@ -153,6 +153,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The `patentsview` source works again**
+  ([#268](https://github.com/vig-os/scitadel/issues/268)). USPTO paused
+  its PatentSearch API on 2026-03-20 and `search.patentsview.org` no
+  longer resolves, so every PatentsView search failed at the connection.
+  The adapter now defaults to PatentRef
+  (`https://patentref.io/api/v1/patent/`), an independent third-party
+  API (not USPTO, free beta: US grants 1976+, no pre-grant publications,
+  1,000 requests a month) that answers the same grammar. The endpoint is
+  configurable with `[patentsview] base_url` or
+  `SCITADEL_PATENTSVIEW_URL`; the base URL is validated at adapter build
+  (https-only, with http allowed for loopback hosts) and an empty value
+  falls back to the default. Error messages that echo a configured or
+  redirect URL now print scheme + host (+ port) only — no `userinfo`,
+  no path, no query — so a bearer token smuggled into any of those
+  cannot ride into logs. The request also asked for `patent_kind`,
+  which the grammar does not have (the kind code is `wipo_kind`) and
+  which a strict server rejects with 400 `ERR_Q`; it now asks for
+  `wipo_kind`. A 400's `X-Status-Reason` header is included in the
+  error, and the missing-key hint no longer points at the retired
+  PatentsView signup page. `build_adapters_with_field` takes a
+  resolved `PatentsViewAdapterConfig` instead of a `&str patentsview_key`
+  so the host-binding below can be enforced before any adapter is
+  built. The reqwest client uses `redirect::Policy::none()` so the
+  `X-Api-Key` cannot be replayed to a 3xx-nominated host, and a
+  redirect is surfaced as an error naming only the `Location` origin.
+  **Host-bound keys.** `scitadel auth login patentsview` now binds the
+  stored key to a host (default `patentref.io`, overridable with
+  `--host <host>`). The adapter refuses to send the key to any other
+  host and names the binding in the error, so a repo-level
+  `.scitadel/config.toml` committing a malicious `[patentsview]
+  base_url` cannot replay a keychain-stored key to that host — the
+  build fails and zero requests are made. An env-set
+  `SCITADEL_PATENTSVIEW_KEY` is sent only when `base_url` also comes
+  from the env or the default (never when it comes from the file).
+  **Migration for pre-#268 users.** A previously stored
+  `patentsview.api_key` has no host binding and is treated as a USPTO
+  PatentSearch key (bound to `search.patentsview.org`, which was
+  retired); the adapter therefore does NOT silently forward it to
+  PatentRef — it refuses and tells the user to request a PatentRef
+  key at `https://patentref.io/docs/migration.html` and re-run
+  `scitadel auth login patentsview`. Running `auth login patentsview
+  --host <mirror>` is the way to point the stored key at a
+  PatentSearch-grammar mirror instead. Offline tests check every
+  requested field against the grammar's field list, replay a recorded
+  response, and cover the four host-binding cases (cross-host refusal
+  with zero requests, matching host, legacy-unbound refusal with the
+  migration message, and the storage round-trip of the binding).
 - **MCP tools now accept the short IDs they print**
   ([#232](https://github.com/vig-os/scitadel/issues/232)). Every
   ID-accepting tool (`add_search_terms`, `save_assessment`,
