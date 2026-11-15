@@ -191,6 +191,7 @@ pub fn spawn_download_paper(
     openalex: OpenAlexAuth,
     db: Database,
     out_dir: PathBuf,
+    body_cap_bytes: Option<u64>,
 ) -> Uuid {
     let id = Uuid::new_v4();
     let ref_id = paper
@@ -221,7 +222,11 @@ pub fn spawn_download_paper(
         });
 
         let status = match PaperDownloader::new(db, openalex, 60.0) {
-            Ok(downloader) => match downloader.download_paper(&paper, &out_dir).await {
+            Ok(downloader) => match downloader
+                .with_body_cap_override(body_cap_bytes)
+                .download_paper(&paper, &out_dir)
+                .await
+            {
                 Ok(result) => TaskStatus::Done {
                     path: result.path,
                     format: result.format,
