@@ -6476,6 +6476,85 @@ mod tests {
         );
     }
 
+    /// The identity gate refuses a wrong PDF on the Crossref-seeded path:
+    /// Crossref names a title, the PDF carries a different one, and the
+    /// **post-fetch** check rejects the mismatch so nothing is recorded as
+    /// the artefact.
+    ///
+    /// The mirror of `download_by_doi_served_pdf_title_corroborates_crossref`:
+    /// that test pins the happy case (`/Title` agrees with Crossref), this
+    /// one pins the refusal. The placeholder row is cleaned up (the paper
+    /// was minted for this fetch and no artefact names it), so the same
+    /// invariant `download_by_doi_failure_cleans_up_the_placeholder_row`
+    /// holds here too.
+    #[tokio::test]
+    async fn download_by_doi_refuses_a_wrong_pdf_on_the_crossref_path() {
+        use scitadel_core::ports::PaperRepository as _;
+        use wiremock::{Mock, ResponseTemplate, matchers};
+
+        let fx = Fixture::new().await;
+        let doi = "10.1101/wrong.pdf.crossref";
+        let encoded = doi.replace('/', "%2F");
+        // OpenAlex has nothing — the minimal-row path.
+        fx.miss(&format!("/works/doi:{doi}")).await;
+        // Crossref names the expected title.
+        let expected_title = "The correct registered title";
+        Mock::given(matchers::method("GET"))
+            .and(matchers::path(format!("/cr/{encoded}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": {
+                    "DOI": doi,
+                    "title": [expected_title],
+                    "published": {"date-parts": [[2026, 1, 1]]},
+                    "author": [{"family": "Lovelace"}],
+                    "type": "journal-article",
+                }
+            })))
+            .mount(&fx.server)
+            .await;
+        // The preprint PDF carries an unrelated `/Title`: the post-fetch
+        // check compares the served title against Crossref's and refuses.
+        let wrong_pdf =
+            b"%PDF-1.7\n/Title(An unrelated paper about something else entirely)\n%%EOF\n".to_vec();
+        Mock::given(matchers::method("GET"))
+            .and(matchers::path(format!("/content/{doi}v1.full.pdf")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/pdf")
+                    .set_body_bytes(wrong_pdf),
+            )
+            .mount(&fx.server)
+            .await;
+
+        let openalex = crate::openalex::OpenAlexAdapter::new(Fixture::auth(), 10.0)
+            .with_base_url(format!("{}/works", fx.server.uri()));
+        let outcome = fx
+            .downloader()
+            .download_by_doi(&openalex, doi, &fx.papers_dir())
+            .await;
+        assert!(
+            outcome.is_err(),
+            "a PDF whose title does not match Crossref's must be refused: {outcome:?}"
+        );
+
+        // Nothing was recorded as the artefact — no row, no blob.
+        assert!(
+            fx.artefacts().is_empty(),
+            "the identity mismatch refuses filing: {:?}",
+            fx.artefacts()
+        );
+        // And the minimal row minted for the fetch was cleaned up.
+        let (paper_repo, _, _, _, _) = fx.db.repositories();
+        let rows_with_doi = paper_repo
+            .find_by_doi(doi)
+            .expect("db read")
+            .map(|p| vec![p])
+            .unwrap_or_default();
+        assert!(
+            rows_with_doi.is_empty(),
+            "the placeholder row minted for this fetch was dropped: {rows_with_doi:?}"
+        );
+    }
     /// The other end of the "no route tried" case: a work with **no**
     /// identifiers at all. Every leg is inapplicable, nothing was put on the
     /// wire, and the row has to say so rather than reporting an absence that
