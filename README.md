@@ -365,7 +365,7 @@ Credentials resolve in this order: **secret store → environment variable → `
 | PubMed | `pubmed.api_key` | `SCITADEL_PUBMED_API_KEY` | Optional, higher rate limits |
 | OpenAlex | `openalex.api_key` | `SCITADEL_OPENALEX_API_KEY` | Required in practice — see below |
 | OpenAlex | `openalex.email` | `SCITADEL_OPENALEX_EMAIL` | Optional polite-pool `mailto` |
-| PatentsView | `patentsview.api_key` | `SCITADEL_PATENTSVIEW_KEY` | Free registration |
+| PatentsView | `patentsview.api_key` | `SCITADEL_PATENTSVIEW_KEY` | PatentRef key — see below |
 | Lens | `lens.api_token` | `SCITADEL_LENS_TOKEN` | Free tier |
 | EPO OPS | `epo.consumer_key` + `epo.consumer_secret` | `SCITADEL_EPO_KEY`, `SCITADEL_EPO_SECRET` | Registered app |
 | Anthropic | _(not stored)_ | `ANTHROPIC_API_KEY` | Required for `assess`, `snowball`, MCP scoring |
@@ -403,12 +403,70 @@ as the email. Rewrite it as `[openalex] email = "…"` when convenient, and
 keep the real key in the secret store rather than in a committed
 `config.toml`.
 
+### PatentsView endpoint
+
+USPTO paused its PatentSearch API (`search.patentsview.org`) on 2026-03-20,
+and new PatentsView keys can no longer be requested. The `patentsview`
+source now defaults to [PatentRef](https://patentref.io/docs/migration.html),
+which answers the same PatentSearch v1 grammar. PatentRef is an
+**independent third party, not USPTO**, in free beta: US grants from 1976
+on, no pre-grant publications, and a free key allows 1,000 requests a month
+and 45 a minute. Store its key with `scitadel auth login patentsview`.
+
+To use another endpoint that speaks the same grammar, set
+`[patentsview] base_url = "…/api/v1/patent/"` in `.scitadel/config.toml`
+or `SCITADEL_PATENTSVIEW_URL`.
+
+#### Host-bound keys
+
+The `patentsview` key is sent as `X-Api-Key`, and `base_url` is a value a
+repo can commit in `.scitadel/config.toml`. To keep a committed
+`base_url` from replaying a stored key to an arbitrary host, the stored
+key is **bound** to a host at store time:
+
+```sh
+scitadel auth login patentsview                       # bound to patentref.io (the default)
+scitadel auth login patentsview --host mirror.example # bound to a PatentSearch-grammar mirror
+```
+
+At adapter build time, the effective endpoint's host must match the
+binding, or the adapter is NOT built — zero requests, with an error
+that names the binding and the configured host.
+
+**Port semantics: host-only, any port.** `--host` takes a bare hostname
+(`patentref.io`), never `host:port`, never a URL or a path. The
+comparison at build time ignores the request URL's port, so a mirror
+served on `https://mirror.example:8443/` still matches a binding to
+`mirror.example`. This keeps the binding stable across environments
+where the mirror is reached on a different port (local testing, port
+forwards). `--host` is case-insensitive, IDN labels are stored in
+punycode, and a trailing dot (`patentref.io.`) is normalised away;
+pass whichever spelling is convenient.
+
+`SCITADEL_PATENTSVIEW_KEY` (an env-set key) is sent only when the
+endpoint also comes from the env or the default. A `base_url` in a
+`.scitadel/config.toml` is **not** authority for an env-set key to
+reach that host. When the two disagree, the refusal is
+**source-aware**: a stored-key error points at `scitadel auth login
+patentsview --host <host>` (rebind); an env-key error points at
+`SCITADEL_PATENTSVIEW_URL=<trusted URL>` or at clearing `[patentsview]
+base_url` in `.scitadel/config.toml` — `auth login` does not help with
+an env-set key.
+
+**Migrating from a pre-#268 key.** A key stored before host binding
+existed is treated as bound to the retired USPTO host
+`search.patentsview.org` and the adapter refuses to forward it to
+PatentRef. Request a PatentRef key at
+<https://patentref.io/docs/migration.html> and run
+`scitadel auth login patentsview` again to replace it.
+
 Other knobs:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SCITADEL_WORKSPACE` | nearest ancestor of cwd that contains a `.scitadel/` marker | Project root. Resolved by one shared function in `scitadel-core` — the MCP confinement boundary and the config/DB placement are now the same thing (#266). Discovery is marker-only: walk up from cwd looking for `.scitadel/`, which is the definition of a scitadel project. The MCP server **never creates** that marker; the CLI's `scitadel init` does. When no marker is visible the MCP server still starts, but its DB and path tools return a single clear "run `scitadel init` in your project, or set `SCITADEL_WORKSPACE`" error until one is set — so the documented user-scope install (`claude mcp add --scope user …`) keeps working from every directory and other tools (search, resolve-doi, etc.) stay reachable. `GIT_WORK_TREE` / `GIT_DIR` are ignored. The override must itself contain a `.scitadel/` child, which must be a real directory (or a symlink whose canonical target sits inside the project); a plain file or an outside-pointing symlink is refused. A leading `~` is expanded; relative paths resolve against the server's cwd. A root at `/`, `$HOME`, or any ancestor of `$HOME` is refused; `$HOME` AND `getpwuid` are both consulted so a spoofed `HOME` cannot disarm the ancestor check. The CLI does not apply the MCP confinement rules, but it honours an explicit `SCITADEL_WORKSPACE` strictly: if the directory has no `.scitadel/` marker, CLI commands fail naming the variable instead of silently falling back to cwd (run `scitadel init` in that directory). |
 | `SCITADEL_DB` | `<workspace>/.scitadel/scitadel.db` | Database path **for the CLI**. The MCP server ignores this env var and always opens the DB at `<project_root>/.scitadel/scitadel.db` — the marker is the project boundary, and letting an env var rehome the DB away from the project is what let the pre-fix MCP code confine against a broader directory (#266 round 4). |
+| `SCITADEL_PATENTSVIEW_URL` | `https://patentref.io/api/v1/patent/` | PatentSearch-grammar endpoint for `patentsview` |
 | `SCITADEL_CREDENTIAL_BACKEND` | auto-detected | `macos-keychain`, `secret-service` or `file` |
 | `SCITADEL_CHAT_MODEL` | `claude-sonnet-4-6` | Model used for scoring |
 | `SCITADEL_CHAT_MAX_TOKENS` | `4096` | Max completion tokens |

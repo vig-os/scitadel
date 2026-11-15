@@ -167,6 +167,13 @@ pub const RETRY_BACKOFF_MINUTES: i64 = 15;
 /// - `unavailable` means the work has no such artefact, and §2 says "no
 ///   action" — re-asking a publisher about it is the wrong behaviour, not a
 ///   cautious one;
+/// - `too_large` is **our** refusal under the per-kind cap (#288): a
+///   publisher that served an oversized body today will serve the same
+///   oversized body tomorrow, so the queue would redownload up to the cap on
+///   every run. The one path that *can* redo it is an explicit
+///   `--paper <id>` after raising `acquire.body_cap_bytes`, which bypasses
+///   this filter below (the caller named the work and declared they changed
+///   the inputs);
 /// - every status with a human action in §2 (`tdm_key_missing`,
 ///   `needs_login`, `not_entitled`, `needs_authorisation`, `needs_ill`,
 ///   `identity_mismatch`, `wrong_version`) belongs to `action_list`. Fetching

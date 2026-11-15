@@ -110,8 +110,16 @@ pub struct StatusVocab {
     pub goes_to: &'static str,
 }
 
-/// ADR-007 §2 "Status vocabulary", all thirteen rows.
-pub const ALL_STATUSES: [StatusVocab; 13] = [
+/// ADR-007 §2 "Status vocabulary", plus `too_large` (migration 015, #288).
+///
+/// `too_large` is spelled here rather than in §2 because the ADR predated
+/// #288's fetch cap: a cap-refused fetch used to share `unavailable` with
+/// "the work has no such artefact", which [`ActionList`] then grouped as
+/// "no action". Those are materially different — the first is **our**
+/// refusal and a human can act on it, the second is a property of the work
+/// — so `too_large` is its own row with a human action (`action_list`
+/// prints it, ADR-007 §2 keeps `unavailable` for its original meaning).
+pub const ALL_STATUSES: [StatusVocab; 14] = [
     StatusVocab {
         status: "pending",
         meaning: "never tried",
@@ -165,6 +173,14 @@ pub const ALL_STATUSES: [StatusVocab; 13] = [
         meaning: "the work has no such artefact (e.g. no SI)",
         action: None,
         goes_to: "no action: the work has no such artefact",
+    },
+    StatusVocab {
+        status: "too_large",
+        meaning: "a route served a body over ADR-007 §1's per-kind cap (#288)",
+        action: Some(
+            "raise acquire.body_cap_bytes, then re-acquire by id or fetch manually and import",
+        ),
+        goes_to: "the human list",
     },
     StatusVocab {
         status: "identity_mismatch",
@@ -2277,9 +2293,65 @@ mod tests {
                 "not_entitled",
                 "needs_authorisation",
                 "needs_ill",
+                // #288: cap-refused is terminal like `unavailable`, but it is
+                // **our** refusal and a human can act on it (raise the cap,
+                // fetch manually). Slots right after `unavailable` in
+                // [`ALL_STATUSES`], so the sorted action-list group order
+                // puts it beside the "no artefact" bucket a reader is
+                // comparing it against.
+                "too_large",
                 "identity_mismatch",
                 "wrong_version",
             ]
+        );
+    }
+
+    /// #288: a `too_large` row lands in `action_list` as its own group under
+    /// its own human action ("raise acquire.body_cap_bytes, then re-acquire
+    /// by id or fetch manually and import"), separate from the deferred
+    /// `unavailable` bucket. The whole point of the migration 015 split.
+    ///
+    /// The revised wording groups the cap-raise step first because *both*
+    /// escape hatches need it: scan and attach now read the same
+    /// `cap_for_kind_with_override` the ladder reads, so a manual import of
+    /// an oversized fulltext only lands if the operator raised the cap too.
+    #[test]
+    fn a_too_large_row_lands_in_its_own_action_group() {
+        let (_dir, db) = open();
+        let mut conn = db.conn().unwrap();
+        let mut row = state("p-wanted", "fulltext", "", "vor", "too_large");
+        row.reason = Some(
+            "refused to file what elsevier.com served: the streamed body passed the 100000-byte \
+             cap ADR-007 §1 \"Storage\" sets for a full-text artefact after 100000+ bytes; the \
+             read was aborted and no file was staged"
+                .into(),
+        );
+        write_acquisition_states(&mut conn, &[row]).unwrap();
+
+        let list = db.action_list().unwrap();
+
+        // Exactly one group, and it is the cap group — not deferred under
+        // `unavailable`'s "no action".
+        assert_eq!(list.groups.len(), 1, "{list:?}");
+        let group = &list.groups[0];
+        assert_eq!(group.status, "too_large");
+        assert_eq!(
+            group.action,
+            "raise acquire.body_cap_bytes, then re-acquire by id or fetch manually and import",
+        );
+        assert_eq!(group.entries.len(), 1);
+
+        // The entry's `reason` carries what a human needs to act on: the
+        // host served, the observed size, the cap.
+        let reason = group.entries[0].reason.as_deref().expect("a reason");
+        assert!(reason.contains("elsevier.com"), "the host: {reason}");
+        assert!(reason.contains("100000"), "the cap and size: {reason}");
+
+        // The deferred list does *not* have `too_large` — it is grouped.
+        assert!(
+            list.deferred.iter().all(|d| d.status != "too_large"),
+            "too_large must not be deferred under its own vocabulary row: {:?}",
+            list.deferred,
         );
     }
 

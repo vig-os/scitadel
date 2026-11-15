@@ -1,8 +1,13 @@
-# VHS tape: TUI two-pane annotation reader (#97).
+# VHS tape: TUI two-pane annotation reader (#97, #307).
 #
 # Iter 1 of #97: split layout + per-thread background highlights +
 # J/K hop between highlights. Multi-line gutter bars and PDF overlay
 # stay deferred (separate iter once a real full_text is available).
+#
+# #307 adds scroll keys (j/k/arrows for one row, d/u + the page
+# keys for a half-page, g/G for top/bottom) and auto-scrolls on a
+# J/K highlight hop. The longer body + scroll-screenshot block
+# below exercises both the plain scroll and the auto-follow.
 #
 # Seeds a paper with full_text + 3 overlapping annotations + 1
 # spanning multiple lines so the highlight palette + multi-line
@@ -28,9 +33,12 @@ Type "scitadel init --yes --email demo@example.org --sources arxiv --db $SCITADE
 Enter
 Sleep 800ms
 
-# Seed a paper whose `full_text` spans multiple sentences across
-# multiple lines.
-Type `sqlite3 $SCITADEL_DB "INSERT INTO papers (id, title, authors, year, abstract, full_text, created_at, updated_at) VALUES ('p-demo', 'Attention Is All You Need', '[\"Vaswani, A.\"]', 2017, 'short abstract here', 'The dominant sequence transduction models are based on complex recurrent or convolutional neural networks. We propose the Transformer, a new simple network architecture based solely on self-attention mechanisms, dispensing with recurrence and convolutions entirely.', datetime('now'), datetime('now'));"`
+# Seed a paper whose `full_text` spans many paragraphs, so the
+# reader's viewport is smaller than the body and scrolling actually
+# moves something on screen (#307). The three quote targets below
+# all live in the first paragraph; later paragraphs are filler so
+# `below_fold` material is reachable through j/d/G.
+Type `sqlite3 $SCITADEL_DB "INSERT INTO papers (id, title, authors, year, abstract, full_text, created_at, updated_at) VALUES ('p-demo', 'Attention Is All You Need', '[\"Vaswani, A.\"]', 2017, 'short abstract here', 'The dominant sequence transduction models are based on complex recurrent or convolutional neural networks. We propose the Transformer, a new simple network architecture based solely on self-attention mechanisms, dispensing with recurrence and convolutions entirely.' || X'0A' || X'0A' || 'The Transformer removes the recurrence and computes representations in parallel across positions, shortening the dependency path between any two tokens to a single attention step.' || X'0A' || X'0A' || 'Encoder and decoder are stacks of identical layers; each layer carries a multi-head self-attention sub-layer and a position-wise feed-forward sub-layer, each wrapped in a residual connection and layer normalization.' || X'0A' || X'0A' || 'Positional encodings replace the order the recurrence used to give for free. Sinusoidal encodings extrapolate to sequence lengths past the training set; learned positional embeddings are a drop-in alternative at the same cost.' || X'0A' || X'0A' || 'Training uses Adam with a warmup-then-decay schedule, dropout on the sub-layer outputs and embeddings, and label smoothing of the target distribution. Regularisation matters because the model has no inductive bias for locality.' || X'0A' || X'0A' || 'Evaluation on WMT 2014 English-to-German and English-to-French reaches new state-of-the-art BLEU scores at a fraction of the training cost of the best prior models, and the architecture generalises to English constituency parsing with limited task-specific tuning.', datetime('now'), datetime('now'));"`
 Enter
 Sleep 300ms
 
@@ -83,10 +91,30 @@ Shift+K
 Sleep 400ms
 Screenshot "tests/vhs/snapshots/tui-annotations-reader/05-back-to-second.png"
 
-# R → leave the reader, back to single-pane.
+# #307 scroll keys. The body is now tall enough that j/d/G move
+# the viewport visibly; g snaps back to the top.
+Type "j"
+Sleep 200ms
+Type "j"
+Sleep 200ms
+Type "j"
+Sleep 300ms
+Screenshot "tests/vhs/snapshots/tui-annotations-reader/06-scrolled-three-lines.png"
+Type "d"
+Sleep 300ms
+Screenshot "tests/vhs/snapshots/tui-annotations-reader/07-scrolled-half-page.png"
+Shift+G
+Sleep 300ms
+Screenshot "tests/vhs/snapshots/tui-annotations-reader/08-scrolled-bottom.png"
+Type "g"
+Sleep 300ms
+Screenshot "tests/vhs/snapshots/tui-annotations-reader/09-scrolled-top.png"
+
+# R → leave the reader, back to single-pane. `R` also resets the
+# scroll offset (#307), so a reopen starts at the top.
 Type "R"
 Sleep 400ms
-Screenshot "tests/vhs/snapshots/tui-annotations-reader/06-back-to-detail.png"
+Screenshot "tests/vhs/snapshots/tui-annotations-reader/10-back-to-detail.png"
 
 Type "q"
 Sleep 300ms

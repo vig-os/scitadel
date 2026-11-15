@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-10-07T20:13:14Z
-updated: 2026-10-07T20:13:14Z
+updated: 2026-11-09T03:51:30Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/296
-comments: 0
-labels: bug, priority:medium
+comments: 1
+labels: bug, effort:small, priority:medium, semver:patch
 assignees: none
-milestone: none
+milestone: 0.9.0
 projects: none
-parent: none
+parent: 234
 children: none
-synced: 2026-10-08T08:09:36.474Z
+synced: 2026-11-09T08:51:01.508Z
 ---
 
 # [Issue 296]: [europepmc.org PDFs 403 behind Cloudflare, so an Europe PMC candidate names a location the fetch leg cannot reach](https://github.com/vig-os/scitadel/issues/296)
@@ -56,3 +56,11 @@ This is a fetch-path question with three honest options, and none is a pure bug 
 - [ ] `Candidate` can distinguish a PDF from a JATS XML payload if option 3 is taken.
 
 Refs: #254, #260, #288
+---
+
+# [Comment #1]() by [gerchowl]()
+
+_Posted on November 9, 2026 at 03:51 AM_
+
+Triage decision 2026-11-09: route to the Europe PMC `fullTextXML` (JATS) endpoint as its own artefact kind, rather than naming the Cloudflare-blocked PDF location. This matches the scitadel-hub source preference JATS → HTML → TEI → PDF (ADR-008 §10, PR #317).
+
