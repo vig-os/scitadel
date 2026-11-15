@@ -638,6 +638,95 @@ pub static PATENTSVIEW_CREDENTIALS: SourceCredentials = SourceCredentials {
     }],
 };
 
+/// Secret-store account name that carries the host a stored
+/// `patentsview.api_key` is bound to (#268).
+///
+/// `scitadel auth login patentsview` writes this alongside the key so
+/// the adapter can refuse to send it to any other endpoint. A missing
+/// value is treated as a *legacy* unbound key by
+/// [`crate::config::resolve_patentsview_adapter`], i.e. bound to the
+/// retired USPTO PatentSearch host.
+pub const PATENTSVIEW_HOST_STORE_KEY: &str = "patentsview.api_host";
+
+/// Default host `scitadel auth login patentsview` binds a new key to
+/// when the operator does not pass `--host`. Must match the host in
+/// [`scitadel_adapters::patentsview::PATENTSVIEW_API_URL`].
+pub const PATENTSVIEW_DEFAULT_HOST: &str = "patentref.io";
+
+/// Where a legacy unbound `patentsview.api_key` is *treated* as pointing
+/// — the retired USPTO PatentSearch host. The key is not sent anywhere
+/// else, so the migration prompt names this host explicitly.
+pub const PATENTSVIEW_LEGACY_HOST: &str = "search.patentsview.org";
+
+/// Canonicalise a hostname for the patentsview `--host` binding and for
+/// comparison against a request URL's host (#268).
+///
+/// The binding is **host-only, any port**: scitadel never stores a
+/// `:port` and the comparison ignores the request URL's port. This is
+/// documented in the README and in the `auth login --host` CLI help.
+///
+/// Normalisation:
+/// * Trim surrounding whitespace, then strip a trailing `.` (FQDN form).
+/// * Parse via [`url::Host::parse`], which converts IDN labels to
+///   their ASCII punycode form (`xn--…`) and validates the shape.
+///   The same encoding `url::Url::parse` uses on a request URL's
+///   host, so the two sides of the binding check never disagree on
+///   spelling.
+/// * Lowercase ASCII for domain hosts; IPv4 and IPv6 forms come back in
+///   their own canonical form.
+/// * A `:port`, a path, a scheme or embedded whitespace is refused with
+///   an `Err` that names what was wrong — the caller surfaces this to
+///   the operator.
+///
+/// The same function runs at **store time** (`scitadel auth login
+/// patentsview --host X` in the CLI) and at **comparison time** (the
+/// adapter's `enforce_patentsview_host_binding`), so two spellings of
+/// the same host (e.g. `Patentref.io.` and `patentref.io`) never
+/// cross-refuse at search time.
+pub fn normalize_patentsview_host(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("--host must be a hostname, not an empty value".to_string());
+    }
+    if trimmed.contains("://") {
+        return Err(format!(
+            "--host must be a bare hostname (no scheme), e.g. `patentref.io`, not a URL: {trimmed:?}",
+        ));
+    }
+    if trimmed.contains('/') {
+        return Err(format!(
+            "--host must be a bare hostname (no path), e.g. `patentref.io`: {trimmed:?}",
+        ));
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err(format!("--host must not contain whitespace: {trimmed:?}"));
+    }
+
+    // Treat `[ipv6]` as a single bracketed host; only reject `:port`
+    // outside those brackets.
+    let is_bracketed_ipv6 = trimmed.starts_with('[') && trimmed.ends_with(']');
+    if !is_bracketed_ipv6 && trimmed.rsplit(':').nth(1).is_some() {
+        return Err(format!(
+            "--host must not include a port — the binding is host-only (any port). Got: {trimmed:?}",
+        ));
+    }
+
+    // Strip a trailing dot (FQDN form) so `patentref.io.` and
+    // `patentref.io` are treated as the same host.
+    let without_trailing_dot = trimmed.strip_suffix('.').unwrap_or(trimmed);
+    if without_trailing_dot.is_empty() {
+        return Err("--host must be a hostname, not just a dot".to_string());
+    }
+
+    let host = url::Host::parse(without_trailing_dot)
+        .map_err(|e| format!("--host is not a valid hostname: {trimmed:?} ({e})"))?;
+    Ok(match host {
+        url::Host::Domain(d) => d.to_ascii_lowercase(),
+        url::Host::Ipv4(ip) => ip.to_string(),
+        url::Host::Ipv6(ip) => ip.to_string(),
+    })
+}
+
 pub static PUBMED_CREDENTIALS: SourceCredentials = SourceCredentials {
     source: "pubmed",
     keys: &[CredentialKey {
@@ -912,6 +1001,139 @@ mod tests {
             file_delete_at(&path, "openalex.api_key").is_err(),
             "deleting an absent credential is an error, not a silent no-op"
         );
+    }
+
+    #[test]
+    fn the_patentsview_host_binding_round_trips_through_the_file_backend() {
+        // The host binding is stored alongside the key under a
+        // dedicated account name so `auth logout patentsview`
+        // clears both in one pass and the resolver can decide the
+        // key's policy at startup (#268). The three backends share
+        // the same get/store/delete contract, so the file backend
+        // (which we can exercise without a Keychain or a Secret
+        // Service) is enough to prove the round-trip.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.toml");
+
+        assert!(file_get_at(&path, PATENTSVIEW_HOST_STORE_KEY).is_none());
+
+        file_store_at(&path, "patentsview.api_key", &Secret::new("pr-key-123")).unwrap();
+        file_store_at(
+            &path,
+            PATENTSVIEW_HOST_STORE_KEY,
+            &Secret::new(PATENTSVIEW_DEFAULT_HOST),
+        )
+        .unwrap();
+
+        assert_eq!(
+            file_get_at(&path, PATENTSVIEW_HOST_STORE_KEY)
+                .as_ref()
+                .map(Secret::expose),
+            Some(PATENTSVIEW_DEFAULT_HOST)
+        );
+
+        // Re-pointing the binding (e.g. `auth login patentsview --host <mirror>`)
+        // must not leave the previous host behind.
+        file_store_at(
+            &path,
+            PATENTSVIEW_HOST_STORE_KEY,
+            &Secret::new("mirror.example.org"),
+        )
+        .unwrap();
+        assert_eq!(
+            file_get_at(&path, PATENTSVIEW_HOST_STORE_KEY)
+                .as_ref()
+                .map(Secret::expose),
+            Some("mirror.example.org")
+        );
+
+        // `auth logout patentsview` clears both entries.
+        file_delete_at(&path, "patentsview.api_key").unwrap();
+        file_delete_at(&path, PATENTSVIEW_HOST_STORE_KEY).unwrap();
+        assert!(file_get_at(&path, "patentsview.api_key").is_none());
+        assert!(file_get_at(&path, PATENTSVIEW_HOST_STORE_KEY).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // normalize_patentsview_host (#268)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn host_normalization_lowercases_a_mixed_case_domain() {
+        assert_eq!(
+            normalize_patentsview_host("Patentref.IO").unwrap(),
+            "patentref.io"
+        );
+    }
+
+    #[test]
+    fn host_normalization_strips_a_trailing_dot_fqdn_form() {
+        assert_eq!(
+            normalize_patentsview_host("patentref.io.").unwrap(),
+            "patentref.io"
+        );
+    }
+
+    #[test]
+    fn host_normalization_punycodes_an_idn_label() {
+        // A non-ASCII label is converted to its ASCII punycode form —
+        // `xn--…` — which is the form `url::Url::parse` already uses
+        // for request URLs, so the comparison does not disagree on
+        // two spellings of the same host. The exact encoding is left
+        // to `idna` (via `url::Host::parse`); the test only asserts
+        // the result is the same form both sides see.
+        let input = "mü\u{0308}nchen.de";
+        let got = normalize_patentsview_host(input).unwrap();
+        assert!(got.starts_with("xn--"), "expected punycode, got {got:?}");
+        assert!(got.ends_with(".de"), "TLD must survive: {got:?}");
+        let via_url = match url::Host::parse(input).unwrap() {
+            url::Host::Domain(d) => d.to_ascii_lowercase(),
+            other => panic!("expected a domain, got {other:?}"),
+        };
+        assert_eq!(
+            got, via_url,
+            "both sides of the binding check must use the same ASCII form",
+        );
+    }
+
+    #[test]
+    fn host_normalization_accepts_ipv4_and_bracketed_ipv6() {
+        assert_eq!(
+            normalize_patentsview_host("127.0.0.1").unwrap(),
+            "127.0.0.1"
+        );
+        assert_eq!(normalize_patentsview_host("[::1]").unwrap(), "::1");
+    }
+
+    #[test]
+    fn host_normalization_refuses_a_port() {
+        let err =
+            normalize_patentsview_host("patentref.io:8443").expect_err("a `:port` must be refused");
+        assert!(err.contains("host-only"), "{err}");
+        assert!(
+            err.contains("8443") || err.contains("patentref.io"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn host_normalization_refuses_a_scheme_path_or_whitespace() {
+        for bad in [
+            "https://patentref.io",
+            "patentref.io/foo",
+            "https://x/y",
+            "patent ref.io",
+        ] {
+            let got = normalize_patentsview_host(bad);
+            assert!(got.is_err(), "{bad:?} must be refused; got {got:?}");
+        }
+    }
+
+    #[test]
+    fn host_normalization_refuses_empty_and_whitespace() {
+        assert!(normalize_patentsview_host("").is_err());
+        assert!(normalize_patentsview_host("   ").is_err());
+        assert!(normalize_patentsview_host(".").is_err());
     }
 
     #[cfg(unix)]
