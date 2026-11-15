@@ -530,35 +530,43 @@ impl PaperDownloader {
     /// `download_paper_tool` take when they are handed a DOI rather than a
     /// paper id (#289).
     ///
-    /// The DOI is resolved to a row in one of three ways, in order:
+    /// The DOI is resolved to a row in one of two ways, in order:
     ///
     /// 1. an existing `papers` row that already carries this DOI, so a
     ///    re-download writes against the row the user already knows;
-    /// 2. an OpenAlex record, saved on success so the row carries the full
-    ///    metadata the identity chain and the TUI expect;
-    /// 3. a **minimal** row — DOI, and the DOI as a placeholder title —
-    ///    minted when OpenAlex has no record for this DOI. ADR-007 §1 is
-    ///    about the file layout mirroring the database, and a row that says
-    ///    only "we know this DOI and we fetched something for it" is still
-    ///    what the acceptance asks for: one artefact, one row that names it.
-    ///    A later `scitadel resolve-doi` or metadata import fills the rest
-    ///    in without touching the artefact.
+    /// 2. a **minimal** row — DOI, and an **empty** title — minted when no
+    ///    row exists yet. The title, year and first author are backfilled
+    ///    after the fetch from the plan's `identity.resolved`, which carries
+    ///    ADR-007 §3's chain answer (the first registry in
+    ///    `identity_chain::CHAIN` that named the work). An empty title at
+    ///    fetch time is what the pre-fetch identity check honestly reports as
+    ///    `unverified` ("no title on one side, so there was nothing to
+    ///    compare") rather than a DOI-as-placeholder-title that would score
+    ///    below the mismatch floor against the served PDF's `/Title`.
     ///
     /// The fetch itself is [`Self::download_paper`] — the same recording
-    /// ladder `scitadel acquire` uses. There is no second route into the
-    /// library from a DOI, and no file lands beside a row that does not name
-    /// it (#289 acceptance, ADR-007 §1).
+    /// ladder `scitadel acquire` uses, and its own metadata pass is the one
+    /// place OpenAlex, Crossref and DataCite are consulted. A separate
+    /// pre-mint `fetch_paper_by_doi` would spend OpenAlex's DOI hop a second
+    /// time (the two URL builders encode the slash differently — raw `/` in
+    /// `fetch_paper_by_doi`, `%2F` in the pass — so a mock-counting matcher
+    /// that filtered on one encoding read two hops as one). The single pass
+    /// is what keeps each registry to at most one request per DOI-only
+    /// download; `download_by_doi_asks_each_registry_at_most_once` pins it.
+    ///
+    /// There is no second route into the library from a DOI, and no file
+    /// lands beside a row that does not name it (#289 acceptance,
+    /// ADR-007 §1).
     ///
     /// # Errors
     ///
     /// - `AdapterError::Validation` on a DOI that fails the DOI gate (#262).
-    /// - Whatever `OpenAlexAdapter::fetch_paper_by_doi` returned on a hard
-    ///   failure (a 404 is not one — that is the minimal-row fallback).
+    /// - `AdapterError::Other` when the papers row cannot be read or saved.
     /// - Whatever [`Self::download_paper`] propagates: the one fetch, the
     ///   identity gate, or the `record_download` transaction.
     pub async fn download_by_doi(
         &self,
-        openalex: &crate::openalex::OpenAlexAdapter,
+        _openalex: &crate::openalex::OpenAlexAdapter,
         doi: &str,
         output_dir: &Path,
     ) -> Result<DownloadByDoiReport, AdapterError> {
@@ -568,7 +576,7 @@ impl PaperDownloader {
         let normalized = validate_doi_detailed(doi)
             .map_err(|reason| AdapterError::Validation(format!("invalid DOI: {reason}")))?;
 
-        // 1. An existing row by DOI takes precedence over resolving one, so a
+        // 1. An existing row by DOI takes precedence over minting one, so a
         // re-download writes against the row the user already knows and the
         // row's existing metadata (title, authors) is what the identity gate
         // compares against. `find_by_doi` is case-insensitive (see the
@@ -581,49 +589,18 @@ impl PaperDownloader {
         let (paper, minted) = if let Some(paper) = existing {
             (paper, false)
         } else {
-            // 2. OpenAlex. A hard failure is surfaced (the caller asked for a
-            // DOI, and giving up on the registry it names first is not an
-            // answer); a 404 is reported as `Ok(None)` and falls through to
-            // the minimal row.
-            match openalex.fetch_paper_by_doi(&normalized).await {
-                Ok(Some(paper)) => {
-                    paper_repo.save(&paper).map_err(|e| {
-                        AdapterError::Other(format!("could not save papers row: {e}"))
-                    })?;
-                    (paper, true)
-                }
-                Ok(None) => {
-                    // 3. Minimal row. The DOI is unknown to OpenAlex, so the
-                    // row is minted with the DOI and an **empty** title — the
-                    // metadata pass that `download_paper` runs next asks the
-                    // same three identity registries the chain would (plus the
-                    // version/licence sources), and letting that be the one
-                    // registry walk keeps `scitadel download <doi>` to each
-                    // registry request at most once. The title, year and
-                    // first author are backfilled after the fetch from the
-                    // plan's `identity.resolved`, which carries ADR-007 §3's
-                    // chain answer (the first registry in
-                    // `identity_chain::CHAIN` that named the work). An empty
-                    // title at fetch time is what the pre-fetch identity
-                    // check honestly reports as `unverified` ("no title on
-                    // one side, so there was nothing to compare") and the
-                    // post-fetch check still compares against the chain
-                    // answer, so a DOI-as-placeholder-title that would score
-                    // below the mismatch floor is never written.
-                    let mut paper = Paper::new(String::new());
-                    paper.id = PaperId::new();
-                    paper.doi = Some(normalized.clone());
-                    paper_repo.save(&paper).map_err(|e| {
-                        AdapterError::Other(format!("could not save minimal papers row: {e}"))
-                    })?;
-                    (paper, true)
-                }
-                Err(e) => {
-                    return Err(AdapterError::Other(format!(
-                        "OpenAlex lookup for DOI {normalized} failed: {e}"
-                    )));
-                }
-            }
+            // 2. Minimal row. The metadata pass that `download_paper` runs
+            // next asks OpenAlex, Crossref and DataCite itself, so minting a
+            // bare row here and backfilling from the pass's answer keeps the
+            // DOI-only walk to one round of registry hops — the fix for
+            // #289's review blocker on repeated OpenAlex requests.
+            let mut paper = Paper::new(String::new());
+            paper.id = PaperId::new();
+            paper.doi = Some(normalized.clone());
+            paper_repo.save(&paper).map_err(|e| {
+                AdapterError::Other(format!("could not save minimal papers row: {e}"))
+            })?;
+            (paper, true)
         };
 
         let RankedDownload { result, plan } =
@@ -1328,15 +1305,20 @@ impl PaperDownloader {
                     "pre-fetch identity chain walked"
                 );
                 if !checked.verdict.allows_filing() {
-                    refused = Some((
-                        IdentityPhase::PreFetch,
-                        outcome
+                    refused = Some(RefusalCtx {
+                        phase: IdentityPhase::PreFetch,
+                        resolver: outcome
                             .recorded_source()
                             .unwrap_or(IdentitySource::OpenAlex)
                             .to_string(),
+                        // The stored paper is the expected side here. Same
+                        // identity the compare's `verify(&expected, …)` read
+                        // above, so the audit row and the error carry the
+                        // exact title the gate compared on.
+                        expected_title: expected.title.clone(),
                         resolved_title,
                         checked,
-                    ));
+                    });
                 }
             }
         }
@@ -1366,28 +1348,27 @@ impl PaperDownloader {
                 &now,
             );
             if !checked.verdict.allows_filing() {
-                refused = Some((
-                    IdentityPhase::PostFetch,
-                    "the served page or PDF".to_string(),
-                    served.title.clone(),
+                refused = Some(RefusalCtx {
+                    phase: IdentityPhase::PostFetch,
+                    resolver: "the served page or PDF".to_string(),
+                    // `expected_side` is the chain's identity when one
+                    // answered, otherwise the stored paper's. Recording the
+                    // stored-paper title here when the chain supplied a title
+                    // would make the error's `expected` disagree with the
+                    // row's own `expected_title` column — a reader would then
+                    // read two different accounts of the same compare. See
+                    // the audit row above, which has the same source.
+                    expected_title: expected_side.title.clone(),
+                    resolved_title: served.title.clone(),
                     checked,
-                ));
+                });
             }
         }
 
-        let Some((phase, resolver, resolved_title, verdict)) = refused else {
+        let Some(refusal) = refused else {
             return Ok(());
         };
-        Err(self.refuse_on_mismatch(
-            paper,
-            route,
-            phase,
-            resolver,
-            &expected,
-            resolved_title.as_deref(),
-            &verdict,
-            &now,
-        ))
+        Err(self.refuse_on_mismatch(paper, route, refusal, &now))
     }
 
     /// The pre-fetch identity chain, pointed at this downloader's endpoints.
@@ -1495,25 +1476,28 @@ impl PaperDownloader {
     /// exactly as it found it, and the cheapest way to guarantee that is for this
     /// function to have no write that could reach it.
     ///
-    /// Nine arguments, and the `#[allow]` is deliberate rather than a reflex:
-    /// this is the one function in the file whose whole job is to turn a
-    /// completed check into an audit row, an error and a gap, and every
-    /// argument is one of the pieces ADR-007 §3's two checks produce. Bundling
-    /// them into a struct would put a second spelling of the check's evidence
-    /// in the file, which is the class of change #253 was about.
-    #[allow(clippy::too_many_arguments)]
+    /// The refusal's inputs are bundled into a single [`RefusalCtx`] — one
+    /// shape the audit row, the error and the gap row all read from — so the
+    /// three cannot disagree about what the gate compared. Before #339 review,
+    /// `expected` came in as the stored paper's identity while the post-fetch
+    /// compare had used the chain's; the error's `expected` was then not the
+    /// title the match actually ran against. That drift is what this struct
+    /// removes.
     fn refuse_on_mismatch(
         &self,
         paper: &Paper,
         route: RouteId,
-        phase: IdentityPhase,
-        resolver: String,
-        expected: &WorkIdentity,
-        resolved_title: Option<&str>,
-        checked: &identity::Checked,
+        refusal: RefusalCtx,
         now: &str,
     ) -> AdapterError {
-        let expected_title = expected.title.clone().unwrap_or_default();
+        let RefusalCtx {
+            phase,
+            resolver,
+            expected_title,
+            resolved_title,
+            checked,
+        } = refusal;
+        let expected_title = expected_title.unwrap_or_default();
         let resolved_title = resolved_title.unwrap_or_default();
         let detail = format!(
             "{} check at {phase} against {resolver}: expected {expected_title:?}, got \
@@ -1549,7 +1533,7 @@ impl PaperDownloader {
             phase: phase.label(),
             expected: expected_title,
             resolver,
-            resolved: resolved_title.to_string(),
+            resolved: resolved_title,
             why: checked.why.clone(),
         }))
     }
@@ -1923,6 +1907,28 @@ struct ComparedSides {
     source: IdentitySource,
     expected_title: Option<String>,
     resolved_title: Option<String>,
+}
+
+/// The one shape the refusal path reads its inputs from.
+///
+/// Carries the **titles the gate actually compared**, not the stored paper's
+/// title again — ADR-007 §3's post-fetch check runs against the chain's
+/// identity when one answered, so recording the stored paper's title in the
+/// audit row and the error would make the row's evidence not the match's.
+/// Grouped so the three sinks (`acquisition_attempts`, the `IdentityMismatch`
+/// error, the `identity_mismatch` state row) cannot drift from each other —
+/// one build site, read in three places.
+struct RefusalCtx {
+    phase: IdentityPhase,
+    resolver: String,
+    /// The expected side the gate matched on. For a pre-fetch refusal this is
+    /// the stored paper's title; for a post-fetch refusal it is the chain
+    /// answer's title (or the stored paper's, if no registry answered).
+    expected_title: Option<String>,
+    /// The resolved side: a registry's title for pre-fetch, the served
+    /// bytes' title for post-fetch.
+    resolved_title: Option<String>,
+    checked: identity::Checked,
 }
 
 /// The two full-text serialisations these legs have ever stored.
@@ -3165,6 +3171,29 @@ mod tests {
                 .into_iter()
                 .filter(|url| url.contains(needle))
                 .collect()
+        }
+
+        /// Like [`Self::requests_to`], but the URL is percent-decoded before
+        /// the match — so a request whose inner `/` was encoded as `%2F` by
+        /// `Url::path_segments_mut()` counts the same as one that kept the
+        /// raw slash. The `download_by_doi` path sends OpenAlex both shapes
+        /// (the `fetch_paper_by_doi` helper keeps the slash; the metadata
+        /// pass encodes it), and a matcher that only saw one form read "two
+        /// hops" as "one". See `download_by_doi_asks_each_registry_at_most_once`.
+        async fn requests_to_decoded(&self, needle: &str) -> Vec<String> {
+            self.requests()
+                .await
+                .into_iter()
+                .filter(|url| Self::decode_percent(url).contains(needle))
+                .collect()
+        }
+
+        /// Lowercase `%2F` / `%2f` to `/` in a URL. The one encoding the
+        /// metadata pass actually produces for the DOI path segment, and the
+        /// only case the DOI-only tests count — a full percent-decoder would
+        /// pull in a dependency for a four-character replacement.
+        fn decode_percent(url: &str) -> String {
+            url.replace("%2F", "/").replace("%2f", "/")
         }
 
         /// The path this request took, with the query string stripped.
@@ -6231,8 +6260,13 @@ mod tests {
             "primary_location": {"source": {"display_name": "Nature"}},
             "abstract_inverted_index": {},
         });
+        // The metadata pass builds OpenAlex's DOI URL via
+        // `Url::path_segments_mut().extend()`, which percent-encodes the
+        // inner `/` to `%2F` — the one path wiremock actually sees on the
+        // wire. See [`crate::openalex::doi_works_url`].
+        let encoded = doi.replace('/', "%2F");
         Mock::given(matchers::method("GET"))
-            .and(matchers::path(format!("/works/doi:{doi}")))
+            .and(matchers::path(format!("/works/doi:{encoded}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(oa_body))
             .mount(&fx.server)
             .await;
@@ -6453,26 +6487,35 @@ mod tests {
         assert_eq!(report.paper.title.as_str(), "A real registered title");
         assert_eq!(fx.artefacts().len(), 1, "one DOI = one artefact row");
 
-        // Each of the three identity-chain registries is asked **at most
-        // once**. The DOI-only path is the one place a redundant second
-        // round of hops was observed (identity chain + metadata pass); this
-        // pins it to one. Unpaywall is a fourth metadata source; it is
-        // counted here for completeness, but the review nit is about the
-        // identity-chain redundancy.
-        let openalex_hits = fx.requests_to(&format!("/works/doi:{doi}")).await.len();
-        let crossref_hits = fx.requests_to(&format!("/cr/{encoded}")).await.len();
-        let datacite_hits = fx.requests_to(&format!("/dc/{encoded}")).await.len();
-        assert!(
-            openalex_hits <= 1,
-            "OpenAlex asked at most once per DOI-only download, saw {openalex_hits}"
+        // Each of the three identity-chain registries is asked **exactly
+        // once**. Both encodings of the DOI's inner `/` count — the raw
+        // `/works/doi:10.1101/x` the `fetch_paper_by_doi` helper builds and
+        // the `/works/doi:10.1101%2Fx` the metadata pass builds via
+        // `Url::path_segments_mut` are the same OpenAlex request, so a
+        // matcher that saw only the raw form would silently fold two hops
+        // into one. The decoded path is compared instead, so a second hop
+        // in either encoding is counted and refused.
+        let openalex_hits = fx
+            .requests_to_decoded(&format!("/works/doi:{doi}"))
+            .await
+            .len();
+        let crossref_hits = fx.requests_to_decoded(&format!("/cr/{doi}")).await.len();
+        let datacite_hits = fx.requests_to_decoded(&format!("/dc/{doi}")).await.len();
+        // `encoded` is still read for clarity on the mock-setup side above; a
+        // bind here keeps the path names paired with the mock routes a reader
+        // can see from inside this test without jumping to the fixture.
+        let _ = &encoded;
+        assert_eq!(
+            openalex_hits, 1,
+            "OpenAlex asked exactly once per DOI-only download, saw {openalex_hits}"
         );
-        assert!(
-            crossref_hits <= 1,
-            "Crossref asked at most once per DOI-only download, saw {crossref_hits}"
+        assert_eq!(
+            crossref_hits, 1,
+            "Crossref asked exactly once per DOI-only download, saw {crossref_hits}"
         );
-        assert!(
-            datacite_hits <= 1,
-            "DataCite asked at most once per DOI-only download, saw {datacite_hits}"
+        assert_eq!(
+            datacite_hits, 1,
+            "DataCite asked exactly once per DOI-only download, saw {datacite_hits}"
         );
     }
 
@@ -6532,9 +6575,28 @@ mod tests {
             .downloader()
             .download_by_doi(&openalex, doi, &fx.papers_dir())
             .await;
-        assert!(
-            outcome.is_err(),
-            "a PDF whose title does not match Crossref's must be refused: {outcome:?}"
+        let err = outcome.expect_err(
+            "a PDF whose title does not match Crossref's must be refused on the \
+             **post-fetch** leg; an `is_err()` here would pass just as well for a \
+             404, so match on the variant.",
+        );
+        // The refusal is specifically the post-fetch check's — the served
+        // bytes' `/Title` did not corroborate the chain's answer. `expected`
+        // is the title the comparison actually used (Crossref's), not the
+        // minted row's empty title; the audit row carries the same value, so
+        // the error and the row cannot drift.
+        let detail = match err {
+            AdapterError::IdentityMismatch(detail) => detail,
+            other => panic!("expected AdapterError::IdentityMismatch, got {other:?}"),
+        };
+        assert_eq!(
+            detail.phase, "post_fetch",
+            "the served bytes refused the chain's title, not the stored row"
+        );
+        assert_eq!(
+            detail.expected, expected_title,
+            "the error records Crossref's title — the one the compare ran against \
+             — not the minted row's empty title"
         );
 
         // Nothing was recorded as the artefact — no row, no blob.
@@ -6555,6 +6617,101 @@ mod tests {
             "the placeholder row minted for this fetch was dropped: {rows_with_doi:?}"
         );
     }
+
+    /// Regression: a DOI-only download whose body is over the cap records
+    /// one `too_large` audit row with a NULL `paper_id`, leaves no `papers`
+    /// row behind, and files no artefact.
+    ///
+    /// The merge of dev (#337) back onto this branch dropped the dev-side
+    /// version of this test. The behaviour survived (the pass still runs,
+    /// `record_too_large_attempt` still writes the audit row, the minted
+    /// placeholder is still dropped, and migration 013's `paper_id` FK is
+    /// `ON DELETE SET NULL`), but the test did not — so a regression here
+    /// would have landed unnoticed. Restored, pointed at the current
+    /// `download_by_doi` call path rather than the removed `download(doi)`
+    /// path the dev-side test addressed.
+    #[tokio::test]
+    async fn the_doi_only_download_writes_a_too_large_row_with_null_paper_id() {
+        const CAP: u64 = 1024;
+        let fx = Fixture::new().await;
+        // bioRxiv-prefixed DOI so the preprint transform supplies the one
+        // fetch candidate: the pass asks OpenAlex / Crossref / DataCite,
+        // none answers (unmounted paths return 404), and the ranked
+        // candidate is the preprint URL served below.
+        let doi = "10.1101/2025.11.10.123456";
+        let over_cap = vec![b'B'; 64 * 1024];
+        fx.serve_pdf_body(&format!("/content/{doi}v1.full.pdf"), over_cap)
+            .await;
+
+        let openalex = crate::openalex::OpenAlexAdapter::new(Fixture::auth(), 10.0)
+            .with_base_url(format!("{}/works", fx.server.uri()));
+        let err = fx
+            .downloader()
+            .with_body_cap(CAP)
+            .download_by_doi(&openalex, doi, &fx.papers_dir())
+            .await
+            .expect_err("a 64 KiB body under a 1 KiB cap must be refused");
+        // The terminal refusal, not a retryable error: `BodyTooLarge` is the
+        // same variant the `scitadel acquire` path hits for the same cap.
+        assert!(
+            matches!(
+                err,
+                AdapterError::Paced(scitadel_http::FetchError::BodyTooLarge { .. })
+            ),
+            "the cap refused it: {err:?}"
+        );
+
+        // Zero papers rows, zero artefacts — the placeholder row this call
+        // minted was dropped on the failed fetch.
+        let (paper_repo, _, _, _, _) = fx.db.repositories();
+        assert!(
+            paper_repo.find_by_doi(doi).expect("db read").is_none(),
+            "the DOI-only fetch minted a row and cleaned it up on failure"
+        );
+        assert!(
+            fx.artefacts().is_empty(),
+            "no artefact was filed: {:?}",
+            fx.artefacts()
+        );
+
+        // Exactly one `too_large` row, with `paper_id` NULL: the audit row
+        // was written against the minted paper id, and migration 013's FK
+        // `REFERENCES papers(id) ON DELETE SET NULL` cleared the column
+        // when the placeholder was dropped — so the audit of the cap
+        // refusal survives the cleanup.
+        let conn = fx.db.conn().expect("conn");
+        let rows: Vec<(Option<String>, String, String)> = conn
+            .prepare(
+                "SELECT paper_id, route, outcome
+                   FROM acquisition_attempts
+                  WHERE outcome = 'too_large'
+                  ORDER BY id",
+            )
+            .expect("prepare")
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("rows");
+        assert_eq!(rows.len(), 1, "exactly one too_large audit row: {rows:?}");
+        let (paper_id, route, outcome) = &rows[0];
+        assert!(
+            paper_id.is_none(),
+            "the placeholder row was dropped, so the attempt's paper_id is NULL: {paper_id:?}"
+        );
+        assert_eq!(outcome, "too_large");
+        assert_eq!(
+            route, "biorxiv",
+            "the ranked candidate was the bioRxiv preprint URL — \
+             `RouteId::Biorxiv::label()`, not the generic preprint label"
+        );
+    }
+
     /// The other end of the "no route tried" case: a work with **no**
     /// identifiers at all. Every leg is inapplicable, nothing was put on the
     /// wire, and the row has to say so rather than reporting an absence that

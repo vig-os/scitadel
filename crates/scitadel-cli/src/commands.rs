@@ -883,11 +883,12 @@ pub async fn download(doi: &str, output_dir: Option<PathBuf>) -> Result<()> {
     println!("Downloading paper: {doi}");
 
     // #289: the DOI-only path records too. The downloader resolves the DOI
-    // into a `papers` row (an existing one, an OpenAlex record, or a minimal
-    // row with the DOI as a placeholder title), fetches through the recording
-    // ladder `scitadel acquire` uses, and the bytes land in the blob store
-    // beside an `artefacts` row that names them. No path writes a file into
-    // the library without a row naming it (ADR-007 §1).
+    // into a `papers` row (an existing one by DOI, or a minimal row with an
+    // empty title that the metadata pass backfills from its chain answer),
+    // fetches through the recording ladder `scitadel acquire` uses, and the
+    // bytes land in the blob store beside an `artefacts` row that names
+    // them. No path writes a file into the library without a row naming it
+    // (ADR-007 §1).
     let report = downloader
         .download_by_doi(&openalex, doi, &out_dir)
         .await
