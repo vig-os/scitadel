@@ -73,6 +73,7 @@ pub fn tui(theme_override: Option<&str>) -> Result<()> {
     scitadel_tui::run(
         &config.db_path,
         openalex,
+        config.acquire.body_cap_bytes,
         papers_dir,
         config.ui.show_institutional_hint,
         reader,
@@ -349,7 +350,7 @@ pub async fn search(
         &source_list,
         &config.pubmed.api_key,
         &config.openalex.auth(),
-        &config.patentsview.api_key,
+        &config.patentsview_adapter,
         &config.lens.api_key,
         &config.epo.consumer_key,
         &config.epo.consumer_secret,
@@ -875,7 +876,8 @@ pub async fn download(doi: &str, output_dir: Option<PathBuf>) -> Result<()> {
 
     let downloader =
         scitadel_adapters::download::PaperDownloader::new(db, config.openalex.auth(), 60.0)
-            .context("build the downloader")?;
+            .context("build the downloader")?
+            .with_body_cap_override(config.acquire.body_cap_bytes);
     let openalex = scitadel_adapters::openalex::OpenAlexAdapter::new(config.openalex.auth(), 30.0);
 
     println!("Downloading paper: {doi}");
@@ -1168,9 +1170,32 @@ pub async fn bib_watch(
     Ok(())
 }
 
-pub fn auth_login(source: &str) -> Result<()> {
+pub fn auth_login(source: &str, host: Option<&str>) -> Result<()> {
     let creds = find_source_credentials(source)?;
     let backend = credentials::backend();
+
+    // `--host` only binds a patentsview key (#268); for every other
+    // source it is a no-op, which is quieter than erroring out from
+    // a shared CI script that always passes it.
+    //
+    // The binding is **host-only, any port** — stored without a
+    // `:port`, compared without a `:port`. `normalize_patentsview_host`
+    // is the single normaliser both sides share (`--host` storage
+    // here, and `enforce_patentsview_host_binding` at build time).
+    let patentsview_host: Option<String> = if source == "patentsview" {
+        let bound = match host.map(str::trim).filter(|h| !h.is_empty()) {
+            Some(h) => {
+                credentials::normalize_patentsview_host(h).map_err(|e| anyhow::anyhow!("{e}"))?
+            }
+            None => credentials::PATENTSVIEW_DEFAULT_HOST.to_string(),
+        };
+        Some(bound)
+    } else {
+        if host.is_some() {
+            println!("  Note: --host is only meaningful for `patentsview`; ignoring.");
+        }
+        None
+    };
 
     println!(
         "Storing credentials for '{source}' — backend: {}",
@@ -1182,6 +1207,17 @@ pub fn auth_login(source: &str) -> Result<()> {
              plain-text file with mode 0600."
         );
     }
+    if let Some(ref h) = patentsview_host {
+        println!("  The stored key will be bound to host: {h} (any port)");
+    }
+
+    // Track whether the primary key for this source was actually
+    // stored this invocation. The host binding (patentsview only) is
+    // written only if the key was: an empty-enter skip, or a cancelled
+    // prompt reaching here some other way, must NOT rewrite the host
+    // binding to the default on top of an already-bound key (#268
+    // round-3 nit).
+    let mut stored_any_required_key = false;
 
     for key in creds.keys {
         let label = if key.optional {
@@ -1202,6 +1238,37 @@ pub fn auth_login(source: &str) -> Result<()> {
         credentials::store(key.store_key, &credentials::Secret::new(&value))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         println!("  Stored: {}", key.store_key);
+        if !key.optional {
+            stored_any_required_key = true;
+        }
+    }
+
+    // The host binding is written AFTER the key, so a half-stored
+    // (key without binding) entry is never left behind by a cancelled
+    // prompt. The value is not a secret, but it goes through the same
+    // store so `scitadel auth logout patentsview` clears it alongside
+    // the key.
+    //
+    // Only write if a required key was actually stored this invocation:
+    // the required-key loop bails on an empty value, so in practice we
+    // reached this line because the key was stored, but the explicit
+    // flag defends against a future refactor turning the key optional
+    // and silently reauthorising an already-bound binding on an
+    // empty-enter.
+    if let Some(h) = patentsview_host {
+        if !stored_any_required_key {
+            bail!(
+                "no patentsview key was stored this invocation, so the host binding \
+                 is not being rewritten. Run `scitadel auth login patentsview` and \
+                 enter a key to rebind."
+            );
+        }
+        credentials::store(
+            credentials::PATENTSVIEW_HOST_STORE_KEY,
+            &credentials::Secret::new(&h),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        println!("  Stored: {}", credentials::PATENTSVIEW_HOST_STORE_KEY);
     }
 
     println!("Done. Credentials saved to the {backend} store.");
@@ -1215,6 +1282,16 @@ pub fn auth_logout(source: &str) -> Result<()> {
         match credentials::delete(key.store_key) {
             Ok(()) => println!("  Removed: {}", key.store_key),
             Err(e) => println!("  Skip: {} ({e})", key.store_key),
+        }
+    }
+
+    // The patentsview host binding lives alongside the key but is
+    // not a `CredentialKey` (it is not prompted for, it is set by
+    // `--host`), so clear it here (#268).
+    if source == "patentsview" {
+        match credentials::delete(credentials::PATENTSVIEW_HOST_STORE_KEY) {
+            Ok(()) => println!("  Removed: {}", credentials::PATENTSVIEW_HOST_STORE_KEY),
+            Err(e) => println!("  Skip: {} ({e})", credentials::PATENTSVIEW_HOST_STORE_KEY),
         }
     }
 
@@ -1238,6 +1315,27 @@ pub fn auth_status() -> Result<()> {
         for key in creds.keys {
             // Location only — the value itself is never printed.
             println!("      {}: {}", key.label, credentials::key_location(key));
+        }
+
+        // The patentsview key can carry a host binding; surface it
+        // here so a stored key with no binding (a legacy entry) is
+        // visible as "legacy / search.patentsview.org" rather than
+        // silently refused at first search (#268).
+        if creds.source == "patentsview" {
+            let has_stored_key = credentials::get("patentsview.api_key").is_some();
+            if has_stored_key {
+                let binding = credentials::get(credentials::PATENTSVIEW_HOST_STORE_KEY)
+                    .map_or_else(
+                        || {
+                            format!(
+                                "legacy (treated as {})",
+                                credentials::PATENTSVIEW_LEGACY_HOST
+                            )
+                        },
+                        |s| s.into_string(),
+                    );
+                println!("      Bound to host: {binding}");
+            }
         }
     }
 
@@ -2331,7 +2429,8 @@ pub async fn acquire(opts: AcquireOptions, json: bool) -> Result<()> {
     // from being a second, subtly different code path.
     let downloader =
         scitadel_adapters::download::PaperDownloader::new(db.clone(), config.openalex.auth(), 60.0)
-            .context("build the downloader")?;
+            .context("build the downloader")?
+            .with_body_cap_override(config.acquire.body_cap_bytes);
 
     // `--from` imports, then drains: two reconciliations of two different things,
     // so they are two calls with one order. A queue import writes
@@ -2527,8 +2626,15 @@ fn resolve_paper(
 /// `scitadel scan --paper <id> [--root <dir>] [--dry-run] [--json]`.
 pub fn scan(paper: &str, root: Option<&std::path::Path>, dry_run: bool, json: bool) -> Result<()> {
     let (db, paper_row) = resolve_paper(paper)?;
+    // One source of truth for the fetch-body cap (#288): `scan` reads the
+    // same `config.acquire.body_cap_bytes` the ladder reads, so an operator
+    // who raised the cap for a named re-acquire can also drop the file in
+    // and `scan` admits the same bytes.
+    let options = scitadel_adapters::scan::ScanOptions::from_body_cap_override(
+        load_config().acquire.body_cap_bytes,
+    );
     if dry_run {
-        let report = scitadel_adapters::scan::plan(&db, &paper_row, root)
+        let report = scitadel_adapters::scan::plan(&db, &paper_row, root, options)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         if json {
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -2537,8 +2643,8 @@ pub fn scan(paper: &str, root: Option<&std::path::Path>, dry_run: bool, json: bo
         }
         return Ok(());
     }
-    let report =
-        scitadel_adapters::scan::scan(&db, &paper_row, root).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let report = scitadel_adapters::scan::scan(&db, &paper_row, root, options)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -2557,8 +2663,12 @@ pub fn attach(
     json: bool,
 ) -> Result<()> {
     let (db, paper_row) = resolve_paper(paper)?;
-    let report = scitadel_adapters::scan::attach(&db, &paper_row, file, kind, label, locator)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let options = scitadel_adapters::scan::ScanOptions::from_body_cap_override(
+        load_config().acquire.body_cap_bytes,
+    );
+    let report =
+        scitadel_adapters::scan::attach(&db, &paper_row, file, kind, label, locator, options)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
     // A refusal is a non-zero exit **in both output modes**. Returning 0 with
     // `"refused_because": "bad_magic"` on stdout would put back exactly the silent
     // failure ADR-007 §1 measured: a landing page saved as an SI, in a script that

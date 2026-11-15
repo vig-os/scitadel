@@ -36,7 +36,8 @@ pub use assessments::SqliteAssessmentRepository;
 /// ADR-007 §1 "Storage": the content-addressed blob store.
 pub use blobs::{
     BLOB_DIR, BLOB_TMP_DIR, CAP_FIGURE_BYTES, CAP_FULLTEXT_BYTES, CAP_SI_BYTES, blob_rel_path,
-    cap_for_kind, file_extension, hash_file, io_error, library_root, store_blob, store_bytes,
+    cap_for_kind, cap_for_kind_with_override, file_extension, hash_file, io_error, library_root,
+    store_blob, store_bytes,
 };
 pub use citations::SqliteCitationRepository;
 /// ADR-007 §1 "Have" (derived) and §2 "Status vocabulary": the readers behind

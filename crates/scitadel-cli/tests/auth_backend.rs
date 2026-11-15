@@ -187,6 +187,137 @@ fn auth_logout_clears_the_stored_credentials() {
         ));
 }
 
+#[test]
+fn auth_login_patentsview_stores_the_default_host_binding() {
+    let tmp = TempDir::new().unwrap();
+    let store = store_path(&tmp);
+
+    scitadel(&store)
+        .arg("auth")
+        .arg("login")
+        .arg("patentsview")
+        .write_stdin("pv-key-123\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Stored: patentsview.api_key"))
+        .stdout(predicate::str::contains("Stored: patentsview.api_host"))
+        .stdout(predicate::str::contains("patentref.io"));
+
+    let written = fs::read_to_string(&store).unwrap();
+    assert!(
+        written.contains("pv-key-123") && written.contains("patentref.io"),
+        "both key and host binding must be in the store:\n{written}"
+    );
+}
+
+#[test]
+fn auth_login_patentsview_normalises_a_mixed_case_and_trailing_dot_host() {
+    let tmp = TempDir::new().unwrap();
+    let store = store_path(&tmp);
+
+    scitadel(&store)
+        .arg("auth")
+        .arg("login")
+        .arg("patentsview")
+        .arg("--host")
+        .arg("Mirror.Example.ORG.")
+        .write_stdin("pv-key-abc\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("mirror.example.org"))
+        .stdout(predicate::str::contains("any port"));
+
+    let written = fs::read_to_string(&store).unwrap();
+    assert!(
+        written.contains("mirror.example.org"),
+        "host must be stored in canonical lowercase, no trailing dot:\n{written}"
+    );
+    assert!(
+        !written.contains("Mirror.Example.ORG"),
+        "the un-normalised spelling must NOT be in the store:\n{written}"
+    );
+}
+
+#[test]
+fn auth_login_patentsview_refuses_a_host_with_a_port() {
+    let tmp = TempDir::new().unwrap();
+    scitadel(&store_path(&tmp))
+        .arg("auth")
+        .arg("login")
+        .arg("patentsview")
+        .arg("--host")
+        .arg("patentref.io:8443")
+        .write_stdin("pv-key\n")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("host-only"));
+}
+
+#[test]
+fn auth_login_patentsview_refuses_a_host_that_is_a_url_or_path() {
+    let tmp = TempDir::new().unwrap();
+    for bad in &["https://patentref.io", "patentref.io/foo"] {
+        scitadel(&store_path(&tmp))
+            .arg("auth")
+            .arg("login")
+            .arg("patentsview")
+            .arg("--host")
+            .arg(*bad)
+            .write_stdin("pv-key\n")
+            .assert()
+            .failure();
+    }
+}
+
+/// Empty-enter on the required key must bail BEFORE the host binding
+/// is rewritten. If the user had previously bound to a mirror and then
+/// ran `auth login patentsview` (no `--host`) and hit enter, the
+/// default-host binding must NOT silently replace the previous one
+/// (#268 round-3 nit).
+#[test]
+fn auth_login_patentsview_does_not_rewrite_the_host_binding_on_empty_enter() {
+    let tmp = TempDir::new().unwrap();
+    let store = store_path(&tmp);
+
+    // Previous invocation: bind to a mirror.
+    scitadel(&store)
+        .arg("auth")
+        .arg("login")
+        .arg("patentsview")
+        .arg("--host")
+        .arg("mirror.example.org")
+        .write_stdin("mirror-key\n")
+        .assert()
+        .success();
+
+    let after_first = fs::read_to_string(&store).unwrap();
+    assert!(
+        after_first.contains("mirror.example.org"),
+        "first login must store the mirror binding:\n{after_first}"
+    );
+
+    // Second invocation: operator runs `auth login patentsview` (no
+    // --host), hits enter on the required key by accident. The
+    // required-key loop bails; the host binding must be untouched.
+    scitadel(&store)
+        .arg("auth")
+        .arg("login")
+        .arg("patentsview")
+        .write_stdin("\n")
+        .assert()
+        .failure();
+
+    let after_second = fs::read_to_string(&store).unwrap();
+    assert!(
+        after_second.contains("mirror.example.org"),
+        "an empty-enter must NOT rewrite the host binding to the default:\n{after_second}"
+    );
+    assert!(
+        !after_second.contains("api_host = \"patentref.io\""),
+        "the default host binding must not have been written:\n{after_second}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn the_file_backend_store_is_owner_only() {
