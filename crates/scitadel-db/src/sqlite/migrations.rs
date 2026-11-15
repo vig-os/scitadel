@@ -306,8 +306,6 @@ mod tests {
     /// CHECK accepts it.
     #[test]
     fn migration_015_preserves_v14_rows_and_the_cascade_fk() {
-        let conn = Connection::open_in_memory().unwrap();
-
         // The 13 statuses `acquisition_state.status` accepted at v14 — the
         // list migration 013 encodes, migration 014 does not touch, and
         // migration 015 must carry through intact.
@@ -326,6 +324,8 @@ mod tests {
             "rate_limited",
             "error",
         ];
+
+        let conn = Connection::open_in_memory().unwrap();
 
         // Bring the DB up to v14 only (migrations 1..=14).
         let up_to_14: Vec<(i64, &str)> = MIGRATIONS

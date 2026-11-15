@@ -865,14 +865,19 @@ Neither label is a licence to render unescaped: `Ours` renders through
   and the model is told whose words it is reading. No schema change was
   needed or made.
 
-- **Two uncapped render paths were found and are recorded here rather
-  than fixed.** The TUI reader renders the whole `full_text` into one
-  `Paragraph` with no scroll offset, and MCP `build_annotated_paper`
-  returns the whole body with no `max_chars` to honour — larger than
-  `read_paper`'s 20k default. Both pre-date the envelope and are not
-  security faults: an uncapped body reaches a terminal *neutralised*.
-  They are rendering-quality gaps, and paging an existing reader is its
-  own slice.
+- **Two uncapped render paths were fixed in #307.** The TUI reader
+  rendered the whole `full_text` into one `Paragraph` with no scroll
+  offset, and MCP `build_annotated_paper` returned the whole body with
+  no `max_chars` to honour — larger than `read_paper`'s 20k default.
+  Neither was a security fault: the envelope sends an uncapped body to
+  a terminal *neutralised*. `build_annotated_paper` now takes
+  `max_chars` / `offset` with the same 20_000 default as `read_paper`,
+  returns `truncated` + `total_chars` + `next_offset` for continuation,
+  and surfaces annotations whose anchor falls outside the returned
+  window so no human comment is silently dropped during paging. The
+  reader has `j`/`k`/arrows/`d`/`u`/page-keys/`g`/`G` scroll; `J`/`K`
+  highlight hops auto-scroll onto the chosen match so it is reachable
+  below the fold.
 
 - **`CandidatePaper.r#abstract` is still a `String`.** It is the
   pre-dedup transport in `scitadel-adapters`, not a `Paper` field, so
