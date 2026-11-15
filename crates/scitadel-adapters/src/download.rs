@@ -564,7 +564,6 @@ impl PaperDownloader {
     ) -> Result<DownloadByDoiReport, AdapterError> {
         use scitadel_core::models::PaperId;
         use scitadel_core::ports::PaperRepository as _;
-        use scitadel_core::untrusted::UntrustedText;
 
         let normalized = validate_doi_detailed(doi)
             .map_err(|reason| AdapterError::Validation(format!("invalid DOI: {reason}")))?;
@@ -594,34 +593,26 @@ impl PaperDownloader {
                     (paper, true)
                 }
                 Ok(None) => {
-                    // 3. Minimal row. The DOI is unknown to OpenAlex but the
-                    // identity chain still asks Crossref and DataCite, so a
-                    // `10.18434`/`10.5281`/`10.26434` DOI comes back with a
-                    // real title here. That is the whole point of this branch:
-                    // a DOI-as-placeholder-title would score below the mismatch
-                    // floor against any Crossref/DataCite answer and the
-                    // identity gate would refuse the download it exists to
-                    // record (#289's blocker 1). When no registry registers
-                    // the DOI either, the title stays empty and the pre-fetch
-                    // check is honestly `unverified` — "no title on one side,
-                    // so there was nothing to compare".
-                    let work = WorkScope::new();
-                    let chain = self
-                        .identity_chain()
-                        .resolve(&self.client, &work, Some(&normalized), None)
-                        .await;
+                    // 3. Minimal row. The DOI is unknown to OpenAlex, so the
+                    // row is minted with the DOI and an **empty** title — the
+                    // metadata pass that `download_paper` runs next asks the
+                    // same three identity registries the chain would (plus the
+                    // version/licence sources), and letting that be the one
+                    // registry walk keeps `scitadel download <doi>` to each
+                    // registry request at most once. The title, year and
+                    // first author are backfilled after the fetch from the
+                    // plan's `identity.resolved`, which carries ADR-007 §3's
+                    // chain answer (the first registry in
+                    // `identity_chain::CHAIN` that named the work). An empty
+                    // title at fetch time is what the pre-fetch identity
+                    // check honestly reports as `unverified` ("no title on
+                    // one side, so there was nothing to compare") and the
+                    // post-fetch check still compares against the chain
+                    // answer, so a DOI-as-placeholder-title that would score
+                    // below the mismatch floor is never written.
                     let mut paper = Paper::new(String::new());
                     paper.id = PaperId::new();
                     paper.doi = Some(normalized.clone());
-                    if let Some(answer) = chain.resolved {
-                        if let Some(title) = answer.identity.title {
-                            paper.title = UntrustedText::ours(title);
-                        }
-                        paper.year = answer.identity.year;
-                        if let Some(first_author) = answer.identity.first_author {
-                            paper.authors = vec![UntrustedText::ours(first_author)];
-                        }
-                    }
                     paper_repo.save(&paper).map_err(|e| {
                         AdapterError::Other(format!("could not save minimal papers row: {e}"))
                     })?;
@@ -635,8 +626,24 @@ impl PaperDownloader {
             }
         };
 
-        match self.download_paper(&paper, output_dir).await {
-            Ok(result) => Ok(DownloadByDoiReport { paper, result }),
+        let RankedDownload { result, plan } =
+            self.download_paper_with_plan(&paper, output_dir).await;
+        match result {
+            Ok(result) => {
+                // Backfill the minted row's title / year / first author from
+                // the metadata pass's resolved identity — the same ADR-007 §3
+                // chain answer the (now-removed) pre-fetch identity walk used
+                // to supply, read out of the pass's own result instead of a
+                // second round of hops. Only the row this call just minted
+                // is touched (an existing row keeps its stored metadata), and
+                // only when at least one registry answered.
+                let paper = if minted {
+                    self.backfill_minted_identity(paper, &plan)
+                } else {
+                    paper
+                };
+                Ok(DownloadByDoiReport { paper, result })
+            }
             Err(error) => {
                 // A failed download must not leave a bare `papers` row behind:
                 // the row was minted for this fetch and now names no artefact,
@@ -653,6 +660,60 @@ impl PaperDownloader {
                 Err(error)
             }
         }
+    }
+
+    /// Write the chain answer's title / year / first author onto a minimal
+    /// `papers` row [`Self::download_by_doi`] minted for a DOI OpenAlex did
+    /// not register.
+    ///
+    /// Reads the identity off the metadata pass's result (`plan.identity`),
+    /// so `download_by_doi` does **not** need to ask Crossref or DataCite a
+    /// second time just to seed the row — the pass already asked them, and
+    /// its resolved identity is the same ADR-007 §3 chain answer the
+    /// pre-#339-review walk used to supply.
+    ///
+    /// Best-effort: a save failure is reported in the trace rather than
+    /// bubbled up, because the fetch succeeded and the artefact is on disk —
+    /// an empty title in the row is the observable cost of the trace, not a
+    /// reason to refuse the caller the download that just landed. The
+    /// returned `Paper` is what the `DownloadByDoiReport` names so the CLI
+    /// / MCP output reflects the registered title even if the save failed.
+    fn backfill_minted_identity(
+        &self,
+        mut paper: Paper,
+        plan: &crate::resolve::Resolution,
+    ) -> Paper {
+        use scitadel_core::ports::PaperRepository as _;
+        use scitadel_core::untrusted::UntrustedText;
+
+        let Some(answer) = plan.identity.resolved.as_ref() else {
+            return paper;
+        };
+        let identity = &answer.identity;
+        let has_title = identity.title.is_some();
+        let has_year = identity.year.is_some();
+        let has_author = identity.first_author.is_some();
+        if !(has_title || has_year || has_author) {
+            return paper;
+        }
+        if let Some(title) = identity.title.clone() {
+            paper.title = UntrustedText::ours(title);
+        }
+        if let Some(year) = identity.year {
+            paper.year = Some(year);
+        }
+        if let Some(first_author) = identity.first_author.clone() {
+            paper.authors = vec![UntrustedText::ours(first_author)];
+        }
+        let (paper_repo, _, _, _, _) = self.db.repositories();
+        if let Err(e) = paper_repo.save(&paper) {
+            tracing::warn!(
+                paper_id = %paper.id,
+                error = %e,
+                "could not backfill the minted row's identity from the metadata pass"
+            );
+        }
+        paper
     }
 
     /// Drop the minimal `papers` row [`Self::download_by_doi`] minted for a
@@ -6337,6 +6398,82 @@ mod tests {
 
         assert_eq!(report.paper.title.as_str(), title);
         assert_eq!(fx.artefacts().len(), 1);
+    }
+
+    /// Review nit: a DOI-only `scitadel download` asks each registry **at
+    /// most once** across the whole call.
+    ///
+    /// Before this fix, the minimal-row path walked the identity chain
+    /// (OpenAlex → Crossref → DataCite) in `download_by_doi` to seed the
+    /// row's title, then `download_paper`'s metadata pass asked the same
+    /// three registries again — four redundant hops per DOI. The fix is to
+    /// let the pass be the single source: mint a bare row, run
+    /// `download_paper_with_plan`, and backfill the title/year/author from
+    /// the plan's `identity.resolved`.
+    ///
+    /// Asserted on the request counts the wiremock server recorded, not on
+    /// a count a helper could silently miss.
+    #[tokio::test]
+    async fn download_by_doi_asks_each_registry_at_most_once() {
+        use wiremock::{Mock, ResponseTemplate, matchers};
+
+        let fx = Fixture::new().await;
+        // bioRxiv prefix so the preprint transform supplies a fetch candidate.
+        let doi = "10.1101/one.hop.per.registry";
+        let encoded = doi.replace('/', "%2F");
+        // OpenAlex has nothing — the minimal-row path.
+        fx.miss(&format!("/works/doi:{doi}")).await;
+        // Crossref answers with a real title, so the row's title is set from
+        // the registry's answer rather than left empty.
+        Mock::given(matchers::method("GET"))
+            .and(matchers::path(format!("/cr/{encoded}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": {
+                    "DOI": doi,
+                    "title": ["A real registered title"],
+                    "published": {"date-parts": [[2026, 4, 2]]},
+                    "author": [{"family": "Lovelace", "given": "Ada"}],
+                    "type": "journal-article",
+                }
+            })))
+            .mount(&fx.server)
+            .await;
+        // The preprint PDF is served so the fetch succeeds end to end.
+        fx.serve_pdf(&format!("/content/{doi}v1.full.pdf")).await;
+
+        let openalex = crate::openalex::OpenAlexAdapter::new(Fixture::auth(), 10.0)
+            .with_base_url(format!("{}/works", fx.server.uri()));
+        let report = fx
+            .downloader()
+            .download_by_doi(&openalex, doi, &fx.papers_dir())
+            .await
+            .expect("Crossref answers, the preprint PDF serves, the download records");
+
+        // The minimal row still carries the registered title.
+        assert_eq!(report.paper.title.as_str(), "A real registered title");
+        assert_eq!(fx.artefacts().len(), 1, "one DOI = one artefact row");
+
+        // Each of the three identity-chain registries is asked **at most
+        // once**. The DOI-only path is the one place a redundant second
+        // round of hops was observed (identity chain + metadata pass); this
+        // pins it to one. Unpaywall is a fourth metadata source; it is
+        // counted here for completeness, but the review nit is about the
+        // identity-chain redundancy.
+        let openalex_hits = fx.requests_to(&format!("/works/doi:{doi}")).await.len();
+        let crossref_hits = fx.requests_to(&format!("/cr/{encoded}")).await.len();
+        let datacite_hits = fx.requests_to(&format!("/dc/{encoded}")).await.len();
+        assert!(
+            openalex_hits <= 1,
+            "OpenAlex asked at most once per DOI-only download, saw {openalex_hits}"
+        );
+        assert!(
+            crossref_hits <= 1,
+            "Crossref asked at most once per DOI-only download, saw {crossref_hits}"
+        );
+        assert!(
+            datacite_hits <= 1,
+            "DataCite asked at most once per DOI-only download, saw {datacite_hits}"
+        );
     }
 
     /// The other end of the "no route tried" case: a work with **no**
