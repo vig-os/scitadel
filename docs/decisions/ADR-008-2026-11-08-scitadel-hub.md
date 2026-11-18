@@ -476,7 +476,10 @@ unchanged across stages.
 - **Warm tier.** A dedicated **NixOS ZFS + versitygw S3 box**
   (gerchowl/g-fleet#1363), replacing the shared research-data store
   path of g-fleet#1121, is the canonical S3-compatible store and the
-  distribution point inside the fleet.
+  distribution point inside the fleet. Its capacity is **20+ TB of HDD
+  attached to anvil** (owner, 2026-11-18): bulk, sequential-friendly
+  storage for raw inputs, cascade outputs and bases, while the KC3000
+  NVMe stays the hot working set for random reads.
 - **Cold tier.** A **Hetzner Storage Box** (encrypted, via `restic`)
   holds the backups and the derived products that fall out of the
   warm working set.
@@ -1473,9 +1476,10 @@ product. The only use that remains is the CC0
    publications (more data, more disk)?
 4. **OpenAlex membership:** does ETH (or the lab) hold an OpenAlex
    Member or Member+ plan? If so, §5's paid path applies.
-5. **Disk:** if a larger OpenAlex subset is wanted, more storage on
-   anvil (or another host) is needed. Is that in scope for
-   g-fleet#1363?
+5. **Disk:** ~~is more storage in scope for g-fleet#1363?~~
+   **Resolved (2026-11-18): 20+ TB of HDD comes to anvil** and backs
+   the warm tier (§8). A larger OpenAlex subset fits there; the hot
+   KC3000 budget (§8 disk budget) is unchanged.
 6. **Default subset:** which subscriptions should the first lab mirror
    carry (topics, the lab's institution, members' libraries)?
 7. **Licence reading:** does ETH Library confirm that free-to-read
