@@ -33,7 +33,9 @@ ADR-007. Four things changed:
 2. **OpenAlex prices freshness, not data.** Since February 2026 a free
    key carries a $1/day budget: a filtered list call costs $0.0001, a
    search call $0.001, and a single-entity GET is free. `per_page` is
-   capped at 200 (the docs say 100; 200 measured on 2026-11-08). The filters that return "everything changed since a
+   set to 100, the documented maximum (the live API also accepts 200,
+   measured on 2026-11-08 and 2026-11-19, but the hub doesn't rely on
+   undocumented behaviour; nerdmachines/scitadel-hub#21). The filters that return "everything changed since a
    date" (`from_updated_date`, `from_created_date` and their `to_`
    pairs) and the daily snapshot are **Member+** ($10k/year). The
    quarterly snapshot is free: CC0, on a public S3 bucket, in JSONL and
@@ -349,8 +351,8 @@ GB per subset *(estimate)*.
 1. **Subscriptions.** For each subscribed topic, author, institution or
    source, a list query with
    `from_publication_date = last_run − lookback` (default 90 days),
-   `per_page=200`, cursor paging. Every new work in all of OpenAlex
-   would cost a few hundred calls, about $0.05/day *(estimate)*; a
+   `per_page=100` (from the adapter's service definition), cursor paging.
+   Every new work in all of OpenAlex would cost several hundred calls, about $0.05/day *(estimate)*; a
    realistic lab set costs under $0.01.
 2. **Rolling refresh.** Re-fetch known works 100 IDs per call
    (`openalex_id:W1|…|W100`), hottest first: works in members'
@@ -388,8 +390,11 @@ verified). The hub computes embeddings only for works they miss.
 ## 6 · Patent corpus
 
 - **Inputs:** `PVGPATDIS` TSVs and the weekly Grant Full Text XML,
-  1976–present. Pre-grant publications and EPO DOCDB are later
-  options.
+  1976–present. USPTO pre-grant publications are the second product
+  (see §15). They are switched on after the grant product passes QC and
+  the warm tier exists, and only after a size check on one year of
+  pre-grant bulk data (nerdmachines/scitadel-hub#36). EPO DOCDB stays
+  a later option.
 - **Build.** Tables: patents, claims, description sections, CPC,
   citations patent→patent and patent→paper, assignees, inventors.
   Embeddings: PatentSBERTa (768-d) over title+abstract, about 8M
@@ -1472,8 +1477,10 @@ product. The only use that remains is the CC0
    and conformance tests are reproducible? (Replaces the old "HF
    org" question, superseded by decision 19.) If yes, size and host
    (crate-embedded, or a small CC0 HF dataset owned by `vig-os`)?
-3. **Patent scope:** grants only (default), or add pre-grant
-   publications (more data, more disk)?
+3. ~~**Patent scope:** grants only (default), or add pre-grant
+   publications (more data, more disk)?~~ **Resolved (2026-11-19):**
+   pre-grant publications are added as the second product, sequenced
+   after grant QC and the warm tier, with a size check first (§6, §15).
 4. **OpenAlex membership:** does ETH (or the lab) hold an OpenAlex
    Member or Member+ plan? If so, §5's paid path applies.
 5. **Disk:** ~~is more storage in scope for g-fleet#1363?~~
