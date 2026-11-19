@@ -2,7 +2,7 @@
 type: issue
 state: open
 created: 2026-11-08T12:02:09Z
-updated: 2026-11-08T12:05:13Z
+updated: 2026-11-18T14:58:49Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/319
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: 311
 children: none
-synced: 2026-11-09T08:50:57.328Z
+synced: 2026-11-19T09:39:02.118Z
 ---
 
 # [Issue 319]: [feat(hub): H5 — document model + tiered extraction pipeline: Arrow/Vortex blocks, tables, figures, math, chunks, embeddings, full provenance](https://github.com/vig-os/scitadel/issues/319)
@@ -73,7 +73,7 @@ The hub stores full text as **Arrow-shaped tables in tessera/Vortex**, a documen
   - Matryoshka truncation to 512–1024 dims, with the quality loss checked on H7's golden set.
   - The Qwen3-VL-Reranker reorders the top-k.
   - CLIP and SigLIP are weak on charts and plots.
-  - Bulk embedding runs on the 5090 via `gpu_submit`; interactive work runs on sage.
+  - Bulk embedding runs on the 5090 via `gpu_submit`; interactive work runs on [mac-studio].
 - **Formulas:** LaTeX/MathML from JATS, or math OCR. Grobid's flattened formula text is a fallback only.
 
 **Tiered extraction cascade.** Each tier runs only on what the cheaper tier couldn't settle (ADR-008 §10).
@@ -83,7 +83,7 @@ The hub stores full text as **Arrow-shaped tables in tessera/Vortex**, a documen
 | T0 | Parse JATS / publisher HTML | CPU | No structured source, or a QC flag |
 | T1 | Tool extraction: Grobid, Docling, Marker, math OCR | CPU + the 5090 (`gpu_submit`) | A QC flag, or two extractors disagree |
 | T2 | System One yes/no checks (Clef/Kev, #246), e.g. "is this table complete?", "is this the reading order?" | Clef hosted / Kev local | The answer is uncertain (below the calibrated threshold) |
-| T3 | A Qwen vision-language model compares the page image with the extraction and repairs it. Model size to be decided; sage's specs are unverified. | sage | It can't repair, or its confidence is low |
+| T3 | A Qwen vision-language model compares the page image with the extraction and repairs it. Model size to be decided; [mac-studio]'s specs are unverified. | [mac-studio] | It can't repair, or its confidence is low |
 | T4 | Opus (`claude-opus-5-5`) via the API gives the final verdict | external API | Fails → quarantine + a red fixture (H7) |
 
 **Guardrails:**
@@ -128,5 +128,5 @@ A work that fails or is flagged goes into H7's red/green loop.
 
 ## Dependencies
 
-H7 (golden set and quarantine loop, the test harness for this pipeline); H0; H4 (artefact store for the raw sources); tessera#778 (W0 strings #628; W1 streaming #654; W2 vectors #768/#769, BM25 #775) tessera#779 (binary columns), tessera#780 (keyed references, work_id → product index), tessera#782 (pipeline / per-row / external-input provenance); #246 (consumer of chunks); anvil GPU via `gpu_submit`.
+H7 (golden set and quarantine loop, the test harness for this pipeline); H0; H4 (artefact store for the raw sources); tessera#778 (W0 strings #628; W1 streaming #654; W2 vectors #768/#769, BM25 #775) tessera#779 (binary columns), tessera#780 (keyed references, work_id → product index), tessera#782 (pipeline / per-row / external-input provenance); #246 (consumer of chunks); [gpu-server] GPU via `gpu_submit`.
 

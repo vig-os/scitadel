@@ -2,7 +2,7 @@
 type: issue
 state: closed
 created: 2026-11-09T03:21:53Z
-updated: 2026-11-09T03:50:36Z
+updated: 2026-11-18T14:59:47Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/327
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: 311
 children: none
-synced: 2026-11-09T08:50:53.723Z
+synced: 2026-11-19T09:38:59.260Z
 ---
 
 # [Issue 327]: [feat(deploy): H15 — tenant simulation on microVMs (stage 0)](https://github.com/vig-os/scitadel/issues/327)
@@ -24,8 +24,8 @@ Part of #311. Design: ADR-008 (PR #317), §8 (stage 0). Target repo: `scitadel-h
 Before any hosted tenant exists, the multi-tenant shape (isolation, per-tenant config, upgrades, backups) must be exercised on owned hardware.
 
 ## Scope
-- N simulated tenants (a personal, a lab and an org hub) as microVMs on anvil (`microvm.nix`), each running the hub module.
-- Per-tenant secrets (a separate sops file), storage quotas and an S3 prefix on the warm tier (gerchowl/g-fleet#1363).
+- N simulated tenants (a personal, a lab and an org hub) as microVMs on [gpu-server] (`microvm.nix`), each running the hub module.
+- Per-tenant secrets (a separate sops file), storage quotas and an S3 prefix on the warm tier ([fleet-config-repo]#1363).
 - Read-through caching between layers (global → org → group → user).
 - Scripted upgrade, rollback, and restore from the cold tier (Storage Box via restic).
 
@@ -35,7 +35,7 @@ Before any hosted tenant exists, the multi-tenant shape (isolation, per-tenant c
 - A restore from cold storage is rehearsed and documented.
 
 ## Depends on
-H0 (#313); the stage-0 hub running; g-fleet#1363.
+H0 (#313); the stage-0 hub running; [fleet-config-repo]#1363.
 
 ---
 
@@ -43,5 +43,5 @@ H0 (#313); the stage-0 hub running; g-fleet#1363.
 
 _Posted on November 9, 2026 at 03:50 AM_
 
-Moved to https://github.com/nerdmachines/scitadel-hub-deploy/issues/1, the private repo for this work (ADR-008 §1). Tracked there from now on.
+Moved to [private-repo link] the private repo for this work (ADR-008 §1). Tracked there from now on.
 

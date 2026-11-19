@@ -2,7 +2,7 @@
 type: issue
 state: open
 created: 2026-11-08T12:02:07Z
-updated: 2026-11-09T04:56:02Z
+updated: 2026-11-18T14:58:53Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/318
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: 311
 children: none
-synced: 2026-11-09T08:50:57.849Z
+synced: 2026-11-19T09:39:02.618Z
 ---
 
 # [Issue 318]: [feat(hub): H4 — artefact store outside the corpus DB: raw retention, licence/entitlement gating, upload-on-acquire, detach/export](https://github.com/vig-os/scitadel/issues/318)
@@ -33,7 +33,7 @@ The hub should keep the **bytes once** and let each client keep **identity only*
 
 **An artefact store outside the corpus database.** Heavy originals sit in a content-addressed store: PDFs, plus raw JATS, TEI and HTML.
 - Keys are blake3 hashes, the same identity tessera and ADR-007 use.
-- It is a bucket on the fleet's S3-compatible store (versitygw, gerchowl/g-fleet#1121), not a table block inside the shard products (H5).
+- It is a bucket on the fleet's S3-compatible store (versitygw, [fleet-config-repo]#1121), not a table block inside the shard products (H5).
 - `works` rows reference artefacts by hash and source URL.
 - **Open access:** the PDF may be pointer-only, because it can be fetched again.
 - **Paywalled:** a PDF acquired through someone's access rights is kept, as the version of record.
@@ -94,7 +94,7 @@ The free-to-read row relies on the Swiss Copyright Act's text-and-data-mining ex
 
 ## Dependencies
 
-H0 (repo); H5 (the `works` table these artefacts hang off); ADR-007 acquisition (#253–#259); gerchowl/g-fleet#1121 (bucket); H3 (#316) for the client/hub protocol, which gains `fetch_artefact` and `offer_artefact` calls.
+H0 (repo); H5 (the `works` table these artefacts hang off); ADR-007 acquisition (#253–#259); [fleet-config-repo]#1121 (bucket); H3 (#316) for the client/hub protocol, which gains `fetch_artefact` and `offer_artefact` calls.
 
 
 ---

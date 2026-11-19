@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-11-08T11:46:57Z
-updated: 2026-11-09T04:56:00Z
+updated: 2026-11-18T14:59:55Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/316
-comments: 1
+comments: 2
 labels: feature, effort:medium, phase:design
 assignees: none
 milestone: none
 projects: none
 parent: 311
 children: 340
-synced: 2026-11-09T08:50:58.272Z
+synced: 2026-11-19T09:39:03.068Z
 ---
 
 # [Issue 316]: [feat(adapters): H3 — hub source adapter and client/hub protocol, falling through to the live APIs](https://github.com/vig-os/scitadel/issues/316)
@@ -73,4 +73,18 @@ A scitadel client needs one switch to use a lab hub: search and metadata are ans
 _Posted on November 9, 2026 at 04:56 AM_
 
 Amended for the 2026-11-08 owner decisions (walled corpus, nerdmachines repo home, licence-gated phase 1, NC/ND excluded from paid tiers, EU DSM Art. 4 opt-out). Source: triage-matrix Cluster E; ADR-008 batch on #317.
+
+---
+
+# [Comment #2]() by [gerchowl]()
+
+_Posted on November 18, 2026 at 11:43 AM_
+
+**Decision (owner, 2026-11-18): query embeddings are computed hub-side.**
+
+- The hub embeds the query with the same service definition (model id, revision, quantization, weights hash) that embedded the corpus, so query and document vectors always come from one model. The service-definition hash is recorded in the response's provenance, as for every other tier (ADR-008 §10).
+- Clients send query text, never vectors. No embedding model ships in the client, which keeps clients thin and removes the version skew between client and corpus models.
+- Model choice and throughput get benchmarked on [gpu-server]'s RTX 5090 via `gpu_submit` before the default is fixed. The benchmark picks the default service definition, the same way the T3 bake-off does.
+- The live-API fallthrough (no hub reachable) keeps BM25/keyword search only. It does not embed locally.
+
 

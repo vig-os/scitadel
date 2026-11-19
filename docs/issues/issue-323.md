@@ -2,7 +2,7 @@
 type: issue
 state: open
 created: 2026-11-08T12:20:27Z
-updated: 2026-11-09T04:56:03Z
+updated: 2026-11-18T14:59:34Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/323
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: 311
 children: none
-synced: 2026-11-09T08:50:55.512Z
+synced: 2026-11-19T09:39:00.402Z
 ---
 
 # [Issue 323]: [spike(hub): source triage — coverage, licence, cost and tiering of literature and patent sources](https://github.com/vig-os/scitadel/issues/323)
@@ -188,7 +188,7 @@ Every `.tsra` product carries a licence column at row level (H5 pipeline; one of
 
 _Posted on November 8, 2026 at 12:21 PM_
 
-Re-checked unverified item 10 from vm-dev (2026-11-08): `bulkdata.uspto.gov` does not resolve here either (curl: no response), while `data.uspto.gov`, `api.uspto.gov` and `developer.uspto.gov` do. This is not a network quirk on the research side: the legacy bulk host appears to be retired. Full-text grant and pre-grant XML should be pulled from the Open Data Portal's Bulk Data Directory on `data.uspto.gov` (the same place PVGPATDIS moved to). #314 should target the ODP bulk API, not bulkdata.uspto.gov.
+Re-checked unverified item 10 from [dev-vm] (2026-11-08): `bulkdata.uspto.gov` does not resolve here either (curl: no response), while `data.uspto.gov`, `api.uspto.gov` and `developer.uspto.gov` do. This is not a network quirk on the research side: the legacy bulk host appears to be retired. Full-text grant and pre-grant XML should be pulled from the Open Data Portal's Bulk Data Directory on `data.uspto.gov` (the same place PVGPATDIS moved to). #314 should target the ODP bulk API, not bulkdata.uspto.gov.
 
 ---
 
@@ -277,7 +277,7 @@ Owner decision 2026-11-08: BUILD FIRST on a strictly licence-clean corpus, then 
 **Owner-addendum phase-1 shape (2026-11-08) — folded into the above:**
 - **Structured sources first (T0: cheap, best quality):** PMC OA `oa_comm` packages (JATS tables/MathML + original figure files); arXiv LaTeX SOURCE via bulk S3 for CC-BY/CC0-licensed papers only (verify per-paper licence applies to the source, not just the PDF); bioRxiv/medRxiv bulk JATS + figures for CC-BY items; US patent XML (100% PD); ACL / OAPEN / DOAB / Zenodo CC-BY items. The GPU-heavy extraction (Docling / Marker / math OCR) is reserved for PDF-only items.
 - **Crossref TDM-link harvester:** filter Crossref metadata to CC-BY/CC0 licence URLs and follow the text-mining full-text links politely through scitadel's paced per-publisher buckets (ADR-007). Main non-biomed lever for ETH fields: MDPI, Frontiers, Copernicus, IOP, APS (PRX etc.), Springer Nature OA, IEEE Access, ACS AuthorChoice CC-BY. Verify Crossref exposes `license` + `link[intended-application=text-mining]` and note any publisher terms.
-- **HF as cold store for the licence-clean public corpus:** the full corpus (esp. figure and patent-drawing products) lives on HF and is read by HTTP range (tessera#777); anvil keeps indexes (BM25/ANN/graph), metadata, text blocks and the hot set. Sizing *(estimates)*: ~5–10M licence-clean papers × (text ~8 KB + tables ~5 KB + figures ~200 KB JXL + vectors ~30 KB) ≈ 1–2.5 TB; US patent drawings ≈ 0.5–1.5 TB; this exceeds anvil's 2 TB 990 PRO, hence HF cold + an anvil hot set.
+- **HF as cold store for the licence-clean public corpus:** the full corpus (esp. figure and patent-drawing products) lives on HF and is read by HTTP range (tessera#777); [gpu-server] keeps indexes (BM25/ANN/graph), metadata, text blocks and the hot set. Sizing *(estimates)*: ~5–10M licence-clean papers × (text ~8 KB + tables ~5 KB + figures ~200 KB JXL + vectors ~30 KB) ≈ 1–2.5 TB; US patent drawings ≈ 0.5–1.5 TB; this exceeds [gpu-server]'s 2 TB 990 PRO, hence HF cold + an [gpu-server] hot set.
 - **Embedding levels:** work, section, chunk, figure (Qwen3-VL), table (serialised + caption → text embedding), independent claim, graph node. GPU budget *(estimates)*: ~250M text chunks ≈ 1–2 days on the 5090; ~100M+ figures/drawings with the 2B VL embedder ≈ days–weeks → staged (hot topics first, the rest at `priority=low`).
 
 ### DEFERRED until the ETH Library conversation

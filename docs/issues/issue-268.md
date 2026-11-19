@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-10-02T15:54:53Z
-updated: 2026-11-09T03:51:21Z
+updated: 2026-11-18T11:43:57Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/268
-comments: 3
+comments: 4
 labels: feature, effort:medium, priority:medium, semver:patch
 assignees: none
 milestone: 0.9.0
 projects: none
 parent: none
 children: none
-synced: 2026-11-09T08:51:03.338Z
+synced: 2026-11-19T09:39:05.363Z
 ---
 
 # [Issue 268]: [feat(adapters): E4 — live API contract tests, which are still unimplemented](https://github.com/vig-os/scitadel/issues/268)
@@ -82,5 +82,24 @@ If you pursue the bulk-data route, there’s also a [CC BY 4.0 SQLite snapshot o
 If you find a mismatch between the docs and the responses, let me know here and I’ll look into it.
 
 Disclosure as before: I run PatentRef.
+
+
+---
+
+# [Comment #4]() by [gerchowl]()
+
+_Posted on November 18, 2026 at 11:43 AM_
+
+Thank you, this was genuinely useful.
+
+We went through the Zenodo snapshot (10.5281/zenodo.23250455) in detail. The CC BY 4.0 licence, the separate lapse/maintenance-fee file and the `X-Data-Version` header are all things we want to use. For the hub we're building, the USPTO bulk XML stays our source of record, and we plan an optional PatentRef snapshot adapter alongside it:
+
+- cross-checking our own USPTO parse against yours,
+- filling the gap between USPTO bulk releases, and
+- lapse/maintenance-fee status, which we don't derive ourselves.
+
+Attribution will follow CC BY 4.0, and each imported row will record the snapshot version it came from. If we hit a mismatch between the docs and the data we'll report it here, as you suggested.
+
+Thanks again for the pointers and for being upfront about running PatentRef.
 
 

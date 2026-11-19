@@ -2,7 +2,7 @@
 type: issue
 state: open
 created: 2026-11-08T11:45:56Z
-updated: 2026-11-08T12:05:47Z
+updated: 2026-11-18T14:59:08Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/311
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: none
 children: 313, 314, 315, 316, 318, 319, 320, 321, 322, 323, 324, 325, 326, 327, 328, 329, 330, 331, 332, 333
-synced: 2026-11-09T08:51:00.082Z
+synced: 2026-11-19T09:39:04.870Z
 ---
 
 # [Issue 311]: [feature: scitadel-hub — lab corpus server (OpenAlex + patent corpus on tessera, local BM25/vector/graph retrieval)](https://github.com/vig-os/scitadel/issues/311)
@@ -29,7 +29,7 @@ The design is **ADR-008** (PR #317; status Proposed). This epic tracks the work 
 - **Patents have no working source.** USPTO paused the PatentsView PatentSearch API on 2026-03-20, and `search.patentsview.org` no longer resolves (reported on #268, verified 2026-11-08). USPTO's Open Data Portal API serves application metadata, not full-text patent search. The bulk data is still free.
 - **Keeping up with OpenAlex is the paid part.** The free key is a $1/day budget (list call $0.0001, search call $0.001, single-entity GET free). The "changed since" sync filters and the daily snapshot are Member+ ($10k/year). The quarterly snapshot is free, CC0, ~770 GB of Parquet.
 - **A lab repeats the same queries.** Every member's scitadel hits the same APIs for the same topics. A shared cache answers from local data and turns search from rate-limited API calls into local queries.
-- **The hardware is next to it.** anvil's RTX 5090 (via `gpu_submit`) can embed a whole corpus in a batch job; System One models (Clef/Kev, #246) can score thousands of candidates per query.
+- **The hardware is next to it.** [gpu-server]'s RTX 5090 (via `gpu_submit`) can embed a whole corpus in a batch job; System One models (Clef/Kev, #246) can score thousands of candidates per query.
 
 ## Work
 
@@ -51,7 +51,7 @@ The design is **ADR-008** (PR #317; status Proposed). This epic tracks the work 
   - W3: #776 (graph edges + CSR cache).
   - Gap issues filed for the hub: #779 (media-typed binary columns for figure bytes), #780 (declared keys / keyed references, work_id → product index; W1), #781 (keyed delta products; W2), #782 (pipeline + per-row provenance, external inputs not held; W1).
   - The caches depend on ADR-0054 (tessera#365, still Proposed).
-- **g-fleet** — gerchowl/g-fleet#1121: S3-compatible research-data store (versitygw) plus read-only POSIX for GPU jobs. Capacity: anvil's only documented drive is a 2 TB 990 PRO.
+- **[fleet-config-repo]** — [fleet-config-repo]#1121: S3-compatible research-data store (versitygw) plus read-only POSIX for GPU jobs. Capacity: [gpu-server]'s only documented drive is a 2 TB 990 PRO.
 
 ### Stopgap already in flight
 - The PatentsView adapter moves to the PatentRef-compatible endpoint (#268 thread). Best-effort only: a third-party free beta.

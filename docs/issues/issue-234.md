@@ -2,7 +2,7 @@
 type: issue
 state: open
 created: 2026-09-28T23:14:14Z
-updated: 2026-09-30T00:07:24Z
+updated: 2026-11-18T14:59:15Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/234
@@ -12,8 +12,8 @@ assignees: none
 milestone: none
 projects: none
 parent: none
-children: none
-synced: 2026-09-30T07:41:26.150Z
+children: 254, 296, 294, 257, 288, 289
+synced: 2026-11-19T09:39:06.179Z
 ---
 
 # [Issue 234]: [feature: corpus acquisition: per-work artefact manifest (full text + SI + structured tables), Europe PMC/JATS + OSTI routes, batch acquire with coverage report and grouped action list](https://github.com/vig-os/scitadel/issues/234)
@@ -146,7 +146,7 @@ The identifier is `{doi | pmcid | osti_id | isbn | report_number | url}`. Works 
 
 ## Additional Context
 
-- **Consumer:** raid (`github.com/gerchowl/raid`), whose first priority as of 2026-09-28 is a publication-acquisition campaign: an inventory of every source and candidate paper with per-artefact status, fetching everything reachable without a human, then one grouped user-action list, then curation with blind re-extraction per paper. raid will retire `tools/fetch/fulltext.py` once scitadel covers routes 2–7.
+- **Consumer:** raid (`github.com/[private-repo]`), whose first priority as of 2026-09-28 is a publication-acquisition campaign: an inventory of every source and candidate paper with per-artefact status, fetching everything reachable without a human, then one grouped user-action list, then curation with blind re-extraction per paper. raid will retire `tools/fetch/fulltext.py` once scitadel covers routes 2–7.
 - **raid pacing baseline for publisher hosts:** ≥20 s per paper, one tab, queued DOIs only, never crawl, never evade rate limits.
 - **Related:** #230 (paywall access ladder, session broker, TUI queue), #112 (download state persisted), #50 (institutional-access hint).
 - **Code touchpoints:**

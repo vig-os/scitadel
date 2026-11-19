@@ -2,7 +2,7 @@
 type: issue
 state: closed
 created: 2026-11-09T03:21:50Z
-updated: 2026-11-09T03:50:32Z
+updated: 2026-11-18T14:59:44Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/326
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: 311
 children: none
-synced: 2026-11-09T08:50:54.154Z
+synced: 2026-11-19T09:38:59.864Z
 ---
 
 # [Issue 326]: [feat(cloud): H14 — accounts, tiers and metering (grounded-query value metric)](https://github.com/vig-os/scitadel/issues/326)
@@ -44,5 +44,5 @@ H13, H0 (#313); the extraction trigger of ADR-008 §1.
 
 _Posted on November 9, 2026 at 03:50 AM_
 
-Moved to https://github.com/nerdmachines/scitadel-cloud/issues/1, the private repo for this work (ADR-008 §1). Tracked there from now on.
+Moved to [private-repo link] the private repo for this work (ADR-008 §1). Tracked there from now on.
 

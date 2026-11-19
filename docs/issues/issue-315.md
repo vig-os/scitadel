@@ -2,7 +2,7 @@
 type: issue
 state: open
 created: 2026-11-08T11:46:56Z
-updated: 2026-11-08T11:49:58Z
+updated: 2026-11-18T14:58:59Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/315
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: 311
 children: none
-synced: 2026-11-09T08:50:58.687Z
+synced: 2026-11-19T09:39:03.484Z
 ---
 
 # [Issue 315]: [feat(hub): H2 — OpenAlex lab mirror: snapshot subset, publication-date subscriptions, rolling refresh on the free key](https://github.com/vig-os/scitadel/issues/315)
@@ -26,7 +26,7 @@ A lab asks OpenAlex the same questions over and over, through each member's scit
 
 ## Proposal
 
-**Base:** the quarterly public snapshot (`s3://openalex/data/parquet/`, no sign-in), filtered to a **subset** of works: by topic/field/subfield, by institution (the lab's own), by source, or by the citation neighbourhood of the lab's libraries. Estimate: 5–50 GB per subset. A full mirror is **not** a goal: works alone are hundreds of GB, and sealed in tessera before #628 is fixed an estimated ~2.5 TB, which does not fit anvil's 2 TB drive.
+**Base:** the quarterly public snapshot (`s3://openalex/data/parquet/`, no sign-in), filtered to a **subset** of works: by topic/field/subfield, by institution (the lab's own), by source, or by the citation neighbourhood of the lab's libraries. Estimate: 5–50 GB per subset. A full mirror is **not** a goal: works alone are hundreds of GB, and sealed in tessera before #628 is fixed an estimated ~2.5 TB, which does not fit [gpu-server]'s 2 TB drive.
 
 **Daily jobs on one free key ($1/day = 10,000 list calls):**
 1. **Subscriptions.** Per topic/author/institution/source subscription, a list query with `from_publication_date` = last run minus a lookback window (default 90 days), `per_page=100`, cursor paging. Even every new work in OpenAlex is an estimated few hundred calls a day (~$0.05); a realistic lab subscription set costs under $0.01.
@@ -52,5 +52,5 @@ Each daily run writes a new delta product; each quarterly snapshot writes a new 
 
 ## Dependencies
 
-- H0 (repo). tessera#778 W0 (especially #628) and W1 for sealed products and bounded-memory queries; internal Parquet staging first is fine (never published). gerchowl/g-fleet#1121 for storage. Note an OpenAlex `per_page` bug in scitadel's adapter (asks for 200; the documented max is 100), being fixed in a separate PR.
+- H0 (repo). tessera#778 W0 (especially #628) and W1 for sealed products and bounded-memory queries; internal Parquet staging first is fine (never published). [fleet-config-repo]#1121 for storage. Note an OpenAlex `per_page` bug in scitadel's adapter (asks for 200; the documented max is 100), being fixed in a separate PR.
 

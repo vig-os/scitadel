@@ -2,7 +2,7 @@
 type: issue
 state: closed
 created: 2026-10-02T12:20:49Z
-updated: 2026-10-09T21:31:14Z
+updated: 2026-11-18T14:59:12Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/260
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-10-10T07:53:25.505Z
+synced: 2026-11-19T09:39:05.779Z
 ---
 
 # [Issue 260]: [fix(acquire): preprint and publisher-direct OA routes are missing — 52 free papers reported unreachable (bioRxiv 3/3 missed)](https://github.com/vig-os/scitadel/issues/260)
@@ -55,7 +55,7 @@ The same root cause hits open-access journals that are free or partly free: in t
 ## Related
 
 - #252 (work/artefact model), #253 (OA routes), #254 (tier-4 session capture). This is the measured gap in #253's scope: OpenAlex-only OA resolution.
-- Consumer context: raid's own ladder is `tools/fetch/fulltext.py` in gerchowl/raid; the run above is reproducible from it.
+- Consumer context: raid's own ladder is `tools/fetch/fulltext.py` in [private-repo]; the run above is reproducible from it.
 ---
 
 # [Comment #1]() by [gerchowl]()

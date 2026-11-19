@@ -2,7 +2,7 @@
 type: issue
 state: open
 created: 2026-11-08T12:08:15Z
-updated: 2026-11-08T12:08:15Z
+updated: 2026-11-18T14:58:43Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/322
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: 311
 children: none
-synced: 2026-11-09T08:50:55.928Z
+synced: 2026-11-19T09:39:00.994Z
 ---
 
 # [Issue 322]: [feat(hub): H8 — worldwide patent corpus: DOCDB/INPADOC families, multilingual full text, claims, patent↔paper bridge](https://github.com/vig-os/scitadel/issues/322)
@@ -50,7 +50,7 @@ H1 (#314) is US-only: USPTO grants and PatentsView tables, 1976+. Worldwide fili
 
 - **T0** structured parse (office XMLs, DOCDB/INPADOC bibliographic) into the hub's document model (#319).
 - **Tools** and **System One** tiers for enrichment.
-- **Qwen VL on sage** for figures.
+- **Qwen VL on [mac-studio]** for figures.
 - **Opus (T4)** only where the licence permits, per office and per source.
 - Random-sample QC on every batch; the golden set (#321) gets a worldwide patent stratum: CN/JP/KR/DE grants, utility models, chemistry-heavy, many-claims and drawings-heavy patents.
 

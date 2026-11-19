@@ -2,7 +2,7 @@
 type: issue
 state: closed
 created: 2026-11-09T03:21:56Z
-updated: 2026-11-09T03:50:40Z
+updated: 2026-11-18T14:59:50Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/328
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: 311
 children: none
-synced: 2026-11-09T08:50:53.223Z
+synced: 2026-11-19T09:38:58.657Z
 ---
 
 # [Issue 328]: [feat(deploy): H16 — on-prem packaging: NixOS module, OCI image, Helm chart (private deploy repo)](https://github.com/vig-os/scitadel/issues/328)
@@ -43,5 +43,5 @@ H0 (#313); the stage-0 hub running.
 
 _Posted on November 9, 2026 at 03:50 AM_
 
-Moved to https://github.com/nerdmachines/scitadel-hub-deploy/issues/2, the private repo for this work (ADR-008 §1). Tracked there from now on.
+Moved to [private-repo link] the private repo for this work (ADR-008 §1). Tracked there from now on.
 

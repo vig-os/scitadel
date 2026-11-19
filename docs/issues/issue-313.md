@@ -2,7 +2,7 @@
 type: issue
 state: open
 created: 2026-11-08T11:46:53Z
-updated: 2026-11-09T04:55:58Z
+updated: 2026-11-18T14:59:53Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/313
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: 311
 children: none
-synced: 2026-11-09T08:50:59.644Z
+synced: 2026-11-19T09:39:04.525Z
 ---
 
 # [Issue 313]: [chore(repo): H0 — split off nerdmachines/scitadel-hub once ADR-008 is accepted](https://github.com/vig-os/scitadel/issues/313)
@@ -22,7 +22,7 @@ Part of #311. Design: ADR-008 (Proposed), PR #317.
 
 ## Motivation
 
-The lab corpus server needs heavy, slow-building dependencies (tessera, Vortex, DataFusion, tantivy, an embedding runtime). It runs on a server (anvil), with GPU batch jobs and its own release cadence. scitadel itself is a laptop client (CLI, MCP, TUI, GUI) with a fast CI and the devkit release train. Putting the hub into this workspace behind cargo features would push those dependencies into every client build, CI run and `cargo install`, and couple two release cycles that have nothing to do with each other.
+The lab corpus server needs heavy, slow-building dependencies (tessera, Vortex, DataFusion, tantivy, an embedding runtime). It runs on a server ([gpu-server]), with GPU batch jobs and its own release cadence. scitadel itself is a laptop client (CLI, MCP, TUI, GUI) with a fast CI and the devkit release train. Putting the hub into this workspace behind cargo features would push those dependencies into every client build, CI run and `cargo install`, and couple two release cycles that have nothing to do with each other.
 
 ## Proposal
 
@@ -32,8 +32,8 @@ The owner decided the repo topology on 2026-11-08 and the repo home on 2026-11-0
 |---|---|---|---|
 | `vig-os/scitadel` (this repo) | public | MIT OR Apache-2.0 | the client, plus the protocol crate `scitadel-hub-proto` |
 | [`nerdmachines/scitadel-hub`](https://github.com/nerdmachines/scitadel-hub) | public | `AGPL-3.0-only OR LicenseRef-scitadel-Commercial` | the hub server source |
-| `nerdmachines/scitadel-hub-deploy` | **private** | proprietary | NixOS module, OCI images, Helm chart. It is deliberate friction for other admins: on-prem comes via the commercial licence or support. |
-| `nerdmachines/scitadel-cloud` | **private** | proprietary | hosted-offering and business docs |
+| `[private-repo]` | **private** | proprietary | NixOS module, OCI images, Helm chart. It is deliberate friction for other admins: on-prem comes via the commercial licence or support. |
+| `[private-repo]` | **private** | proprietary | hosted-offering and business docs |
 
 The hub repos live under `nerdmachines`, not `vig-os`, so vig-os/org-config otterdog doesn't apply to them. Issues can't move across owners, so hub-side work is filed directly in the nerdmachines repos.
 
@@ -45,7 +45,7 @@ The hub repos live under `nerdmachines`, not `vig-os`, so vig-os/org-config otte
 ## Acceptance
 
 - [x] `nerdmachines/scitadel-hub` exists (default branch `dev`) with the dual-licence files, a README and CONTRIBUTING.md.
-- [x] `nerdmachines/scitadel-hub-deploy` and `nerdmachines/scitadel-cloud` exist and are private.
+- [x] `[private-repo]` and `[private-repo]` exist and are private.
 - [ ] ADR-008 is Accepted.
 - [ ] The hub's trace gate CI is green on `dev` (nerdmachines/scitadel-hub#2).
 - [ ] `scitadel-hub-proto` exists in this repo and is published (or path/git-pinned), so that H3 can build against it.
@@ -63,8 +63,8 @@ _Posted on November 9, 2026 at 03:51 AM_
 
 The repos exist as scaffolds (licence, README, CONTRIBUTING), created 2026-11-09 under the owner's `nerdmachines` org. That supersedes `vig-os/scitadel-hub` in this issue's title:
 - https://github.com/nerdmachines/scitadel-hub (public, `AGPL-3.0-only OR LicenseRef-scitadel-Commercial`);
-- nerdmachines/scitadel-hub-deploy (private);
-- nerdmachines/scitadel-cloud (private).
+- [private-repo] (private);
+- [private-repo] (private).
 
 Code still lands only after ADR-008 is Accepted. The protocol crate stays in vig-os/scitadel under MIT/Apache.
 

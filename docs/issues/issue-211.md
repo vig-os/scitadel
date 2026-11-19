@@ -2,7 +2,7 @@
 type: issue
 state: closed
 created: 2026-09-23T16:43:44Z
-updated: 2026-11-09T03:51:29Z
+updated: 2026-11-18T14:59:18Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/211
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-11-09T08:51:07.870Z
+synced: 2026-11-19T09:39:06.672Z
 ---
 
 # [Issue 211]: [idea: non-generative relevance scoring — calibrated/reranker scores for ordering, generation only for the shortlist](https://github.com/vig-os/scitadel/issues/211)
@@ -100,8 +100,8 @@ question (separate `ScorerBackend` trait? optional `reasoning: Option<String>`?)
 and probably the first thing to decide.
 
 Local builds exist for both fleet boxes, so nothing need leave the network:
-- sage (MLX): `vserifsaglam/Qwen3-Reranker-4B-4bit-MLX`, `kerncore/Qwen3-Reranker-0.6B-MLX-4bit`
-- anvil (GGUF): `dean2155/Qwen3-Reranker-0.6B-Q8_0-GGUF`, `prithivMLmods/Qwen3-Reranker-4B-F32-GGUF`
+- [mac-studio] (MLX): `vserifsaglam/Qwen3-Reranker-4B-4bit-MLX`, `kerncore/Qwen3-Reranker-0.6B-MLX-4bit`
+- [gpu-server] (GGUF): `dean2155/Qwen3-Reranker-0.6B-Q8_0-GGUF`, `prithivMLmods/Qwen3-Reranker-4B-F32-GGUF`
 
 Privacy is a weaker constraint here than for the mail index — abstracts are
 public — but research *questions* and annotations are not necessarily, and

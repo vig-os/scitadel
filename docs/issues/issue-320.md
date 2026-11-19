@@ -2,7 +2,7 @@
 type: issue
 state: open
 created: 2026-11-08T12:02:12Z
-updated: 2026-11-08T12:05:15Z
+updated: 2026-11-18T14:58:46Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/320
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: 311
 children: none
-synced: 2026-11-09T08:50:56.875Z
+synced: 2026-11-19T09:39:01.514Z
 ---
 
 # [Issue 320]: [feat(hub): H6 — base + delta lifecycle: tombstones, newest-wins reads, compaction, retention (OpenAlex + patents)](https://github.com/vig-os/scitadel/issues/320)
@@ -48,21 +48,21 @@ H2 (OpenAlex) and H1 (patents) both produce a stream of releases: a quarterly sn
 - Every compaction output is a new sealed product.
 
 **Retention.**
-- Hub data lives in its own versitygw bucket (g-fleet#1121), with an explicit policy. Default: keep the last 2 bases and their deltas.
-- The fleet's add-only rule for `/srv/anvil` covers research data written by GPU jobs. The hub's working copy is a rebuildable mirror of the bucket, and expiring a generation follows the bucket's retention policy, never an ad-hoc delete.
-- Reconciling the two rules is part of this issue, agreed in g-fleet#1121.
+- Hub data lives in its own versitygw bucket ([fleet-config-repo]#1121), with an explicit policy. Default: keep the last 2 bases and their deltas.
+- The fleet's add-only rule for `/srv/[gpu-server]` covers research data written by GPU jobs. The hub's working copy is a rebuildable mirror of the bucket, and expiring a generation follows the bucket's retention policy, never an ad-hoc delete.
+- Reconciling the two rules is part of this issue, agreed in [fleet-config-repo]#1121.
 
-**Size blocker.** tessera#628: string-heavy tables seal about 3× larger than Parquet. The architect triaged it as a format decision (a determinism test on ksb, then an ADR). Until it lands, sealed bases are estimated at about 3× the size of their Parquet equivalent.
+**Size blocker.** tessera#628: string-heavy tables seal about 3× larger than Parquet. The architect triaged it as a format decision (a determinism test on [batch-host], then an ADR). Until it lands, sealed bases are estimated at about 3× the size of their Parquet equivalent.
 
 ## Acceptance
 
 - [ ] A base plus three deltas (including a merge and a deletion) reads as one logical table with newest-wins and tombstones applied; this is tested.
 - [ ] A hybrid search over base plus deltas never returns a superseded or tombstoned row; this is tested.
 - [ ] Compaction produces a new base whose logical content equals base plus deltas, and `current` moves atomically.
-- [ ] The retention policy is written down, enforced by the bucket or by a job, and agreed in g-fleet#1121.
+- [ ] The retention policy is written down, enforced by the bucket or by a job, and agreed in [fleet-config-repo]#1121.
 - [ ] The same mechanism serves OpenAlex (daily deltas) and patents (weekly deltas).
 
 ## Dependencies
 
-H0; H5 (block schema); H1 (#314) and H2 (#315) as producers; tessera#781 (keyed delta products: upsert / tombstone / redirect, newest-wins read, compaction, retention), tessera#780 (keyed references); tessera ADR-0033/0049/0064 (collections, numbered leaves); gerchowl/g-fleet#1121.
+H0; H5 (block schema); H1 (#314) and H2 (#315) as producers; tessera#781 (keyed delta products: upsert / tombstone / redirect, newest-wins read, compaction, retention), tessera#780 (keyed references); tessera ADR-0033/0049/0064 (collections, numbered leaves); [fleet-config-repo]#1121.
 
