@@ -130,9 +130,10 @@ a permissive licence — fall out of that target.
     tiers T1 and T3, bulk embedding, figure descriptions and
     re-embedding after a model upgrade go to the 5090 through
     `gpu_submit`; filters, BM25, ANN search, graph hops and fusion
-    serve from CPU and NVMe. Query embedding is client-side by
-    default; the hub advertises the exact embedding model and rejects
-    mismatched query vectors.
+    serve from CPU and NVMe. Query embedding happens in the hub
+    (owner, 2026-11-18; scitadel-hub D-009, SYS-071): clients send
+    query text, and the hub embeds it with the service definition that
+    matches the target index generation, or refuses.
 15. **Build first on a strictly licence-clean corpus** (§15). Phase 1
     ingests only content that is CC0, CC-BY or public-domain per
     item, and whose access terms allow bulk harvest. The corpus is
@@ -441,11 +442,11 @@ verified). The hub computes embeddings only for works they miss.
 
 | Call | Input | Output |
 |---|---|---|
-| `search` | query text **or** a client-supplied query vector (tagged with embedding model id, version and dims), filters, mode (`bm25` / `vector` / `hybrid`), limit | Snippet-only candidates (IDs, scores, snippets, provenance), each with the mode that produced it, plus a search-level `reranked: bool` |
+| `search` | query text (the hub embeds it; clients never send query vectors), filters, mode (`bm25` / `vector` / `hybrid`), limit | Snippet-only candidates (IDs, scores, snippets, provenance), each with the mode that produced it, plus a search-level `reranked: bool` |
 | `get` | Up to 100 IDs | Records |
 | `neighbours` | ID, edge kind, depth | Graph neighbours |
 | `coverage` | — | Which sources, subsets and product versions the hub holds — a client reads this to decide when to fall through to a live API |
-| `capabilities` | — (optionally an index id) | Per index: embedding model id, version, output dims, Matryoshka truncation applied, BM25 analyzer configuration, and the available rerankers — a client reads this to decide whether to send a query vector or fall back to text (#316) |
+| `capabilities` | — (optionally an index id) | Per index: embedding model id, version, output dims, Matryoshka truncation applied, BM25 analyzer configuration, and the available rerankers — a client reads this to embed a detached subset locally with the same model, and to explain results (#316) |
 
 - **Two separate advertisements.** `coverage` says *what the hub
   holds*; `capabilities` says *how each index is built*. They change
@@ -460,11 +461,12 @@ verified). The hub computes embeddings only for works they miss.
 - **Fallback:** the client asks the hub only for what `coverage`
   covers, and falls through to the live API on a miss, an error, or a
   bounded timeout. Every result records `answered_by: hub | <source>`.
-- **Model mismatch is explicit.** A client-supplied query vector
-  whose declared model id, version or dims do not match the target
-  index's `capabilities` response is rejected with an explicit
-  protocol error — the hub never silently re-embeds it under the
-  wrong model (§14).
+- **Model identity is explicit.** The hub embeds query text with the
+  service definition whose embedding-space identity (model id,
+  revision, quantization, dims, truncation) matches the target index
+  generation. If no such definition is active, it refuses with an
+  explicit protocol error rather than embedding under the wrong model
+  (§14). Without a hub, clients fall through to BM25 or a live API.
 - **Transport:** HTTP+JSON first. The types do not assume it.
 
 ## 8 · Infrastructure — staged
@@ -906,7 +908,7 @@ tail latency.
 |---|---|---|
 | Filters / metadata (DataFusion over tessera) | Hub, CPU + NVMe | ms to tens of ms |
 | BM25 (tantivy) | Hub, CPU | <50 ms at 10⁸ docs |
-| Query embedding | Client or hub, CPU | ~10–50 ms with a small text model (e.g. `Qwen3-Embedding-0.6B`); ~0.2–1 s for the 2B VL embedder on a laptop CPU |
+| Query embedding | Hub (CPU, or GPU per its service definition) | ~10–50 ms with a small text model (e.g. `Qwen3-Embedding-0.6B`); ~0.2–1 s for the 2B VL embedder on a laptop CPU |
 | ANN search | Hub, CPU + RAM or NVMe | ms |
 | RRF fusion, filters, graph hops | Hub, CPU | ms |
 | Rerank of the top 50 (`Qwen3-VL-Reranker`) | Optional; hub GPU queue or sage | ~0.1–0.5 s on GPU |
@@ -923,21 +925,22 @@ IDs, scores and snippets. Bytes flow only on `open` or `detach`
 (§12), so a search round-trip stays small even for a long
 shortlist.
 
-**Client-side query embedding is the default.** It offloads the
-hub, works offline against detached subsets (§9, §12), and keeps
-the exact Matryoshka truncation the index was built with. The hub's
+**Query embedding happens in the hub** (amended 2026-11-19 to match
+the owner decision of 2026-11-18, scitadel-hub D-009 and SYS-071;
+the placement is benchmarked on anvil's RTX 5090). Clients send query
+text only. This keeps one embedder identity per index generation, with
+no client coupling to model versions. Detached subsets (§9, §12) are
+searched locally by the client with the model the subset's
+`capabilities` names. The hub's
 **`capabilities` response** (§7, #316) advertises, per index: the
 embedding model id, version, output dims, Matryoshka truncation
 applied, the BM25 analyzer configuration, and the available
 rerankers. (`coverage` is a separate call that lists what the hub
 holds, not how each index is built — they change at different
-cadences and clients cache them independently.) The hub **rejects a
-query vector whose declared model id, version or dims do not match
-the target index** with an explicit error, rather than embedding it
-under the wrong model and silently degrading recall. Hub-side query
-embedding (text in, hub embeds) remains a fallback for thin clients
-and for the window between an index re-embedding and a client
-refresh.
+cadences and clients cache them independently.) The hub **refuses a
+query when no active embedder matches the target index's
+embedding-space identity**, with an explicit error, rather than
+embedding under the wrong model and silently degrading recall.
 
 **Hub sizing** *(estimates)*. A 50M-chunk corpus at 512-d fp16 is
 about 51 GB of raw vectors — resident in RAM on a sized box, or
@@ -1457,13 +1460,11 @@ product. The only use that remains is the CC0
   box has must fall back to an on-disk ANN (IVF-PQ or DiskANN-style),
   paying tens of ms per probe rather than the RAM path's ms.
   The 51 GB raw-vectors estimate is a ceiling, not a floor.
-- Client-side query embedding couples the client to the hub's
-  embedding-model identity, version and output dims. The
-  `capabilities` advertisement (§7) plus the hub's explicit mismatch
-  rejection keeps that coupling safe, but a client that cannot run
-  the current embedder (thin clients, old builds, a window after a
-  hub re-embedding) has to fall back to hub-side embedding and pays
-  the hub's CPU for it.
+- Hub-side query embedding puts every query's embedding cost on the
+  hub (CPU, or the GPU per the service definition). That is the price
+  of one embedder identity per index generation and of thin clients;
+  its placement is benchmarked on anvil's RTX 5090 (scitadel-hub
+  SYS-071).
 
 ## Open questions for the owner
 
