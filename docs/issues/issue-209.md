@@ -2,7 +2,7 @@
 type: issue
 state: closed
 created: 2026-08-07T13:06:14Z
-updated: 2026-09-28T12:38:19Z
+updated: 2026-11-19T19:08:03Z
 author: c-vigo
 author_url: https://github.com/c-vigo
 url: https://github.com/vig-os/scitadel/issues/209
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-09-29T07:39:26.956Z
+synced: 2026-11-20T09:23:19.538Z
 ---
 
 # [Issue 209]: [chore(ci): bump devkit to 1.6.0 and migrate release-bot to client-id](https://github.com/vig-os/scitadel/issues/209)
@@ -112,7 +112,7 @@ under an existing tracker being re-scoped separately.
 ## Migration principle
 
 *No numeric `*_APP_ID` secret or variable is deleted while any pinned workflow
-still references it.* Cautionary precedent — `exo-pet/playground-carlos`'s
+still references it.* Cautionary precedent — `[private-repo]`'s
 sync-issues job broke **silently for a week** when `COMMIT_APP_ID` was
 unavailable: it kept reporting success while syncing nothing. The
 `if: vars.… != ''` gate here has exactly the same failure mode — a missing
