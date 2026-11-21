@@ -616,10 +616,8 @@ pub async fn download_paper_tool(
         // #289: the DOI-only path now records. `download_by_doi` resolves the
         // DOI to a `papers` row (or mints a minimal one) before fetching
         // through the same ladder, so the library sees every byte we fetched.
-        let openalex =
-            scitadel_adapters::openalex::OpenAlexAdapter::new(config.openalex.auth(), 30.0);
         downloader
-            .download_by_doi(&openalex, d, &out_dir)
+            .download_by_doi(d, &out_dir)
             .await
             .map_err(|e| e.to_string())?
             .result

@@ -535,8 +535,12 @@ impl PaperDownloader {
     /// 1. an existing `papers` row that already carries this DOI, so a
     ///    re-download writes against the row the user already knows;
     /// 2. a **minimal** row — DOI, and an **empty** title — minted when no
-    ///    row exists yet. The title, year and first author are backfilled
-    ///    after the fetch from the plan's `identity.resolved`, which carries
+    ///    row exists yet. The record is backfilled after the fetch from the
+    ///    metadata pass's own result. An OpenAlex hit lands the whole
+    ///    `/works` body (every author, the journal, the abstract, the
+    ///    OpenAlex id — carried on
+    ///    [`crate::resolve::Resolution::openalex_work`]); an OpenAlex miss
+    ///    falls back to the chain's three-field identity, which carries
     ///    ADR-007 §3's chain answer (the first registry in
     ///    `identity_chain::CHAIN` that named the work). An empty title at
     ///    fetch time is what the pre-fetch identity check honestly reports as
@@ -566,7 +570,6 @@ impl PaperDownloader {
     ///   identity gate, or the `record_download` transaction.
     pub async fn download_by_doi(
         &self,
-        _openalex: &crate::openalex::OpenAlexAdapter,
         doi: &str,
         output_dir: &Path,
     ) -> Result<DownloadByDoiReport, AdapterError> {
@@ -607,13 +610,14 @@ impl PaperDownloader {
             self.download_paper_with_plan(&paper, output_dir).await;
         match result {
             Ok(result) => {
-                // Backfill the minted row's title / year / first author from
-                // the metadata pass's resolved identity — the same ADR-007 §3
-                // chain answer the (now-removed) pre-fetch identity walk used
-                // to supply, read out of the pass's own result instead of a
-                // second round of hops. Only the row this call just minted
-                // is touched (an existing row keeps its stored metadata), and
-                // only when at least one registry answered.
+                // Backfill the minted row from the metadata pass's own
+                // result, read out of the pass instead of a second round of
+                // hops. An OpenAlex hit lands the whole `/works` record
+                // (every author, journal, abstract, openalex_id), which is
+                // the metadata the (now-removed) pre-fetch `fetch_paper_by_doi`
+                // used to supply; an OpenAlex miss falls back to the chain's
+                // three-field identity. Only the row this call just minted
+                // is touched (an existing row keeps its stored metadata).
                 let paper = if minted {
                     self.backfill_minted_identity(paper, &plan)
                 } else {
@@ -639,22 +643,34 @@ impl PaperDownloader {
         }
     }
 
-    /// Write the chain answer's title / year / first author onto a minimal
-    /// `papers` row [`Self::download_by_doi`] minted for a DOI OpenAlex did
-    /// not register.
+    /// Write the registry answer onto a minimal `papers` row
+    /// [`Self::download_by_doi`] minted for a DOI no row existed for.
     ///
-    /// Reads the identity off the metadata pass's result (`plan.identity`),
-    /// so `download_by_doi` does **not** need to ask Crossref or DataCite a
-    /// second time just to seed the row — the pass already asked them, and
-    /// its resolved identity is the same ADR-007 §3 chain answer the
-    /// pre-#339-review walk used to supply.
+    /// Reads the metadata pass's own result rather than re-asking any
+    /// registry — the pass already made the one OpenAlex, Crossref and
+    /// DataCite hop apiece, and
+    /// `download_by_doi_asks_each_registry_at_most_once` pins that count.
+    ///
+    /// **OpenAlex hit.** The pass carries the full `/works` body on
+    /// [`crate::resolve::Resolution::openalex_work`], so a DOI OpenAlex
+    /// knows lands the whole record on the row — every author in OpenAlex's
+    /// order, the journal, the abstract reconstructed from the inverted
+    /// index, the OpenAlex id and the URL — the shape the pre-#339-review
+    /// `fetch_paper_by_doi` backfill used to supply. The row's `id` stays
+    /// whatever `download_by_doi` minted it with, because the `artefacts`
+    /// row written by the recording ladder already points at that id.
+    ///
+    /// **OpenAlex miss.** Falls back to the chain's three-field identity
+    /// (`plan.identity.resolved`) — the same Crossref or DataCite answer
+    /// the pre-#339-review walk used to supply. Title, year and first
+    /// author only, because that is all a `ChainOutcome` carries.
     ///
     /// Best-effort: a save failure is reported in the trace rather than
     /// bubbled up, because the fetch succeeded and the artefact is on disk —
     /// an empty title in the row is the observable cost of the trace, not a
     /// reason to refuse the caller the download that just landed. The
     /// returned `Paper` is what the `DownloadByDoiReport` names so the CLI
-    /// / MCP output reflects the registered title even if the save failed.
+    /// / MCP output reflects the registered record even if the save failed.
     fn backfill_minted_identity(
         &self,
         mut paper: Paper,
@@ -663,6 +679,41 @@ impl PaperDownloader {
         use scitadel_core::ports::PaperRepository as _;
         use scitadel_core::untrusted::UntrustedText;
 
+        // 1. OpenAlex: the whole record, read off the body the pass already
+        //    fetched (`work_to_paper` is the same shared decoder every other
+        //    OpenAlex caller uses, so the fields the row ends up with are the
+        //    same ones a `scitadel acquire` would land).
+        if let Some(body) = plan.openalex_work.as_ref() {
+            let from_openalex = crate::openalex::work_to_paper(body);
+            // The id and the DOI stay the ones `download_by_doi` minted the
+            // row with: the `artefacts` row the recording ladder just wrote
+            // names *this* id, and a `papers.id` swap here would orphan it.
+            // The DOI is the same one `download_by_doi` normalised, so there
+            // is no fact to overwrite either. Every other field is OpenAlex's,
+            // including an empty `title` or empty author list — if OpenAlex
+            // sent them empty, the row reflects that honestly rather than
+            // inventing a placeholder.
+            paper.title = from_openalex.title;
+            paper.authors = from_openalex.authors;
+            paper.r#abstract = from_openalex.r#abstract;
+            paper.openalex_id = from_openalex.openalex_id;
+            paper.pubmed_id = from_openalex.pubmed_id;
+            paper.year = from_openalex.year;
+            paper.journal = from_openalex.journal;
+            paper.url = from_openalex.url;
+            let (paper_repo, _, _, _, _) = self.db.repositories();
+            if let Err(e) = paper_repo.save(&paper) {
+                tracing::warn!(
+                    paper_id = %paper.id,
+                    error = %e,
+                    "could not backfill the minted row from the OpenAlex /works body"
+                );
+            }
+            return paper;
+        }
+
+        // 2. OpenAlex miss: Crossref or DataCite still supply title / year /
+        //    first author, as before.
         let Some(answer) = plan.identity.resolved.as_ref() else {
             return paper;
         };
@@ -3176,10 +3227,11 @@ mod tests {
         /// Like [`Self::requests_to`], but the URL is percent-decoded before
         /// the match — so a request whose inner `/` was encoded as `%2F` by
         /// `Url::path_segments_mut()` counts the same as one that kept the
-        /// raw slash. The `download_by_doi` path sends OpenAlex both shapes
-        /// (the `fetch_paper_by_doi` helper keeps the slash; the metadata
-        /// pass encodes it), and a matcher that only saw one form read "two
-        /// hops" as "one". See `download_by_doi_asks_each_registry_at_most_once`.
+        /// raw slash. The metadata pass is the single OpenAlex caller on the
+        /// DOI-only path and it encodes the slash, but adjacent legs (the
+        /// preprint transform, the record's own URL) keep it raw, so a
+        /// matcher that only saw one encoding would miscount cross-leg
+        /// traffic. See `download_by_doi_asks_each_registry_at_most_once`.
         async fn requests_to_decoded(&self, needle: &str) -> Vec<String> {
             self.requests()
                 .await
@@ -5940,11 +5992,9 @@ mod tests {
         fx.serve_pdf("/content/10.1101/2025.06.14.659707v1.full.pdf")
             .await;
 
-        let openalex = crate::openalex::OpenAlexAdapter::new(Fixture::auth(), 10.0)
-            .with_base_url(format!("{}/works", fx.server.uri()));
         let report = fx
             .downloader()
-            .download_by_doi(&openalex, doi, &fx.papers_dir())
+            .download_by_doi(doi, &fx.papers_dir())
             .await
             .expect("the DOI-only path records against a minimal row");
 
@@ -6039,11 +6089,9 @@ mod tests {
             fx.miss(&miss).await;
         }
 
-        let openalex = crate::openalex::OpenAlexAdapter::new(Fixture::auth(), 10.0)
-            .with_base_url(format!("{}/works", fx.server.uri()));
         let err = fx
             .downloader()
-            .download_by_doi(&openalex, doi, &fx.papers_dir())
+            .download_by_doi(doi, &fx.papers_dir())
             .await
             .expect_err("every leg misses, so no bytes arrive");
         assert!(
@@ -6094,11 +6142,9 @@ mod tests {
         let existing = save(&fx, "p-known", Some(doi), None, None, None);
         fx.serve_pdf(&format!("/content/{doi}v1.full.pdf")).await;
 
-        let openalex = crate::openalex::OpenAlexAdapter::new(Fixture::auth(), 10.0)
-            .with_base_url(format!("{}/works", fx.server.uri()));
         let report = fx
             .downloader()
-            .download_by_doi(&openalex, doi, &fx.papers_dir())
+            .download_by_doi(doi, &fx.papers_dir())
             .await
             .expect("the existing row carries the DOI");
 
@@ -6162,11 +6208,9 @@ mod tests {
         // suffix. Serve the PDF there so the download succeeds end to end.
         fx.serve_pdf(&format!("/content/{doi}v1.full.pdf")).await;
 
-        let openalex = crate::openalex::OpenAlexAdapter::new(Fixture::auth(), 10.0)
-            .with_base_url(format!("{}/works", fx.server.uri()));
         let report = fx
             .downloader()
-            .download_by_doi(&openalex, doi, &fx.papers_dir())
+            .download_by_doi(doi, &fx.papers_dir())
             .await
             .expect("Crossref's title lets the identity gate pass");
 
@@ -6208,11 +6252,9 @@ mod tests {
         fx.serve_pdf("/content/10.1101/2025.06.14.659707v1.full.pdf")
             .await;
 
-        let openalex = crate::openalex::OpenAlexAdapter::new(Fixture::auth(), 10.0)
-            .with_base_url(format!("{}/works", fx.server.uri()));
         let report = fx
             .downloader()
-            .download_by_doi(&openalex, doi, &fx.papers_dir())
+            .download_by_doi(doi, &fx.papers_dir())
             .await
             .expect("an empty title is `unverified`, which allows filing");
 
@@ -6272,11 +6314,9 @@ mod tests {
             .await;
         fx.serve_pdf(&format!("/content/{doi}v1.full.pdf")).await;
 
-        let openalex = crate::openalex::OpenAlexAdapter::new(Fixture::auth(), 10.0)
-            .with_base_url(format!("{}/works", fx.server.uri()));
         let report = fx
             .downloader()
-            .download_by_doi(&openalex, doi, &fx.papers_dir())
+            .download_by_doi(doi, &fx.papers_dir())
             .await
             .expect("OpenAlex named the work, so the download is recorded");
 
@@ -6298,6 +6338,105 @@ mod tests {
         assert_eq!(fx.artefacts().len(), 1);
     }
 
+    /// #339 review regression: a DOI OpenAlex names must land on the row
+    /// with the **whole** OpenAlex record, not just the three fields a
+    /// `ChainOutcome` carries. Title and year are the obvious ones; authors
+    /// (all of them, not just the first), the journal, the abstract and the
+    /// OpenAlex id are the four facts the pre-#339 `fetch_paper_by_doi`
+    /// backfill used to supply — dropping them would turn a known work into
+    /// a stub row on every DOI-only download and silently regress #289.
+    ///
+    /// Still exactly **one** OpenAlex request per DOI
+    /// (`download_by_doi_asks_each_registry_at_most_once`'s invariant), so
+    /// the fix has to route the single hop's body back to the backfill rather
+    /// than re-ask.
+    #[tokio::test]
+    async fn download_by_doi_backfills_the_full_openalex_record() {
+        use scitadel_core::ports::PaperRepository as _;
+        use wiremock::{Mock, ResponseTemplate, matchers};
+
+        let fx = Fixture::new().await;
+        let doi = "10.1101/oa.full.record";
+        let title = "A fully-known work with co-authors and an abstract";
+        let oa_body = serde_json::json!({
+            "id": "https://openalex.org/W3091980498",
+            "doi": format!("https://doi.org/{doi}"),
+            "title": title,
+            "display_name": title,
+            "publication_year": 2021,
+            "authorships": [
+                {"author": {"display_name": "Charles R. Harris"}},
+                {"author": {"display_name": "K. Jarrod Millman"}},
+                {"author": {"display_name": "Stéfan J. van der Walt"}},
+            ],
+            "primary_location": {"source": {"display_name": "Nature"}},
+            // `abstract_inverted_index` is the shape OpenAlex serves; a
+            // single-word body is enough to exercise the reconstruction.
+            "abstract_inverted_index": {"Reconstructed": [0]},
+        });
+        let encoded = doi.replace('/', "%2F");
+        Mock::given(matchers::method("GET"))
+            .and(matchers::path(format!("/works/doi:{encoded}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(oa_body))
+            .mount(&fx.server)
+            .await;
+        fx.serve_pdf(&format!("/content/{doi}v1.full.pdf")).await;
+
+        let report = fx
+            .downloader()
+            .download_by_doi(doi, &fx.papers_dir())
+            .await
+            .expect("OpenAlex named the work, so the download is recorded");
+
+        let (paper_repo, _, _, _, _) = fx.db.repositories();
+        let saved = paper_repo
+            .get(report.paper.id.as_str())
+            .expect("db read")
+            .expect("paper row");
+        assert_eq!(saved.title.as_str(), title);
+        assert_eq!(saved.year, Some(2021));
+        // **All** authors, in OpenAlex's order — not just the first.
+        let authors: Vec<&str> = saved.authors.iter().map(|a| a.as_str()).collect();
+        assert_eq!(
+            authors,
+            vec![
+                "Charles R. Harris",
+                "K. Jarrod Millman",
+                "Stéfan J. van der Walt",
+            ],
+            "every OpenAlex author lands on the row, not just the first",
+        );
+        assert_eq!(
+            saved.journal.as_deref(),
+            Some("Nature"),
+            "the primary-location source is the row's journal",
+        );
+        assert_eq!(
+            saved.r#abstract.as_str(),
+            "Reconstructed",
+            "the abstract reconstructed from the inverted index lands on the row",
+        );
+        assert_eq!(
+            saved.openalex_id.as_deref(),
+            Some("W3091980498"),
+            "the short OpenAlex id lands on the row",
+        );
+        assert_eq!(saved.doi.as_deref(), Some(doi));
+
+        // And still exactly one OpenAlex hop: the metadata pass is the single
+        // reader of the body (#339 blocker). `requests_to_decoded` folds both
+        // encodings into one.
+        let openalex_hits = fx
+            .requests_to_decoded(&format!("/works/doi:{doi}"))
+            .await
+            .len();
+        assert_eq!(
+            openalex_hits, 1,
+            "OpenAlex asked exactly once per DOI-only download, saw {openalex_hits}",
+        );
+        assert_eq!(fx.artefacts().len(), 1);
+    }
+
     /// #289 review: downloading the same DOI twice must not create a second
     /// `artefacts` row for the same bytes. Migration 013's artefact unique
     /// index is `(paper_id, kind, version, sha256)` (see
@@ -6311,15 +6450,13 @@ mod tests {
         let existing = save(&fx, "p-idempotent", Some(doi), None, None, None);
         fx.serve_pdf(&format!("/content/{doi}v1.full.pdf")).await;
 
-        let openalex = crate::openalex::OpenAlexAdapter::new(Fixture::auth(), 10.0)
-            .with_base_url(format!("{}/works", fx.server.uri()));
         let downloader = fx.downloader();
         let first = downloader
-            .download_by_doi(&openalex, doi, &fx.papers_dir())
+            .download_by_doi(doi, &fx.papers_dir())
             .await
             .expect("first call records the download");
         let second = downloader
-            .download_by_doi(&openalex, doi, &fx.papers_dir())
+            .download_by_doi(doi, &fx.papers_dir())
             .await
             .expect("second call finds the existing row and re-fetches");
 
@@ -6356,11 +6493,9 @@ mod tests {
         fx.serve_pdf(&format!("/content/{lookup_doi}v1.full.pdf"))
             .await;
 
-        let openalex = crate::openalex::OpenAlexAdapter::new(Fixture::auth(), 10.0)
-            .with_base_url(format!("{}/works", fx.server.uri()));
         let report = fx
             .downloader()
-            .download_by_doi(&openalex, lookup_doi, &fx.papers_dir())
+            .download_by_doi(lookup_doi, &fx.papers_dir())
             .await
             .expect("the lowercased lookup matches the mixed-case stored row");
 
@@ -6422,11 +6557,9 @@ mod tests {
             .mount(&fx.server)
             .await;
 
-        let openalex = crate::openalex::OpenAlexAdapter::new(Fixture::auth(), 10.0)
-            .with_base_url(format!("{}/works", fx.server.uri()));
         let report = fx
             .downloader()
-            .download_by_doi(&openalex, doi, &fx.papers_dir())
+            .download_by_doi(doi, &fx.papers_dir())
             .await
             .expect("post-fetch check against Crossref's title agrees");
 
@@ -6475,11 +6608,9 @@ mod tests {
         // The preprint PDF is served so the fetch succeeds end to end.
         fx.serve_pdf(&format!("/content/{doi}v1.full.pdf")).await;
 
-        let openalex = crate::openalex::OpenAlexAdapter::new(Fixture::auth(), 10.0)
-            .with_base_url(format!("{}/works", fx.server.uri()));
         let report = fx
             .downloader()
-            .download_by_doi(&openalex, doi, &fx.papers_dir())
+            .download_by_doi(doi, &fx.papers_dir())
             .await
             .expect("Crossref answers, the preprint PDF serves, the download records");
 
@@ -6488,23 +6619,16 @@ mod tests {
         assert_eq!(fx.artefacts().len(), 1, "one DOI = one artefact row");
 
         // Each of the three identity-chain registries is asked **exactly
-        // once**. Both encodings of the DOI's inner `/` count — the raw
-        // `/works/doi:10.1101/x` the `fetch_paper_by_doi` helper builds and
-        // the `/works/doi:10.1101%2Fx` the metadata pass builds via
-        // `Url::path_segments_mut` are the same OpenAlex request, so a
-        // matcher that saw only the raw form would silently fold two hops
-        // into one. The decoded path is compared instead, so a second hop
-        // in either encoding is counted and refused.
+        // once**. `requests_to_decoded` folds `%2F` and the raw `/` so a
+        // second hop in either encoding is counted — the metadata pass
+        // encodes via `Url::path_segments_mut`, but any future caller that
+        // kept the raw slash would still land in the same bucket.
         let openalex_hits = fx
             .requests_to_decoded(&format!("/works/doi:{doi}"))
             .await
             .len();
         let crossref_hits = fx.requests_to_decoded(&format!("/cr/{doi}")).await.len();
         let datacite_hits = fx.requests_to_decoded(&format!("/dc/{doi}")).await.len();
-        // `encoded` is still read for clarity on the mock-setup side above; a
-        // bind here keeps the path names paired with the mock routes a reader
-        // can see from inside this test without jumping to the fixture.
-        let _ = &encoded;
         assert_eq!(
             openalex_hits, 1,
             "OpenAlex asked exactly once per DOI-only download, saw {openalex_hits}"
@@ -6569,12 +6693,7 @@ mod tests {
             .mount(&fx.server)
             .await;
 
-        let openalex = crate::openalex::OpenAlexAdapter::new(Fixture::auth(), 10.0)
-            .with_base_url(format!("{}/works", fx.server.uri()));
-        let outcome = fx
-            .downloader()
-            .download_by_doi(&openalex, doi, &fx.papers_dir())
-            .await;
+        let outcome = fx.downloader().download_by_doi(doi, &fx.papers_dir()).await;
         let err = outcome.expect_err(
             "a PDF whose title does not match Crossref's must be refused on the \
              **post-fetch** leg; an `is_err()` here would pass just as well for a \
@@ -6643,12 +6762,10 @@ mod tests {
         fx.serve_pdf_body(&format!("/content/{doi}v1.full.pdf"), over_cap)
             .await;
 
-        let openalex = crate::openalex::OpenAlexAdapter::new(Fixture::auth(), 10.0)
-            .with_base_url(format!("{}/works", fx.server.uri()));
         let err = fx
             .downloader()
             .with_body_cap(CAP)
-            .download_by_doi(&openalex, doi, &fx.papers_dir())
+            .download_by_doi(doi, &fx.papers_dir())
             .await
             .expect_err("a 64 KiB body under a 1 KiB cap must be refused");
         // The terminal refusal, not a retryable error: `BodyTooLarge` is the

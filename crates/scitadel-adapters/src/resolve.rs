@@ -1222,6 +1222,20 @@ pub struct Resolution {
     /// `NotConsulted` never appears — which is why a plan can show four hops and
     /// a single identity verdict without the two disagreeing.
     pub identity: crate::identity_chain::ChainOutcome,
+    /// The raw OpenAlex `/works` body the pass fetched, when it fetched one.
+    ///
+    /// Kept because `identity: ChainOutcome` compresses OpenAlex's answer down
+    /// to three fields — title, year, first author — and a caller that mints a
+    /// `papers` row for a DOI OpenAlex names wants the rest of the record
+    /// (every author, the journal, the abstract, the OpenAlex id) rather than
+    /// a stub. The pre-#339 path got those by asking OpenAlex a second time;
+    /// carrying the body on the `Resolution` keeps the single OpenAlex hop
+    /// `download_by_doi_asks_each_registry_at_most_once` pins and lets the
+    /// caller read [`crate::openalex::work_to_paper`] against it.
+    ///
+    /// By-DOI takes precedence over by-id; `None` when neither hop answered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openalex_work: Option<serde_json::Value>,
 }
 
 /// One registry the metadata pass asked, and what it said.
@@ -1327,6 +1341,7 @@ pub fn rank_candidates(mut candidates: Vec<Candidate>) -> Resolution {
             resolved: None,
             hops: Vec::new(),
         },
+        openalex_work: None,
     }
 }
 
@@ -2508,6 +2523,17 @@ impl MetadataPass {
 
         let mut resolution = rank_candidates(candidates);
         resolution.identity = Self::identity_answer(&consulted, &identity_bodies);
+        // The OpenAlex body the pass fetched, carried through so a caller that
+        // mints a `papers` row for a DOI OpenAlex knows (e.g. `download_by_doi`)
+        // can backfill every author, the journal, the abstract and the OpenAlex
+        // id — the full record `work_to_paper` builds. By-DOI's body is pushed
+        // first (step 1 above), by-id's second (step 1b), and the chain order
+        // keeps the by-DOI body winning the tiebreak when both hops answered.
+        // See `Resolution::openalex_work`.
+        resolution.openalex_work = identity_bodies
+            .iter()
+            .find(|(registry, _)| *registry == Registry::OpenAlex)
+            .map(|(_, body)| body.clone());
         resolution.consulted = consulted;
         resolution.hosts_contacted = hosts;
         resolution.derived_routes = derived_routes;

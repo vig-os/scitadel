@@ -878,19 +878,18 @@ pub async fn download(doi: &str, output_dir: Option<PathBuf>) -> Result<()> {
         scitadel_adapters::download::PaperDownloader::new(db, config.openalex.auth(), 60.0)
             .context("build the downloader")?
             .with_body_cap_override(config.acquire.body_cap_bytes);
-    let openalex = scitadel_adapters::openalex::OpenAlexAdapter::new(config.openalex.auth(), 30.0);
 
     println!("Downloading paper: {doi}");
 
     // #289: the DOI-only path records too. The downloader resolves the DOI
-    // into a `papers` row (an existing one by DOI, or a minimal row with an
-    // empty title that the metadata pass backfills from its chain answer),
-    // fetches through the recording ladder `scitadel acquire` uses, and the
-    // bytes land in the blob store beside an `artefacts` row that names
-    // them. No path writes a file into the library without a row naming it
-    // (ADR-007 §1).
+    // into a `papers` row (an existing one by DOI, or a minimal row the
+    // metadata pass backfills from its own OpenAlex / Crossref / DataCite
+    // answer), fetches through the recording ladder `scitadel acquire`
+    // uses, and the bytes land in the blob store beside an `artefacts` row
+    // that names them. No path writes a file into the library without a row
+    // naming it (ADR-007 §1).
     let report = downloader
-        .download_by_doi(&openalex, doi, &out_dir)
+        .download_by_doi(doi, &out_dir)
         .await
         .context("download failed")?;
 
