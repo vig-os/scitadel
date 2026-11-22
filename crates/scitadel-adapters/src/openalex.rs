@@ -536,12 +536,18 @@ fn work_to_candidate(work: &serde_json::Value, rank: i32) -> CandidatePaper {
         .map(reconstruct_abstract)
         .unwrap_or_default();
 
-    let doi_url = work.get("doi").and_then(|v| v.as_str()).unwrap_or("");
-    let doi = if doi_url.is_empty() {
-        None
-    } else {
-        Some(doi_url.replace("https://doi.org/", ""))
-    };
+    // OpenAlex returns the DOI as a URL (`https://doi.org/10.…`). Route it
+    // through `normalize_doi` so the stored form matches every other
+    // adapter's write path: the resolver prefix is stripped and the DOI is
+    // lowercased, which is what `find_by_doi` and `idx_papers_doi` compare
+    // on — a mixed-case DOI here would create a duplicate `papers` row on a
+    // re-download. Empty-after-normalise falls back to `None` so we do not
+    // write a placeholder DOI to the row.
+    let doi = work
+        .get("doi")
+        .and_then(|v| v.as_str())
+        .map(normalize_doi)
+        .filter(|s| !s.is_empty());
 
     let year = work
         .get("publication_year")

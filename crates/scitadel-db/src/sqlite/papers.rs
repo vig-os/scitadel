@@ -467,9 +467,19 @@ impl PaperRepository for SqlitePaperRepository {
     }
 
     fn find_by_doi(&self, doi: &str) -> Result<Option<Paper>, CoreError> {
+        // DOIs are case-insensitive per the DOI Handbook (§2.4, "DOIs are
+        // case-insensitive ... though the canonical form is lowercase"), so
+        // the lookup compares lowercased forms. Every scitadel-owned write
+        // path normalises to lowercase through `normalize_doi`, but data
+        // can still arrive from an adapter that only strips the resolver
+        // prefix (OpenAlex's own `doi` field, until it is routed through
+        // `dedup::deduplicate`), so a stored row may be mixed case. A
+        // case-sensitive lookup would then miss a row the user has already,
+        // and the download path would mint a duplicate — the thing the DOI
+        // unique index exists to prevent.
         let conn = self.db.conn()?;
         let mut stmt = conn
-            .prepare("SELECT * FROM papers WHERE doi = ?1")
+            .prepare("SELECT * FROM papers WHERE unicode_lower(doi) = unicode_lower(?1)")
             .map_err(DbError::Sqlite)?;
         let result = stmt
             .query_row(params![doi], row_to_paper)
