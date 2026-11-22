@@ -1234,7 +1234,12 @@ pub struct Resolution {
     /// caller read [`crate::openalex::work_to_paper`] against it.
     ///
     /// By-DOI takes precedence over by-id; `None` when neither hop answered.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    ///
+    /// Never serialized: the body holds the publisher's abstract index, and a
+    /// `Resolution` is part of the `acquire` reports printed by `acquire --json`
+    /// and the MCP `acquire` tool. Untrusted publisher text only leaves through
+    /// the untrusted-content envelope (#306).
+    #[serde(skip)]
     pub openalex_work: Option<serde_json::Value>,
 }
 
@@ -3436,6 +3441,29 @@ fn openalex_with_mailto(
 
 #[cfg(test)]
 mod tests {
+    /// #339: `Resolution::openalex_work` carries the raw OpenAlex `/works`
+    /// body, including the publisher's abstract index. `Resolution` sits inside
+    /// the `acquire` reports that `acquire --json` and the MCP `acquire` tool
+    /// print, so the body must never reach that output: untrusted publisher
+    /// text only leaves through the untrusted-content envelope (#306).
+    #[test]
+    fn the_raw_openalex_body_is_never_serialized() {
+        let mut resolution = super::rank_candidates(Vec::new());
+        resolution.openalex_work = Some(serde_json::json!({
+            "id": "https://openalex.org/W1",
+            "abstract_inverted_index": {"ignore": [0], "previous": [1]},
+        }));
+        let out = serde_json::to_value(&resolution).unwrap();
+        assert!(
+            out.get("openalex_work").is_none(),
+            "the raw OpenAlex body leaked into serialized output: {out}"
+        );
+        assert!(
+            !out.to_string().contains("abstract_inverted_index"),
+            "publisher abstract text leaked: {out}"
+        );
+    }
+
     use super::*;
 
     use scitadel_core::ports::{Bucket, Cost, PaceDenied, PaceTier, Pacer, Permit};
