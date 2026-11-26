@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-10-02T15:54:53Z
-updated: 2026-11-18T11:43:57Z
+updated: 2026-11-25T18:10:54Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/scitadel/issues/268
-comments: 4
+comments: 5
 labels: feature, effort:medium, priority:medium, semver:patch
 assignees: none
 milestone: 0.9.0
 projects: none
 parent: none
 children: none
-synced: 2026-11-19T09:39:05.363Z
+synced: 2026-11-26T10:11:02.049Z
 ---
 
 # [Issue 268]: [feat(adapters): E4 — live API contract tests, which are still unimplemented](https://github.com/vig-os/scitadel/issues/268)
@@ -102,4 +102,16 @@ Attribution will follow CC BY 4.0, and each imported row will record the snapsho
 
 Thanks again for the pointers and for being upfront about running PatentRef.
 
+
+---
+
+# [Comment #5]() by [Nietzsche247]()
+
+_Posted on November 25, 2026 at 06:10 PM_
+
+Thanks for going through the snapshot, and for the plan to add an optional PatentRef snapshot adapter while keeping USPTO bulk XML as your source of record. I run PatentRef, and if a mismatch turns up, or if anything about the files is unclear, tell me here and I'll look into it.
+
+The snapshot stays at DOI 10.5281/zenodo.23250455, which always resolves to the newest version. Today that version is 10.5281/zenodo.23612407, data version 20261020.1, as three SQLite files, including the separate lapse file with maintenance-fee status. A new snapshot version is added to the same DOI each quarter. The live API refreshes every week from USPTO data and is on a newer build today (data version 20261117.2, as of 2026-11-17). Every API answer carries that version in X-Data-Version.
+
+The CC BY 4.0 attribution lines are at https://patentref.io/docs/attribution.html, and the snapshot layout and checksums are at https://patentref.io/docs/snapshot.html.
 
