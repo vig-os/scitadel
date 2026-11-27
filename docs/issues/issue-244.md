@@ -2,7 +2,7 @@
 type: issue
 state: open
 created: 2026-09-29T12:26:32Z
-updated: 2026-11-21T07:50:12Z
+updated: 2026-11-26T18:32:07Z
 author: renovate[bot]
 author_url: https://github.com/renovate[bot]
 url: https://github.com/vig-os/scitadel/issues/244
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-11-21T08:58:03.113Z
+synced: 2026-11-27T10:16:27.557Z
 ---
 
 # [Issue 244]: [Dependency Dashboard](https://github.com/vig-os/scitadel/issues/244)
@@ -32,14 +32,14 @@ The following updates are awaiting their schedule. To get an update now, click o
  - [ ] <!-- unschedule-branch=renovate/url-2.x-lockfile -->chore(deps): update rust crate url to v2.5.9
  - [ ] <!-- unschedule-branch=renovate/github-actions-(minor-and-patch) -->ci(actions): update github-actions (minor and patch) (`rust-lang/crates-io-auth-action`, `vig-os/commit-action`)
  - [ ] <!-- unschedule-branch=renovate/assert_cmd-2.x-lockfile -->chore(deps): update rust crate assert_cmd to v2.2.2
- - [ ] <!-- unschedule-branch=renovate/clap-4.x-lockfile -->chore(deps): update rust crate clap to v4.6.9
+ - [ ] <!-- unschedule-branch=renovate/clap-4.x-lockfile -->chore(deps): update rust crate clap to v4.6.10
  - [ ] <!-- unschedule-branch=renovate/insta-1.x-lockfile -->chore(deps): update rust crate insta to v1.49.0
  - [ ] <!-- unschedule-branch=renovate/pdf-extract-0.x -->chore(deps): update rust crate pdf-extract to 0.12
  - [ ] <!-- unschedule-branch=renovate/proptest-1.x-lockfile -->chore(deps): update rust crate proptest to v1.12.0
  - [ ] <!-- unschedule-branch=renovate/quick-xml-0.x -->chore(deps): update rust crate quick-xml to 0.42
  - [ ] <!-- unschedule-branch=renovate/r2d2_sqlite-0.x -->chore(deps): update rust crate r2d2_sqlite to 0.37
  - [ ] <!-- unschedule-branch=renovate/reqwest-0.x -->chore(deps): update rust crate reqwest to 0.13
- - [ ] <!-- unschedule-branch=renovate/rmcp-3.x-lockfile -->chore(deps): update rust crate rmcp to v3.11.0
+ - [ ] <!-- unschedule-branch=renovate/rmcp-3.x-lockfile -->chore(deps): update rust crate rmcp to v3.12.0
  - [ ] <!-- unschedule-branch=renovate/rusqlite-0.x -->chore(deps): update rust crate rusqlite to 0.43
  - [ ] <!-- unschedule-branch=renovate/scraper-0.x -->chore(deps): update rust crate scraper to 0.29
  - [ ] <!-- unschedule-branch=renovate/sha1-0.x -->chore(deps): update rust crate sha1 to 0.11
@@ -62,7 +62,7 @@ The following updates are awaiting their schedule. To get an update now, click o
 The following updates have all been created. To force a retry/rebase of any, click on a checkbox below.
 
  - [ ] <!-- rebase-branch=renovate/actions-create-github-app-token-digest -->[chore(deps): update actions/create-github-app-token digest to f418cff](../pull/309)
- - [ ] <!-- rebase-branch=renovate/anyhow-1.x-lockfile -->[chore(deps): update rust crate anyhow to v1.0.104](../pull/310)
+ - [ ] <!-- rebase-branch=renovate/anyhow-1.x-lockfile -->[chore(deps): update rust crate anyhow to v1.0.105](../pull/310)
  - [ ] <!-- rebase-branch=renovate/async-trait-0.x-lockfile -->[chore(deps): update rust crate async-trait to v0.1.92](../pull/342)
  - [ ] <!-- rebase-branch=renovate/chrono-0.x-lockfile -->[chore(deps): update rust crate chrono to v0.4.45](../pull/343)
  - [ ] <!-- rebase-branch=renovate/rust-futures-monorepo -->[chore(deps): update rust crate futures to v0.3.34](../pull/347)
@@ -83,7 +83,7 @@ The following updates have all been created. To force a retry/rebase of any, cli
  - `serde 1` → [Updates: `lock file @ 1.0.229`]
  - `serde_json 1` → [Updates: `lock file @ 1.0.154`]
  - `thiserror 2` → [Updates: `lock file @ 2.0.21`]
- - `anyhow 1` → [Updates: `lock file @ 1.0.104`]
+ - `anyhow 1` → [Updates: `lock file @ 1.0.105`]
  - `sha2 0.10` → [Updates: `0.11`]
  - `tokio 1` → [Updates: `lock file @ 1.54.1`]
  - `async-trait 0.1` → [Updates: `lock file @ 0.1.92`]
@@ -100,10 +100,10 @@ The following updates have all been created. To force a retry/rebase of any, cli
  - `rpassword 7` → [Updates: `lock file @ 7.5.5`]
  - `zeroize 1` → [Updates: `lock file @ 1.9.2`]
  - `security-framework 3`
- - `clap 4` → [Updates: `lock file @ 4.6.9`]
+ - `clap 4` → [Updates: `lock file @ 4.6.10`]
  - `ratatui 0.30`
  - `crossterm 0.29`
- - `rmcp 3.4` → [Updates: `lock file @ 3.11.0`]
+ - `rmcp 3.4` → [Updates: `lock file @ 3.12.0`]
  - `schemars 1` → [Updates: `lock file @ 1.2.3`]
  - `pdf-extract 0.7` → [Updates: `0.12`]
  - `scraper 0.20` → [Updates: `0.29`]
